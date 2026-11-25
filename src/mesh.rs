@@ -10,7 +10,7 @@ use crate::crypto::{
 };
 use crate::deflate::{base64url_decode, base64url_encode, deflate_raw, inflate_auto};
 use crate::json::{JsonValue, write_json_string, write_json_value};
-use crate::log::{LogMessage, ReplicatedLog, SealedLogRecord};
+use crate::log::{LogMessage, MSG_TYPE_DELETE, ReplicatedLog, SealedLogRecord};
 use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
     DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
@@ -74,6 +74,7 @@ pub enum MeshAction {
     },
     LogUpdated {
         added_ids: Vec<String>,
+        deleted_ids: Vec<String>,
         total_count: usize,
         lamport: u64,
     },
@@ -98,6 +99,16 @@ pub enum MeshAction {
         from_peer_id: String,
         candidate: JsonValue,
     },
+    BotActionReceived {
+        action_uid: String,
+        from_peer_id: String,
+        from_name: String,
+        message_id: String,
+        action_id: String,
+        label: String,
+        value: JsonValue,
+        ts: u64,
+    },
     Telemetry {
         event: String,
         detail: String,
@@ -116,11 +127,19 @@ impl MeshAction {
             }
             Self::LogUpdated {
                 added_ids,
+                deleted_ids,
                 total_count,
                 lamport,
             } => {
                 out.push_str("{\"action\":\"log_updated\",\"addedIds\":[");
                 for (i, id) in added_ids.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_json_string(out, id);
+                }
+                out.push_str("],\"deletedIds\":[");
+                for (i, id) in deleted_ids.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
@@ -182,6 +201,32 @@ impl MeshAction {
                 out.push_str(",\"candidate\":");
                 write_json_value(out, candidate);
                 out.push('}');
+            }
+            Self::BotActionReceived {
+                action_uid,
+                from_peer_id,
+                from_name,
+                message_id,
+                action_id,
+                label,
+                value,
+                ts,
+            } => {
+                out.push_str("{\"action\":\"bot_action\",\"actionUid\":");
+                write_json_string(out, action_uid);
+                out.push_str(",\"fromPeerId\":");
+                write_json_string(out, from_peer_id);
+                out.push_str(",\"fromName\":");
+                write_json_string(out, from_name);
+                out.push_str(",\"messageId\":");
+                write_json_string(out, message_id);
+                out.push_str(",\"actionId\":");
+                write_json_string(out, action_id);
+                out.push_str(",\"label\":");
+                write_json_string(out, label);
+                out.push_str(",\"value\":");
+                write_json_value(out, value);
+                let _ = write!(out, ",\"ts\":{ts}}}");
             }
             Self::Telemetry { event, detail } => {
                 out.push_str("{\"action\":\"telemetry\",\"event\":");
@@ -305,6 +350,7 @@ pub struct ConnectedPeer {
     pub rtt_ms: Option<u64>,
     pub in_voice: bool,
     pub voice_muted: bool,
+    pub is_bot: bool,
     crypto: PeerCryptoState,
     known_ids: HashSet<String>,
     pending_inv: Option<PendingInventory>,
@@ -343,6 +389,7 @@ pub struct MeshNode {
     passphrase_mode: bool,
     in_voice: bool,
     voice_muted: bool,
+    is_bot: bool,
     csprng: SafeCsprng,
     config: MeshConfig,
     log: ReplicatedLog,
@@ -350,6 +397,7 @@ pub struct MeshNode {
     known_pub_keys: BTreeMap<String, [u8; KEY_LEN]>,
     indirect_routes: BTreeMap<String, IndirectPeerRoute>,
     auto_mesh_pending: BTreeMap<String, PendingAutoMesh>,
+    seen_bot_actions: HashSet<String>,
     stats: MeshStats,
     seq: u64,
 }
@@ -389,6 +437,7 @@ impl MeshNode {
             passphrase_mode: false,
             in_voice: false,
             voice_muted: false,
+            is_bot: false,
             csprng,
             config,
             log: ReplicatedLog::new(),
@@ -396,6 +445,7 @@ impl MeshNode {
             known_pub_keys: BTreeMap::new(),
             indirect_routes: BTreeMap::new(),
             auto_mesh_pending: BTreeMap::new(),
+            seen_bot_actions: HashSet::new(),
             stats: MeshStats::default(),
             seq: 0,
         }
@@ -439,6 +489,14 @@ impl MeshNode {
 
     pub fn voice_muted(&self) -> bool {
         self.voice_muted
+    }
+
+    pub fn is_bot(&self) -> bool {
+        self.is_bot
+    }
+
+    pub fn set_is_bot(&mut self, is_bot: bool) {
+        self.is_bot = is_bot;
     }
 
     pub fn invite_wrap_key(&self) -> Option<[u8; KEY_LEN]> {
@@ -517,6 +575,7 @@ impl MeshNode {
                     peer_id: p.peer_id.clone(),
                     author_name: p.author_name.clone(),
                     pub_key: p.crypto.pub_key,
+                    is_bot: p.is_bot,
                 })
                 .collect();
             let hello = WireFrame::Hello {
@@ -528,6 +587,7 @@ impl MeshNode {
                 log_count: self.log.len(),
                 in_voice: self.in_voice,
                 voice_muted: self.voice_muted,
+                is_bot: self.is_bot,
                 peers: other_peers,
             };
             self.emit_wire(&mut actions, &pid, &hello);
@@ -717,9 +777,20 @@ impl MeshNode {
             &mut self.csprng,
         )?;
 
+        let mut added_ids = Vec::new();
+        let mut deleted_ids = Vec::new();
+        if msg.msg_type == MSG_TYPE_DELETE {
+            if let Some(target_id) = msg.payload.get_str("targetId") {
+                deleted_ids.push(target_id.to_owned());
+            }
+        } else {
+            added_ids.push(msg.id.clone());
+        }
+
         let mut actions = Vec::new();
         actions.push(MeshAction::LogUpdated {
-            added_ids: vec![msg.id.clone()],
+            added_ids,
+            deleted_ids,
             total_count: self.log.len(),
             lamport: self.log.lamport(),
         });
@@ -740,7 +811,11 @@ impl MeshNode {
         }
 
         actions.push(MeshAction::Telemetry {
-            event: "publish".to_owned(),
+            event: if msg.msg_type == MSG_TYPE_DELETE {
+                "delete_message".to_owned()
+            } else {
+                "publish".to_owned()
+            },
             detail: format!(
                 "Sealed & gossiped {} (L={}) to {} peer(s)",
                 msg.id,
@@ -750,6 +825,107 @@ impl MeshNode {
         });
 
         Ok((msg, actions))
+    }
+
+    /// Publishes an authenticated CRDT tombstone (`msg-delete`) that immediately scrubs `target_id`
+    /// from local RAM and gossips/syncs the deletion to all peers in the room.
+    pub fn delete_message(
+        &mut self,
+        target_id: String,
+        ts_ms: u64,
+    ) -> Result<(LogMessage, Vec<MeshAction>), String> {
+        let clean = target_id.trim().to_owned();
+        if clean.is_empty() {
+            return Err("delete_message missing non-empty 'targetId'".to_owned());
+        }
+        let mut map = BTreeMap::new();
+        map.insert("targetId".to_owned(), JsonValue::string(&clean));
+        self.publish_local(MSG_TYPE_DELETE.to_owned(), JsonValue::Object(map), ts_ms, None)
+    }
+
+    /// Sends an E2EE interactive bot button callback to `to_peer_id` (or `"*"` broadcast),
+    /// routing directly or multi-hop through the mesh without polluting the replicated chat log.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_bot_action(
+        &mut self,
+        to_peer_id: String,
+        message_id: String,
+        action_id: String,
+        label: String,
+        value: JsonValue,
+        ts_ms: u64,
+    ) -> Result<(String, Vec<MeshAction>), String> {
+        let to_clean = to_peer_id.trim().to_owned();
+        if to_clean.is_empty() {
+            return Err("send_bot_action missing 'toPeerId'".to_owned());
+        }
+        if message_id.trim().is_empty() {
+            return Err("send_bot_action missing 'messageId'".to_owned());
+        }
+        if action_id.trim().is_empty() {
+            return Err("send_bot_action missing 'actionId'".to_owned());
+        }
+
+        let seq = self.next_seq();
+        let action_uid = format!("ba-{}-{}-{}", self.peer_id, ts_ms, seq);
+        self.record_seen_bot_action(&action_uid);
+
+        let mut actions = Vec::new();
+        if to_clean == self.peer_id {
+            actions.push(MeshAction::BotActionReceived {
+                action_uid: action_uid.clone(),
+                from_peer_id: self.peer_id.clone(),
+                from_name: self.author_name.clone(),
+                message_id,
+                action_id,
+                label,
+                value,
+                ts: ts_ms,
+            });
+            return Ok((action_uid, actions));
+        }
+
+        let frame = WireFrame::BotAction {
+            action_uid: action_uid.clone(),
+            from: self.peer_id.clone(),
+            from_name: self.author_name.clone(),
+            to: to_clean.clone(),
+            message_id,
+            action_id,
+            label,
+            value,
+            ts: ts_ms,
+            hops: vec![self.peer_id.clone()],
+            ttl: self.config.relay_ttl,
+        };
+
+        let next_hops: Vec<String> = if to_clean != "*" && self.peers.contains_key(&to_clean) {
+            vec![to_clean]
+        } else if to_clean != "*"
+            && let Some(route) = self.indirect_routes.get(&to_clean)
+            && self.peers.contains_key(&route.via_peer_id)
+        {
+            vec![route.via_peer_id.clone()]
+        } else {
+            self.peers.keys().cloned().collect()
+        };
+
+        for hop in next_hops {
+            self.emit_wire(&mut actions, &hop, &frame);
+        }
+
+        Ok((action_uid, actions))
+    }
+
+    fn record_seen_bot_action(&mut self, action_uid: &str) -> bool {
+        if self.seen_bot_actions.contains(action_uid) {
+            return false;
+        }
+        if self.seen_bot_actions.len() >= 512 {
+            self.seen_bot_actions.clear();
+        }
+        self.seen_bot_actions.insert(action_uid.to_owned());
+        true
     }
 
     /// Called when a direct WebRTC DataChannel opens with `peer_id` and its verified X25519 `peer_pub_key`.
@@ -805,6 +981,7 @@ impl MeshNode {
                 peer_id: p.peer_id.clone(),
                 author_name: p.author_name.clone(),
                 pub_key: p.crypto.pub_key,
+                is_bot: p.is_bot,
             })
             .collect();
 
@@ -826,6 +1003,7 @@ impl MeshNode {
                 rtt_ms: None,
                 in_voice: false,
                 voice_muted: false,
+                is_bot: false,
                 crypto: PeerCryptoState {
                     pub_key: peer_pub_key,
                     tx_key,
@@ -855,6 +1033,7 @@ impl MeshNode {
             log_count: self.log.len(),
             in_voice: self.in_voice,
             voice_muted: self.voice_muted,
+            is_bot: self.is_bot,
             peers: other_peers,
         };
         self.emit_wire(&mut actions, &peer_id, &hello);
@@ -1256,6 +1435,7 @@ impl MeshNode {
                 log_count: _,
                 in_voice,
                 voice_muted,
+                is_bot,
                 peers,
             } => {
                 self.handle_hello(
@@ -1266,6 +1446,7 @@ impl MeshNode {
                     lamport,
                     in_voice,
                     voice_muted,
+                    is_bot,
                     peers,
                     now_ms,
                     &mut actions,
@@ -1321,6 +1502,7 @@ impl MeshNode {
                 peer_id,
                 author_name,
                 pub_key,
+                is_bot: _,
             } => {
                 self.consider_auto_mesh_peer(
                     &peer_id,
@@ -1386,9 +1568,131 @@ impl MeshNode {
                     });
                 }
             }
+            WireFrame::BotAction {
+                action_uid,
+                from,
+                from_name,
+                to,
+                message_id,
+                action_id,
+                label,
+                value,
+                ts,
+                hops,
+                ttl,
+            } => {
+                self.handle_bot_action(
+                    from_peer,
+                    action_uid,
+                    from,
+                    from_name,
+                    to,
+                    message_id,
+                    action_id,
+                    label,
+                    value,
+                    ts,
+                    hops,
+                    ttl,
+                    &mut actions,
+                );
+            }
         }
 
         Ok(actions)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_bot_action(
+        &mut self,
+        from_link: &str,
+        action_uid: String,
+        from: String,
+        from_name: String,
+        to: String,
+        message_id: String,
+        action_id: String,
+        label: String,
+        value: JsonValue,
+        ts: u64,
+        hops: Vec<String>,
+        ttl: u32,
+        actions: &mut Vec<MeshAction>,
+    ) {
+        if !self.record_seen_bot_action(&action_uid) {
+            return;
+        }
+
+        if to == self.peer_id || to == "*" {
+            actions.push(MeshAction::BotActionReceived {
+                action_uid: action_uid.clone(),
+                from_peer_id: from.clone(),
+                from_name: from_name.clone(),
+                message_id: message_id.clone(),
+                action_id: action_id.clone(),
+                label: label.clone(),
+                value: value.clone(),
+                ts,
+            });
+            if to == self.peer_id {
+                return;
+            }
+        }
+
+        if ttl <= 1 || hops.iter().any(|h| h == &self.peer_id) {
+            return;
+        }
+
+        let mut next_hops = hops;
+        if !next_hops.iter().any(|h| h == from_link) {
+            next_hops.push(from_link.to_owned());
+        }
+        next_hops.push(self.peer_id.clone());
+
+        let forwarded = WireFrame::BotAction {
+            action_uid,
+            from,
+            from_name,
+            to: to.clone(),
+            message_id,
+            action_id,
+            label,
+            value,
+            ts,
+            hops: next_hops.clone(),
+            ttl: ttl - 1,
+        };
+
+        if to != "*" && self.peers.contains_key(&to) && to != from_link {
+            self.emit_wire(actions, &to, &forwarded);
+            return;
+        }
+
+        if to != "*"
+            && let Some(route) = self.indirect_routes.get(&to)
+        {
+            let next = route.via_peer_id.clone();
+            if self.peers.contains_key(&next)
+                && next != from_link
+                && !next_hops.iter().any(|h| h == &next)
+            {
+                self.emit_wire(actions, &next, &forwarded);
+                return;
+            }
+        }
+
+        let targets: Vec<String> = self
+            .peers
+            .keys()
+            .filter(|pid| {
+                pid.as_str() != from_link && !next_hops.iter().any(|h| h == pid.as_str())
+            })
+            .cloned()
+            .collect();
+
+        for target in targets {
+            self.emit_wire(actions, &target, &forwarded);
+        }
     }
 
     fn send_sync_inv_to(&mut self, peer_id: &str, actions: &mut Vec<MeshAction>) {
@@ -1468,6 +1772,7 @@ impl MeshNode {
         remote_lamport: u64,
         remote_in_voice: bool,
         remote_voice_muted: bool,
+        remote_is_bot: bool,
         remote_peers: Vec<PeerSummary>,
         now_ms: u64,
         actions: &mut Vec<MeshAction>,
@@ -1497,6 +1802,7 @@ impl MeshNode {
             } else {
                 false
             };
+            peer.is_bot = remote_is_bot;
             peer.remote_peers = remote_peers.clone();
         }
 
@@ -1514,19 +1820,27 @@ impl MeshNode {
             return;
         }
 
-        let other_peers: Vec<(String, String, [u8; KEY_LEN])> = self
+        let other_peers: Vec<(String, String, [u8; KEY_LEN], bool)> = self
             .peers
             .values()
             .filter(|p| p.peer_id != effective_peer)
-            .map(|p| (p.peer_id.clone(), p.author_name.clone(), p.crypto.pub_key))
+            .map(|p| {
+                (
+                    p.peer_id.clone(),
+                    p.author_name.clone(),
+                    p.crypto.pub_key,
+                    p.is_bot,
+                )
+            })
             .collect();
 
-        for (other_id, other_name, other_pk) in other_peers {
+        for (other_id, other_name, other_pk, other_is_bot) in other_peers {
             let intro_to_other = WireFrame::MeshIntro {
                 via: self.peer_id.clone(),
                 peer_id: effective_peer.clone(),
                 author_name: author_name.to_owned(),
                 pub_key: verified_pub_key,
+                is_bot: remote_is_bot,
             };
             self.stats.auto_mesh_intros_sent = self.stats.auto_mesh_intros_sent.saturating_add(1);
             self.emit_wire(actions, &other_id, &intro_to_other);
@@ -1536,6 +1850,7 @@ impl MeshNode {
                 peer_id: other_id,
                 author_name: other_name,
                 pub_key: other_pk,
+                is_bot: other_is_bot,
             };
             self.stats.auto_mesh_intros_sent = self.stats.auto_mesh_intros_sent.saturating_add(1);
             self.emit_wire(actions, &effective_peer, &intro_to_new);
@@ -1567,7 +1882,7 @@ impl MeshNode {
             peer.known_ids.insert(msg_id.clone());
         }
 
-        if self.log.contains_id(&msg_id) {
+        if self.log.contains_or_deleted(&msg_id) {
             self.stats.gossip_duplicates_dropped =
                 self.stats.gossip_duplicates_dropped.saturating_add(1);
             return Ok(());
@@ -1581,14 +1896,25 @@ impl MeshNode {
             }
         };
 
-        let Some(_) = inserted else {
+        let Some(inserted_msg) = inserted else {
             self.stats.gossip_duplicates_dropped =
                 self.stats.gossip_duplicates_dropped.saturating_add(1);
             return Ok(());
         };
 
+        let mut added_ids = Vec::new();
+        let mut deleted_ids = Vec::new();
+        if inserted_msg.msg_type == MSG_TYPE_DELETE {
+            if let Some(target_id) = inserted_msg.payload.get_str("targetId") {
+                deleted_ids.push(target_id.to_owned());
+            }
+        } else {
+            added_ids.push(msg_id.clone());
+        }
+
         actions.push(MeshAction::LogUpdated {
-            added_ids: vec![msg_id.clone()],
+            added_ids,
+            deleted_ids,
             total_count: self.log.len(),
             lamport: self.log.lamport(),
         });
@@ -1692,7 +2018,7 @@ impl MeshNode {
             if should_send_req {
                 let mut missing_locally: Vec<String> = remote_ids
                     .into_iter()
-                    .filter(|id| !self.log.contains_id(id))
+                    .filter(|id| !self.log.contains_or_deleted(id))
                     .collect();
                 missing_locally.sort();
                 if !missing_locally.is_empty() {
@@ -1739,7 +2065,7 @@ impl MeshNode {
             if let Some(peer) = self.peers.get_mut(from_peer) {
                 peer.known_ids.insert(rec.id.clone());
             }
-            if self.log.contains_id(&rec.id) {
+            if self.log.contains_or_deleted(&rec.id) {
                 continue;
             }
             match self.log.insert_sealed(rec.clone(), &self.log_key) {
@@ -1756,9 +2082,20 @@ impl MeshNode {
             return Ok(());
         }
 
-        let added_ids: Vec<String> = added_records.iter().map(|(m, _)| m.id.clone()).collect();
+        let mut added_ids: Vec<String> = Vec::new();
+        let mut deleted_ids: Vec<String> = Vec::new();
+        for (m, _) in &added_records {
+            if m.msg_type == MSG_TYPE_DELETE {
+                if let Some(target_id) = m.payload.get_str("targetId") {
+                    deleted_ids.push(target_id.to_owned());
+                }
+            } else {
+                added_ids.push(m.id.clone());
+            }
+        }
         actions.push(MeshAction::LogUpdated {
             added_ids,
+            deleted_ids,
             total_count: self.log.len(),
             lamport: self.log.lamport(),
         });
@@ -2070,6 +2407,7 @@ impl MeshNode {
         write_json_string(&mut out, &self.author_name);
         out.push_str(",\"room\":");
         write_json_string(&mut out, &self.room);
+        let _ = write!(out, ",\"isBot\":{}", self.is_bot);
         out.push_str(",\"e2ee\":{\"cipher\":\"X25519 + ChaCha20-Poly1305\",\"keyFingerprint\":");
         write_json_string(&mut out, &self.key_fp);
         out.push_str(",\"roomTopic\":");
@@ -2100,7 +2438,8 @@ impl MeshNode {
             write_json_string(&mut out, &base64url_encode(&peer.crypto.pub_key));
             let _ = write!(
                 out,
-                ",\"viaAutoMesh\":{},\"introducedBy\":",
+                ",\"isBot\":{},\"viaAutoMesh\":{},\"introducedBy\":",
+                peer.is_bot,
                 peer.via_auto_mesh
             );
             match &peer.introduced_by {

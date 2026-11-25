@@ -637,10 +637,12 @@ fn wire_frames_e2ee_envelope_and_chunking_roundtrip() -> TestResult {
             log_count: 1,
             in_voice: true,
             voice_muted: false,
+            is_bot: true,
             peers: vec![PeerSummary {
                 peer_id: "p-2".to_owned(),
                 author_name: "Node2".to_owned(),
                 pub_key: pk2,
+                is_bot: false,
             }],
         },
         WireFrame::Msg {
@@ -673,6 +675,7 @@ fn wire_frames_e2ee_envelope_and_chunking_roundtrip() -> TestResult {
             peer_id: "p-3".to_owned(),
             author_name: "Node3".to_owned(),
             pub_key: pk2,
+            is_bot: true,
         },
         WireFrame::RelaySignal {
             from: "p-1".to_owned(),
@@ -688,6 +691,19 @@ fn wire_frames_e2ee_envelope_and_chunking_roundtrip() -> TestResult {
         WireFrame::VoiceState {
             in_voice: true,
             muted: true,
+        },
+        WireFrame::BotAction {
+            action_uid: "ba-p1-1000-1".to_owned(),
+            from: "p-1".to_owned(),
+            from_name: "Node1".to_owned(),
+            to: "p-bot".to_owned(),
+            message_id: "m-1".to_owned(),
+            action_id: "wf:cetus".to_owned(),
+            label: "Refresh Cetus".to_owned(),
+            value: parse_json(r#"{"zone":"cetus"}"#)?,
+            ts: 1_700_000_001_000,
+            hops: vec!["p-1".to_owned()],
+            ttl: 8,
         },
     ];
 
@@ -907,5 +923,132 @@ fn ima_adpcm_and_e2ee_voice_packet_roundtrip() -> TestResult {
     assert!(open_voice_packet_ciphertext(&b_rx, seq, &nonce, "peer-b", "peer-a", ct).is_err());
     let opened = open_voice_packet_ciphertext(&b_rx, seq, &nonce, "peer-a", "peer-b", ct)?;
     assert_eq!(opened, encoded);
+    Ok(())
+}
+
+#[test]
+fn replicated_log_delete_tombstones_scrub_and_prevent_zombie_resurrection() -> TestResult {
+    let mut log = ReplicatedLog::new();
+    let m1 = log.append_local(
+        "m-1".to_owned(),
+        "chat".to_owned(),
+        100,
+        "peer-a".to_owned(),
+        "Alice".to_owned(),
+        parse_json(r#"{"text":"secret message"}"#)?,
+    )?;
+    let _m2 = log.append_local(
+        "m-2".to_owned(),
+        "chat".to_owned(),
+        200,
+        "peer-a".to_owned(),
+        "Alice".to_owned(),
+        parse_json(r#"{"text":"keep me"}"#)?,
+    )?;
+    assert_eq!(log.len(), 2);
+
+    // Delete m-1 via CRDT tombstone
+    let _t1 = log.append_local(
+        "del-1".to_owned(),
+        "msg-delete".to_owned(),
+        300,
+        "peer-b".to_owned(),
+        "Bob".to_owned(),
+        parse_json(r#"{"targetId":"m-1"}"#)?,
+    )?;
+    assert_eq!(log.len(), 1);
+    assert!(log.is_deleted("m-1"));
+    assert!(log.get_by_id("m-1").is_none()); // scrubbed from RAM!
+    assert!(log.contains_or_deleted("m-1"));
+
+    // Late re-delivery of m-1 must NOT resurrect it
+    assert!(!log.insert(m1)?);
+    assert_eq!(log.len(), 1);
+
+    // Out-of-order tombstone arriving BEFORE original message m-3
+    let _t3 = log.append_local(
+        "del-3".to_owned(),
+        "msg-delete".to_owned(),
+        350,
+        "peer-b".to_owned(),
+        "Bob".to_owned(),
+        parse_json(r#"{"targetId":"m-3"}"#)?,
+    )?;
+    let late_m3 = LogMessage {
+        id: "m-3".to_owned(),
+        msg_type: "chat".to_owned(),
+        lamport: 2,
+        ts: 250,
+        author: "peer-c".to_owned(),
+        author_name: "Carol".to_owned(),
+        payload: parse_json(r#"{"text":"late arrival"}"#)?,
+    };
+    assert!(!log.insert(late_m3)?);
+    assert_eq!(log.len(), 1);
+
+    // JSON export omits tombstones and deleted content completely
+    let mut json_arr = String::new();
+    log.write_messages_json_array(&mut json_arr);
+    assert!(!json_arr.contains("secret message"));
+    assert!(!json_arr.contains("msg-delete"));
+    assert!(json_arr.contains("keep me"));
+    Ok(())
+}
+
+#[test]
+fn replicated_log_bot_update_lww_folding_and_scrub_on_delete() -> TestResult {
+    let mut log = ReplicatedLog::new();
+    let _b1 = log.append_local(
+        "bot-msg-1".to_owned(),
+        "bot".to_owned(),
+        100,
+        "bot-1".to_owned(),
+        "WarframeBot".to_owned(),
+        parse_json(r#"{"title":"Cetus","badge":"DAY"}"#)?,
+    )?;
+    let _c1 = log.append_local(
+        "chat-1".to_owned(),
+        "chat".to_owned(),
+        150,
+        "peer-a".to_owned(),
+        "Alice".to_owned(),
+        parse_json(r#"{"text":"nice"}"#)?,
+    )?;
+    let _u1 = log.append_local(
+        "upd-1".to_owned(),
+        "bot-update".to_owned(),
+        200,
+        "bot-1".to_owned(),
+        "WarframeBot".to_owned(),
+        parse_json(r#"{"targetId":"bot-msg-1","card":{"title":"Cetus","badge":"NIGHT"}}"#)?,
+    )?;
+
+    // Visible count stays 2 (bot-msg-1 + chat-1), and bot-msg-1 stays at index 0 with NIGHT badge
+    assert_eq!(log.len(), 2);
+    let mut json_arr = String::new();
+    log.write_messages_json_array(&mut json_arr);
+    let parsed = parse_json(&json_arr)?;
+    let items = parsed.as_array().ok_or("expected array")?;
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].get_str("id"), Some("bot-msg-1"));
+    assert_eq!(
+        items[0].get("payload").and_then(|p| p.get_str("badge")),
+        Some("NIGHT")
+    );
+    assert_eq!(items[0].get_u64("updatedLamport"), Some(3));
+    assert_eq!(items[1].get_str("id"), Some("chat-1"));
+
+    // Deleting bot-msg-1 scrubs both bot-msg-1 AND its bot-update from memory
+    let _del = log.append_local(
+        "del-bot-1".to_owned(),
+        "msg-delete".to_owned(),
+        300,
+        "peer-a".to_owned(),
+        "Alice".to_owned(),
+        parse_json(r#"{"targetId":"bot-msg-1"}"#)?,
+    )?;
+    assert_eq!(log.len(), 1);
+    assert!(log.get_by_id("bot-msg-1").is_none());
+    assert!(log.get_by_id("upd-1").is_none());
     Ok(())
 }

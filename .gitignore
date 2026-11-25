@@ -1,3 +1,6 @@
 /target/
+/bot/node_modules/
+__pycache__/
+*.pyc
 *.swp
 .DS_Store

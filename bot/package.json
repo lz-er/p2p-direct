@@ -1,0 +1,22 @@
+{
+  "name": "p2p-direct-bot-sdk",
+  "version": "1.0.0",
+  "description": "Self-hostable Node.js WebRTC Bot SDK and local WebSocket bridge for p2p-direct (voice.dequ.org)",
+  "type": "module",
+  "main": "./sdk.mjs",
+  "exports": {
+    ".": "./sdk.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "bridge": "node ./bridge.mjs",
+    "warframe": "node ./examples/warframe-bot.mjs",
+    "music": "node ./examples/music-bot.mjs"
+  },
+  "dependencies": {
+    "werift": "^0.22.2",
+    "ws": "^8.18.0"
+  }
+}

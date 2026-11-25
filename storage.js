@@ -9,6 +9,91 @@
 const LEGACY_DB_NAME = "p2p_direct_mesh_v2";
 const LEGACY_LS_PREFIX = "p2p_direct_profile_v2:";
 const SESSION_NAME_KEY = "p2p-direct-name";
+const SESSION_AUDIO_KEY = "p2p-direct-audio-settings";
+
+export const DEFAULT_AUDIO_SETTINGS = Object.freeze({
+  preset: "voice",
+  deviceId: "",
+  micGain: 100, // 0..250 (%)
+  outputGain: 100, // 0..200 (%)
+  noiseGate: 2, // 0..35 (% of full scale RMS)
+  highPassHz: 80, // 0 | 80 | 120 | 200
+  presenceDb: 2, // -6..+6 dB @ 2800 Hz
+  compressor: true,
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+});
+
+function clampNum(val, min, max, fallback) {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+export function sanitizeAudioSettings(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const hp = Number(src.highPassHz);
+  const highPassHz = [0, 80, 120, 200].includes(hp) ? hp : DEFAULT_AUDIO_SETTINGS.highPassHz;
+  const preset = ["voice", "broadcast", "raw", "custom"].includes(src.preset)
+    ? src.preset
+    : DEFAULT_AUDIO_SETTINGS.preset;
+  return {
+    preset,
+    deviceId: typeof src.deviceId === "string" ? src.deviceId.slice(0, 128) : "",
+    micGain: Math.round(clampNum(src.micGain, 0, 250, DEFAULT_AUDIO_SETTINGS.micGain)),
+    outputGain: Math.round(clampNum(src.outputGain, 0, 200, DEFAULT_AUDIO_SETTINGS.outputGain)),
+    noiseGate: Math.round(clampNum(src.noiseGate, 0, 35, DEFAULT_AUDIO_SETTINGS.noiseGate)),
+    highPassHz,
+    presenceDb: Math.round(clampNum(src.presenceDb, -6, 6, DEFAULT_AUDIO_SETTINGS.presenceDb)),
+    compressor:
+      typeof src.compressor === "boolean" ? src.compressor : DEFAULT_AUDIO_SETTINGS.compressor,
+    echoCancellation:
+      typeof src.echoCancellation === "boolean"
+        ? src.echoCancellation
+        : DEFAULT_AUDIO_SETTINGS.echoCancellation,
+    noiseSuppression:
+      typeof src.noiseSuppression === "boolean"
+        ? src.noiseSuppression
+        : DEFAULT_AUDIO_SETTINGS.noiseSuppression,
+    autoGainControl:
+      typeof src.autoGainControl === "boolean"
+        ? src.autoGainControl
+        : DEFAULT_AUDIO_SETTINGS.autoGainControl,
+  };
+}
+
+/**
+ * Loads personal audio settings for this browser session (sessionStorage only; zero permanent storage).
+ */
+export function loadSessionAudioSettings() {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      const raw = sessionStorage.getItem(SESSION_AUDIO_KEY);
+      if (raw) {
+        return sanitizeAudioSettings(JSON.parse(raw));
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return { ...DEFAULT_AUDIO_SETTINGS };
+}
+
+/**
+ * Saves personal audio settings for this browser session only (sessionStorage only).
+ */
+export function saveSessionAudioSettings(settings) {
+  const clean = sanitizeAudioSettings(settings);
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(SESSION_AUDIO_KEY, JSON.stringify(clean));
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return clean;
+}
 
 function sanitizeAuthorName(raw) {
   const clean = String(raw || "").trim().slice(0, 32);

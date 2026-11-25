@@ -35,11 +35,15 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
 - **Step-by-Step 1-to-1 Manual Wizard & Background Keepalive**:
   - Offline / relay-free 3-step guided Connect flow: **Invite a Peer** (Step 1 Copy Invite Link → Step 2 Paste Peer's Reply → Step 3 Connected) or **Join with Invite** (Step 1 Paste Invite → Step 2 Copy Reply Link → Step 3 Connected), with automatic step progression on `#offer=` / `#answer=` URL fragments and cross-tab `#answer=` delivery via `BroadcastChannel`.
   - An inline Blob Web Worker sends encrypted `Ping`/`Pong` keepalive frames every 4s (unthrottled in hidden tabs) paired with liveness-aware disconnect timers and foreground resume sync so background tabs stay connected.
-- **Real-Time Multi-Peer E2EE Voice Channel**:
+- **Real-Time Multi-Peer E2EE Voice Channel & Personal Audio Settings**:
   - Full-color flat Metro participant mosaic with oversized monograms, spinning speaker starbursts, and 10-column Bauhaus floor equalizers. Active voice participants appear immediately beside an in-grid **+ Join Voice** (or **Listen Only**) tile that morphs into your own tile upon joining.
   - Icon-only **Mute** & **Deafen** toggles and a separated **Leave Voice** button live directly inside your own card, with per-hue color muting (**Mute** softens your card's hue; **Deafen** softens everyone else's card hues) plus per-peer mute & volume sliders.
+  - Built-in **Audio Settings** drawer (available before joining and live in a call): presets (**Voice**, **Broadcast**, **Raw / Music**), microphone input selector, **Mic Loudness** (`0–250%`) with live input meter, **Master Output Loudness** (`0–200%`), smooth **Noise Gate**, **Low-Cut (High-Pass)** filter, **Voice Clarity (2.8 kHz)** EQ, **Compressor / Limiter**, hardware **Echo Cancellation / Noise Suppression / Auto Gain Control** switches, and local **Test Mic** loopback.
   - Captured via an inline Blob `AudioWorkletProcessor` (with `ScriptProcessorNode` fallback) into 16 kHz mono 20 ms (`320`-sample) PCM frames, encoded inside safe Rust WASM with a stateless **IMA ADPCM** wideband codec (`src/audio.rs`), and sealed per peer into binary `V1` ChaCha20-Poly1305 AEAD packets under domain-separated directional `X25519 + meshKey` voice keys with a 64-slot anti-replay window.
   - Sent over a dedicated unordered, zero-retransmit WebRTC DataChannel (`p2p-voice`, `{ ordered: false, maxRetransmits: 0 }`) with zero SDP renegotiation and mixed simultaneously across all active remote speakers via independent Web Audio `GainNode` playout jitter buffers.
+- **CRDT Message Deletion & Self-Hostable Bots (`bot/`)**:
+  - Delete any message for everyone in the room via authenticated CRDT tombstones (`msg-delete`) that immediately scrub deleted payloads from memory and synchronize across active and late-joining peers without zombie resurrection.
+  - Self-host bots (music bots, Warframe worldstate bots, Discord bridges) directly as ordinary encrypted peers using the exact same room link and secret — no roles or permissions required. Includes the Node.js **Bot SDK** (`bot/sdk.mjs`), a **Local WebSocket Bridge** (`bot/bridge.mjs`) for Python/Rust/Go bots, interactive bot message cards with live-updating callback & quick-reply buttons, E2EE voice channel streaming, and ready-to-run examples in [`bot/examples/`](bot/README.md).
 
 ## Architecture
 
@@ -50,15 +54,16 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
 | `src/json.rs` | Pure safe Rust RFC 8259 JSON parser & canonical serializer |
 | `src/deflate.rs` | Pure safe Rust RFC 1951 DEFLATE/INFLATE + Base64URL codec |
 | `src/codec.rs` | `P2P1:` deflate + optional AEAD-encrypted codec for `#room=`, `#offer=`, and `#answer=` URL fragments |
-| `src/log.rs` | Deterministic `(lamport, ts, id)` `ReplicatedLog` & ChaCha20-Poly1305 `SealedLogRecord` encrypted snapshots |
-| `src/protocol.rs` | Outer `EncryptedWireEnvelope`, E2EE wire frames (`VoiceState`, `Hello`, etc.), binary `V1` E2EE voice packet framing, opaque `RelaySignal`, and chunkers |
+| `src/log.rs` | Deterministic `(lamport, ts, id)` `ReplicatedLog`, CRDT `msg-delete` tombstones, LWW `bot-update` folding & ChaCha20-Poly1305 `SealedLogRecord` encrypted snapshots |
+| `src/protocol.rs` | Outer `EncryptedWireEnvelope`, E2EE wire frames (`VoiceState`, `Hello`, `BotAction`, etc.), binary `V1` E2EE voice packet framing, opaque `RelaySignal`, and chunkers |
 | `src/mesh.rs` | Pure deterministic E2EE `MeshNode` state machine with wire & voice anti-replay windows and `R1:` room signal AEAD sealing/opening |
 | `src/rpc.rs` | JSON RPC command dispatcher |
 | `src/main.rs` | Safe Rust WASM shared-memory bridge + zero-JSON binary fast-path voice opcodes (`#![forbid(unsafe_code)]`, zero `unsafe`) |
 | `p2p_mesh.wasm` | Compiled release WebAssembly binary for zero-build static hosting |
 | `mqtt_relay.js` | Zero-dependency MQTT 3.1.1 over WebSocket multi-broker client for opaque encrypted room rendezvous (supports custom `?relay=ws(s)://...` override) |
 | `fonts/` | Self-hosted OFL WOFF2 fonts (`Sora` + `Kode Mono`) for zero-CDN static delivery |
-| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport (`p2p-mesh` + `p2p-voice`), Web Audio multi-speaker voice channel, ephemeral in-memory session lifecycle, Long-Lived Room Links, step-by-step Connect Wizard, Dark/Light mode, image/link chat, topology SVG, and Signal Blocks UI |
+| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport (`p2p-mesh` + `p2p-voice`), Web Audio DSP & multi-speaker voice channel, ephemeral in-memory session lifecycle, Long-Lived Room Links, message deletion, interactive bot cards, and Signal Blocks UI |
+| `bot/` | Optional self-hostable Node.js Bot SDK (`sdk.mjs`), local WebSocket bridge (`bridge.mjs`), and Warframe / Music / Python bot examples |
 
 ## Running Locally
 

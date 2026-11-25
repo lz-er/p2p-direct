@@ -266,7 +266,8 @@ impl SimNetwork {
                         via: "relay".to_owned(),
                     });
                 }
-                MeshAction::AutoMeshAddIce { .. }
+                MeshAction::BotActionReceived { .. }
+                | MeshAction::AutoMeshAddIce { .. }
                 | MeshAction::LogUpdated { .. }
                 | MeshAction::Telemetry { .. } => {}
             }
@@ -1028,6 +1029,126 @@ fn sim_long_lived_room_invite_first_joiner_and_subsequent_joiners() -> TestResul
     sim.connect("peer-b", "peer-c", false, None)?;
     sim.drain()?;
     sim.assert_all_converged(2)?;
+    Ok(())
+}
+
+#[test]
+fn sim_delete_message_syncs_across_partition_and_late_joiner() -> TestResult {
+    let mut sim = SimNetwork::new(20_000);
+    sim.add_node("peer-a", "Alice", MeshConfig::default());
+    sim.add_node("peer-b", "Bob", MeshConfig::default());
+    sim.connect("peer-a", "peer-b", false, None)?;
+    sim.drain()?;
+
+    let m1_id = sim.publish("peer-a", "chat", parse_json(r#"{"text":"erase me"}"#)?, None)?;
+    let _m2_id = sim.publish("peer-b", "chat", parse_json(r#"{"text":"keep me"}"#)?, None)?;
+    sim.drain()?;
+    sim.assert_all_converged(2)?;
+
+    // Partition peer-b while peer-a deletes m1
+    sim.disconnect("peer-a", "peer-b")?;
+    let (_, del_acts) = sim.node_mut("peer-a")?.delete_message(m1_id.clone(), 9_000)?;
+    sim.process_actions("peer-a", del_acts)?;
+    assert_eq!(sim.node("peer-a")?.log().len(), 1);
+    assert_eq!(sim.node("peer-b")?.log().len(), 2);
+
+    // Reconnect -> anti-entropy syncs tombstone so Bob scrubs m1 (zero resurrection!)
+    sim.connect("peer-a", "peer-b", false, None)?;
+    sim.drain()?;
+    sim.assert_all_converged(1)?;
+    assert!(!sim.node("peer-b")?.log_json().contains("erase me"));
+    assert!(sim.node("peer-b")?.log_json().contains("keep me"));
+
+    // Late joiner Carol joins Bob -> receives only m2 (m1 never resurrects)
+    sim.add_node("peer-c", "Carol", MeshConfig::default());
+    sim.connect("peer-b", "peer-c", false, None)?;
+    sim.drain()?;
+    sim.assert_all_converged(1)?;
+    assert!(!sim.node("peer-c")?.log_json().contains("erase me"));
+    assert!(sim.node("peer-c")?.log_json().contains("keep me"));
+    Ok(())
+}
+
+#[test]
+fn sim_bot_identity_and_multihop_bot_action_delivery() -> TestResult {
+    let cfg = MeshConfig {
+        auto_mesh_enabled: false, // keep strict 2-hop topology: Alice -- Bob -- Bot
+        ..MeshConfig::default()
+    };
+    let mut sim = SimNetwork::new(20_000);
+    sim.add_node("peer-a", "Alice", cfg.clone());
+    sim.add_node("peer-b", "Bob", cfg.clone());
+    sim.add_node("peer-bot", "WarframeBot", cfg);
+    sim.node_mut("peer-bot")?.set_is_bot(true);
+
+    sim.connect("peer-a", "peer-b", false, None)?;
+    sim.connect("peer-b", "peer-bot", false, None)?;
+    sim.drain()?;
+
+    // Verify Bob sees peer-bot as isBot:true in status_json
+    let bob_status = parse_json(&sim.node("peer-b")?.status_json())?;
+    let bob_peers = bob_status
+        .get("peers")
+        .and_then(|v| v.as_array())
+        .ok_or("missing peers")?;
+    let bot_entry = bob_peers
+        .iter()
+        .find(|p| p.get_str("peerId") == Some("peer-bot"))
+        .ok_or("missing bot peer")?;
+    assert_eq!(bot_entry.get_bool("isBot"), Some(true));
+
+    // Bot publishes a bot card with buttons -> gossips across Bob to Alice
+    let bot_msg_id = sim.publish(
+        "peer-bot",
+        "bot",
+        parse_json(r#"{"title":"Cetus","buttons":[[{"id":"wf:refresh","label":"Refresh"}]]}"#)?,
+        None,
+    )?;
+    sim.drain()?;
+    sim.assert_all_converged(1)?;
+
+    // Alice (not directly connected to Bot!) clicks Refresh -> multi-hop BotAction reaches Bot!
+    let (uid, acts) = sim.node_mut("peer-a")?.send_bot_action(
+        "peer-bot".to_owned(),
+        bot_msg_id.clone(),
+        "wf:refresh".to_owned(),
+        "Refresh".to_owned(),
+        parse_json(r#"{"zone":"cetus"}"#)?,
+        12_345,
+    )?;
+    // Manually route wire frames to capture the final BotActionReceived action on peer-bot
+    let mut bot_received = None;
+    let mut queue: Vec<(String, String, String)> = Vec::new();
+    for act in acts {
+        if let MeshAction::SendWire { peer_id, frame } = act {
+            queue.push(("peer-a".to_owned(), peer_id, frame));
+        }
+    }
+    let mut idx = 0;
+    while idx < queue.len() {
+        let (from, to, frame) = queue[idx].clone();
+        idx += 1;
+        let next_acts = sim.node_mut(&to)?.on_wire_message(&from, &frame, 12_346)?;
+        for a in next_acts {
+            match a {
+                MeshAction::SendWire { peer_id, frame } => queue.push((to.clone(), peer_id, frame)),
+                MeshAction::BotActionReceived {
+                    action_uid,
+                    from_peer_id,
+                    message_id,
+                    action_id,
+                    ..
+                } if to == "peer-bot" => {
+                    bot_received = Some((action_uid, from_peer_id, message_id, action_id));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        bot_received,
+        Some((uid, "peer-a".to_owned(), bot_msg_id, "wf:refresh".to_owned()))
+    );
     Ok(())
 }
 

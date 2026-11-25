@@ -225,7 +225,7 @@
             </div>
           </section>
 
-          <!-- Metro Live Voice Wall (Zero Header Buttons — All Call Controls Live Directly Inside Your Card) -->
+          <!-- Metro Live Voice Wall (Zero Header Call-Leave Buttons; Audio Settings Drawer lives right here) -->
           <section class="panel voice-stage-panel" id="voice-panel" aria-labelledby="voice-panel-title">
             <div class="panel-header voice-stage-header">
               <div class="voice-title-group">
@@ -239,6 +239,170 @@
                 <span id="voice-codec-meta">End-to-end encrypted · 16 kHz</span>
                 <span id="voice-join-hint" class="hidden">Click + Join Voice</span>
                 <span id="voice-packet-stats" class="advanced-only"></span>
+                <button
+                  type="button"
+                  id="btn-voice-settings"
+                  class="voice-settings-trigger"
+                  aria-expanded="false"
+                  aria-controls="voice-settings-drawer"
+                  title="Configure your microphone loudness, noise gate, and audio filters"
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true">
+                    <line x1="4" y1="21" x2="4" y2="14" />
+                    <line x1="4" y1="10" x2="4" y2="3" />
+                    <line x1="12" y1="21" x2="12" y2="12" />
+                    <line x1="12" y1="8" x2="12" y2="3" />
+                    <line x1="20" y1="21" x2="20" y2="16" />
+                    <line x1="20" y1="12" x2="20" y2="3" />
+                    <line x1="1" y1="14" x2="7" y2="14" />
+                    <line x1="9" y1="8" x2="15" y2="8" />
+                    <line x1="17" y1="16" x2="23" y2="16" />
+                  </svg>
+                  <span>Audio</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Personal Audio Settings Drawer (Flat Metro DSP & Filter Deck) -->
+            <div id="voice-settings-drawer" class="audio-settings-drawer hidden" role="region" aria-label="My audio settings">
+              <div class="audio-settings-bar">
+                <div class="audio-presets-group" role="group" aria-label="Audio filter presets">
+                  <span class="audio-bar-label">Preset</span>
+                  <button type="button" class="audio-preset-btn active" data-audio-preset="voice">Voice</button>
+                  <button type="button" class="audio-preset-btn" data-audio-preset="broadcast">Broadcast</button>
+                  <button type="button" class="audio-preset-btn" data-audio-preset="raw">Raw / Music</button>
+                </div>
+                <div class="audio-bar-actions">
+                  <button
+                    type="button"
+                    id="btn-audio-monitor"
+                    class="audio-action-btn"
+                    aria-pressed="false"
+                    title="Route your processed microphone back to your headphones to test loudness and filters"
+                  >
+                    Test Mic
+                  </button>
+                  <button type="button" id="btn-audio-reset" class="audio-action-btn">Reset</button>
+                </div>
+              </div>
+
+              <div class="audio-settings-grid">
+                <!-- Column 1: Device + Loudness + Live Mic Meter -->
+                <div class="audio-settings-col">
+                  <div class="audio-field">
+                    <div class="audio-field-head">
+                      <label for="audio-input-select">Microphone Input</label>
+                      <span class="audio-meter-status" id="audio-mic-meter-status">Idle</span>
+                    </div>
+                    <select id="audio-input-select" class="select-input audio-select">
+                      <option value="">Default Microphone</option>
+                    </select>
+                  </div>
+
+                  <div class="audio-field">
+                    <div class="audio-field-head">
+                      <label for="audio-mic-gain">Mic Loudness</label>
+                      <span class="audio-readout" id="audio-mic-gain-val">100%</span>
+                    </div>
+                    <input
+                      id="audio-mic-gain"
+                      class="audio-range"
+                      type="range"
+                      min="0"
+                      max="250"
+                      step="5"
+                      value="100"
+                    />
+                    <div class="audio-meter-track" title="Live post-filter microphone level (vertical notch marks noise gate threshold)">
+                      <div id="audio-mic-meter-fill" class="audio-meter-fill"></div>
+                      <div id="audio-gate-marker" class="audio-gate-marker"></div>
+                    </div>
+                  </div>
+
+                  <div class="audio-field">
+                    <div class="audio-field-head">
+                      <label for="audio-output-gain">Master Output Loudness</label>
+                      <span class="audio-readout" id="audio-output-gain-val">100%</span>
+                    </div>
+                    <input
+                      id="audio-output-gain"
+                      class="audio-range"
+                      type="range"
+                      min="0"
+                      max="200"
+                      step="5"
+                      value="100"
+                    />
+                  </div>
+                </div>
+
+                <!-- Column 2: Noise Gate + Tone/EQ Filters -->
+                <div class="audio-settings-col">
+                  <div class="audio-field">
+                    <div class="audio-field-head">
+                      <label for="audio-noise-gate">Noise Gate</label>
+                      <span class="audio-readout" id="audio-noise-gate-val">2%</span>
+                    </div>
+                    <input
+                      id="audio-noise-gate"
+                      class="audio-range"
+                      type="range"
+                      min="0"
+                      max="35"
+                      step="1"
+                      value="2"
+                    />
+                  </div>
+
+                  <div class="audio-field">
+                    <div class="audio-field-head">
+                      <label for="audio-highpass">Low-Cut (High-Pass Filter)</label>
+                      <span class="audio-readout" id="audio-highpass-val">80 Hz</span>
+                    </div>
+                    <select id="audio-highpass" class="select-input audio-select">
+                      <option value="0">Off (Full Range)</option>
+                      <option value="80" selected>80 Hz — Rumble Cut</option>
+                      <option value="120">120 Hz — Desk / AC Cut</option>
+                      <option value="200">200 Hz — Tight Voice Cut</option>
+                    </select>
+                  </div>
+
+                  <div class="audio-field">
+                    <div class="audio-field-head">
+                      <label for="audio-presence">Voice Clarity (2.8 kHz)</label>
+                      <span class="audio-readout" id="audio-presence-val">+2 dB</span>
+                    </div>
+                    <input
+                      id="audio-presence"
+                      class="audio-range"
+                      type="range"
+                      min="-6"
+                      max="6"
+                      step="1"
+                      value="2"
+                    />
+                  </div>
+                </div>
+
+                <!-- Column 3: Live Processing Switches -->
+                <div class="audio-settings-col audio-switches-col">
+                  <label class="audio-switch-row" for="audio-compressor">
+                    <input id="audio-compressor" class="metro-switch" type="checkbox" checked />
+                    <span>Compressor / Limiter</span>
+                  </label>
+                  <label class="audio-switch-row" for="audio-ec">
+                    <input id="audio-ec" class="metro-switch" type="checkbox" checked />
+                    <span>Echo Cancellation</span>
+                  </label>
+                  <label class="audio-switch-row" for="audio-ns">
+                    <input id="audio-ns" class="metro-switch" type="checkbox" checked />
+                    <span>Noise Suppression</span>
+                  </label>
+                  <label class="audio-switch-row" for="audio-agc">
+                    <input id="audio-agc" class="metro-switch" type="checkbox" checked />
+                    <span>Auto Gain Control</span>
+                  </label>
+                </div>
               </div>
             </div>
 
@@ -756,6 +920,36 @@
               </ul>
             </div>
           </section>
+
+          <details id="bot-connect-details" class="panel bot-connect-panel">
+            <summary class="panel-header bot-setup-summary">
+              <h2 class="panel-title">Self-Host a Bot</h2>
+              <span class="panel-meta">SDK · WS Bridge ▾</span>
+            </summary>
+            <div class="panel-body bot-setup-body">
+              <p class="step-hint">
+                Bots join as normal encrypted peers using this room link (no roles or permissions needed).
+              </p>
+              <textarea
+                id="bot-cli-command"
+                class="code-box"
+                rows="3"
+                readonly
+                aria-label="Bot connection command"
+              >node bot/bridge.mjs --room "&lt;create or join a room&gt;" --name "MyBot"</textarea>
+              <div class="btn-row" style="margin-top: 8px">
+                <button type="button" id="btn-copy-bot-cmd" class="btn btn-sm btn-primary">
+                  Copy Bridge Command
+                </button>
+                <button type="button" id="btn-copy-bot-wf" class="btn btn-sm">
+                  Warframe Bot
+                </button>
+                <button type="button" id="btn-copy-bot-music" class="btn btn-sm">
+                  Music Bot
+                </button>
+              </div>
+            </div>
+          </details>
 
           <details class="panel diagnostics-panel">
             <summary class="panel-header diagnostics-summary">

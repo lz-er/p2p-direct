@@ -112,6 +112,7 @@ pub struct PeerSummary {
     pub peer_id: String,
     pub author_name: String,
     pub pub_key: [u8; KEY_LEN],
+    pub is_bot: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +263,7 @@ pub enum WireFrame {
         log_count: usize,
         in_voice: bool,
         voice_muted: bool,
+        is_bot: bool,
         peers: Vec<PeerSummary>,
     },
     Msg {
@@ -294,6 +296,7 @@ pub enum WireFrame {
         peer_id: String,
         author_name: String,
         pub_key: [u8; KEY_LEN],
+        is_bot: bool,
     },
     RelaySignal {
         from: String,
@@ -316,6 +319,19 @@ pub enum WireFrame {
         in_voice: bool,
         muted: bool,
     },
+    BotAction {
+        action_uid: String,
+        from: String,
+        from_name: String,
+        to: String,
+        message_id: String,
+        action_id: String,
+        label: String,
+        value: JsonValue,
+        ts: u64,
+        hops: Vec<String>,
+        ttl: u32,
+    },
 }
 
 impl WireFrame {
@@ -331,6 +347,7 @@ impl WireFrame {
                 log_count,
                 in_voice,
                 voice_muted,
+                is_bot,
                 peers,
             } => {
                 out.push_str("{\"kind\":\"hello\",\"peerId\":");
@@ -343,7 +360,7 @@ impl WireFrame {
                 write_json_string(&mut out, &base64url_encode(pub_key));
                 let _ = write!(
                     out,
-                    ",\"lamport\":{lamport},\"logCount\":{log_count},\"inVoice\":{in_voice},\"voiceMuted\":{voice_muted},\"peers\":["
+                    ",\"lamport\":{lamport},\"logCount\":{log_count},\"inVoice\":{in_voice},\"voiceMuted\":{voice_muted},\"isBot\":{is_bot},\"peers\":["
                 );
                 for (i, p) in peers.iter().enumerate() {
                     if i > 0 {
@@ -355,7 +372,7 @@ impl WireFrame {
                     write_json_string(&mut out, &p.author_name);
                     out.push_str(",\"pubKey\":");
                     write_json_string(&mut out, &base64url_encode(&p.pub_key));
-                    out.push('}');
+                    let _ = write!(out, ",\"isBot\":{}}}", p.is_bot);
                 }
                 out.push_str("]}");
             }
@@ -427,6 +444,7 @@ impl WireFrame {
                 peer_id,
                 author_name,
                 pub_key,
+                is_bot,
             } => {
                 out.push_str("{\"kind\":\"mesh-intro\",\"via\":");
                 write_json_string(&mut out, via);
@@ -436,7 +454,7 @@ impl WireFrame {
                 write_json_string(&mut out, author_name);
                 out.push_str(",\"pubKey\":");
                 write_json_string(&mut out, &base64url_encode(pub_key));
-                out.push('}');
+                let _ = write!(out, ",\"isBot\":{is_bot}}}");
             }
             Self::RelaySignal {
                 from,
@@ -479,6 +497,39 @@ impl WireFrame {
                     "{{\"kind\":\"voice-state\",\"inVoice\":{in_voice},\"muted\":{muted}}}"
                 );
             }
+            Self::BotAction {
+                action_uid,
+                from,
+                from_name,
+                to,
+                message_id,
+                action_id,
+                label,
+                value,
+                ts,
+                hops,
+                ttl,
+            } => {
+                out.push_str("{\"kind\":\"bot-action\",\"actionUid\":");
+                write_json_string(&mut out, action_uid);
+                out.push_str(",\"from\":");
+                write_json_string(&mut out, from);
+                out.push_str(",\"fromName\":");
+                write_json_string(&mut out, from_name);
+                out.push_str(",\"to\":");
+                write_json_string(&mut out, to);
+                out.push_str(",\"messageId\":");
+                write_json_string(&mut out, message_id);
+                out.push_str(",\"actionId\":");
+                write_json_string(&mut out, action_id);
+                out.push_str(",\"label\":");
+                write_json_string(&mut out, label);
+                out.push_str(",\"value\":");
+                write_json_value(&mut out, value);
+                let _ = write!(out, ",\"ts\":{ts},\"ttl\":{ttl},\"hops\":");
+                write_string_array(&mut out, hops);
+                out.push('}');
+            }
         }
         out
     }
@@ -499,6 +550,7 @@ impl WireFrame {
                 let log_count = val.get_u64("logCount").unwrap_or(0) as usize;
                 let in_voice = val.get_bool("inVoice").unwrap_or(false);
                 let voice_muted = val.get_bool("voiceMuted").unwrap_or(false);
+                let is_bot = val.get_bool("isBot").unwrap_or(false);
                 let mut peers = Vec::new();
                 if let Some(arr) = val.get("peers").and_then(JsonValue::as_array) {
                     for item in arr {
@@ -515,6 +567,7 @@ impl WireFrame {
                                     .unwrap_or("Peer")
                                     .to_owned(),
                                 pub_key: p_pk,
+                                is_bot: item.get_bool("isBot").unwrap_or(false),
                             });
                         }
                     }
@@ -528,6 +581,7 @@ impl WireFrame {
                     log_count,
                     in_voice,
                     voice_muted,
+                    is_bot,
                     peers,
                 })
             }
@@ -597,11 +651,13 @@ impl WireFrame {
                 let author_name = val.get_str("authorName").unwrap_or("Peer").to_owned();
                 let pk_b64 = req_str(&val, "pubKey")?;
                 let pub_key = parse_fixed_32(&base64url_decode(&pk_b64)?, "mesh-intro pubKey")?;
+                let is_bot = val.get_bool("isBot").unwrap_or(false);
                 Ok(Self::MeshIntro {
                     via,
                     peer_id,
                     author_name,
                     pub_key,
+                    is_bot,
                 })
             }
             "relay-signal" => {
@@ -644,6 +700,35 @@ impl WireFrame {
                 in_voice: val.get_bool("inVoice").unwrap_or(false),
                 muted: val.get_bool("muted").unwrap_or(false),
             }),
+            "bot-action" => {
+                let action_uid = req_str(&val, "actionUid")?;
+                let from = req_str(&val, "from")?;
+                let from_name = val.get_str("fromName").unwrap_or("Peer").to_owned();
+                let to = req_str(&val, "to")?;
+                let message_id = req_str(&val, "messageId")?;
+                let action_id = req_str(&val, "actionId")?;
+                let label = val.get_str("label").unwrap_or("").to_owned();
+                let value = val.get("value").cloned().unwrap_or(JsonValue::Null);
+                let ts = val.get_u64("ts").unwrap_or(0);
+                let hops = parse_string_array(val.get("hops"));
+                let ttl = val
+                    .get_u64("ttl")
+                    .unwrap_or(u64::from(DEFAULT_RELAY_TTL))
+                    .min(u64::from(u32::MAX)) as u32;
+                Ok(Self::BotAction {
+                    action_uid,
+                    from,
+                    from_name,
+                    to,
+                    message_id,
+                    action_id,
+                    label,
+                    value,
+                    ts,
+                    hops,
+                    ttl,
+                })
+            }
             other => Err(format!("unknown wire frame kind '{other}'")),
         }
     }

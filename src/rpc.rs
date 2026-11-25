@@ -87,19 +87,28 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             if passphrase_mode {
                 node.set_mesh_key(mesh_key, true)?;
             }
+            if val.get_bool("isBot").unwrap_or(false) {
+                node.set_is_bot(true);
+            }
             let status = node.status_json();
             *state = Some(node);
             Ok(format!("{{\"ok\":true,\"status\":{status}}}"))
         }
         "set_profile" => {
             let node = require_node(state)?;
-            let mut name_changed = false;
+            let mut hello_changed = false;
             if let Some(name) = val.get_str("authorName")
                 && !name.trim().is_empty()
                 && name != node.author_name()
             {
                 node.set_author_name(name.to_owned());
-                name_changed = true;
+                hello_changed = true;
+            }
+            if let Some(is_bot) = val.get_bool("isBot")
+                && is_bot != node.is_bot()
+            {
+                node.set_is_bot(is_bot);
+                hello_changed = true;
             }
             if let Some(room) = val.get_str("room") {
                 node.set_room(room.to_owned());
@@ -107,7 +116,7 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             if let Some(enabled) = val.get_bool("autoMeshEnabled") {
                 node.set_auto_mesh_enabled(enabled);
             }
-            let actions = if name_changed {
+            let actions = if hello_changed {
                 node.broadcast_hello_update()
             } else {
                 Vec::new()
@@ -235,6 +244,64 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             Ok(format!(
                 "{{\"ok\":true,\"message\":{msg_json},\"actions\":{actions_json},\"status\":{status}}}"
             ))
+        }
+        "delete_message" => {
+            let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
+            let target_id = val
+                .get_str("targetId")
+                .ok_or_else(|| "delete_message missing string field 'targetId'".to_owned())?
+                .to_owned();
+            let ts = val.get_u64("ts").unwrap_or(0);
+            let (tombstone, actions) = node.delete_message(target_id.clone(), ts)?;
+            let actions_json = actions_to_json_array(&actions);
+            let status = node.status_json();
+            let mut out = String::with_capacity(actions_json.len() + status.len() + 128);
+            out.push_str("{\"ok\":true,\"deletedId\":");
+            write_json_string(&mut out, &target_id);
+            out.push_str(",\"tombstoneId\":");
+            write_json_string(&mut out, &tombstone.id);
+            out.push_str(",\"actions\":");
+            out.push_str(&actions_json);
+            out.push_str(",\"status\":");
+            out.push_str(&status);
+            out.push('}');
+            Ok(out)
+        }
+        "send_bot_action" => {
+            let node = require_node(state)?;
+            let to_peer_id = val
+                .get_str("toPeerId")
+                .ok_or_else(|| "send_bot_action missing string field 'toPeerId'".to_owned())?
+                .to_owned();
+            let message_id = val
+                .get_str("messageId")
+                .ok_or_else(|| "send_bot_action missing string field 'messageId'".to_owned())?
+                .to_owned();
+            let action_id = val
+                .get_str("actionId")
+                .ok_or_else(|| "send_bot_action missing string field 'actionId'".to_owned())?
+                .to_owned();
+            let label = val.get_str("label").unwrap_or("").to_owned();
+            let value = val.get("value").cloned().unwrap_or(JsonValue::Null);
+            let ts = val.get_u64("ts").unwrap_or(0);
+            let (action_uid, actions) =
+                node.send_bot_action(to_peer_id, message_id, action_id, label, value, ts)?;
+            let actions_json = actions_to_json_array(&actions);
+            let status = node.status_json();
+            let mut out = String::with_capacity(actions_json.len() + status.len() + 128);
+            out.push_str("{\"ok\":true,\"actionUid\":");
+            write_json_string(&mut out, &action_uid);
+            out.push_str(",\"actions\":");
+            out.push_str(&actions_json);
+            out.push_str(",\"status\":");
+            out.push_str(&status);
+            out.push('}');
+            Ok(out)
         }
         "peer_connected" => {
             let node = require_node(state)?;

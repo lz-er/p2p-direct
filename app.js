@@ -1,9 +1,12 @@
 import { SafeRustWasmMesh } from "./wasm_client.js";
 import { MultiRelayRendezvous, resolveRelayUrls } from "./mqtt_relay.js";
 import {
+  DEFAULT_AUDIO_SETTINGS,
   createEphemeralProfile,
+  loadSessionAudioSettings,
   purgeLegacyClientStorage,
   randomBase64Url,
+  saveSessionAudioSettings,
   saveSessionAuthorName,
 } from "./storage.js";
 
@@ -20,6 +23,42 @@ const DISCONNECT_GRACE_MS = 6000;
 
 const VOICE_SAMPLE_RATE = 16000;
 const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16kHz wideband
+
+const AUDIO_PRESETS = Object.freeze({
+  voice: {
+    preset: "voice",
+    micGain: 100,
+    noiseGate: 2,
+    highPassHz: 80,
+    presenceDb: 2,
+    compressor: true,
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  },
+  broadcast: {
+    preset: "broadcast",
+    micGain: 125,
+    noiseGate: 3,
+    highPassHz: 120,
+    presenceDb: 4,
+    compressor: true,
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: false,
+  },
+  raw: {
+    preset: "raw",
+    micGain: 100,
+    noiseGate: 0,
+    highPassHz: 0,
+    presenceDb: 0,
+    compressor: false,
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  },
+});
 
 const VOICE_CAPTURE_WORKLET_CODE = `
 class P2PVoiceCaptureProcessor extends AudioWorkletProcessor {
@@ -94,6 +133,7 @@ const METRO_TILE_THEMES = [
 
 const VOICE_EQ_WEIGHTS = [0.32, 0.54, 0.76, 0.92, 1.0, 1.0, 0.92, 0.76, 0.54, 0.32];
 const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+const SAFE_HTTP_URL_RE = /^https?:\/\/[^\s<>"']+$/i;
 const URL_REGEX = /https?:\/\/[^\s<>"']+/gi;
 const MAX_IMAGES_PER_MESSAGE = 3;
 const MAX_TOTAL_IMAGE_DATA_CHARS = 60000;
@@ -112,6 +152,30 @@ const EXIT_VOICE_SVG =
   '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="square" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
 const LINK_ARROW_SVG =
   '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><path d="M18 13v6H5V6h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
+const TRASH_SVG =
+  '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><line x1="10" y1="11" x2="10" y2="16"/><line x1="14" y1="11" x2="14" y2="16"/></svg>';
+
+function isSafeImageSrc(src) {
+  if (typeof src !== "string") return false;
+  return SAFE_IMAGE_DATA_URL_RE.test(src) || /^https:\/\/[^\s<>"']+$/i.test(src);
+}
+
+function formatBotRichText(raw) {
+  const { html } = extractAndLinkify(String(raw || ""));
+  return html
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+}
+
+function computePcmRms(int16Pcm) {
+  if (!int16Pcm || int16Pcm.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < int16Pcm.length; i++) {
+    const s = int16Pcm[i];
+    sumSq += s * s;
+  }
+  return Math.round(Math.sqrt(sumSq / int16Pcm.length));
+}
 
 function randomId(prefix) {
   const bytes = new Uint8Array(4);
@@ -424,6 +488,9 @@ class P2PDirectApp {
     this.keepaliveFallbackTimer = null;
     this.keepaliveTickCount = 0;
 
+    // Personal audio settings (session-only; zero permanent storage)
+    this.audioSettings = loadSessionAudioSettings();
+
     // Real-time multi-peer voice channel state
     this.voice = {
       inVoice: false,
@@ -433,9 +500,20 @@ class P2PDirectApp {
       audioCtx: null,
       micStream: null,
       micSource: null,
+      highPassFilter: null,
+      presenceFilter: null,
+      compressorNode: null,
+      micGainNode: null,
+      monitorGain: null,
+      monitorActive: false,
       captureNode: null,
       silentGain: null,
       masterGain: null,
+      gateOpenUntil: 0,
+      gateClosed: false,
+      settingsOpen: false,
+      preCallMonitor: null, // { ctx, stream, source, highPass, presence, compressor, micGain, monitorGain, analyser, timer }
+      audioDevices: [],
       peerMixers: new Map(), // peerId -> { gainNode, volume, muted, nextPlayTime, rms, smoothLevel, lastAudioAt, packetsReceived }
       joinOrder: [], // ordered participant keys (peerId or "self") so cards never jump when joining
       localRms: 0,
@@ -562,6 +640,28 @@ class P2PDirectApp {
       "e2ee-bar-hint",
       "voice-panel",
       "voice-status-badge",
+      "btn-voice-settings",
+      "voice-settings-drawer",
+      "btn-audio-monitor",
+      "btn-audio-reset",
+      "audio-input-select",
+      "audio-mic-meter-status",
+      "audio-mic-gain",
+      "audio-mic-gain-val",
+      "audio-mic-meter-fill",
+      "audio-gate-marker",
+      "audio-output-gain",
+      "audio-output-gain-val",
+      "audio-noise-gate",
+      "audio-noise-gate-val",
+      "audio-highpass",
+      "audio-highpass-val",
+      "audio-presence",
+      "audio-presence-val",
+      "audio-compressor",
+      "audio-ec",
+      "audio-ns",
+      "audio-agc",
       "voice-join-card",
       "voice-empty-state",
       "btn-voice-join",
@@ -578,6 +678,11 @@ class P2PDirectApp {
       "auto-mesh-toggle",
       "auto-mesh-badge",
       "peer-list",
+      "bot-connect-details",
+      "bot-cli-command",
+      "btn-copy-bot-cmd",
+      "btn-copy-bot-wf",
+      "btn-copy-bot-music",
       "stat-e2ee",
       "stat-batches",
       "stat-voice",
@@ -788,6 +893,107 @@ class P2PDirectApp {
     // Real-time Multi-Peer Voice Channel controls (mute/deafen/leave bind dynamically inside your voice tile)
     this.el["btn-voice-join"].addEventListener("click", () => this.joinVoiceChat({ listenOnly: false }));
     this.el["btn-voice-listen"].addEventListener("click", () => this.joinVoiceChat({ listenOnly: true }));
+
+    // Personal Audio Settings (loudness, noise gate, EQ filters, compressor, hardware constraints, mic test)
+    if (this.el["btn-voice-settings"]) {
+      this.el["btn-voice-settings"].addEventListener("click", () => this.toggleAudioSettingsDrawer());
+    }
+    for (const btn of document.querySelectorAll("[data-audio-preset]")) {
+      btn.addEventListener("click", () => this.applyAudioPreset(btn.dataset.audioPreset));
+    }
+    if (this.el["btn-audio-monitor"]) {
+      this.el["btn-audio-monitor"].addEventListener("click", () => this.toggleMicMonitor());
+    }
+    if (this.el["btn-audio-reset"]) {
+      this.el["btn-audio-reset"].addEventListener("click", () => this.resetAudioSettings());
+    }
+    if (this.el["audio-input-select"]) {
+      this.el["audio-input-select"].addEventListener("change", () =>
+        this.updateAudioSetting("deviceId", this.el["audio-input-select"].value, {
+          reconnectMic: true,
+          keepPreset: true,
+        })
+      );
+    }
+    if (this.el["audio-mic-gain"]) {
+      this.el["audio-mic-gain"].addEventListener("input", () =>
+        this.updateAudioSetting("micGain", Number(this.el["audio-mic-gain"].value))
+      );
+    }
+    if (this.el["audio-output-gain"]) {
+      this.el["audio-output-gain"].addEventListener("input", () =>
+        this.updateAudioSetting("outputGain", Number(this.el["audio-output-gain"].value), {
+          keepPreset: true,
+        })
+      );
+    }
+    if (this.el["audio-noise-gate"]) {
+      this.el["audio-noise-gate"].addEventListener("input", () =>
+        this.updateAudioSetting("noiseGate", Number(this.el["audio-noise-gate"].value))
+      );
+    }
+    if (this.el["audio-highpass"]) {
+      this.el["audio-highpass"].addEventListener("change", () =>
+        this.updateAudioSetting("highPassHz", Number(this.el["audio-highpass"].value))
+      );
+    }
+    if (this.el["audio-presence"]) {
+      this.el["audio-presence"].addEventListener("input", () =>
+        this.updateAudioSetting("presenceDb", Number(this.el["audio-presence"].value))
+      );
+    }
+    if (this.el["audio-compressor"]) {
+      this.el["audio-compressor"].addEventListener("change", () =>
+        this.updateAudioSetting("compressor", this.el["audio-compressor"].checked, {
+          rewireGraph: true,
+        })
+      );
+    }
+    if (this.el["audio-ec"]) {
+      this.el["audio-ec"].addEventListener("change", () =>
+        this.updateAudioSetting("echoCancellation", this.el["audio-ec"].checked, {
+          applyTrackConstraints: true,
+        })
+      );
+    }
+    if (this.el["audio-ns"]) {
+      this.el["audio-ns"].addEventListener("change", () =>
+        this.updateAudioSetting("noiseSuppression", this.el["audio-ns"].checked, {
+          applyTrackConstraints: true,
+        })
+      );
+    }
+    if (this.el["audio-agc"]) {
+      this.el["audio-agc"].addEventListener("change", () =>
+        this.updateAudioSetting("autoGainControl", this.el["audio-agc"].checked, {
+          applyTrackConstraints: true,
+        })
+      );
+    }
+    if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
+      navigator.mediaDevices.addEventListener("devicechange", () => {
+        if (this.voice.settingsOpen) {
+          this.refreshAudioInputDevices();
+        }
+      });
+    }
+
+    // Self-hosted Bot quick CLI copy buttons (Advanced sidebar)
+    if (this.el["btn-copy-bot-cmd"]) {
+      this.el["btn-copy-bot-cmd"].addEventListener("click", () => {
+        this.copyText(this.buildBotCliCommand("bridge"), "Copied bot bridge command");
+      });
+    }
+    if (this.el["btn-copy-bot-wf"]) {
+      this.el["btn-copy-bot-wf"].addEventListener("click", () => {
+        this.copyText(this.buildBotCliCommand("warframe"), "Copied Warframe bot command");
+      });
+    }
+    if (this.el["btn-copy-bot-music"]) {
+      this.el["btn-copy-bot-music"].addEventListener("click", () => {
+        this.copyText(this.buildBotCliCommand("music"), "Copied Music bot command");
+      });
+    }
 
     // Identity & Mesh controls
     this.el["author-name-input"].addEventListener("input", () => {
@@ -1086,6 +1292,7 @@ class P2PDirectApp {
     this.el["author-name-input"].value = this.status.authorName;
     this.el["auto-mesh-toggle"].checked = this.status.autoMeshEnabled;
     this.el["auto-mesh-badge"].textContent = this.status.autoMeshEnabled ? "ON" : "OFF";
+    this.syncAudioSettingsUI();
 
     this.setupBroadcastChannel();
     this.startKeepaliveWorker();
@@ -2513,6 +2720,7 @@ class P2PDirectApp {
   }
 
   leaveLongLivedRoom() {
+    this.stopPreCallMicMonitor();
     if (this.roomRendezvous) {
       this.roomRendezvous.stop();
       this.roomRendezvous = null;
@@ -3290,6 +3498,482 @@ class P2PDirectApp {
     }
   }
 
+  /* ================= Personal Audio Settings & DSP Pipeline ================= */
+
+  toggleAudioSettingsDrawer(forceOpen) {
+    const next = typeof forceOpen === "boolean" ? forceOpen : !this.voice.settingsOpen;
+    this.voice.settingsOpen = next;
+    if (this.el["voice-settings-drawer"]) {
+      this.el["voice-settings-drawer"].classList.toggle("hidden", !next);
+    }
+    if (this.el["btn-voice-settings"]) {
+      this.el["btn-voice-settings"].setAttribute("aria-expanded", next ? "true" : "false");
+    }
+    if (next) {
+      this.syncAudioSettingsUI();
+      this.refreshAudioInputDevices();
+    } else if (!this.voice.inVoice && this.voice.monitorActive) {
+      this.stopPreCallMicMonitor();
+    }
+  }
+
+  syncAudioSettingsUI() {
+    const s = this.audioSettings;
+    if (this.el["audio-mic-gain"]) {
+      this.el["audio-mic-gain"].value = String(s.micGain);
+    }
+    if (this.el["audio-mic-gain-val"]) {
+      this.el["audio-mic-gain-val"].textContent = `${s.micGain}%`;
+    }
+    if (this.el["audio-output-gain"]) {
+      this.el["audio-output-gain"].value = String(s.outputGain);
+    }
+    if (this.el["audio-output-gain-val"]) {
+      this.el["audio-output-gain-val"].textContent = `${s.outputGain}%`;
+    }
+    if (this.el["audio-noise-gate"]) {
+      this.el["audio-noise-gate"].value = String(s.noiseGate);
+    }
+    if (this.el["audio-noise-gate-val"]) {
+      this.el["audio-noise-gate-val"].textContent = s.noiseGate === 0 ? "Off" : `${s.noiseGate}%`;
+    }
+    if (this.el["audio-gate-marker"]) {
+      const markerPct = Math.min(98, Math.round((s.noiseGate / 35) * 65));
+      this.el["audio-gate-marker"].style.left = `${markerPct}%`;
+      this.el["audio-gate-marker"].classList.toggle("hidden", s.noiseGate === 0);
+    }
+    if (this.el["audio-highpass"]) {
+      this.el["audio-highpass"].value = String(s.highPassHz);
+    }
+    if (this.el["audio-highpass-val"]) {
+      this.el["audio-highpass-val"].textContent = s.highPassHz === 0 ? "Off" : `${s.highPassHz} Hz`;
+    }
+    if (this.el["audio-presence"]) {
+      this.el["audio-presence"].value = String(s.presenceDb);
+    }
+    if (this.el["audio-presence-val"]) {
+      const sign = s.presenceDb > 0 ? "+" : "";
+      this.el["audio-presence-val"].textContent = `${sign}${s.presenceDb} dB`;
+    }
+    if (this.el["audio-compressor"]) {
+      this.el["audio-compressor"].checked = Boolean(s.compressor);
+    }
+    if (this.el["audio-ec"]) {
+      this.el["audio-ec"].checked = Boolean(s.echoCancellation);
+    }
+    if (this.el["audio-ns"]) {
+      this.el["audio-ns"].checked = Boolean(s.noiseSuppression);
+    }
+    if (this.el["audio-agc"]) {
+      this.el["audio-agc"].checked = Boolean(s.autoGainControl);
+    }
+    for (const btn of document.querySelectorAll("[data-audio-preset]")) {
+      btn.classList.toggle("active", btn.dataset.audioPreset === s.preset);
+    }
+    if (this.el["btn-audio-monitor"]) {
+      this.el["btn-audio-monitor"].classList.toggle("is-active", this.voice.monitorActive);
+      this.el["btn-audio-monitor"].setAttribute(
+        "aria-pressed",
+        this.voice.monitorActive ? "true" : "false"
+      );
+      this.el["btn-audio-monitor"].textContent = this.voice.monitorActive ? "Stop Test" : "Test Mic";
+    }
+  }
+
+  async refreshAudioInputDevices() {
+    const select = this.el["audio-input-select"];
+    if (!select) return;
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== "function") {
+      return;
+    }
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices.filter((d) => d.kind === "audioinput");
+      this.voice.audioDevices = mics;
+      const current = this.audioSettings.deviceId || "";
+      const opts = ['<option value="">Default Microphone</option>'];
+      mics.forEach((d, idx) => {
+        if (!d.deviceId || d.deviceId === "default") return;
+        const label = d.label && d.label.trim() ? d.label.trim() : `Microphone ${idx + 1}`;
+        opts.push(`<option value="${escapeHtml(d.deviceId)}">${escapeHtml(label)}</option>`);
+      });
+      select.innerHTML = opts.join("");
+      if (current && mics.some((d) => d.deviceId === current)) {
+        select.value = current;
+      } else {
+        select.value = "";
+      }
+    } catch {
+      // ignore permission/device enumeration errors
+    }
+  }
+
+  applyAudioPreset(presetName) {
+    const preset = AUDIO_PRESETS[presetName];
+    if (!preset) return;
+    this.audioSettings = saveSessionAudioSettings({
+      ...this.audioSettings,
+      ...preset,
+    });
+    this.syncAudioSettingsUI();
+    this.applyLiveAudioDspParams(true);
+    this.applyMicTrackConstraints();
+    this.showToast(
+      `Audio preset: ${presetName === "raw" ? "Raw / Music" : presetName[0].toUpperCase() + presetName.slice(1)}`
+    );
+  }
+
+  resetAudioSettings() {
+    this.audioSettings = saveSessionAudioSettings({
+      ...DEFAULT_AUDIO_SETTINGS,
+      deviceId: this.audioSettings.deviceId || "",
+    });
+    this.syncAudioSettingsUI();
+    this.applyLiveAudioDspParams(true);
+    this.applyMicTrackConstraints();
+    this.showToast("Audio settings reset to defaults");
+  }
+
+  updateAudioSetting(
+    key,
+    value,
+    { reconnectMic = false, rewireGraph = false, applyTrackConstraints = false, keepPreset = false } = {}
+  ) {
+    const next = {
+      ...this.audioSettings,
+      [key]: value,
+    };
+    if (!keepPreset) {
+      next.preset = "custom";
+    }
+    this.audioSettings = saveSessionAudioSettings(next);
+    this.syncAudioSettingsUI();
+    this.applyLiveAudioDspParams(rewireGraph);
+    if (applyTrackConstraints) {
+      this.applyMicTrackConstraints();
+    }
+    if (reconnectMic) {
+      this.switchActiveMicrophone();
+    }
+  }
+
+  buildMicConstraints() {
+    const s = this.audioSettings;
+    const audio = {
+      echoCancellation: Boolean(s.echoCancellation),
+      noiseSuppression: Boolean(s.noiseSuppression),
+      autoGainControl: Boolean(s.autoGainControl),
+      channelCount: 1,
+    };
+    if (s.deviceId) {
+      audio.deviceId = { ideal: s.deviceId };
+    }
+    return { audio, video: false };
+  }
+
+  async applyMicTrackConstraints() {
+    const streams = [this.voice.micStream, this.voice.preCallMonitor?.stream].filter(Boolean);
+    const s = this.audioSettings;
+    for (const stream of streams) {
+      for (const track of stream.getAudioTracks()) {
+        if (typeof track.applyConstraints === "function") {
+          try {
+            await track.applyConstraints({
+              echoCancellation: Boolean(s.echoCancellation),
+              noiseSuppression: Boolean(s.noiseSuppression),
+              autoGainControl: Boolean(s.autoGainControl),
+            });
+          } catch {
+            // some browsers ignore live constraint updates cleanly
+          }
+        }
+      }
+    }
+  }
+
+  async switchActiveMicrophone() {
+    if (this.voice.inVoice && !this.voice.listenOnly && this.voice.audioCtx) {
+      try {
+        const nextStream = await navigator.mediaDevices.getUserMedia(this.buildMicConstraints());
+        for (const track of nextStream.getAudioTracks()) {
+          track.enabled = !this.voice.muted;
+        }
+        const prevStream = this.voice.micStream;
+        this.teardownMicCaptureGraph();
+        this.voice.micStream = nextStream;
+        await this.startMicCaptureGraph(this.voice.audioCtx, nextStream);
+        if (prevStream) {
+          for (const t of prevStream.getTracks()) {
+            try {
+              t.stop();
+            } catch {
+              // ignore
+            }
+          }
+        }
+        this.refreshAudioInputDevices();
+        this.showToast("Switched microphone input");
+      } catch (err) {
+        this.showToast(`Could not switch microphone: ${err.message}`);
+      }
+    } else if (this.voice.preCallMonitor) {
+      this.stopPreCallMicMonitor();
+      await this.startPreCallMicMonitor();
+    }
+  }
+
+  createMicDspNodes(ctx, source) {
+    const highPass = ctx.createBiquadFilter();
+    highPass.type = "highpass";
+    highPass.Q.value = 0.707;
+
+    const presence = ctx.createBiquadFilter();
+    presence.type = "peaking";
+    presence.frequency.value = 2800;
+    presence.Q.value = 1.1;
+
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.value = -20;
+    compressor.knee.value = 18;
+    compressor.ratio.value = 4;
+    compressor.attack.value = 0.004;
+    compressor.release.value = 0.12;
+
+    const micGain = ctx.createGain();
+    const monitorGain = ctx.createGain();
+    monitorGain.gain.value = 0;
+
+    return { source, highPass, presence, compressor, micGain, monitorGain };
+  }
+
+  wireDspChain(nodes, destinationNode, ctxDestination, enableMonitor) {
+    const s = this.audioSettings;
+    const { source, highPass, presence, compressor, micGain, monitorGain } = nodes;
+    for (const n of [source, highPass, presence, compressor, micGain, monitorGain]) {
+      try {
+        n.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+
+    if (s.highPassHz > 0) {
+      highPass.type = "highpass";
+      highPass.frequency.value = s.highPassHz;
+    } else {
+      highPass.type = "allpass";
+      highPass.frequency.value = 20;
+    }
+
+    presence.gain.value = s.presenceDb;
+    micGain.gain.value = s.micGain / 100;
+    monitorGain.gain.value = enableMonitor ? 0.7 : 0;
+
+    source.connect(highPass);
+    highPass.connect(presence);
+    if (s.compressor) {
+      presence.connect(compressor);
+      compressor.connect(micGain);
+    } else {
+      presence.connect(micGain);
+    }
+
+    if (destinationNode) {
+      micGain.connect(destinationNode);
+    }
+    if (ctxDestination) {
+      micGain.connect(monitorGain);
+      monitorGain.connect(ctxDestination);
+    }
+  }
+
+  applyLiveAudioDspParams(rewire = false) {
+    const s = this.audioSettings;
+    if (this.voice.masterGain) {
+      this.voice.masterGain.gain.value = this.voice.deafened ? 0 : s.outputGain / 100;
+    }
+
+    if (this.voice.micSource && this.voice.micGainNode && this.voice.audioCtx) {
+      const nodes = {
+        source: this.voice.micSource,
+        highPass: this.voice.highPassFilter,
+        presence: this.voice.presenceFilter,
+        compressor: this.voice.compressorNode,
+        micGain: this.voice.micGainNode,
+        monitorGain: this.voice.monitorGain,
+      };
+      if (rewire) {
+        this.wireDspChain(
+          nodes,
+          this.voice.captureNode,
+          this.voice.audioCtx.destination,
+          this.voice.monitorActive
+        );
+      } else {
+        if (s.highPassHz > 0) {
+          nodes.highPass.type = "highpass";
+          nodes.highPass.frequency.value = s.highPassHz;
+        } else {
+          nodes.highPass.type = "allpass";
+          nodes.highPass.frequency.value = 20;
+        }
+        nodes.presence.gain.value = s.presenceDb;
+        nodes.micGain.gain.value = s.micGain / 100;
+        nodes.monitorGain.gain.value = this.voice.monitorActive ? 0.7 : 0;
+      }
+    }
+
+    const mon = this.voice.preCallMonitor;
+    if (mon) {
+      if (rewire) {
+        this.wireDspChain(mon, mon.analyser, mon.ctx.destination, true);
+      } else {
+        if (s.highPassHz > 0) {
+          mon.highPass.type = "highpass";
+          mon.highPass.frequency.value = s.highPassHz;
+        } else {
+          mon.highPass.type = "allpass";
+          mon.highPass.frequency.value = 20;
+        }
+        mon.presence.gain.value = s.presenceDb;
+        mon.micGain.gain.value = s.micGain / 100;
+        mon.monitorGain.gain.value = 0.7;
+      }
+    }
+  }
+
+  async toggleMicMonitor() {
+    if (this.voice.inVoice) {
+      if (this.voice.listenOnly || !this.voice.monitorGain) {
+        this.showToast("Microphone test is unavailable in Listen-Only mode");
+        return;
+      }
+      this.voice.monitorActive = !this.voice.monitorActive;
+      this.voice.monitorGain.gain.value = this.voice.monitorActive ? 0.7 : 0;
+      this.syncAudioSettingsUI();
+      return;
+    }
+
+    if (this.voice.preCallMonitor) {
+      this.stopPreCallMicMonitor();
+    } else {
+      await this.startPreCallMicMonitor();
+    }
+  }
+
+  async startPreCallMicMonitor() {
+    if (this.voice.preCallMonitor) return;
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+      this.showToast("Microphone capture is unavailable in this browser context");
+      return;
+    }
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) throw new Error("Web Audio API unsupported");
+      const stream = await navigator.mediaDevices.getUserMedia(this.buildMicConstraints());
+      const ctx = new AudioCtx();
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+      const source = ctx.createMediaStreamSource(stream);
+      const nodes = this.createMicDspNodes(ctx, source);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      this.wireDspChain(nodes, analyser, ctx.destination, true);
+
+      const sampleBuf = new Float32Array(analyser.fftSize);
+      const timer = setInterval(() => {
+        if (!this.voice.preCallMonitor) return;
+        analyser.getFloatTimeDomainData(sampleBuf);
+        let sumSq = 0;
+        for (let i = 0; i < sampleBuf.length; i++) {
+          sumSq += sampleBuf[i] * sampleBuf[i];
+        }
+        const rmsInt16 = Math.round(Math.sqrt(sumSq / sampleBuf.length) * 32767);
+        const gateThreshold = (this.audioSettings.noiseGate / 100) * 14000;
+        const gated = this.audioSettings.noiseGate > 0 && rmsInt16 < gateThreshold;
+        this.updateAudioMeterUi(rmsInt16, gated, "Testing");
+      }, 65);
+
+      this.voice.preCallMonitor = { ...nodes, ctx, stream, analyser, timer };
+      this.voice.monitorActive = true;
+      this.syncAudioSettingsUI();
+      this.refreshAudioInputDevices();
+    } catch (err) {
+      this.stopPreCallMicMonitor();
+      this.showToast(`Mic test error: ${err.message}`);
+    }
+  }
+
+  stopPreCallMicMonitor() {
+    const mon = this.voice.preCallMonitor;
+    this.voice.preCallMonitor = null;
+    if (!this.voice.inVoice) {
+      this.voice.monitorActive = false;
+    }
+    if (mon) {
+      if (mon.timer) clearInterval(mon.timer);
+      for (const n of [
+        mon.source,
+        mon.highPass,
+        mon.presence,
+        mon.compressor,
+        mon.micGain,
+        mon.monitorGain,
+        mon.analyser,
+      ]) {
+        try {
+          n?.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      if (mon.stream) {
+        for (const t of mon.stream.getTracks()) {
+          try {
+            t.stop();
+          } catch {
+            // ignore
+          }
+        }
+      }
+      try {
+        mon.ctx?.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.updateAudioMeterUi(0, false, "Idle");
+    this.syncAudioSettingsUI();
+  }
+
+  updateAudioMeterUi(rmsInt16, gated, activeLabel = "Live") {
+    const fill = this.el["audio-mic-meter-fill"];
+    const status = this.el["audio-mic-meter-status"];
+    if (!fill && !status) return;
+    const pct = Math.min(100, Math.round((rmsInt16 / 7500) * 100));
+    if (fill) {
+      fill.style.width = `${pct}%`;
+      fill.classList.toggle("is-gated", Boolean(gated));
+      fill.classList.toggle("is-hot", !gated && pct > 82);
+    }
+    if (status) {
+      if (!this.voice.inVoice && !this.voice.preCallMonitor) {
+        status.textContent = "Idle";
+        status.className = "audio-meter-status";
+      } else if (this.voice.inVoice && (this.voice.muted || this.voice.listenOnly)) {
+        status.textContent = this.voice.listenOnly ? "Listen-Only" : "Muted";
+        status.className = "audio-meter-status";
+      } else if (gated) {
+        status.textContent = "Gated";
+        status.className = "audio-meter-status is-gated";
+      } else {
+        status.textContent = activeLabel;
+        status.className = "audio-meter-status is-live";
+      }
+    }
+  }
+
   /* ================= Real-Time Multi-Peer E2EE Voice Chat ================= */
 
   attachVoiceDataChannel(peerId, voiceDc) {
@@ -3333,7 +4017,7 @@ class P2PDirectApp {
       }
       const ctx = new AudioCtx();
       const masterGain = ctx.createGain();
-      masterGain.gain.value = this.voice.deafened ? 0 : 1;
+      masterGain.gain.value = this.voice.deafened ? 0 : this.audioSettings.outputGain / 100;
       masterGain.connect(ctx.destination);
       this.voice.audioCtx = ctx;
       this.voice.masterGain = masterGain;
@@ -3368,6 +4052,7 @@ class P2PDirectApp {
 
   async joinVoiceChat({ listenOnly = false } = {}) {
     if (this.voice.inVoice) return;
+    this.stopPreCallMicMonitor();
     this.el["btn-voice-join"].disabled = true;
     this.el["btn-voice-listen"].disabled = true;
     this.el["voice-notice"].classList.add("hidden");
@@ -3385,15 +4070,7 @@ class P2PDirectApp {
         if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
           throw new Error("Microphone capture is unavailable in this browser context. Try Listen Only.");
         }
-        micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            channelCount: 1,
-          },
-          video: false,
-        });
+        micStream = await navigator.mediaDevices.getUserMedia(this.buildMicConstraints());
       }
 
       this.voice.micStream = micStream;
@@ -3401,17 +4078,21 @@ class P2PDirectApp {
       this.voice.muted = effectiveListenOnly;
       this.voice.deafened = false;
       this.voice.inVoice = true;
+      this.voice.monitorActive = false;
       this.voice.localRms = 0;
       this.voice.localSmoothLevel = 0;
       this.voice.localSpeakingAt = 0;
+      this.voice.gateOpenUntil = 0;
+      this.voice.gateClosed = false;
       this.voice.meterTicks = 0;
 
       if (this.voice.masterGain) {
-        this.voice.masterGain.gain.value = 1.0;
+        this.voice.masterGain.gain.value = this.audioSettings.outputGain / 100;
       }
 
       if (micStream) {
         await this.startMicCaptureGraph(ctx, micStream);
+        this.refreshAudioInputDevices();
       }
 
       const res = this.wasm.call({
@@ -3426,6 +4107,7 @@ class P2PDirectApp {
         this.voice.meterTimer = setInterval(() => this.updateVoiceMeters(), 70);
       }
 
+      this.syncAudioSettingsUI();
       this.renderAll();
       this.showToast(
         effectiveListenOnly ? "Joined voice channel (listen-only)" : "Joined voice channel"
@@ -3445,13 +4127,51 @@ class P2PDirectApp {
     }
   }
 
+  teardownMicCaptureGraph() {
+    if (this.voice.captureNode) {
+      try {
+        if (this.voice.captureNode.port) {
+          this.voice.captureNode.port.onmessage = null;
+        }
+        this.voice.captureNode.disconnect();
+      } catch {
+        // ignore
+      }
+      this.voice.captureNode = null;
+    }
+    for (const key of [
+      "micSource",
+      "highPassFilter",
+      "presenceFilter",
+      "compressorNode",
+      "micGainNode",
+      "monitorGain",
+      "silentGain",
+    ]) {
+      if (this.voice[key]) {
+        try {
+          this.voice[key].disconnect();
+        } catch {
+          // ignore
+        }
+        this.voice[key] = null;
+      }
+    }
+  }
+
   async startMicCaptureGraph(ctx, micStream) {
     const source = ctx.createMediaStreamSource(micStream);
+    const dspNodes = this.createMicDspNodes(ctx, source);
     const silentGain = ctx.createGain();
     silentGain.gain.value = 0;
     silentGain.connect(ctx.destination);
 
-    this.voice.micSource = source;
+    this.voice.micSource = dspNodes.source;
+    this.voice.highPassFilter = dspNodes.highPass;
+    this.voice.presenceFilter = dspNodes.presence;
+    this.voice.compressorNode = dspNodes.compressor;
+    this.voice.micGainNode = dspNodes.micGain;
+    this.voice.monitorGain = dspNodes.monitorGain;
     this.voice.silentGain = silentGain;
 
     // Prefer modern off-main-thread AudioWorkletProcessor; fall back to ScriptProcessorNode cleanly
@@ -3473,7 +4193,7 @@ class P2PDirectApp {
             this.onCapturedPcmFrame(new Int16Array(ev.data.buffer));
           }
         };
-        source.connect(workletNode);
+        this.wireDspChain(dspNodes, workletNode, ctx.destination, this.voice.monitorActive);
         workletNode.connect(silentGain);
         this.voice.captureNode = workletNode;
         workletOk = true;
@@ -3514,7 +4234,7 @@ class P2PDirectApp {
           phase -= drop;
         }
       };
-      source.connect(proc);
+      this.wireDspChain(dspNodes, proc, ctx.destination, this.voice.monitorActive);
       proc.connect(silentGain);
       this.voice.captureNode = proc;
     }
@@ -3522,10 +4242,34 @@ class P2PDirectApp {
 
   onCapturedPcmFrame(int16Pcm) {
     if (!this.voice.inVoice || !this.wasm) return;
+    const rawRms = this.voice.muted ? 0 : computePcmRms(int16Pcm);
+    const now = Date.now();
+    const gatePct = this.audioSettings.noiseGate;
+    let gated = false;
+    if (!this.voice.muted && gatePct > 0) {
+      const thresholdRms = (gatePct / 100) * 14000;
+      if (rawRms >= thresholdRms) {
+        this.voice.gateOpenUntil = now + 180;
+      }
+      if (now > this.voice.gateOpenUntil) {
+        gated = true;
+      }
+    }
+    this.voice.gateClosed = gated;
+
+    if (this.voice.settingsOpen) {
+      this.updateAudioMeterUi(rawRms, gated, "Live");
+    }
+
+    if (gated) {
+      this.voice.localRms = 0;
+      return;
+    }
+
     const { rms, packets } = this.wasm.sealVoicePcm(int16Pcm);
     this.voice.localRms = this.voice.muted ? 0 : rms;
     if (!this.voice.muted && rms > 220) {
-      this.voice.localSpeakingAt = Date.now();
+      this.voice.localSpeakingAt = now;
     }
     for (const { peerId, data } of packets) {
       const vdc = this.voiceChannels.get(peerId);
@@ -3625,7 +4369,7 @@ class P2PDirectApp {
     if (!this.voice.inVoice) return;
     this.voice.deafened = !this.voice.deafened;
     if (this.voice.masterGain) {
-      this.voice.masterGain.gain.value = this.voice.deafened ? 0 : 1;
+      this.voice.masterGain.gain.value = this.voice.deafened ? 0 : this.audioSettings.outputGain / 100;
     }
     this.renderVoicePanel(true);
     this.updateVoiceMeters();
@@ -3652,33 +4396,8 @@ class P2PDirectApp {
       clearInterval(this.voice.meterTimer);
       this.voice.meterTimer = null;
     }
-    if (this.voice.captureNode) {
-      try {
-        if (this.voice.captureNode.port) {
-          this.voice.captureNode.port.onmessage = null;
-        }
-        this.voice.captureNode.disconnect();
-      } catch {
-        // ignore
-      }
-      this.voice.captureNode = null;
-    }
-    if (this.voice.micSource) {
-      try {
-        this.voice.micSource.disconnect();
-      } catch {
-        // ignore
-      }
-      this.voice.micSource = null;
-    }
-    if (this.voice.silentGain) {
-      try {
-        this.voice.silentGain.disconnect();
-      } catch {
-        // ignore
-      }
-      this.voice.silentGain = null;
-    }
+    this.teardownMicCaptureGraph();
+    this.voice.monitorActive = false;
     if (this.voice.micStream) {
       for (const track of this.voice.micStream.getTracks()) {
         try {
@@ -3713,6 +4432,8 @@ class P2PDirectApp {
       }
       this.voice.audioCtx = null;
     }
+    this.updateAudioMeterUi(0, false, "Idle");
+    this.syncAudioSettingsUI();
   }
 
   leaveVoiceChat(silent = false) {
@@ -3724,6 +4445,7 @@ class P2PDirectApp {
     this.voice.listenOnly = false;
     this.voice.localRms = 0;
     this.voice.localSmoothLevel = 0;
+    this.voice.gateClosed = false;
     this.voice.joinOrder = this.voice.joinOrder.filter((id) => id !== "self");
     this.voice.renderedKeys.delete("self");
     this.voice.lastRosterKey = "";
@@ -4138,6 +4860,13 @@ class P2PDirectApp {
           this.applyRelayedIce(act.fromPeerId, act.candidate);
           break;
         }
+        case "bot_action": {
+          this.addTelemetry(
+            "bot_action",
+            `${act.fromName || act.fromPeerId} clicked "${act.label || act.actionId}"`
+          );
+          break;
+        }
         case "telemetry": {
           this.addTelemetry(act.event, act.detail);
           break;
@@ -4389,11 +5118,27 @@ class P2PDirectApp {
     this.renderLog();
   }
 
+  buildBotCliCommand(kind = "bridge") {
+    const roomUrl = this.activeRoom?.url || "<paste-room-link>";
+    const passFlag = this.activeRoom?.encrypted ? ' --passphrase "<room-passphrase>"' : "";
+    if (kind === "warframe") {
+      return `node bot/examples/warframe-bot.mjs --room "${roomUrl}"${passFlag}`;
+    }
+    if (kind === "music") {
+      return `node bot/examples/music-bot.mjs --room "${roomUrl}"${passFlag}`;
+    }
+    return `node bot/bridge.mjs --room "${roomUrl}" --name "MyBot" --port 8765${passFlag}`;
+  }
+
   renderRoomCard() {
     const isActive = Boolean(this.activeRoom);
     const peerCount = this.status?.peers?.length || 0;
     const relayState = this.roomRelayStatus?.state || "connecting";
     const relayCount = this.roomRelayStatus?.connectedCount || 0;
+
+    if (this.el["bot-cli-command"]) {
+      this.el["bot-cli-command"].value = this.buildBotCliCommand("bridge");
+    }
 
     let badgeText = "Connecting…";
     let badgeClass = "badge pending";
@@ -4583,7 +5328,13 @@ class P2PDirectApp {
         .map((id) => {
           const p = peerMap.get(id);
           const mx = this.voice.peerMixers.get(id);
-          return [id, p ? p.authorName : "", p ? p.voiceMuted : false, mx ? mx.muted : false];
+          return [
+            id,
+            p ? p.authorName : "",
+            p ? p.voiceMuted : false,
+            mx ? mx.muted : false,
+            Boolean(p && p.isBot),
+          ];
         }),
     });
 
@@ -4668,6 +5419,7 @@ class P2PDirectApp {
       if (!p) continue;
       const peerTheme = peerTileTheme(p.peerId, false);
       const initials = escapeHtml(avatarInitials(p.authorName));
+      const botPill = p.isBot ? '<span class="voice-bot-pill">BOT</span>' : "";
 
       if (this.voice.inVoice) {
         const mixer = this.voice.peerMixers.get(p.peerId);
@@ -4689,6 +5441,7 @@ class P2PDirectApp {
             <div class="tile-lower">
               <div class="voice-tile-mid">
                 <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
+                ${botPill}
               </div>
               <div class="tile-control-slot">
                 <div class="voice-peer-mixer">
@@ -4723,6 +5476,7 @@ class P2PDirectApp {
             <div class="tile-lower">
               <div class="voice-tile-mid">
                 <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
+                ${botPill}
               </div>
               <div class="tile-control-slot">
                 <span class="tile-prejoin-hint">Active in voice channel</span>
@@ -4785,6 +5539,7 @@ class P2PDirectApp {
     const parts = [];
     for (const p of direct) {
       const peerTheme = peerTileTheme(p.peerId, false);
+      const botBadge = p.isBot ? '<span class="bot-tag">BOT</span>' : "";
       const originBadge = p.viaAutoMesh
         ? `<span class="badge auto" title="Auto-connected via ${escapeHtml(p.introducedBy || "peer")}">auto</span>`
         : '<span class="badge">direct</span>';
@@ -4795,7 +5550,7 @@ class P2PDirectApp {
       parts.push(`
         <li class="peer-item ${peerTheme}" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
-            <div class="peer-name">${escapeHtml(p.authorName)} ${originBadge} ${voiceBadge}</div>
+            <div class="peer-name">${escapeHtml(p.authorName)} ${botBadge} ${originBadge} ${voiceBadge}</div>
             <div class="peer-id">${escapeHtml(p.peerId)} · code ${escapeHtml(p.safetyCode || "—")}${rttLabel}</div>
           </div>
           <button type="button" class="btn btn-sm btn-danger" data-disconnect="${escapeHtml(p.peerId)}">Drop</button>
@@ -4840,7 +5595,7 @@ class P2PDirectApp {
     for (const p of direct) {
       const n = {
         id: p.peerId,
-        label: p.authorName,
+        label: p.isBot ? `[BOT] ${p.authorName}` : p.authorName,
         kind: p.viaAutoMesh ? "auto" : "direct",
         inVoice: Boolean(p.inVoice),
       };
@@ -4991,8 +5746,126 @@ class P2PDirectApp {
     }
   }
 
+  isPeerBot(peerId) {
+    if (!peerId) return false;
+    if (!this.knownBotPeerIds) {
+      this.knownBotPeerIds = new Set();
+    }
+    const peers = this.status?.peers || [];
+    for (const p of peers) {
+      if (p.isBot) {
+        this.knownBotPeerIds.add(p.peerId);
+      }
+    }
+    return this.knownBotPeerIds.has(peerId);
+  }
+
+  deleteLogMessage(msgId) {
+    if (!msgId || !this.wasm) return;
+    try {
+      const res = this.wasm.call({
+        cmd: "delete_message",
+        targetId: msgId,
+        ts: Date.now(),
+        entropy: randomBase64Url(16),
+      });
+      this.status = res.status;
+      this.executeActions(res.actions);
+      this.renderAll();
+      this.showToast("Message deleted for room");
+    } catch (err) {
+      this.addTelemetry("error", `Delete failed: ${err.message}`);
+      this.showToast(`Could not delete message: ${err.message}`);
+    }
+  }
+
+  handleBotButtonClick(msg, btnObj, btnEl) {
+    if (!msg || !btnObj || btnObj.disabled || !this.wasm) return;
+
+    if (typeof btnObj.url === "string" && SAFE_HTTP_URL_RE.test(btnObj.url.trim())) {
+      window.open(btnObj.url.trim(), "_blank", "noopener,noreferrer");
+      return;
+    }
+
+    const actionId = String(btnObj.id || btnObj.actionId || btnObj.label || "action");
+    const label = String(btnObj.label || actionId);
+    const value = btnObj.value !== undefined ? btnObj.value : null;
+    const mode = btnObj.mode === "reply" ? "reply" : "action";
+
+    if (mode === "reply") {
+      const replyText =
+        typeof btnObj.replyText === "string" && btnObj.replyText.trim()
+          ? btnObj.replyText.trim()
+          : label;
+      try {
+        const res = this.wasm.call({
+          cmd: "publish",
+          type: "chat",
+          payload: {
+            text: replyText,
+            replyTo: {
+              messageId: msg.id,
+              botPeerId: msg.author,
+              botName: msg.authorName,
+              actionId,
+              label,
+              value,
+            },
+          },
+          ts: Date.now(),
+          entropy: randomBase64Url(16),
+        });
+        this.status = res.status;
+        this.executeActions(res.actions);
+        this.renderAll();
+      } catch (err) {
+        this.addTelemetry("error", `Bot reply error: ${err.message}`);
+      }
+      return;
+    }
+
+    // Discord-style silent E2EE interaction callback routed to the bot peer
+    try {
+      const targetBot = msg.author || "*";
+      const res = this.wasm.call({
+        cmd: "send_bot_action",
+        toPeerId: targetBot,
+        messageId: msg.id,
+        actionId,
+        label,
+        value,
+        ts: Date.now(),
+      });
+      this.status = res.status;
+      this.executeActions(res.actions);
+
+      if (btnEl) {
+        const origHtml = btnEl.innerHTML;
+        btnEl.classList.add("is-sent");
+        btnEl.textContent = `${label} ✓`;
+        setTimeout(() => {
+          if (btnEl.isConnected) {
+            btnEl.classList.remove("is-sent");
+            btnEl.innerHTML = origHtml;
+          }
+        }, 700);
+      }
+    } catch (err) {
+      this.addTelemetry("error", `Bot action failed: ${err.message}`);
+      this.showToast(`Bot action failed: ${err.message}`);
+    }
+  }
+
   renderChatPayload(payload) {
     const parts = [];
+    if (payload.replyTo && typeof payload.replyTo === "object") {
+      const targetName = escapeHtml(payload.replyTo.botName || "Bot");
+      const viaLabel = escapeHtml(payload.replyTo.label || payload.replyTo.actionId || "Button");
+      parts.push(
+        `<div class="chat-reply-banner"><span>↳ Answer to <strong>${targetName}</strong> · ${viaLabel}</span></div>`
+      );
+    }
+
     const text = typeof payload.text === "string" ? payload.text : "";
     if (text) {
       const { html, links } = extractAndLinkify(text);
@@ -5035,42 +5908,191 @@ class P2PDirectApp {
     return parts.join("");
   }
 
+  normalizeBotButtonRows(rawButtons) {
+    if (!Array.isArray(rawButtons) || rawButtons.length === 0) return [];
+    const rows = Array.isArray(rawButtons[0]) ? rawButtons : [rawButtons];
+    const cleanRows = [];
+    for (const row of rows) {
+      if (!Array.isArray(row)) continue;
+      const cleanBtns = row.filter((b) => b && typeof b === "object" && (b.label || b.id));
+      if (cleanBtns.length > 0) {
+        cleanRows.push(cleanBtns);
+      }
+    }
+    return cleanRows;
+  }
+
+  renderBotCardPayload(payload) {
+    const p = payload && typeof payload === "object" ? payload : {};
+    const allowedColors = new Set(["cobalt", "mint", "ochre", "coral", "cyan", "ink"]);
+    const accent = allowedColors.has(p.color) ? p.color : "cobalt";
+    const parts = [];
+
+    if (p.title || p.subtitle || p.badge) {
+      const subHtml = p.subtitle
+        ? `<span class="bot-card-subtitle">${escapeHtml(p.subtitle)}</span>`
+        : "";
+      const titleHtml = p.title
+        ? `<h3 class="bot-card-title">${escapeHtml(p.title)}</h3>`
+        : "";
+      const badgeHtml = p.badge
+        ? `<span class="bot-card-badge">${escapeHtml(p.badge)}</span>`
+        : "";
+      parts.push(`
+        <div class="bot-card-head">
+          <div class="bot-card-titles">${subHtml}${titleHtml}</div>
+          ${badgeHtml}
+        </div>
+      `);
+    }
+
+    if (typeof p.text === "string" && p.text.trim()) {
+      parts.push(`<div class="bot-card-text">${formatBotRichText(p.text)}</div>`);
+    }
+
+    if (Array.isArray(p.fields) && p.fields.length > 0) {
+      const fieldHtml = p.fields
+        .filter((f) => f && typeof f === "object" && (f.label || f.value !== undefined))
+        .map((f) => {
+          const fullCls = f.inline === false ? " is-full" : "";
+          return `
+            <div class="bot-field${fullCls}">
+              <span class="bot-field-label">${escapeHtml(f.label || "")}</span>
+              <span class="bot-field-value">${formatBotRichText(f.value ?? "")}</span>
+            </div>
+          `;
+        })
+        .join("");
+      if (fieldHtml) {
+        parts.push(`<div class="bot-card-fields">${fieldHtml}</div>`);
+      }
+    }
+
+    const imgSrc =
+      typeof p.image === "string"
+        ? p.image
+        : p.image && typeof p.image === "object"
+          ? p.image.dataUrl || p.image.url || ""
+          : "";
+    if (isSafeImageSrc(imgSrc)) {
+      const alt = escapeHtml((p.image && p.image.alt) || p.title || "Bot attachment");
+      parts.push(`
+        <button type="button" class="bot-card-image-btn" data-lightbox-src="${escapeHtml(imgSrc)}" data-lightbox-alt="${alt}">
+          <img src="${escapeHtml(imgSrc)}" alt="${alt}" loading="lazy" />
+        </button>
+      `);
+    }
+
+    const buttonRows = this.normalizeBotButtonRows(p.buttons);
+    const flatButtons = [];
+    if (buttonRows.length > 0) {
+      const allowedStyles = new Set(["primary", "success", "warning", "danger", "secondary"]);
+      const rowsHtml = buttonRows
+        .map((row) => {
+          const btnsHtml = row
+            .map((btn) => {
+              const idx = flatButtons.length;
+              flatButtons.push(btn);
+              const style = allowedStyles.has(btn.style) ? btn.style : "secondary";
+              const label = escapeHtml(btn.label || btn.id || "Action");
+              const isLink = typeof btn.url === "string" && SAFE_HTTP_URL_RE.test(btn.url.trim());
+              const suffix = isLink ? ` ${LINK_ARROW_SVG}` : "";
+              const disabledAttr = btn.disabled ? " disabled" : "";
+              return `<button type="button" class="bot-btn bot-btn-${style}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(btn.id || btn.actionId || "")}"${disabledAttr}>${label}${suffix}</button>`;
+            })
+            .join("");
+          return `<div class="bot-btn-row">${btnsHtml}</div>`;
+        })
+        .join("");
+      parts.push(`<div class="bot-card-actions">${rowsHtml}</div>`);
+    }
+
+    if (typeof p.footer === "string" && p.footer.trim()) {
+      parts.push(`<div class="bot-card-footer">${escapeHtml(p.footer)}</div>`);
+    }
+
+    return {
+      html: `<div class="bot-card bot-accent-${accent}">${parts.join("")}</div>`,
+      buttons: flatButtons,
+    };
+  }
+
   buildLogEntryElement(m, isSelf, isNew) {
     const stripeTheme = peerTileTheme(m.author, isSelf);
+    const isBotMsg = m.type === "bot" && m.payload && typeof m.payload === "object";
     const isChat =
       m.type === "chat" &&
       m.payload &&
       (typeof m.payload.text === "string" || Array.isArray(m.payload.images));
-    const bodyHtml = isChat
-      ? this.renderChatPayload(m.payload)
-      : `<pre class="log-json-pre">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
-    const typeTag = isChat
-      ? ""
-      : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
+
+    let bodyHtml;
+    let botButtons = [];
+    if (isBotMsg) {
+      const rendered = this.renderBotCardPayload(m.payload);
+      bodyHtml = rendered.html;
+      botButtons = rendered.buttons;
+    } else if (isChat) {
+      bodyHtml = this.renderChatPayload(m.payload);
+    } else {
+      bodyHtml = `<pre class="log-json-pre">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
+    }
+
+    const showBotTag = isBotMsg || this.isPeerBot(m.author);
+    const botTagHtml = showBotTag ? '<span class="bot-tag">BOT</span>' : "";
+    const typeTag =
+      isChat || isBotMsg ? "" : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
+    const updatedTag = m.updatedLamport
+      ? '<span class="bot-updated-tag" title="Updated live by bot">edited</span>'
+      : "";
 
     const article = document.createElement("article");
-    article.className = `log-entry${isSelf ? " is-self" : ""}${isNew ? " is-new" : ""}`;
+    article.className = `log-entry${isSelf ? " is-self" : ""}${isBotMsg ? " is-bot-entry" : ""}${isNew ? " is-new" : ""}`;
     article.dataset.msgId = m.id;
+    article.dataset.rev = String(m.updatedLamport || 0);
     article.innerHTML = `
       <div class="msg-stripe ${stripeTheme}" aria-hidden="true"></div>
       <div class="log-entry-main">
         <div class="log-entry-head">
           <div class="log-author-group">
             <span class="log-author">${escapeHtml(m.authorName)}</span>
+            ${botTagHtml}
             ${typeTag}
+            ${updatedTag}
           </div>
-          <span class="log-order-tuple" title="Order (lamport ${m.lamport}) · ${escapeHtml(m.id)}">
-            ${escapeHtml(formatTime(m.ts))}
-          </span>
+          <div class="log-head-right">
+            <span class="log-order-tuple" title="Order (lamport ${m.lamport}) · ${escapeHtml(m.id)}">
+              ${escapeHtml(formatTime(m.ts))}
+            </span>
+            <button
+              type="button"
+              class="msg-delete-btn"
+              data-delete-msg="${escapeHtml(m.id)}"
+              title="Delete message for everyone in room"
+              aria-label="Delete message"
+            >${TRASH_SVG}</button>
+          </div>
         </div>
         ${bodyHtml}
       </div>
     `;
 
+    const delBtn = article.querySelector("[data-delete-msg]");
+    if (delBtn) {
+      delBtn.addEventListener("click", () => this.deleteLogMessage(m.id));
+    }
+
     for (const btn of article.querySelectorAll("[data-lightbox-src]")) {
       btn.addEventListener("click", () =>
         this.openLightbox(btn.dataset.lightboxSrc, btn.dataset.lightboxAlt)
       );
+    }
+
+    for (const btnEl of article.querySelectorAll("[data-bot-btn-idx]")) {
+      const idx = Number(btnEl.dataset.botBtnIdx);
+      const btnObj = botButtons[idx];
+      if (btnObj) {
+        btnEl.addEventListener("click", () => this.handleBotButtonClick(m, btnObj, btnEl));
+      }
     }
 
     return article;
@@ -5119,7 +6141,7 @@ class P2PDirectApp {
     }
 
     if (this.advancedMode && this.rawJsonMode) {
-      const rawKey = `raw:${filtered.map((m) => m.id).join(",")}`;
+      const rawKey = `raw:${filtered.map((m) => `${m.id}:${m.updatedLamport || 0}`).join(",")}`;
       if (this.logRenderState.mode === "raw" && this.logRenderState.key === rawKey) {
         return;
       }
@@ -5130,7 +6152,7 @@ class P2PDirectApp {
     }
 
     const myId = this.status?.peerId || "";
-    const chatKey = `chat:${myId}:${filtered.map((m) => m.id).join(",")}`;
+    const chatKey = `chat:${myId}:${filtered.map((m) => `${m.id}:${m.updatedLamport || 0}`).join(",")}`;
     if (this.logRenderState.mode === "chat" && this.logRenderState.key === chatKey) {
       return;
     }
@@ -5165,10 +6187,16 @@ class P2PDirectApp {
     for (let i = 0; i < filtered.length; i++) {
       const m = filtered[i];
       const isSelf = m.author === myId;
+      const rev = String(m.updatedLamport || 0);
       let node = existingNodes.get(m.id);
       if (!node) {
         node = this.buildLogEntryElement(m, isSelf, animateNew);
         if (isSelf) addedSelfMessage = true;
+      } else if (node.dataset.rev !== rev) {
+        // Live bot card update: replace ONLY this message node in place (zero flicker on others)
+        const updatedNode = this.buildLogEntryElement(m, isSelf, false);
+        feed.replaceChild(updatedNode, node);
+        node = updatedNode;
       }
       const refNode = feed.children[i] || null;
       if (refNode !== node) {
