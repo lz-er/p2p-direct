@@ -1,15 +1,20 @@
 /**
- * Ephemeral in-memory session identity helpers.
+ * Ephemeral in-memory session identity helpers & optional local room bookmarks.
  *
- * Nothing is stored permanently on the client (zero IndexedDB, zero localStorage writes).
- * Messages live strictly in active peers' memory and stay alive as long as at least one
- * peer remains in the room; once all users leave, all messages are cleared.
+ * Messages, media, peer keys, and passphrases are NEVER stored permanently on the client
+ * (zero IndexedDB; messages live strictly in active peers' memory and clear when all leave).
+ * Users can explicitly bookmark room invite links locally (`p2p-direct-saved-rooms-v1`), and
+ * the most recently joined room shortcut (`p2p-direct-last-room-v1`) is remembered locally so
+ * users can rejoin it manually in one click (never auto-joined).
  */
 
 const LEGACY_DB_NAME = "p2p_direct_mesh_v2";
 const LEGACY_LS_PREFIX = "p2p_direct_profile_v2:";
 const SESSION_NAME_KEY = "p2p-direct-name";
 const SESSION_AUDIO_KEY = "p2p-direct-audio-settings";
+export const SAVED_ROOMS_KEY = "p2p-direct-saved-rooms-v1";
+export const LAST_ROOM_KEY = "p2p-direct-last-room-v1";
+const MAX_SAVED_ROOMS = 50;
 
 export const DEFAULT_AUDIO_SETTINGS = Object.freeze({
   preset: "voice",
@@ -164,6 +169,233 @@ export function saveSessionAuthorName(name) {
   }
 }
 
+/* ================= Local Room Bookmarks & Last Joined Room ================= */
+
+function sanitizeRoomName(raw) {
+  const clean = String(raw || "").replace(/\s+/g, " ").trim().slice(0, 40);
+  return clean || "Shared Room";
+}
+
+function sanitizeRoomUrl(raw) {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim().slice(0, 2400);
+  if (!trimmed) return "";
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol === "http:" || u.protocol === "https:") {
+      return trimmed;
+    }
+  } catch {
+    // ignore invalid URL
+  }
+  return "";
+}
+
+function sanitizeRelayUrl(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().slice(0, 512);
+  if (!trimmed) return null;
+  // Allow comma-separated ws:// or wss:// relay endpoints
+  const parts = trimmed
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => /^wss?:\/\//i.test(p));
+  return parts.length > 0 ? parts.join(",") : null;
+}
+
+export function sanitizeRoomBookmark(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const code = typeof raw.code === "string" ? raw.code.trim().slice(0, 2048) : "";
+  if (!code || !/^P2P1:/i.test(code)) return null;
+  const topicRaw = typeof raw.topic === "string" ? raw.topic.trim().slice(0, 128) : "";
+  const topic = topicRaw || code.slice(0, 48);
+  const now = Date.now();
+  const savedAt =
+    typeof raw.savedAt === "number" && Number.isFinite(raw.savedAt) && raw.savedAt > 0
+      ? Math.round(raw.savedAt)
+      : now;
+  const lastJoinedAt =
+    typeof raw.lastJoinedAt === "number" && Number.isFinite(raw.lastJoinedAt) && raw.lastJoinedAt > 0
+      ? Math.round(raw.lastJoinedAt)
+      : savedAt;
+  return {
+    topic,
+    name: sanitizeRoomName(raw.name),
+    code,
+    url: sanitizeRoomUrl(raw.url),
+    relay: sanitizeRelayUrl(raw.relay),
+    encrypted: Boolean(raw.encrypted),
+    savedAt,
+    lastJoinedAt,
+  };
+}
+
+function sortSavedRooms(list) {
+  return list.sort((a, b) => {
+    const ta = Math.max(a.lastJoinedAt || 0, a.savedAt || 0);
+    const tb = Math.max(b.lastJoinedAt || 0, b.savedAt || 0);
+    return tb - ta;
+  });
+}
+
+/**
+ * Loads the user's locally saved rooms from localStorage (sorted most-recent first).
+ */
+export function loadSavedRooms() {
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(SAVED_ROOMS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const dedup = new Map();
+    for (const item of parsed) {
+      const clean = sanitizeRoomBookmark(item);
+      if (clean && !dedup.has(clean.topic)) {
+        dedup.set(clean.topic, clean);
+      }
+    }
+    return sortSavedRooms(Array.from(dedup.values())).slice(0, MAX_SAVED_ROOMS);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Writes the sanitized saved-rooms list to localStorage (or clears key if empty).
+ */
+export function saveSavedRooms(list) {
+  const dedup = new Map();
+  if (Array.isArray(list)) {
+    for (const item of list) {
+      const clean = sanitizeRoomBookmark(item);
+      if (clean && !dedup.has(clean.topic)) {
+        dedup.set(clean.topic, clean);
+      }
+    }
+  }
+  const ordered = sortSavedRooms(Array.from(dedup.values())).slice(0, MAX_SAVED_ROOMS);
+  try {
+    if (typeof localStorage !== "undefined") {
+      if (ordered.length === 0) {
+        localStorage.removeItem(SAVED_ROOMS_KEY);
+      } else {
+        localStorage.setItem(SAVED_ROOMS_KEY, JSON.stringify(ordered));
+      }
+    }
+  } catch {
+    // ignore storage quota/privacy errors
+  }
+  return ordered;
+}
+
+/**
+ * Adds or updates a room in local saved rooms.
+ */
+export function upsertSavedRoom(entry, { preserveCustomName = false } = {}) {
+  const clean = sanitizeRoomBookmark(entry);
+  if (!clean) return loadSavedRooms();
+  const list = loadSavedRooms();
+  const idx = list.findIndex((r) => r.topic === clean.topic);
+  if (idx >= 0) {
+    const existing = list[idx];
+    list[idx] = {
+      ...clean,
+      name: preserveCustomName && existing.name ? existing.name : clean.name,
+      savedAt: existing.savedAt || clean.savedAt,
+      lastJoinedAt: Math.max(existing.lastJoinedAt || 0, clean.lastJoinedAt || 0),
+    };
+  } else {
+    list.unshift(clean);
+  }
+  return saveSavedRooms(list);
+}
+
+/**
+ * Renames a locally saved room (and updates Last Joined if it points to the same room).
+ */
+export function renameSavedRoom(topic, newName) {
+  const cleanName = sanitizeRoomName(newName);
+  const list = loadSavedRooms();
+  let changed = false;
+  for (const r of list) {
+    if (r.topic === topic) {
+      r.name = cleanName;
+      changed = true;
+    }
+  }
+  const saved = changed ? saveSavedRooms(list) : list;
+  const last = loadLastJoinedRoom();
+  if (last && last.topic === topic) {
+    saveLastJoinedRoom({ ...last, name: cleanName }, { syncSaved: false });
+  }
+  return saved;
+}
+
+/**
+ * Removes a room from local saved rooms by topic.
+ */
+export function removeSavedRoom(topic) {
+  const list = loadSavedRooms().filter((r) => r.topic !== topic);
+  return saveSavedRooms(list);
+}
+
+/**
+ * Loads the last joined room shortcut from localStorage (never auto-joined).
+ */
+export function loadLastJoinedRoom() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(LAST_ROOM_KEY);
+    if (!raw) return null;
+    return sanitizeRoomBookmark(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Saves the most recently joined/created room locally so the user can manually rejoin it later.
+ * Never stores passphrases or messages, and never triggers auto-join.
+ */
+export function saveLastJoinedRoom(entry, { syncSaved = true } = {}) {
+  const clean = sanitizeRoomBookmark(entry);
+  if (!clean) return null;
+  const savedList = loadSavedRooms();
+  const existingSaved = savedList.find((r) => r.topic === clean.topic);
+  const finalEntry = existingSaved
+    ? {
+        ...clean,
+        name: existingSaved.name || clean.name,
+        savedAt: existingSaved.savedAt,
+      }
+    : clean;
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(LAST_ROOM_KEY, JSON.stringify(finalEntry));
+    }
+  } catch {
+    // ignore storage errors
+  }
+  if (syncSaved && existingSaved) {
+    upsertSavedRoom(finalEntry, { preserveCustomName: true });
+  }
+  return finalEntry;
+}
+
+/**
+ * Clears the stored last-joined room shortcut without touching saved rooms.
+ */
+export function clearLastJoinedRoom() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(LAST_ROOM_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
 function randomBytes(len) {
   const arr = new Uint8Array(len);
   if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
@@ -190,8 +422,9 @@ export function randomBase64Url(bytesLen = 32) {
 }
 
 /**
- * Purges any legacy IndexedDB databases or localStorage entries left from earlier versions
+ * Purges any legacy IndexedDB databases or legacy localStorage entries left from earlier versions
  * so zero messages, keys, or profiles persist permanently on the client.
+ * Local room bookmarks (`p2p-direct-saved-rooms-v1` / `p2p-direct-last-room-v1`) are preserved.
  */
 export function purgeLegacyClientStorage() {
   try {

@@ -12,12 +12,21 @@ import {
 } from "./mqtt_relay.js";
 import {
   DEFAULT_AUDIO_SETTINGS,
+  LAST_ROOM_KEY,
+  SAVED_ROOMS_KEY,
+  clearLastJoinedRoom,
   createEphemeralProfile,
+  loadLastJoinedRoom,
+  loadSavedRooms,
   loadSessionAudioSettings,
   purgeLegacyClientStorage,
   randomBase64Url,
+  removeSavedRoom,
+  renameSavedRoom,
+  saveLastJoinedRoom,
   saveSessionAudioSettings,
   saveSessionAuthorName,
+  upsertSavedRoom,
 } from "./storage.js";
 import {
   WatchTogetherPlayer,
@@ -1310,6 +1319,9 @@ class P2PDirectApp {
 
     // Long-lived reusable room link & encrypted MQTT rendezvous state
     this.activeRoom = null; // { name, code, url, topic, relay, encrypted }
+    this.savedRooms = [];
+    this.lastJoinedRoom = null;
+    this.editingSavedRoomTopic = null;
     this.roomRendezvous = null;
     this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0 };
     this.roomDialing = new Map();
@@ -1671,6 +1683,17 @@ class P2PDirectApp {
       "watch-queue-head",
       "watch-queue-count",
       "watch-queue-list",
+      "lobby-saved-section",
+      "lobby-saved-count",
+      "lobby-last-room-wrap",
+      "lobby-saved-rooms-grid",
+      "btn-simple-save-room",
+      "simple-save-room-icon",
+      "simple-save-room-label",
+      "btn-room-save",
+      "adv-saved-rooms-card",
+      "adv-saved-rooms-count",
+      "adv-saved-rooms-list",
       "toast",
     ];
     for (const id of ids) {
@@ -1699,6 +1722,9 @@ class P2PDirectApp {
       ev.preventDefault();
       this.unlockRoomFromLobby();
     });
+    if (this.el["btn-simple-save-room"]) {
+      this.el["btn-simple-save-room"].addEventListener("click", () => this.toggleSaveActiveRoom());
+    }
     this.el["btn-simple-copy-link"].addEventListener("click", () => {
       if (!this.activeRoom) return;
       this.copyText(
@@ -1738,6 +1764,9 @@ class P2PDirectApp {
         "Copied room link — anyone who opens it joins automatically"
       );
     });
+    if (this.el["btn-room-save"]) {
+      this.el["btn-room-save"].addEventListener("click", () => this.toggleSaveActiveRoom());
+    }
     this.el["btn-room-share"].addEventListener("click", async () => {
       if (!this.activeRoom || typeof navigator.share !== "function") return;
       try {
@@ -1753,6 +1782,15 @@ class P2PDirectApp {
       this.createLongLivedRoom({ freshKey: true })
     );
     this.el["btn-room-leave"].addEventListener("click", () => this.leaveLongLivedRoom());
+
+    // Cross-tab live sync for locally saved rooms & last joined room
+    window.addEventListener("storage", (ev) => {
+      if (ev.key === SAVED_ROOMS_KEY || ev.key === LAST_ROOM_KEY || ev.key === null) {
+        this.savedRooms = loadSavedRooms();
+        this.lastJoinedRoom = loadLastJoinedRoom();
+        this.renderSavedRooms();
+      }
+    });
 
     // Quick local tab discovery banner
     this.el["btn-join-local-mesh"].addEventListener("click", () => this.joinDiscoveredLocalMesh());
@@ -2534,8 +2572,10 @@ class P2PDirectApp {
     this.bindEvents();
     this.initPwa();
 
-    // Ensure nothing is persisted permanently on the client
+    // Purge legacy profile/message storage while preserving local room bookmarks (never auto-joined)
     purgeLegacyClientStorage();
+    this.savedRooms = loadSavedRooms();
+    this.lastJoinedRoom = loadLastJoinedRoom();
     this.el["profile-slot-label"].textContent = "in-memory session";
     this.profile = createEphemeralProfile();
 
@@ -6038,15 +6078,18 @@ class P2PDirectApp {
       entropy: randomBase64Url(16),
     });
     this.status = encoded.status;
+    const savedMatch = this.savedRooms.find((r) => r.topic === encoded.roomTopic);
+    const displayName = (savedMatch && savedMatch.name) || encoded.room;
     this.activeRoom = {
-      name: encoded.room,
+      name: displayName,
       code: encoded.code,
       url: encoded.url,
       topic: encoded.roomTopic,
       relay: relay || null,
       encrypted: Boolean(encoded.encrypted),
     };
-    this.profile.room = encoded.room;
+    this.profile.room = displayName;
+    this._recordLastJoinedRoom(this.activeRoom);
 
     if (updateHash) {
       try {
@@ -6061,18 +6104,18 @@ class P2PDirectApp {
 
     this.addTelemetry(
       "room",
-      `${joined ? "Joined" : "Created"} long-lived room "${encoded.room}" (topic ${encoded.roomTopic.slice(0, 10)}…)`
+      `${joined ? "Joined" : "Created"} long-lived room "${displayName}" (topic ${encoded.roomTopic.slice(0, 10)}…)`
     );
     if (!silent) {
       this.showToast(
         joined
-          ? `Joined "${encoded.room}" — connecting to peers automatically`
-          : `Room link ready for "${encoded.room}"`
+          ? `Joined "${displayName}" — connecting to peers automatically`
+          : `Room link ready for "${displayName}"`
       );
     }
   }
 
-  leaveLongLivedRoom() {
+  leaveLongLivedRoom({ silent = false } = {}) {
     this.stopPreCallMicMonitor();
     this.closeLightbox();
     for (const item of this.pendingImages) {
@@ -6100,7 +6143,424 @@ class P2PDirectApp {
     }
     this.renderAll();
     this.addTelemetry("room", "Left room and cleared in-memory session");
-    this.showToast("Left room — local messages cleared");
+    if (!silent) {
+      this.showToast("Left room — local messages cleared");
+    }
+  }
+
+  /* ================= Locally Saved Rooms & Last Joined Room ================= */
+
+  _formatRelativeRoomTime(tsMs) {
+    if (!tsMs || !Number.isFinite(tsMs)) return "";
+    const diffSec = Math.max(0, Math.floor((Date.now() - tsMs) / 1000));
+    if (diffSec < 45) return "Just now";
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    const diffDay = Math.floor(diffHr / 24);
+    if (diffDay < 30) return `${diffDay}d ago`;
+    try {
+      return new Date(tsMs).toLocaleDateString();
+    } catch {
+      return "";
+    }
+  }
+
+  _savedRoomAccentClass(topic) {
+    let hash = 0;
+    const s = String(topic || "");
+    for (let i = 0; i < s.length; i++) {
+      hash = (hash * 31 + s.charCodeAt(i)) >>> 0;
+    }
+    return `accent-${hash % 5}`;
+  }
+
+  _recordLastJoinedRoom(room) {
+    if (!room || !room.code || !room.topic) return;
+    const now = Date.now();
+    const saved = saveLastJoinedRoom({
+      topic: room.topic,
+      name: room.name || "Shared Room",
+      code: room.code,
+      url: room.url || `${shareableBaseUrl()}#room=${room.code}`,
+      relay: room.relay || null,
+      encrypted: Boolean(room.encrypted),
+      lastJoinedAt: now,
+    });
+    if (saved) {
+      this.lastJoinedRoom = saved;
+      this.savedRooms = loadSavedRooms();
+    }
+  }
+
+  isRoomTopicSaved(topic) {
+    if (!topic) return false;
+    return this.savedRooms.some((r) => r.topic === topic);
+  }
+
+  toggleSaveActiveRoom() {
+    if (!this.activeRoom) return;
+    const { topic, name } = this.activeRoom;
+    if (this.isRoomTopicSaved(topic)) {
+      this.savedRooms = removeSavedRoom(topic);
+      if (this.editingSavedRoomTopic === topic) {
+        this.editingSavedRoomTopic = null;
+      }
+      this.renderSavedRooms();
+      this.showToast(`Removed "${name || "Shared Room"}" from saved rooms`);
+    } else {
+      this.saveRoomBookmark(this.activeRoom);
+    }
+  }
+
+  saveRoomBookmark(entry) {
+    if (!entry || !entry.code || !entry.topic) return;
+    const now = Date.now();
+    this.savedRooms = upsertSavedRoom({
+      topic: entry.topic,
+      name: entry.name || "Shared Room",
+      code: entry.code,
+      url: entry.url || `${shareableBaseUrl()}#room=${entry.code}`,
+      relay: entry.relay || null,
+      encrypted: Boolean(entry.encrypted),
+      savedAt: now,
+      lastJoinedAt: entry.lastJoinedAt || now,
+    });
+    this.renderSavedRooms();
+    this.showToast(`Saved "${entry.name || "Shared Room"}" locally`);
+  }
+
+  removeSavedRoomByTopic(topic) {
+    if (!topic) return;
+    const prev = this.savedRooms.find((r) => r.topic === topic);
+    this.savedRooms = removeSavedRoom(topic);
+    if (this.editingSavedRoomTopic === topic) {
+      this.editingSavedRoomTopic = null;
+    }
+    this.renderSavedRooms();
+    if (prev) {
+      this.showToast(`Removed "${prev.name}" from saved rooms`);
+    }
+  }
+
+  renameSavedRoomByTopic(topic, newName) {
+    if (!topic) return;
+    const trimmed = String(newName || "").replace(/\s+/g, " ").trim().slice(0, 40);
+    if (!trimmed) {
+      this.editingSavedRoomTopic = null;
+      this.renderSavedRooms();
+      return;
+    }
+    this.savedRooms = renameSavedRoom(topic, trimmed);
+    this.lastJoinedRoom = loadLastJoinedRoom();
+    if (this.activeRoom && this.activeRoom.topic === topic) {
+      this.activeRoom.name = trimmed;
+      this.profile.room = trimmed;
+    }
+    this.editingSavedRoomTopic = null;
+    this.renderRoomCard();
+    this.showToast(`Renamed room to "${trimmed}"`);
+  }
+
+  dismissLastJoinedRoom() {
+    clearLastJoinedRoom();
+    this.lastJoinedRoom = null;
+    this.renderSavedRooms();
+    this.showToast("Cleared last joined room");
+  }
+
+  async joinSavedRoom(entry) {
+    if (!entry || (!entry.code && !entry.url)) return false;
+    if (this.activeRoom && this.activeRoom.topic === entry.topic) {
+      this.showToast(`Already in "${this.activeRoom.name || "Shared Room"}"`);
+      return true;
+    }
+    if (this.activeRoom) {
+      this.leaveLongLivedRoom({ silent: true });
+    }
+    return await this.joinLongLivedRoomLink(entry.code || entry.url);
+  }
+
+  renderSavedRooms() {
+    const activeTopic = this.activeRoom?.topic || "";
+    const activeIsSaved = Boolean(activeTopic && this.isRoomTopicSaved(activeTopic));
+
+    // 1. Update Simple Room Bar Save button
+    const simpleSaveBtn = this.el["btn-simple-save-room"];
+    if (simpleSaveBtn) {
+      simpleSaveBtn.classList.toggle("hidden", !this.activeRoom);
+      simpleSaveBtn.classList.toggle("is-saved", activeIsSaved);
+      simpleSaveBtn.setAttribute("aria-pressed", String(activeIsSaved));
+      simpleSaveBtn.title = activeIsSaved
+        ? "Saved locally — click to remove from saved rooms"
+        : "Save this room locally so you can rejoin it anytime";
+      if (this.el["simple-save-room-icon"]) {
+        this.el["simple-save-room-icon"].textContent = activeIsSaved ? "★" : "☆";
+      }
+      if (this.el["simple-save-room-label"]) {
+        this.el["simple-save-room-label"].innerHTML = activeIsSaved
+          ? 'Saved'
+          : 'Save<span class="mobile-hide"> Room</span>';
+      }
+    }
+
+    // 2. Update Advanced Rail Save Room button
+    const advSaveBtn = this.el["btn-room-save"];
+    if (advSaveBtn) {
+      advSaveBtn.classList.toggle("is-saved", activeIsSaved);
+      advSaveBtn.setAttribute("aria-pressed", String(activeIsSaved));
+      advSaveBtn.textContent = activeIsSaved ? "★ Saved" : "☆ Save Room";
+    }
+
+    // Memoize DOM rebuild so inline rename input never loses focus on unrelated status refreshes
+    const renderKey = JSON.stringify({
+      activeTopic,
+      editing: this.editingSavedRoomTopic,
+      last: this.lastJoinedRoom,
+      saved: this.savedRooms,
+    });
+    if (this._lastSavedRoomsRenderKey === renderKey) {
+      return;
+    }
+    this._lastSavedRoomsRenderKey = renderKey;
+
+    const saved = this.savedRooms || [];
+    const last = this.lastJoinedRoom || null;
+
+    // 3. Render Lobby Saved Rooms & Last Joined Dock
+    const lobbySection = this.el["lobby-saved-section"];
+    const lastWrap = this.el["lobby-last-room-wrap"];
+    const gridEl = this.el["lobby-saved-rooms-grid"];
+    const countEl = this.el["lobby-saved-count"];
+
+    if (lobbySection && lastWrap && gridEl) {
+      const hasAnything = Boolean(last || saved.length > 0);
+      lobbySection.classList.toggle("hidden", !hasAnything);
+
+      if (hasAnything) {
+        if (countEl) {
+          const summaryParts = [];
+          if (last) summaryParts.push("Last Joined");
+          if (saved.length > 0) {
+            summaryParts.push(`${saved.length} Saved`);
+          }
+          countEl.textContent = summaryParts.join(" · ");
+        }
+
+        // Last Joined card (never auto-joins; 1-click manual Rejoin)
+        if (last) {
+          lastWrap.classList.remove("hidden");
+          const lastSaved = this.isRoomTopicSaved(last.topic);
+          const relTime = this._formatRelativeRoomTime(last.lastJoinedAt);
+          const lockTag = last.encrypted
+            ? '<span class="lobby-room-tag is-lock">Passphrase</span>'
+            : "";
+          const savedTag = lastSaved
+            ? '<span class="lobby-room-tag is-saved-badge">★ Saved</span>'
+            : "";
+          const saveBtnHtml = lastSaved
+            ? ""
+            : '<button type="button" class="lobby-room-sub-btn" id="btn-lobby-save-last-room" title="Save this room to your saved rooms list">☆ Save</button>';
+
+          lastWrap.innerHTML = `
+            <div class="lobby-last-room-card" data-last-room-topic="${escapeHtml(last.topic)}">
+              <div class="lobby-room-main">
+                <div class="lobby-room-top">
+                  <span class="lobby-room-tag">Last Joined</span>
+                  ${lockTag}
+                  ${savedTag}
+                </div>
+                <span class="lobby-room-name" title="${escapeHtml(last.name)}">${escapeHtml(last.name)}</span>
+                <span class="lobby-room-meta">${relTime ? `${escapeHtml(relTime)} · ` : ""}#${escapeHtml(last.topic.slice(0, 8))}</span>
+              </div>
+              <div class="lobby-room-actions">
+                <button type="button" class="lobby-room-join-btn" id="btn-lobby-rejoin-last">▶ Rejoin</button>
+                ${saveBtnHtml}
+                <button type="button" class="lobby-room-sub-btn is-danger" id="btn-lobby-dismiss-last" title="Forget last joined room" aria-label="Forget last joined room">×</button>
+              </div>
+            </div>
+          `;
+          const rejoinBtn = lastWrap.querySelector("#btn-lobby-rejoin-last");
+          if (rejoinBtn) {
+            rejoinBtn.addEventListener("click", () => this.joinSavedRoom(last));
+          }
+          const saveLastBtn = lastWrap.querySelector("#btn-lobby-save-last-room");
+          if (saveLastBtn) {
+            saveLastBtn.addEventListener("click", () => this.saveRoomBookmark(last));
+          }
+          const dismissBtn = lastWrap.querySelector("#btn-lobby-dismiss-last");
+          if (dismissBtn) {
+            dismissBtn.addEventListener("click", () => this.dismissLastJoinedRoom());
+          }
+        } else {
+          lastWrap.classList.add("hidden");
+          lastWrap.innerHTML = "";
+        }
+
+        // Saved Rooms grid
+        if (saved.length > 0) {
+          gridEl.classList.remove("hidden");
+          gridEl.innerHTML = saved
+            .map((room, idx) => {
+              const isEditing = this.editingSavedRoomTopic === room.topic;
+              const accentCls = this._savedRoomAccentClass(room.topic);
+              const relTime = this._formatRelativeRoomTime(room.lastJoinedAt || room.savedAt);
+              const lockTag = room.encrypted
+                ? '<span class="lobby-room-tag is-lock">Passphrase</span>'
+                : "";
+              const titleBlock = isEditing
+                ? `
+                  <form class="saved-room-rename-form" data-rename-form="${idx}">
+                    <input
+                      type="text"
+                      class="saved-room-rename-input"
+                      data-rename-input="${idx}"
+                      maxlength="40"
+                      value="${escapeHtml(room.name)}"
+                      aria-label="Room name"
+                    />
+                    <button type="submit" class="lobby-room-sub-btn" title="Save name">✓</button>
+                    <button type="button" class="lobby-room-sub-btn" data-rename-cancel="${idx}" title="Cancel rename">✕</button>
+                  </form>
+                `
+                : `<span class="lobby-room-name" title="${escapeHtml(room.name)}">${escapeHtml(room.name)}</span>`;
+
+              return `
+                <article class="saved-room-card ${accentCls}" data-saved-room-topic="${escapeHtml(room.topic)}">
+                  <div class="lobby-room-main">
+                    <div class="lobby-room-top">
+                      <span class="lobby-room-tag is-saved-badge">★ Saved</span>
+                      ${lockTag}
+                    </div>
+                    ${titleBlock}
+                    <span class="lobby-room-meta">${relTime ? `${escapeHtml(relTime)} · ` : ""}#${escapeHtml(room.topic.slice(0, 8))}</span>
+                  </div>
+                  <div class="lobby-room-actions">
+                    <button type="button" class="lobby-room-join-btn" data-saved-join="${idx}">▶ Join</button>
+                    <button type="button" class="lobby-room-sub-btn" data-saved-copy="${idx}" title="Copy room invite link">Copy</button>
+                    <button type="button" class="lobby-room-sub-btn" data-saved-rename="${idx}" title="Rename saved room" aria-label="Rename saved room">✎</button>
+                    <button type="button" class="lobby-room-sub-btn is-danger" data-saved-remove="${idx}" title="Remove from saved rooms" aria-label="Remove saved room">×</button>
+                  </div>
+                </article>
+              `;
+            })
+            .join("");
+
+          for (const btn of gridEl.querySelectorAll("[data-saved-join]")) {
+            const room = saved[Number(btn.dataset.savedJoin)];
+            if (room) btn.addEventListener("click", () => this.joinSavedRoom(room));
+          }
+          for (const btn of gridEl.querySelectorAll("[data-saved-copy]")) {
+            const room = saved[Number(btn.dataset.savedCopy)];
+            if (room) {
+              btn.addEventListener("click", () => {
+                const copyUrl = room.url || `${shareableBaseUrl()}#room=${room.code}`;
+                this.copyText(copyUrl, `Copied link for "${room.name}"`);
+              });
+            }
+          }
+          for (const btn of gridEl.querySelectorAll("[data-saved-rename]")) {
+            const room = saved[Number(btn.dataset.savedRename)];
+            if (room) {
+              btn.addEventListener("click", () => {
+                this.editingSavedRoomTopic =
+                  this.editingSavedRoomTopic === room.topic ? null : room.topic;
+                this.renderSavedRooms();
+              });
+            }
+          }
+          for (const btn of gridEl.querySelectorAll("[data-saved-remove]")) {
+            const room = saved[Number(btn.dataset.savedRemove)];
+            if (room) btn.addEventListener("click", () => this.removeSavedRoomByTopic(room.topic));
+          }
+          for (const form of gridEl.querySelectorAll("[data-rename-form]")) {
+            const idx = Number(form.dataset.renameForm);
+            const room = saved[idx];
+            const input = form.querySelector(`[data-rename-input="${idx}"]`);
+            const cancelBtn = form.querySelector(`[data-rename-cancel="${idx}"]`);
+            if (input) {
+              input.focus();
+              input.select();
+              input.addEventListener("keydown", (ev) => {
+                if (ev.key === "Escape") {
+                  ev.preventDefault();
+                  this.editingSavedRoomTopic = null;
+                  this.renderSavedRooms();
+                }
+              });
+            }
+            if (cancelBtn) {
+              cancelBtn.addEventListener("click", () => {
+                this.editingSavedRoomTopic = null;
+                this.renderSavedRooms();
+              });
+            }
+            if (room && input) {
+              form.addEventListener("submit", (ev) => {
+                ev.preventDefault();
+                this.renameSavedRoomByTopic(room.topic, input.value);
+              });
+            }
+          }
+        } else {
+          gridEl.classList.add("hidden");
+          gridEl.innerHTML = "";
+        }
+      } else {
+        lastWrap.classList.add("hidden");
+        lastWrap.innerHTML = "";
+        gridEl.classList.add("hidden");
+        gridEl.innerHTML = "";
+      }
+    }
+
+    // 4. Render Compact Saved Rooms Switcher in Advanced Connect Peer Rail
+    const advCard = this.el["adv-saved-rooms-card"];
+    const advList = this.el["adv-saved-rooms-list"];
+    const advCount = this.el["adv-saved-rooms-count"];
+    if (advCard && advList) {
+      advCard.classList.toggle("hidden", saved.length === 0);
+      if (advCount) advCount.textContent = String(saved.length);
+      if (saved.length > 0) {
+        advList.innerHTML = saved
+          .map((room, idx) => {
+            const isCurrent = Boolean(activeTopic && activeTopic === room.topic);
+            const subParts = [
+              isCurrent ? "Active" : this._formatRelativeRoomTime(room.lastJoinedAt || room.savedAt),
+              room.encrypted ? "Passphrase" : "",
+            ].filter(Boolean);
+            return `
+              <div class="adv-saved-room-row${isCurrent ? " is-current" : ""}" data-adv-saved-topic="${escapeHtml(room.topic)}">
+                <div class="adv-saved-room-info">
+                  <span class="adv-saved-room-name" title="${escapeHtml(room.name)}">${escapeHtml(room.name)}</span>
+                  <span class="adv-saved-room-sub">${escapeHtml(subParts.join(" · "))}</span>
+                </div>
+                <div class="adv-saved-room-actions">
+                  ${
+                    isCurrent
+                      ? '<span class="badge auto">Here</span>'
+                      : `<button type="button" class="btn btn-sm btn-primary" data-adv-saved-join="${idx}">Join</button>`
+                  }
+                  <button type="button" class="btn btn-sm" data-adv-saved-remove="${idx}" title="Remove saved room" aria-label="Remove saved room">×</button>
+                </div>
+              </div>
+            `;
+          })
+          .join("");
+
+        for (const btn of advList.querySelectorAll("[data-adv-saved-join]")) {
+          const room = saved[Number(btn.dataset.advSavedJoin)];
+          if (room) btn.addEventListener("click", () => this.joinSavedRoom(room));
+        }
+        for (const btn of advList.querySelectorAll("[data-adv-saved-remove]")) {
+          const room = saved[Number(btn.dataset.advSavedRemove)];
+          if (room) btn.addEventListener("click", () => this.removeSavedRoomByTopic(room.topic));
+        }
+      } else {
+        advList.innerHTML = "";
+      }
+    }
   }
 
   _resetRoomRelayState() {
@@ -11070,6 +11530,8 @@ class P2PDirectApp {
       }
       this.el["btn-simple-copy-link"].classList.toggle("hidden", !isActive);
     }
+
+    this.renderSavedRooms();
 
     if (!this.el["room-link-card"]) return;
     this.el["room-link-card"].classList.toggle("is-active", isActive);

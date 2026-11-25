@@ -165,6 +165,19 @@
 
         <div id="lobby-notice" class="lobby-notice inline-notice hidden"></div>
 
+        <!-- Locally Saved Rooms & Last Joined Shortcut (never auto-joins; hidden when empty) -->
+        <section id="lobby-saved-section" class="lobby-saved-section hidden" aria-label="Saved and recent rooms">
+          <div class="lobby-saved-head">
+            <div class="lobby-saved-title-group">
+              <span class="lobby-saved-kicker">YOUR ROOMS</span>
+              <span class="lobby-saved-count" id="lobby-saved-count"></span>
+            </div>
+            <span class="lobby-saved-hint">Saved locally on this browser · Messages stay in-memory</span>
+          </div>
+          <div id="lobby-last-room-wrap" class="lobby-last-room-wrap hidden"></div>
+          <div id="lobby-saved-rooms-grid" class="lobby-saved-rooms-grid hidden"></div>
+        </section>
+
         <div class="lobby-doors">
           <div class="lobby-door door-create">
             <div class="door-top">
@@ -223,7 +236,7 @@
             </div>
             <div class="door-foot">
               <span>End-to-End Encrypted</span>
-              <span>In-Memory Only</span>
+              <span>Messages In-Memory</span>
             </div>
           </div>
         </div>
@@ -247,6 +260,16 @@
               </div>
             </div>
             <div class="simple-room-actions">
+              <button
+                type="button"
+                id="btn-simple-save-room"
+                class="ribbon-btn ribbon-btn-save hidden"
+                aria-pressed="false"
+                title="Save this room locally so you can rejoin it anytime"
+              >
+                <span id="simple-save-room-icon" aria-hidden="true">☆</span>
+                <span id="simple-save-room-label">Save<span class="mobile-hide"> Room</span></span>
+              </button>
               <button type="button" id="btn-simple-copy-link" class="ribbon-btn ribbon-btn-copy">
                 <span>Copy<span class="mobile-hide"> Link</span></span>
               </button>
@@ -941,6 +964,15 @@
                     <button type="button" id="btn-room-copy-url" class="btn btn-live btn-sm">
                       Copy Room Link
                     </button>
+                    <button
+                      type="button"
+                      id="btn-room-save"
+                      class="btn btn-sm"
+                      aria-pressed="false"
+                      title="Save this room locally so you can rejoin anytime"
+                    >
+                      ☆ Save Room
+                    </button>
                     <button type="button" id="btn-room-share" class="btn btn-sm hidden">
                       Share…
                     </button>
@@ -962,6 +994,15 @@
                     </button>
                   </div>
                 </div>
+              </div>
+
+              <!-- Compact Saved Rooms Switcher (Advanced Rail) -->
+              <div id="adv-saved-rooms-card" class="adv-saved-rooms-card hidden">
+                <div class="room-card-head">
+                  <span class="room-card-title">Saved Rooms</span>
+                  <span class="panel-meta" id="adv-saved-rooms-count">0</span>
+                </div>
+                <div id="adv-saved-rooms-list" class="adv-saved-rooms-list"></div>
               </div>
 
               <!-- Mode 0: Clear Role Picker for 1-to-1 Offline Manual Connect -->
