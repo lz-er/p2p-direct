@@ -10,12 +10,76 @@ import {
   saveSessionAuthorName,
 } from "./storage.js";
 
+const BASE_STUN_SERVERS = [
+  { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun.relay.metered.ca:80" },
+];
+
 const ICE_CONFIG = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-  ],
+  iceServers: BASE_STUN_SERVERS.slice(),
+  iceCandidatePoolSize: 2,
 };
+
+// Public coturn shared-secret fallback (Metered Open Relay Project) — used strictly as an
+// automatic WebRTC fallback when Symmetric NAT / mobile CGNAT / missing router NAT hairpinning
+// blocks direct P2P. All traffic stays double end-to-end encrypted (DTLS + Rust ChaCha20-Poly1305).
+const OPENRELAY_STATIC_HOST = "staticauth.openrelay.metered.ca";
+const OPENRELAY_STATIC_SECRET = "openrelayprojectsecret";
+
+async function computeHmacSha1Base64(secret, message) {
+  if (typeof crypto === "undefined" || !crypto.subtle) return null;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  const bytes = new Uint8Array(sig);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin);
+}
+
+async function buildIceConfig() {
+  if (typeof window !== "undefined" && Array.isArray(window.__P2P_ICE_SERVERS__)) {
+    return { iceServers: window.__P2P_ICE_SERVERS__, iceCandidatePoolSize: 2 };
+  }
+  const servers = BASE_STUN_SERVERS.slice();
+  try {
+    const expiry = Math.floor(Date.now() / 1000) + 12 * 3600;
+    const username = `${expiry}:p2pd`;
+    const credential = await computeHmacSha1Base64(OPENRELAY_STATIC_SECRET, username);
+    if (credential) {
+      servers.push({
+        urls: [
+          `turn:${OPENRELAY_STATIC_HOST}:80`,
+          `turn:${OPENRELAY_STATIC_HOST}:80?transport=tcp`,
+          `turn:${OPENRELAY_STATIC_HOST}:443`,
+          `turn:${OPENRELAY_STATIC_HOST}:443?transport=tcp`,
+          `turns:${OPENRELAY_STATIC_HOST}:443?transport=tcp`,
+        ],
+        username,
+        credential,
+      });
+    }
+  } catch {
+    // Gracefully fall back to STUN-only if SubtleCrypto is unavailable
+  }
+  return { iceServers: servers, iceCandidatePoolSize: 2 };
+}
+
+function classifyIceCandidateType(candStr) {
+  if (!candStr || typeof candStr !== "string") return "other";
+  const m = candStr.match(/\btyp\s+(host|srflx|prflx|relay)\b/i);
+  return m ? m[1].toLowerCase() : "other";
+}
 
 const BROADCAST_CHANNEL_NAME = "p2p-direct-signal-v1";
 const KEEPALIVE_INTERVAL_MS = 4000;
@@ -525,7 +589,12 @@ class P2PDirectApp {
       renderedKeys: new Set(),
     };
 
+    this.iceConfig = ICE_CONFIG;
     this.el = {};
+  }
+
+  createPeerConnection() {
+    return new RTCPeerConnection(this.iceConfig || ICE_CONFIG);
   }
 
   bindElements() {
@@ -664,7 +733,6 @@ class P2PDirectApp {
       "audio-ns",
       "audio-agc",
       "voice-join-card",
-      "voice-empty-state",
       "btn-voice-join",
       "btn-voice-listen",
       "voice-participant-list",
@@ -1277,8 +1345,20 @@ class P2PDirectApp {
     this.el["profile-slot-label"].textContent = "in-memory session";
     this.profile = createEphemeralProfile();
 
-    this.wasm = await SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm");
-    this.addTelemetry("engine", "In-memory encrypted session ready");
+    const [wasm, iceCfg] = await Promise.all([
+      SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm"),
+      buildIceConfig(),
+    ]);
+    this.wasm = wasm;
+    this.iceConfig = iceCfg;
+    const hasTurn = (iceCfg.iceServers || []).some((s) => {
+      const list = Array.isArray(s.urls) ? s.urls : [s.urls];
+      return list.some((u) => typeof u === "string" && /^turns?:/i.test(u));
+    });
+    this.addTelemetry(
+      "engine",
+      `In-memory encrypted session ready (${hasTurn ? "STUN + TURN fallback" : "STUN"} ICE)`
+    );
 
     const initRes = this.wasm.call({
       cmd: "init",
@@ -2056,7 +2136,7 @@ class P2PDirectApp {
   async startLocalAutoRejoinOffer(targetPeerId, targetName, targetPubKey) {
     if (this.localDialing.has(targetPeerId)) return;
     try {
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
       const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
       const early = this.earlyLocalIce.get(targetPeerId) || [];
@@ -2129,7 +2209,7 @@ class P2PDirectApp {
       this.localDialing.delete(msg.fromPeerId);
     }
     try {
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const early = this.earlyLocalIce.get(msg.fromPeerId) || [];
       this.earlyLocalIce.delete(msg.fromPeerId);
       const entry = {
@@ -2272,7 +2352,7 @@ class P2PDirectApp {
   async handleLocalJoinRequest(requesterPeerId) {
     try {
       const inviteId = randomId("inv");
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
       const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
       this.pendingOffers.set(inviteId, { inviteId, pc, dc, voiceDc, code: "", url: "" });
@@ -2861,9 +2941,18 @@ class P2PDirectApp {
       onMessage: (sealedPayload) => {
         this.handleSealedRoomSignal(sealedPayload);
       },
-      onBrokerReady: (_client, status) => {
+      onBrokerReady: (client, status) => {
         this.roomRelayStatus = status;
         this.renderRoomCard();
+        try {
+          const host = new URL(client.url).host;
+          this.addTelemetry(
+            "room",
+            `Relay ready (${status.connectedCount}/${status.totalCount}): ${host}`
+          );
+        } catch {
+          // ignore invalid URL formatting
+        }
         this.announceRoomHello(true);
       },
       onStatusChange: (status) => {
@@ -2973,27 +3062,124 @@ class P2PDirectApp {
         break;
       }
 
+      case "ice-batch": {
+        if (Array.isArray(msg.cands)) {
+          for (const cand of msg.cands) {
+            await this.applyRoomIce(msg.from, cand);
+          }
+        }
+        break;
+      }
+
       default:
         break;
     }
   }
 
+  _waitForInitialIce(pc, entry, maxWaitMs = 950) {
+    if (pc.iceGatheringState === "complete") {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      let graceTimer = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardTimer);
+        if (graceTimer) clearTimeout(graceTimer);
+        pc.removeEventListener("icegatheringstatechange", onState);
+        entry.onInitialCandidate = null;
+        resolve();
+      };
+      const onState = () => {
+        if (pc.iceGatheringState === "complete") {
+          finish();
+        }
+      };
+      entry.onInitialCandidate = () => {
+        // Once we have a relay candidate (or srflx + short grace), ship SDP without waiting full timeout
+        if (entry.gatheredTypes.has("relay") && entry.gatheredTypes.has("srflx")) {
+          if (!graceTimer) graceTimer = setTimeout(finish, 100);
+        } else if (entry.gatheredTypes.has("relay")) {
+          if (!graceTimer) graceTimer = setTimeout(finish, 180);
+        }
+      };
+      pc.addEventListener("icegatheringstatechange", onState);
+      const hardTimer = setTimeout(finish, maxWaitMs);
+    });
+  }
+
+  _createBatchedIceSender(targetPeerId, entry) {
+    const flush = () => {
+      if (entry.trickleTimer) {
+        clearTimeout(entry.trickleTimer);
+        entry.trickleTimer = null;
+      }
+      if (!entry.trickleBuffer || entry.trickleBuffer.length === 0) return;
+      const batch = entry.trickleBuffer.splice(0, entry.trickleBuffer.length);
+      this.sendRoomSignal({
+        t: "ice-batch",
+        from: this.status.peerId,
+        to: targetPeerId,
+        cands: batch,
+      });
+    };
+    entry.flushTrickle = flush;
+    return (candJson) => {
+      if (!candJson) {
+        flush();
+        return;
+      }
+      entry.trickleBuffer.push(candJson);
+      if (entry.trickleBuffer.length >= 6) {
+        flush();
+      } else if (!entry.trickleTimer) {
+        entry.trickleTimer = setTimeout(flush, 180);
+      }
+    };
+  }
+
+  _cleanupRoomDialingEntry(peerId, entry, reason) {
+    if (entry.trickleTimer) {
+      clearTimeout(entry.trickleTimer);
+      entry.trickleTimer = null;
+    }
+    if (this.roomDialing.get(peerId) === entry) {
+      this.roomDialing.delete(peerId);
+    }
+    try {
+      entry.pc.close();
+    } catch {
+      // ignore
+    }
+    if (reason) {
+      const types = Array.from(entry.gatheredTypes || []).join(",") || "none";
+      this.addTelemetry("error", `Room WebRTC ${reason} for ${peerId} (ICE gathered: ${types})`);
+    }
+  }
+
   async startRoomOffer(targetPeerId, targetName, targetPubKey) {
     if (this.roomDialing.has(targetPeerId) || this.localDialing.has(targetPeerId)) return;
+    let entry = null;
     try {
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
       const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
       const early = this.earlyRoomIce.get(targetPeerId) || [];
       this.earlyRoomIce.delete(targetPeerId);
 
-      const entry = {
+      entry = {
         pc,
         dc,
         voiceDc,
         remoteDescSet: false,
         sdpSent: false,
-        localIceQueue: [],
+        gatheredTypes: new Set(),
+        trickleBuffer: [],
+        trickleTimer: null,
+        flushTrickle: null,
+        onInitialCandidate: null,
         pendingIce: early,
         startedAt: Date.now(),
       };
@@ -3001,27 +3187,29 @@ class P2PDirectApp {
       this.attachVoiceDataChannel(targetPeerId, voiceDc);
       this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, false, null, true);
 
-      const sendIce = (candJson) => {
-        this.sendRoomSignal({
-          t: "ice",
-          from: this.status.peerId,
-          to: targetPeerId,
-          cand: candJson,
-        });
-      };
+      const enqueueTrickle = this._createBatchedIceSender(targetPeerId, entry);
 
       pc.onicecandidate = (ev) => {
-        if (!ev.candidate) return;
-        const candJson = ev.candidate.toJSON();
-        if (!entry.sdpSent) {
-          entry.localIceQueue.push(candJson);
+        if (!ev.candidate) {
+          if (entry.sdpSent) enqueueTrickle(null);
           return;
         }
-        sendIce(candJson);
+        const candJson = ev.candidate.toJSON();
+        entry.gatheredTypes.add(classifyIceCandidateType(candJson.candidate));
+        if (!entry.sdpSent) {
+          if (entry.onInitialCandidate) entry.onInitialCandidate();
+          return;
+        }
+        enqueueTrickle(candJson);
       };
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      // Gather initial host + srflx + relay candidates into SDP so one MQTT publish carries them reliably
+      await this._waitForInitialIce(pc, entry, 950);
+
+      if (this.roomDialing.get(targetPeerId) !== entry) return;
+      const fullSdp = pc.localDescription?.sdp || offer.sdp;
 
       this.sendRoomSignal({
         t: "offer",
@@ -3029,16 +3217,21 @@ class P2PDirectApp {
         to: targetPeerId,
         name: this.status.authorName,
         pk: this.status.e2ee.publicKey,
-        sdp: offer.sdp,
+        sdp: fullSdp,
       });
 
       entry.sdpSent = true;
-      while (entry.localIceQueue.length > 0) {
-        sendIce(entry.localIceQueue.shift());
+      const gatheredList = Array.from(entry.gatheredTypes).join(",") || "none";
+      this.addTelemetry(
+        "room",
+        `Dialing ${targetName} (${targetPeerId}) — bundled ICE [${gatheredList}]`
+      );
+    } catch (err) {
+      if (entry) {
+        this._cleanupRoomDialingEntry(targetPeerId, entry, err?.message || "offer failed");
+      } else {
+        this.roomDialing.delete(targetPeerId);
       }
-      this.addTelemetry("room", `Dialing ${targetName} (${targetPeerId}) via encrypted room link`);
-    } catch {
-      this.roomDialing.delete(targetPeerId);
     }
   }
 
@@ -3046,28 +3239,40 @@ class P2PDirectApp {
     if (!msg.from || !msg.sdp || !msg.pk) return;
     const prev = this.roomDialing.get(msg.from);
     if (prev) {
-      try {
-        prev.pc.close();
-      } catch {
-        // ignore
-      }
-      this.roomDialing.delete(msg.from);
+      this._cleanupRoomDialingEntry(msg.from, prev, null);
     }
+    let entry = null;
     try {
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const early = this.earlyRoomIce.get(msg.from) || [];
       this.earlyRoomIce.delete(msg.from);
 
-      const entry = {
+      entry = {
         pc,
         dc: null,
         remoteDescSet: false,
         sdpSent: false,
-        localIceQueue: [],
+        gatheredTypes: new Set(),
+        trickleBuffer: [],
+        trickleTimer: null,
+        flushTrickle: null,
+        onInitialCandidate: null,
         pendingIce: early,
         startedAt: Date.now(),
       };
       this.roomDialing.set(msg.from, entry);
+
+      // Monitor pre-datachannel ICE failure immediately on the answerer side too
+      const monitorAnswerIce = () => {
+        if (this.roomDialing.get(msg.from) !== entry) return;
+        const ics = pc.iceConnectionState;
+        const cs = pc.connectionState;
+        if (ics === "failed" || cs === "failed" || cs === "closed") {
+          this._cleanupRoomDialingEntry(msg.from, entry, `answer ICE ${ics}/${cs}`);
+        }
+      };
+      pc.oniceconnectionstatechange = monitorAnswerIce;
+      pc.onconnectionstatechange = monitorAnswerIce;
 
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
@@ -3087,23 +3292,20 @@ class P2PDirectApp {
         );
       };
 
-      const sendIce = (candJson) => {
-        this.sendRoomSignal({
-          t: "ice",
-          from: this.status.peerId,
-          to: msg.from,
-          cand: candJson,
-        });
-      };
+      const enqueueTrickle = this._createBatchedIceSender(msg.from, entry);
 
       pc.onicecandidate = (ev) => {
-        if (!ev.candidate) return;
-        const candJson = ev.candidate.toJSON();
-        if (!entry.sdpSent) {
-          entry.localIceQueue.push(candJson);
+        if (!ev.candidate) {
+          if (entry.sdpSent) enqueueTrickle(null);
           return;
         }
-        sendIce(candJson);
+        const candJson = ev.candidate.toJSON();
+        entry.gatheredTypes.add(classifyIceCandidateType(candJson.candidate));
+        if (!entry.sdpSent) {
+          if (entry.onInitialCandidate) entry.onInitialCandidate();
+          return;
+        }
+        enqueueTrickle(candJson);
       };
 
       await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
@@ -3112,6 +3314,10 @@ class P2PDirectApp {
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+      await this._waitForInitialIce(pc, entry, 950);
+
+      if (this.roomDialing.get(msg.from) !== entry) return;
+      const fullSdp = pc.localDescription?.sdp || answer.sdp;
 
       this.sendRoomSignal({
         t: "answer",
@@ -3119,15 +3325,21 @@ class P2PDirectApp {
         to: msg.from,
         name: this.status.authorName,
         pk: this.status.e2ee.publicKey,
-        sdp: answer.sdp,
+        sdp: fullSdp,
       });
 
       entry.sdpSent = true;
-      while (entry.localIceQueue.length > 0) {
-        sendIce(entry.localIceQueue.shift());
+      const gatheredList = Array.from(entry.gatheredTypes).join(",") || "none";
+      this.addTelemetry(
+        "room",
+        `Answered ${msg.name || msg.from} — bundled ICE [${gatheredList}]`
+      );
+    } catch (err) {
+      if (entry) {
+        this._cleanupRoomDialingEntry(msg.from, entry, err?.message || "answer failed");
+      } else {
+        this.roomDialing.delete(msg.from);
       }
-    } catch {
-      this.roomDialing.delete(msg.from);
     }
   }
 
@@ -3140,8 +3352,8 @@ class P2PDirectApp {
         entry.remoteDescSet = true;
         await this.flushPendingIce(entry);
       }
-    } catch {
-      // ignore race
+    } catch (err) {
+      this.addTelemetry("error", `Room answer apply failed for ${msg.from}: ${err?.message || err}`);
     }
   }
 
@@ -3366,7 +3578,7 @@ class P2PDirectApp {
 
     try {
       const inviteId = randomId("inv");
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
       const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
       const pending = { inviteId, pc, dc, voiceDc, code: "", url: "" };
@@ -3463,7 +3675,7 @@ class P2PDirectApp {
         this.renderHeader();
       }
 
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
           this.attachVoiceDataChannel(sig.peerId, ev.channel);
@@ -3825,10 +4037,20 @@ class P2PDirectApp {
     highPass.type = "highpass";
     highPass.Q.value = 0.707;
 
+    const s = this.audioSettings;
+    if (s.highPassHz > 0) {
+      highPass.type = "highpass";
+      highPass.frequency.value = s.highPassHz;
+    } else {
+      highPass.type = "allpass";
+      highPass.frequency.value = 20;
+    }
+
     const presence = ctx.createBiquadFilter();
     presence.type = "peaking";
     presence.frequency.value = 2800;
     presence.Q.value = 1.1;
+    presence.gain.value = s.presenceDb;
 
     const compressor = ctx.createDynamicsCompressor();
     compressor.threshold.value = -20;
@@ -3838,6 +4060,7 @@ class P2PDirectApp {
     compressor.release.value = 0.12;
 
     const micGain = ctx.createGain();
+    micGain.gain.value = s.micGain / 100;
     const monitorGain = ctx.createGain();
     monitorGain.gain.value = 0;
 
@@ -4730,6 +4953,11 @@ class P2PDirectApp {
       this.earlyRelayIce.delete(peerId);
       this.localDialing.delete(peerId);
       this.earlyLocalIce.delete(peerId);
+      const dialingEntry = this.roomDialing.get(peerId);
+      if (dialingEntry && dialingEntry.trickleTimer) {
+        clearTimeout(dialingEntry.trickleTimer);
+        dialingEntry.trickleTimer = null;
+      }
       this.roomDialing.delete(peerId);
       this.earlyRoomIce.delete(peerId);
       this.pendingAnswers.delete(peerId);
@@ -4738,6 +4966,32 @@ class P2PDirectApp {
       }
       this.discoveredLocalMeshes.delete(peerId);
       this.directPeers.set(peerId, peerEntry);
+
+      if (typeof pc.getStats === "function") {
+        pc.getStats()
+          .then((stats) => {
+            let pair = null;
+            stats.forEach((r) => {
+              if (r.type === "candidate-pair" && (r.nominated || r.state === "succeeded")) {
+                pair = r;
+              }
+            });
+            if (pair) {
+              const local = stats.get(pair.localCandidateId);
+              const remote = stats.get(pair.remoteCandidateId);
+              if (local || remote) {
+                const lt = local?.candidateType || "?";
+                const rt = remote?.candidateType || "?";
+                const proto = local?.protocol || "";
+                this.addTelemetry(
+                  "room",
+                  `WebRTC path to ${peerEntry.authorName}: ${lt} ↔ ${rt}${proto ? ` (${proto})` : ""}`
+                );
+              }
+            }
+          })
+          .catch(() => {});
+      }
 
       const res = this.wasm.call({
         cmd: "peer_connected",
@@ -5005,7 +5259,7 @@ class P2PDirectApp {
       return;
     }
     try {
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
       const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
       const early = this.earlyRelayIce.get(targetPeerId) || [];
@@ -5074,7 +5328,7 @@ class P2PDirectApp {
     }
 
     try {
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const pc = this.createPeerConnection();
       const early = this.earlyRelayIce.get(fromPeerId) || [];
       this.earlyRelayIce.delete(fromPeerId);
       const entry = {
@@ -5388,7 +5642,6 @@ class P2PDirectApp {
     }
 
     this.el["voice-join-card"].classList.toggle("hidden", this.voice.inVoice);
-    this.el["voice-empty-state"].classList.toggle("hidden", totalInVoice > 0);
     this.el["voice-participant-list"].classList.toggle("hidden", totalInVoice === 0);
 
     if (this.voice.inVoice) {
@@ -6227,13 +6480,15 @@ class P2PDirectApp {
     });
 
     if (filtered.length === 0) {
-      const emptyPrompt = this.advancedMode
-        ? "No messages yet. Write a message, drop a link, press Ctrl+V to share an image, or send structured JSON."
-        : "No messages yet. Write a message, drop a link, or press Ctrl+V to share an image.";
-      const emptyText =
-        this.logMessages.length === 0
-          ? emptyPrompt
-          : "No messages match your current filter.";
+      if (this.logMessages.length === 0) {
+        if (this.logRenderState.mode === "empty" && this.logRenderState.key === "empty:none") {
+          return;
+        }
+        feed.innerHTML = "";
+        this.logRenderState = { mode: "empty", key: "empty:none" };
+        return;
+      }
+      const emptyText = "No messages match your current filter.";
       const emptyKey = `empty:${emptyText}`;
       if (this.logRenderState.mode === "empty" && this.logRenderState.key === emptyKey) {
         return;

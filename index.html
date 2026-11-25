@@ -459,17 +459,6 @@
                     <span aria-hidden="true">→</span>
                   </button>
                 </div>
-
-                <!-- Shown beside "+ Join Voice" only when 0 participants are in the channel -->
-                <div id="voice-empty-state" class="voice-empty-stage">
-                  <div class="voice-idle-bars" aria-hidden="true">
-                    <span></span><span></span><span></span><span></span><span></span><span></span>
-                  </div>
-                  <div class="voice-empty-text">
-                    <strong>Channel Empty</strong>
-                    <span>Join voice to talk in real time</span>
-                  </div>
-                </div>
               </div>
 
               <div id="voice-notice" class="inline-notice voice-inline-notice hidden"></div>
@@ -510,11 +499,7 @@
               </select>
             </div>
 
-            <div id="log-feed" class="log-feed" aria-live="polite">
-              <div class="empty-state">
-                No messages yet. Write a message, drop a link, or press Ctrl+V to share an image.
-              </div>
-            </div>
+            <div id="log-feed" class="log-feed" aria-live="polite"></div>
 
             <div class="composer" id="chat-composer-dropzone">
               <div class="composer-head advanced-only">

@@ -8,15 +8,16 @@
  */
 
 export const DEFAULT_MQTT_RELAYS = [
+  "wss://mqtt.eclipseprojects.io:443/mqtt",
   "wss://broker.emqx.io:8084/mqtt",
   "wss://broker.hivemq.com:8884/mqtt",
-  "wss://test.mosquitto.org:8081/mqtt",
+  "wss://test.mosquitto.org:8081",
 ];
 
 const TOPIC_PREFIX = "p2pdirect/v1/";
 const KEEPALIVE_SECONDS = 30;
 const PING_INTERVAL_MS = 20_000;
-const MAX_OUTBOUND_QUEUE = 8;
+const MAX_OUTBOUND_QUEUE = 32;
 const MAX_SEEN_CACHE = 600;
 
 const textEncoder = new TextEncoder();
@@ -48,19 +49,28 @@ export function isValidRelayUrl(url) {
 
 export function resolveRelayUrls(customRelay) {
   const list = [];
+  const addUrl = (raw) => {
+    if (!raw || typeof raw !== "string") return;
+    const cleaned = raw.trim();
+    if (isValidRelayUrl(cleaned) && !list.includes(cleaned)) {
+      list.push(cleaned);
+    }
+  };
   const addCsv = (raw) => {
     if (!raw || typeof raw !== "string") return;
     for (const part of raw.split(",")) {
-      const cleaned = part.trim();
-      if (isValidRelayUrl(cleaned) && !list.includes(cleaned)) {
-        list.push(cleaned);
-      }
+      addUrl(part);
     }
   };
 
   if (typeof window !== "undefined") {
     const params = new URLSearchParams(window.location.search);
     addCsv(params.get("relay"));
+    if (list.length === 0 && Array.isArray(window.__P2P_MQTT_BROKERS__)) {
+      for (const item of window.__P2P_MQTT_BROKERS__) {
+        addUrl(typeof item === "string" ? item : item?.url);
+      }
+    }
   }
   addCsv(customRelay);
 
@@ -510,7 +520,8 @@ export class MultiRelayRendezvous {
 
   getStatus() {
     const totalCount = this.clients.length;
-    const connectedCount = this.clients.filter((c) => c.ready).length;
+    const readyClients = this.clients.filter((c) => c.ready);
+    const connectedCount = readyClients.length;
     const state = this.stopped
       ? "stopped"
       : connectedCount > 0
@@ -522,6 +533,7 @@ export class MultiRelayRendezvous {
       state,
       connectedCount,
       totalCount,
+      connectedUrls: readyClients.map((c) => c.url),
       topic: this.roomTopic,
     };
   }

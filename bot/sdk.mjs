@@ -14,9 +14,25 @@ export const VOICE_SAMPLE_RATE = 16000;
 export const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16 kHz mono
 export const VOICE_FRAME_BYTES = VOICE_FRAME_SAMPLES * 2; // Int16LE
 
+function buildOpenRelayTurnServer() {
+  const expiry = Math.floor(Date.now() / 1000) + 12 * 3600;
+  const username = `${expiry}:p2pdbot`;
+  const credential = crypto
+    .createHmac("sha1", "openrelayprojectsecret")
+    .update(username)
+    .digest("base64");
+  return {
+    urls: "turn:staticauth.openrelay.metered.ca:443?transport=tcp",
+    username,
+    credential,
+  };
+}
+
 export const DEFAULT_ICE_SERVERS = [
+  { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  buildOpenRelayTurnServer(),
 ];
 
 function randomHex(byteLen) {
@@ -767,6 +783,14 @@ export class P2PBot extends EventEmitter {
       }
       case "ice": {
         await this._applyRoomIce(msg.from, msg.cand);
+        break;
+      }
+      case "ice-batch": {
+        if (Array.isArray(msg.cands)) {
+          for (const cand of msg.cands) {
+            await this._applyRoomIce(msg.from, cand);
+          }
+        }
         break;
       }
       default:
