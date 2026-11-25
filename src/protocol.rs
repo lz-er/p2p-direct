@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use crate::crypto::{
     KEY_LEN, NONCE_LEN, aead_open, aead_seal, parse_fixed_12, parse_fixed_32,
 };
-use crate::deflate::{base64url_decode, base64url_encode};
+use crate::deflate::{base64url_decode, base64url_encode, base64url_encode_into};
 use crate::json::{JsonValue, parse_json, write_json_string, write_json_value};
 use crate::log::SealedLogRecord;
 
@@ -61,16 +61,16 @@ impl EncryptedWireEnvelope {
     }
 
     pub fn to_json_string(&self) -> String {
-        let mut out = String::with_capacity(self.ciphertext.len() * 2 + 64);
+        let mut out = String::with_capacity(self.ciphertext.len().div_ceil(3) * 4 + 96);
         let _ = write!(
             out,
-            "{{\"kind\":\"e2ee\",\"v\":{},\"s\":{},\"n\":",
+            "{{\"kind\":\"e2ee\",\"v\":{},\"s\":{},\"n\":\"",
             self.version, self.seq
         );
-        write_json_string(&mut out, &base64url_encode(&self.nonce));
-        out.push_str(",\"c\":");
-        write_json_string(&mut out, &base64url_encode(&self.ciphertext));
-        out.push('}');
+        base64url_encode_into(&self.nonce, &mut out);
+        out.push_str("\",\"c\":\"");
+        base64url_encode_into(&self.ciphertext, &mut out);
+        out.push_str("\"}");
         out
     }
 

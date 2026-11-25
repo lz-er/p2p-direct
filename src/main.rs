@@ -4,12 +4,16 @@
 
 use std::cell::RefCell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use p2p_direct::mesh::MeshNode;
-use p2p_direct::rpc::dispatch_rpc;
+use p2p_direct::rpc::{
+    dispatch_commit_bulk_publish, dispatch_commit_bulk_rx, dispatch_rpc, dispatch_wire_message,
+    worker_open_bulk, worker_seal_bulk, worker_seal_forward,
+};
 
 const BUF_CAP: usize = 262_144;
+const BUF_WORDS: usize = BUF_CAP / 8;
 
 const OP_HANDSHAKE: u32 = 0;
 const OP_CALL: u32 = 1;
@@ -21,6 +25,18 @@ const OP_VOICE_OPEN_DECODE: u32 = 6;
 const OP_VOICE_SEAL_RAW: u32 = 7;
 const OP_VOICE_OPEN_RAW: u32 = 8;
 const OP_VOICE_PROCESS_CAPTURE_48K: u32 = 9;
+const OP_WIRE_MESSAGE: u32 = 10;
+const OP_STREAM_EXEC_WIRE: u32 = 11;
+const OP_WORKER_SEAL_BULK: u32 = 12;
+const OP_STREAM_EXEC_WORKER_SEAL: u32 = 13;
+const OP_WORKER_OPEN_BULK: u32 = 14;
+const OP_STREAM_EXEC_WORKER_OPEN: u32 = 15;
+const OP_COMMIT_BULK_PUBLISH: u32 = 16;
+const OP_STREAM_EXEC_COMMIT_PUBLISH: u32 = 17;
+const OP_COMMIT_BULK_RX: u32 = 18;
+const OP_STREAM_EXEC_COMMIT_RX: u32 = 19;
+const OP_WORKER_SEAL_FORWARD: u32 = 20;
+const OP_STREAM_EXEC_WORKER_SEAL_FORWARD: u32 = 21;
 
 const STATUS_OK: u32 = 1;
 const STATUS_ERR: u32 = 2;
@@ -60,8 +76,8 @@ static HEADER: BridgeHeader = BridgeHeader {
     buf_cap: AtomicU32::new(0),
 };
 
-static IN_BUF: [AtomicU8; BUF_CAP] = [const { AtomicU8::new(0) }; BUF_CAP];
-static OUT_BUF: [AtomicU8; BUF_CAP] = [const { AtomicU8::new(0) }; BUF_CAP];
+static IN_BUF: [AtomicU64; BUF_WORDS] = [const { AtomicU64::new(0) }; BUF_WORDS];
+static OUT_BUF: [AtomicU64; BUF_WORDS] = [const { AtomicU64::new(0) }; BUF_WORDS];
 
 struct RuntimeState {
     node: Option<MeshNode>,
@@ -83,34 +99,66 @@ thread_local! {
     static RUNTIME: RefCell<RuntimeState> = const { RefCell::new(RuntimeState::new()) };
 }
 
-fn read_in_buf(len: usize) -> Vec<u8> {
+fn append_in_buf_into(out: &mut Vec<u8>, len: usize) {
     let clamped = len.min(BUF_CAP);
     let buf = black_box(&IN_BUF);
-    let mut out = Vec::with_capacity(clamped);
-    for slot in buf.iter().take(clamped) {
-        out.push(slot.load(Ordering::SeqCst));
+    let full_words = clamped / 8;
+    let tail = clamped % 8;
+    out.reserve(clamped);
+    for slot in buf.iter().take(full_words) {
+        let word = slot.load(Ordering::Relaxed);
+        out.extend_from_slice(&word.to_le_bytes());
     }
+    if tail > 0
+        && let Some(slot) = buf.get(full_words)
+    {
+        let word_bytes = slot.load(Ordering::Relaxed).to_le_bytes();
+        out.extend_from_slice(&word_bytes[..tail]);
+    }
+}
+
+fn read_in_buf(len: usize) -> Vec<u8> {
+    let clamped = len.min(BUF_CAP);
+    let mut out = Vec::with_capacity(clamped);
+    append_in_buf_into(&mut out, clamped);
     out
 }
 
 fn write_out_slice(slice: &[u8]) -> usize {
     let clamped = slice.len().min(BUF_CAP);
     let buf = black_box(&OUT_BUF);
-    for (slot, &b) in buf.iter().zip(slice.iter()).take(clamped) {
-        slot.store(b, Ordering::SeqCst);
+    let src = &slice[..clamped];
+    let (chunks, rem) = src.as_chunks::<8>();
+    let mut word_idx = 0usize;
+    for chunk in chunks {
+        if let Some(slot) = buf.get(word_idx) {
+            slot.store(u64::from_le_bytes(*chunk), Ordering::Relaxed);
+        }
+        word_idx += 1;
+    }
+    if !rem.is_empty()
+        && let Some(slot) = buf.get(word_idx)
+    {
+        let mut bytes = [0u8; 8];
+        bytes[..rem.len()].copy_from_slice(rem);
+        slot.store(u64::from_le_bytes(bytes), Ordering::Relaxed);
     }
     black_box(buf);
     clamped
 }
 
-fn publish_response(hdr: &BridgeHeader, rt: &mut RuntimeState, resp: String, ok: bool) {
-    rt.out_staging = resp.into_bytes();
+fn publish_bytes_response(hdr: &BridgeHeader, rt: &mut RuntimeState, bytes: Vec<u8>, ok: bool) {
+    rt.out_staging = bytes;
     let total = rt.out_staging.len();
     let copied = write_out_slice(&rt.out_staging);
     hdr.out_len.store(total as u32, Ordering::SeqCst);
     hdr.chunk_len.store(copied as u32, Ordering::SeqCst);
     hdr.status
         .store(if ok { STATUS_OK } else { STATUS_ERR }, Ordering::SeqCst);
+}
+
+fn publish_response(hdr: &BridgeHeader, rt: &mut RuntimeState, resp: String, ok: bool) {
+    publish_bytes_response(hdr, rt, resp.into_bytes(), ok);
 }
 
 fn publish_binary_out(hdr: &BridgeHeader, bytes: &[u8], ok: bool) {
@@ -136,6 +184,65 @@ fn execute_request_bytes(hdr: &BridgeHeader, rt: &mut RuntimeState, req_bytes: &
             );
         }
     }
+}
+
+/// Binary fast-path for `wire_message`: `[u16 peerIdLen LE][peerId UTF-8][u64 nowMs LE][raw frame UTF-8]`.
+fn execute_wire_message_bytes(hdr: &BridgeHeader, rt: &mut RuntimeState, in_bytes: &[u8]) {
+    let (Some(&b0), Some(&b1)) = (in_bytes.first(), in_bytes.get(1)) else {
+        publish_response(
+            hdr,
+            rt,
+            "{\"ok\":false,\"error\":\"truncated binary wire_message header\"}".to_owned(),
+            false,
+        );
+        return;
+    };
+    let pid_len = usize::from(u16::from_le_bytes([b0, b1]));
+    let pid_end = 2usize.saturating_add(pid_len);
+    let ts_end = pid_end.saturating_add(8);
+    let (Some(pid_slice), Some(ts_slice), Some(frame_slice)) = (
+        in_bytes.get(2..pid_end),
+        in_bytes.get(pid_end..ts_end),
+        in_bytes.get(ts_end..),
+    ) else {
+        publish_response(
+            hdr,
+            rt,
+            "{\"ok\":false,\"error\":\"truncated binary wire_message payload\"}".to_owned(),
+            false,
+        );
+        return;
+    };
+    let Ok(from_peer) = std::str::from_utf8(pid_slice) else {
+        publish_response(
+            hdr,
+            rt,
+            "{\"ok\":false,\"error\":\"invalid UTF-8 peerId in wire_message\"}".to_owned(),
+            false,
+        );
+        return;
+    };
+    let Ok(frame_str) = std::str::from_utf8(frame_slice) else {
+        publish_response(
+            hdr,
+            rt,
+            "{\"ok\":false,\"error\":\"invalid UTF-8 frame in wire_message\"}".to_owned(),
+            false,
+        );
+        return;
+    };
+    let now_ms = u64::from_le_bytes([
+        ts_slice[0],
+        ts_slice[1],
+        ts_slice[2],
+        ts_slice[3],
+        ts_slice[4],
+        ts_slice[5],
+        ts_slice[6],
+        ts_slice[7],
+    ]);
+    let resp = dispatch_wire_message(&mut rt.node, from_peer, frame_str, now_ms);
+    publish_response(hdr, rt, resp, true);
 }
 
 fn execute_voice_encode_seal(hdr: &BridgeHeader, rt: &mut RuntimeState, in_bytes: &[u8]) {
@@ -356,8 +463,8 @@ fn main() {
             hdr.magic[1].store(black_box(MAGIC_1), Ordering::SeqCst);
             hdr.magic[2].store(black_box(MAGIC_2), Ordering::SeqCst);
             hdr.magic[3].store(black_box(MAGIC_3), Ordering::SeqCst);
-            let in_ptr = (black_box(&IN_BUF) as *const [AtomicU8; BUF_CAP] as usize) as u32;
-            let out_ptr = (black_box(&OUT_BUF) as *const [AtomicU8; BUF_CAP] as usize) as u32;
+            let in_ptr = (black_box(&IN_BUF) as *const [AtomicU64; BUF_WORDS] as usize) as u32;
+            let out_ptr = (black_box(&OUT_BUF) as *const [AtomicU64; BUF_WORDS] as usize) as u32;
             hdr.in_ptr.store(in_ptr, Ordering::SeqCst);
             hdr.out_ptr.store(out_ptr, Ordering::SeqCst);
             hdr.buf_cap.store(BUF_CAP as u32, Ordering::SeqCst);
@@ -377,10 +484,9 @@ fn main() {
             });
         }
         OP_STREAM_APPEND => {
-            let chunk = read_in_buf(arg_len);
             RUNTIME.with(|cell| {
                 if let Ok(mut rt) = cell.try_borrow_mut() {
-                    rt.in_staging.extend_from_slice(&chunk);
+                    append_in_buf_into(&mut rt.in_staging, arg_len);
                     hdr.out_len.store(rt.in_staging.len() as u32, Ordering::SeqCst);
                     hdr.chunk_len.store(0, Ordering::SeqCst);
                     hdr.status.store(STATUS_OK, Ordering::SeqCst);
@@ -394,6 +500,142 @@ fn main() {
                 if let Ok(mut rt) = cell.try_borrow_mut() {
                     let req_bytes = std::mem::take(&mut rt.in_staging);
                     execute_request_bytes(hdr, &mut rt, &req_bytes);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_WIRE_MESSAGE => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    rt.in_staging.clear();
+                    execute_wire_message_bytes(hdr, &mut rt, &in_bytes);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_STREAM_EXEC_WIRE => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let in_bytes = std::mem::take(&mut rt.in_staging);
+                    execute_wire_message_bytes(hdr, &mut rt, &in_bytes);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_WORKER_SEAL_BULK => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    rt.in_staging.clear();
+                    let out = worker_seal_bulk(&in_bytes);
+                    publish_bytes_response(hdr, &mut rt, out, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_STREAM_EXEC_WORKER_SEAL => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let in_bytes = std::mem::take(&mut rt.in_staging);
+                    let out = worker_seal_bulk(&in_bytes);
+                    publish_bytes_response(hdr, &mut rt, out, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_WORKER_OPEN_BULK => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    rt.in_staging.clear();
+                    let out = worker_open_bulk(&in_bytes);
+                    publish_bytes_response(hdr, &mut rt, out, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_STREAM_EXEC_WORKER_OPEN => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let in_bytes = std::mem::take(&mut rt.in_staging);
+                    let out = worker_open_bulk(&in_bytes);
+                    publish_bytes_response(hdr, &mut rt, out, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_COMMIT_BULK_PUBLISH => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    rt.in_staging.clear();
+                    let resp = dispatch_commit_bulk_publish(&mut rt.node, &in_bytes);
+                    publish_response(hdr, &mut rt, resp, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_STREAM_EXEC_COMMIT_PUBLISH => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let in_bytes = std::mem::take(&mut rt.in_staging);
+                    let resp = dispatch_commit_bulk_publish(&mut rt.node, &in_bytes);
+                    publish_response(hdr, &mut rt, resp, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_COMMIT_BULK_RX => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    rt.in_staging.clear();
+                    let resp = dispatch_commit_bulk_rx(&mut rt.node, &in_bytes);
+                    publish_response(hdr, &mut rt, resp, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_STREAM_EXEC_COMMIT_RX => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let in_bytes = std::mem::take(&mut rt.in_staging);
+                    let resp = dispatch_commit_bulk_rx(&mut rt.node, &in_bytes);
+                    publish_response(hdr, &mut rt, resp, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_WORKER_SEAL_FORWARD => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    rt.in_staging.clear();
+                    let resp = worker_seal_forward(&in_bytes);
+                    publish_response(hdr, &mut rt, resp, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_STREAM_EXEC_WORKER_SEAL_FORWARD => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let in_bytes = std::mem::take(&mut rt.in_staging);
+                    let resp = worker_seal_forward(&in_bytes);
+                    publish_response(hdr, &mut rt, resp, true);
                 } else {
                     hdr.status.store(STATUS_ERR, Ordering::SeqCst);
                 }

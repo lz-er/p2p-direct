@@ -252,10 +252,10 @@ class MqttWsClient {
     return false;
   }
 
-  publishBinary(payloadBytes, queueIfOffline = false) {
+  publishBinary(payloadBytes, queueIfOffline = false, maxBuffered = 131072) {
     if (this.stopped || !payloadBytes) return false;
     if (this.ready && this.ws && this.ws.readyState === WebSocket.OPEN) {
-      if ((this.ws.bufferedAmount || 0) > 131072) {
+      if ((this.ws.bufferedAmount || 0) > maxBuffered) {
         return false;
       }
       try {
@@ -621,26 +621,50 @@ export class MultiRelayRendezvous {
   /**
    * Publishes raw E2EE binary fallback payloads ("DF" data frames / "VB" voice bundles),
    * preferring low-RTT, uncongested brokers shared by both local and remote peers.
-   * When `stripe` is true (realtime voice), round-robins across the fastest shared brokers
-   * so no single public MQTT sandbox hits its per-second publish token bucket.
+   *
+   * 3-Tier QoS:
+   * - `priority: "high"` (realtime voice): gets first pick of the fastest shared brokers,
+   *   round-robin striped across low-RTT brokers so no sandbox token bucket throttles voice.
+   * - `priority: "normal"` (small chat/control): uses fast shared brokers without waiting on bulk.
+   * - `priority: "low"` (GIFs/videos/bulk >16KB): enforces a tight WebSocket buffer cap (8 KB
+   *   during voice) and, when `avoidPrimaryVoiceBroker` is true and >=2 shared brokers are ready,
+   *   steers bulk traffic onto secondary broker(s) so the fastest primary voice broker stays clear.
    */
   publishBinary(
     payloadBytes,
-    { preferredUrls = null, maxBrokers = 1, queueIfOffline = false, stripe = false } = {}
+    {
+      preferredUrls = null,
+      maxBrokers = 1,
+      queueIfOffline = false,
+      stripe = false,
+      priority = "normal",
+      avoidPrimaryVoiceBroker = false,
+    } = {}
   ) {
     if (this.stopped || !payloadBytes || payloadBytes.length === 0) return 0;
+
+    const maxBuffered =
+      priority === "high"
+        ? 131072
+        : priority === "low"
+          ? avoidPrimaryVoiceBroker
+            ? 8192
+            : 49152
+          : 65536;
+
     const ready = this.clients.filter(
-      (c) => c.ready && c.ws && c.ws.readyState === WebSocket.OPEN && (c.ws.bufferedAmount || 0) <= 131072
+      (c) => c.ready && c.ws && c.ws.readyState === WebSocket.OPEN && (c.ws.bufferedAmount || 0) <= maxBuffered
     );
 
     if (ready.length === 0) {
-      if (queueIfOffline && this.clients.length > 0) {
-        this.clients[0].publishBinary(payloadBytes, true);
+      if (queueIfOffline && priority !== "low" && this.clients.length > 0) {
+        this.clients[0].publishBinary(payloadBytes, true, maxBuffered);
       }
       return 0;
     }
 
-    const uncongested = ready.filter((c) => (c.ws.bufferedAmount || 0) <= 16384);
+    const uncongestedLimit = priority === "low" ? Math.min(4096, maxBuffered) : 16384;
+    const uncongested = ready.filter((c) => (c.ws.bufferedAmount || 0) <= uncongestedLimit);
     const pool = uncongested.length > 0 ? uncongested : ready;
 
     let ordered = pool;
@@ -659,6 +683,21 @@ export class MultiRelayRendezvous {
 
     ordered = ordered.slice().sort((a, b) => (a.rttMs ?? 150) - (b.rttMs ?? 150));
 
+    // Low-priority bulk lane: keep the fastest primary voice broker completely clear when >=2 brokers exist
+    if (priority === "low") {
+      let bulkCandidates = ordered;
+      if (avoidPrimaryVoiceBroker && ordered.length >= 2) {
+        // Pick secondary broker(s) furthest from primary voice broker (ordered[0])
+        bulkCandidates = ordered.slice(1).reverse();
+      }
+      for (const c of bulkCandidates) {
+        if (c.publishBinary(payloadBytes, false, maxBuffered)) {
+          return 1;
+        }
+      }
+      return 0;
+    }
+
     if (stripe && ordered.length > 1) {
       const bestRtt = ordered[0].rttMs ?? 150;
       const fastPool = ordered
@@ -668,12 +707,12 @@ export class MultiRelayRendezvous {
       const startIdx = this.voiceStripeIdx % stripePool.length;
       this.voiceStripeIdx = (this.voiceStripeIdx + 1) >>> 0;
       for (let k = 0; k < stripePool.length; k++) {
-        if (stripePool[(startIdx + k) % stripePool.length].publishBinary(payloadBytes, false)) {
+        if (stripePool[(startIdx + k) % stripePool.length].publishBinary(payloadBytes, false, maxBuffered)) {
           return 1;
         }
       }
       for (const c of ordered) {
-        if (c.publishBinary(payloadBytes, false)) {
+        if (c.publishBinary(payloadBytes, false, maxBuffered)) {
           return 1;
         }
       }
@@ -683,7 +722,7 @@ export class MultiRelayRendezvous {
     const limit = Math.max(1, Math.min(ordered.length, maxBrokers));
     let sent = 0;
     for (let i = 0; i < ordered.length && sent < limit; i++) {
-      if (ordered[i].publishBinary(payloadBytes, false)) {
+      if (ordered[i].publishBinary(payloadBytes, false, maxBuffered)) {
         sent += 1;
       }
     }

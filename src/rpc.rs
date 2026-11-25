@@ -5,18 +5,48 @@ use crate::codec::{
     encode_signal_code, extract_fragment_code,
 };
 use crate::crypto::{
-    derive_invite_wrap_key, derive_mesh_key_from_passphrase, parse_fixed_32,
+    aead_open, aead_seal, derive_invite_wrap_key, derive_mesh_key_from_passphrase, parse_fixed_12,
+    parse_fixed_32,
 };
 use crate::deflate::{base64url_decode, base64url_encode};
 use crate::json::{JsonValue, parse_json, write_json_string};
-use crate::mesh::{MeshConfig, MeshNode, actions_to_json_array};
-use crate::protocol::RelaySignalType;
+use crate::log::{LogMessage, SealedLogRecord, is_internal_log_type};
+use crate::mesh::{BulkPeerKeyTarget, MeshConfig, MeshNode, actions_to_json_array};
+use crate::protocol::{EncryptedWireEnvelope, RelaySignalType, WireFrame};
 
 pub fn dispatch_rpc(state: &mut Option<MeshNode>, req_json: &str) -> String {
     match dispatch_inner(state, req_json) {
         Ok(resp) => resp,
         Err(msg) => error_json(&msg),
     }
+}
+
+/// Binary fast-path for incoming encrypted wire frames (avoids JSON-escaping & re-parsing multi-MB frames).
+pub fn dispatch_wire_message(
+    state: &mut Option<MeshNode>,
+    from_peer: &str,
+    frame: &str,
+    now_ms: u64,
+) -> String {
+    match dispatch_wire_inner(state, from_peer, frame, now_ms) {
+        Ok(resp) => resp,
+        Err(msg) => error_json(&msg),
+    }
+}
+
+fn dispatch_wire_inner(
+    state: &mut Option<MeshNode>,
+    from_peer: &str,
+    frame: &str,
+    now_ms: u64,
+) -> Result<String, String> {
+    let node = require_node(state)?;
+    let actions = node.on_wire_message(from_peer, frame, now_ms)?;
+    let actions_json = actions_to_json_array(&actions);
+    let status = node.status_json();
+    Ok(format!(
+        "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
+    ))
 }
 
 fn error_json(message: &str) -> String {
@@ -28,12 +58,13 @@ fn error_json(message: &str) -> String {
 }
 
 fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String, String> {
-    let val = parse_json(req_json)?;
+    let mut val = parse_json(req_json)?;
     let cmd = val
         .get_str("cmd")
-        .ok_or_else(|| "RPC request missing string field 'cmd'".to_owned())?;
+        .ok_or_else(|| "RPC request missing string field 'cmd'".to_owned())?
+        .to_owned();
 
-    match cmd {
+    match cmd.as_str() {
         "init" => {
             let peer_id = val
                 .get_str("peerId")
@@ -204,12 +235,33 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             let snap = node.export_decrypted_json();
             Ok(format!("{{\"ok\":true,\"snapshot\":{snap}}}"))
         }
+        "get_status" => {
+            let node = require_node(state)?;
+            let status = node.status_json();
+            Ok(format!("{{\"ok\":true,\"status\":{status}}}"))
+        }
         "get_state" => {
             let node = require_node(state)?;
             let status = node.status_json();
             let log = node.log_json();
             Ok(format!(
                 "{{\"ok\":true,\"status\":{status},\"log\":{log}}}"
+            ))
+        }
+        "get_log_delta" => {
+            let node = require_node(state)?;
+            let mut known: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+            if let Some(JsonValue::Object(map)) = val.get("knownVersions") {
+                for (k, v) in map {
+                    if let Some(ver) = v.as_u64() {
+                        known.insert(k.as_str(), ver);
+                    }
+                }
+            }
+            let status = node.status_json();
+            let delta = node.log_delta_json(&known);
+            Ok(format!(
+                "{{\"ok\":true,\"status\":{status},\"delta\":{delta}}}"
             ))
         }
         "clear_log" => {
@@ -229,21 +281,31 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 .get_str("type")
                 .ok_or_else(|| "publish missing string field 'type'".to_owned())?
                 .to_owned();
-            let payload = val
-                .get("payload")
-                .cloned()
-                .ok_or_else(|| "publish missing field 'payload'".to_owned())?;
             let ts = val
                 .get_u64("ts")
                 .ok_or_else(|| "publish missing integer field 'ts'".to_owned())?;
             let custom_id = val.get_str("id").map(str::to_owned);
+            let omit_payload = val.get_bool("omitMessagePayload").unwrap_or(false);
+            let payload = match &mut val {
+                JsonValue::Object(map) => map
+                    .remove("payload")
+                    .ok_or_else(|| "publish missing field 'payload'".to_owned())?,
+                _ => return Err("publish missing field 'payload'".to_owned()),
+            };
             let (msg, actions) = node.publish_local(msg_type, payload, ts, custom_id)?;
-            let msg_json = msg.to_json_string();
             let actions_json = actions_to_json_array(&actions);
             let status = node.status_json();
-            Ok(format!(
-                "{{\"ok\":true,\"message\":{msg_json},\"actions\":{actions_json},\"status\":{status}}}"
-            ))
+            if omit_payload {
+                let meta_json = msg.to_meta_json_string();
+                Ok(format!(
+                    "{{\"ok\":true,\"messageMeta\":{meta_json},\"actions\":{actions_json},\"status\":{status}}}"
+                ))
+            } else {
+                let msg_json = msg.to_json_string();
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":{msg_json},\"actions\":{actions_json},\"status\":{status}}}"
+                ))
+            }
         }
         "delete_message" => {
             let node = require_node(state)?;
@@ -630,6 +692,59 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 None => Ok("{\"ok\":true,\"found\":false}".to_owned()),
             }
         }
+        "prepare_bulk_publish" => {
+            let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
+            let msg_type = val
+                .get_str("type")
+                .ok_or_else(|| "prepare_bulk_publish missing string field 'type'".to_owned())?
+                .to_owned();
+            let ts = val
+                .get_u64("ts")
+                .ok_or_else(|| "prepare_bulk_publish missing integer field 'ts'".to_owned())?;
+            let custom_id = val.get_str("id").map(str::to_owned);
+            let prep = node.prepare_bulk_publish(msg_type, ts, custom_id)?;
+            let mut out = String::with_capacity(384 + prep.peer_targets.len() * 140);
+            out.push_str("{\"ok\":true,\"prep\":{\"id\":");
+            write_json_string(&mut out, &prep.id);
+            out.push_str(",\"type\":");
+            write_json_string(&mut out, &prep.msg_type);
+            let _ = write!(out, ",\"lamport\":{},\"ts\":{},\"author\":", prep.lamport, prep.ts);
+            write_json_string(&mut out, &prep.author);
+            out.push_str(",\"authorName\":");
+            write_json_string(&mut out, &prep.author_name);
+            out.push_str(",\"logKey\":");
+            write_json_string(&mut out, &base64url_encode(&prep.log_key));
+            out.push_str(",\"logNonce\":");
+            write_json_string(&mut out, &base64url_encode(&prep.log_nonce));
+            let _ = write!(out, ",\"gossipTtl\":{},\"targets\":[", prep.gossip_ttl);
+            write_bulk_targets_json(&prep.peer_targets, &mut out);
+            out.push_str("]}}");
+            Ok(out)
+        }
+        "prepare_bulk_rx" => {
+            let node = require_node(state)?;
+            let from_peer = val
+                .get_str("fromPeer")
+                .ok_or_else(|| "prepare_bulk_rx missing 'fromPeer'".to_owned())?;
+            let seq = val
+                .get_u64("seq")
+                .ok_or_else(|| "prepare_bulk_rx missing 'seq'".to_owned())?;
+            let (rx_key, log_key) = node.prepare_bulk_rx(from_peer, seq)?;
+            let mut out = String::with_capacity(220);
+            out.push_str("{\"ok\":true,\"rxKey\":");
+            write_json_string(&mut out, &base64url_encode(&rx_key));
+            out.push_str(",\"logKey\":");
+            write_json_string(&mut out, &base64url_encode(&log_key));
+            out.push_str(",\"selfPeerId\":");
+            write_json_string(&mut out, node.peer_id());
+            out.push('}');
+            Ok(out)
+        }
         other => Err(format!("unknown RPC command '{other}'")),
     }
 }
@@ -638,4 +753,492 @@ fn require_node(state: &mut Option<MeshNode>) -> Result<&mut MeshNode, String> {
     state
         .as_mut()
         .ok_or_else(|| "mesh node is not initialized; call 'init' first".to_owned())
+}
+
+fn write_bulk_targets_json(targets: &[BulkPeerKeyTarget], out: &mut String) {
+    for (i, t) in targets.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"peerId\":");
+        write_json_string(out, &t.peer_id);
+        out.push_str(",\"txKey\":");
+        write_json_string(out, &base64url_encode(&t.tx_key));
+        let _ = write!(out, ",\"txSeq\":{},\"wireNonce\":", t.tx_seq);
+        write_json_string(out, &base64url_encode(&t.wire_nonce));
+        out.push('}');
+    }
+}
+
+fn split_framed_input(in_bytes: &[u8]) -> Result<(&str, &[u8]), String> {
+    if in_bytes.len() < 4 {
+        return Err("truncated framed bulk header".to_owned());
+    }
+    let header_len = u32::from_le_bytes([in_bytes[0], in_bytes[1], in_bytes[2], in_bytes[3]]) as usize;
+    let header_end = 4usize.saturating_add(header_len);
+    let (Some(hdr_bytes), Some(tail)) = (in_bytes.get(4..header_end), in_bytes.get(header_end..))
+    else {
+        return Err("truncated framed bulk payload".to_owned());
+    };
+    let hdr_str =
+        std::str::from_utf8(hdr_bytes).map_err(|_| "invalid UTF-8 bulk header JSON".to_owned())?;
+    Ok((hdr_str, tail))
+}
+
+fn frame_json_and_tail(json: &str, tail: &[u8]) -> Vec<u8> {
+    let jb = json.as_bytes();
+    let mut out = Vec::with_capacity(4 + jb.len() + tail.len());
+    out.extend_from_slice(&(jb.len() as u32).to_le_bytes());
+    out.extend_from_slice(jb);
+    out.extend_from_slice(tail);
+    out
+}
+
+fn parse_meta_msg_from_json(meta: &JsonValue) -> Result<LogMessage, String> {
+    let id = meta
+        .get_str("id")
+        .ok_or_else(|| "bulk meta missing 'id'".to_owned())?
+        .to_owned();
+    let msg_type = meta
+        .get_str("type")
+        .ok_or_else(|| "bulk meta missing 'type'".to_owned())?
+        .to_owned();
+    let lamport = meta
+        .get_u64("lamport")
+        .ok_or_else(|| "bulk meta missing 'lamport'".to_owned())?;
+    let ts = meta
+        .get_u64("ts")
+        .ok_or_else(|| "bulk meta missing 'ts'".to_owned())?;
+    let author = meta
+        .get_str("author")
+        .ok_or_else(|| "bulk meta missing 'author'".to_owned())?
+        .to_owned();
+    let author_name = meta.get_str("authorName").unwrap_or(&author).to_owned();
+    Ok(LogMessage {
+        id,
+        msg_type,
+        lamport,
+        ts,
+        author,
+        author_name,
+        payload: JsonValue::Null,
+    })
+}
+
+fn parse_targets_from_json(val: &JsonValue) -> Result<Vec<BulkPeerKeyTarget>, String> {
+    let mut targets = Vec::new();
+    if let Some(arr) = val.get("targets").and_then(JsonValue::as_array) {
+        for item in arr {
+            let peer_id = item
+                .get_str("peerId")
+                .ok_or_else(|| "bulk target missing 'peerId'".to_owned())?
+                .to_owned();
+            let tx_key = parse_fixed_32(
+                &base64url_decode(
+                    item.get_str("txKey")
+                        .ok_or_else(|| "bulk target missing 'txKey'".to_owned())?,
+                )?,
+                "txKey",
+            )?;
+            let tx_seq = item
+                .get_u64("txSeq")
+                .ok_or_else(|| "bulk target missing 'txSeq'".to_owned())?;
+            let wire_nonce = parse_fixed_12(
+                &base64url_decode(
+                    item.get_str("wireNonce")
+                        .ok_or_else(|| "bulk target missing 'wireNonce'".to_owned())?,
+                )?,
+                "wireNonce",
+            )?;
+            targets.push(BulkPeerKeyTarget {
+                peer_id,
+                tx_key,
+                tx_seq,
+                wire_nonce,
+            });
+        }
+    }
+    Ok(targets)
+}
+
+/// Stateless off-thread worker seal for bulk GIF/video messages.
+/// Input: `[u32 headerJsonLen][headerJson][raw canonical LogMessage UTF-8 JSON]`.
+/// Output: `[u32 respJsonLen][respJson { ok, wireFrames }][raw sealed ciphertext bytes]`.
+pub fn worker_seal_bulk(in_bytes: &[u8]) -> Vec<u8> {
+    match worker_seal_bulk_inner(in_bytes) {
+        Ok(out) => out,
+        Err(err) => frame_json_and_tail(&error_json(&err), &[]),
+    }
+}
+
+fn worker_seal_bulk_inner(in_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (hdr_str, msg_json_bytes) = split_framed_input(in_bytes)?;
+    let hdr = parse_json(hdr_str)?;
+    let meta = hdr
+        .get("meta")
+        .ok_or_else(|| "worker_seal_bulk missing 'meta'".to_owned())?;
+    let meta_msg = parse_meta_msg_from_json(meta)?;
+    let log_key = parse_fixed_32(
+        &base64url_decode(
+            hdr.get_str("logKey")
+                .ok_or_else(|| "worker_seal_bulk missing 'logKey'".to_owned())?,
+        )?,
+        "logKey",
+    )?;
+    let log_nonce = parse_fixed_12(
+        &base64url_decode(
+            hdr.get_str("logNonce")
+                .ok_or_else(|| "worker_seal_bulk missing 'logNonce'".to_owned())?,
+        )?,
+        "logNonce",
+    )?;
+    let gossip_ttl = hdr.get_u64("gossipTtl").unwrap_or(16) as u32;
+    let targets = parse_targets_from_json(&hdr)?;
+
+    let log_aad = format!(
+        "p2p-log-v1|{}|{}|{}",
+        meta_msg.id, meta_msg.lamport, meta_msg.ts
+    );
+    let sealed_ct = aead_seal(&log_key, &log_nonce, log_aad.as_bytes(), msg_json_bytes);
+
+    let mut wire_frames: Vec<(String, String)> = Vec::with_capacity(targets.len());
+    if !targets.is_empty() {
+        let record = SealedLogRecord {
+            id: meta_msg.id.clone(),
+            lamport: meta_msg.lamport,
+            ts: meta_msg.ts,
+            nonce: log_nonce,
+            ciphertext: sealed_ct.clone(),
+        };
+        let wire = WireFrame::Msg {
+            origin: meta_msg.author.clone(),
+            ttl: gossip_ttl,
+            path: vec![meta_msg.author.clone()],
+            record,
+        };
+        let wire_plaintext = wire.to_json_string();
+        for t in targets {
+            let env = EncryptedWireEnvelope::seal(
+                &t.tx_key,
+                t.tx_seq,
+                t.wire_nonce,
+                &meta_msg.author,
+                &t.peer_id,
+                &wire_plaintext,
+            );
+            wire_frames.push((t.peer_id, env.to_json_string()));
+        }
+    }
+
+    let total_frames_len: usize = wire_frames.iter().map(|(p, f)| p.len() + f.len() + 32).sum();
+    let mut resp_json = String::with_capacity(total_frames_len + 64);
+    resp_json.push_str("{\"ok\":true,\"wireFrames\":[");
+    for (i, (pid, frame)) in wire_frames.iter().enumerate() {
+        if i > 0 {
+            resp_json.push(',');
+        }
+        resp_json.push_str("{\"peerId\":");
+        write_json_string(&mut resp_json, pid);
+        resp_json.push_str(",\"frame\":");
+        write_json_string(&mut resp_json, frame);
+        resp_json.push('}');
+    }
+    resp_json.push_str("]}");
+
+    Ok(frame_json_and_tail(&resp_json, &sealed_ct))
+}
+
+/// Stateless off-thread worker open for incoming encrypted bulk wire frames.
+/// Input: `[u32 headerJsonLen][headerJson { fromPeer, selfPeerId, rxKey, logKey }][raw wire frame UTF-8]`.
+/// Output:
+/// - For `WireFrame::Msg` (non-internal):
+///   `[u32 metaJsonLen][metaJson][u32 msgJsonLen][msgJson UTF-8][raw sealed ciphertext bytes]`
+/// - For any non-`Msg` / internal frame:
+///   `[u32 metaJsonLen][{"ok":true,"kind":"fallback"}]`
+pub fn worker_open_bulk(in_bytes: &[u8]) -> Vec<u8> {
+    match worker_open_bulk_inner(in_bytes) {
+        Ok(out) => out,
+        Err(err) => frame_json_and_tail(&error_json(&err), &[]),
+    }
+}
+
+fn worker_open_bulk_inner(in_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (hdr_str, frame_bytes) = split_framed_input(in_bytes)?;
+    let hdr = parse_json(hdr_str)?;
+    let from_peer = hdr
+        .get_str("fromPeer")
+        .ok_or_else(|| "worker_open_bulk missing 'fromPeer'".to_owned())?;
+    let self_peer = hdr
+        .get_str("selfPeerId")
+        .ok_or_else(|| "worker_open_bulk missing 'selfPeerId'".to_owned())?;
+    let rx_key = parse_fixed_32(
+        &base64url_decode(
+            hdr.get_str("rxKey")
+                .ok_or_else(|| "worker_open_bulk missing 'rxKey'".to_owned())?,
+        )?,
+        "rxKey",
+    )?;
+    let log_key = parse_fixed_32(
+        &base64url_decode(
+            hdr.get_str("logKey")
+                .ok_or_else(|| "worker_open_bulk missing 'logKey'".to_owned())?,
+        )?,
+        "logKey",
+    )?;
+    let frame_str =
+        std::str::from_utf8(frame_bytes).map_err(|_| "invalid UTF-8 wire frame".to_owned())?;
+
+    let env = EncryptedWireEnvelope::parse_json(frame_str)?;
+    let decrypted_json = env.open(&rx_key, from_peer, self_peer)?;
+    let wire_frame = WireFrame::parse_json(&decrypted_json)?;
+
+    let WireFrame::Msg {
+        origin,
+        ttl,
+        path,
+        record,
+    } = wire_frame
+    else {
+        return Ok(frame_json_and_tail("{\"ok\":true,\"kind\":\"fallback\"}", &[]));
+    };
+
+    let aad = format!("p2p-log-v1|{}|{}|{}", record.id, record.lamport, record.ts);
+    let plain_bytes = aead_open(&log_key, &record.nonce, aad.as_bytes(), &record.ciphertext)?;
+    let plain_str = std::str::from_utf8(&plain_bytes)
+        .map_err(|_| "decrypted log record is not valid UTF-8".to_owned())?;
+    let msg_val = parse_json(plain_str)?;
+    let meta_msg = parse_meta_msg_from_json(&msg_val)?;
+    if meta_msg.id != record.id || meta_msg.lamport != record.lamport || meta_msg.ts != record.ts {
+        return Err("sealed log record metadata mismatch with authenticated plaintext".to_owned());
+    }
+    if is_internal_log_type(&meta_msg.msg_type) {
+        return Ok(frame_json_and_tail("{\"ok\":true,\"kind\":\"fallback\"}", &[]));
+    }
+
+    let mut meta_json = String::with_capacity(384);
+    let _ = write!(meta_json, "{{\"ok\":true,\"kind\":\"msg\",\"seq\":{},\"origin\":", env.seq);
+    write_json_string(&mut meta_json, &origin);
+    let _ = write!(meta_json, ",\"ttl\":{ttl},\"path\":[");
+    for (i, hop) in path.iter().enumerate() {
+        if i > 0 {
+            meta_json.push(',');
+        }
+        write_json_string(&mut meta_json, hop);
+    }
+    meta_json.push_str("],\"sealedNonce\":");
+    write_json_string(&mut meta_json, &base64url_encode(&record.nonce));
+    meta_json.push_str(",\"meta\":");
+    meta_json.push_str(&meta_msg.to_meta_json_string());
+    meta_json.push('}');
+
+    let mj_bytes = meta_json.as_bytes();
+    let mut out = Vec::with_capacity(8 + mj_bytes.len() + plain_bytes.len() + record.ciphertext.len());
+    out.extend_from_slice(&(mj_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(mj_bytes);
+    out.extend_from_slice(&(plain_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&plain_bytes);
+    out.extend_from_slice(&record.ciphertext);
+    Ok(out)
+}
+
+/// Stateless off-thread worker seal for multi-hop bulk gossip forwarding (3+ peer meshes).
+/// Input: `[u32 headerJsonLen][headerJson { selfPeerId, origin, ttl, path, recordMeta, targets }][raw sealed ciphertext]`.
+/// Output: JSON `{ ok, wireFrames }`.
+pub fn worker_seal_forward(in_bytes: &[u8]) -> String {
+    match worker_seal_forward_inner(in_bytes) {
+        Ok(resp) => resp,
+        Err(err) => error_json(&err),
+    }
+}
+
+fn worker_seal_forward_inner(in_bytes: &[u8]) -> Result<String, String> {
+    let (hdr_str, sealed_ct) = split_framed_input(in_bytes)?;
+    let hdr = parse_json(hdr_str)?;
+    let self_peer = hdr
+        .get_str("selfPeerId")
+        .ok_or_else(|| "worker_seal_forward missing 'selfPeerId'".to_owned())?;
+    let origin = hdr
+        .get_str("origin")
+        .ok_or_else(|| "worker_seal_forward missing 'origin'".to_owned())?
+        .to_owned();
+    let ttl = hdr.get_u64("ttl").unwrap_or(1) as u32;
+    let mut path = Vec::new();
+    if let Some(arr) = hdr.get("path").and_then(JsonValue::as_array) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                path.push(s.to_owned());
+            }
+        }
+    }
+    let rec_meta = hdr
+        .get("recordMeta")
+        .ok_or_else(|| "worker_seal_forward missing 'recordMeta'".to_owned())?;
+    let id = rec_meta
+        .get_str("id")
+        .ok_or_else(|| "recordMeta missing 'id'".to_owned())?
+        .to_owned();
+    let lamport = rec_meta
+        .get_u64("lamport")
+        .ok_or_else(|| "recordMeta missing 'lamport'".to_owned())?;
+    let ts = rec_meta
+        .get_u64("ts")
+        .ok_or_else(|| "recordMeta missing 'ts'".to_owned())?;
+    let nonce = parse_fixed_12(
+        &base64url_decode(
+            rec_meta
+                .get_str("nonce")
+                .ok_or_else(|| "recordMeta missing 'nonce'".to_owned())?,
+        )?,
+        "recordMeta.nonce",
+    )?;
+    let targets = parse_targets_from_json(&hdr)?;
+
+    let wire = WireFrame::Msg {
+        origin,
+        ttl,
+        path,
+        record: SealedLogRecord {
+            id,
+            lamport,
+            ts,
+            nonce,
+            ciphertext: sealed_ct.to_vec(),
+        },
+    };
+    let wire_plaintext = wire.to_json_string();
+    let mut out = String::with_capacity(targets.len().saturating_mul(wire_plaintext.len() + 256) + 64);
+    out.push_str("{\"ok\":true,\"wireFrames\":[");
+    for (i, t) in targets.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let env = EncryptedWireEnvelope::seal(
+            &t.tx_key,
+            t.tx_seq,
+            t.wire_nonce,
+            self_peer,
+            &t.peer_id,
+            &wire_plaintext,
+        );
+        out.push_str("{\"peerId\":");
+        write_json_string(&mut out, &t.peer_id);
+        out.push_str(",\"frame\":");
+        write_json_string(&mut out, &env.to_json_string());
+        out.push('}');
+    }
+    out.push_str("]}");
+    Ok(out)
+}
+
+/// Main-thread commit after off-thread bulk publish sealing (< 1 ms, zero crypto/parsing of payload).
+pub fn dispatch_commit_bulk_publish(state: &mut Option<MeshNode>, in_bytes: &[u8]) -> String {
+    match dispatch_commit_bulk_publish_inner(state, in_bytes) {
+        Ok(resp) => resp,
+        Err(err) => error_json(&err),
+    }
+}
+
+fn dispatch_commit_bulk_publish_inner(
+    state: &mut Option<MeshNode>,
+    in_bytes: &[u8],
+) -> Result<String, String> {
+    let node = require_node(state)?;
+    let (hdr_str, sealed_ct) = split_framed_input(in_bytes)?;
+    let hdr = parse_json(hdr_str)?;
+    let meta = hdr
+        .get("meta")
+        .ok_or_else(|| "commit_bulk_publish missing 'meta'".to_owned())?;
+    let meta_msg = parse_meta_msg_from_json(meta)?;
+    let nonce = parse_fixed_12(
+        &base64url_decode(
+            hdr.get_str("sealedNonce")
+                .ok_or_else(|| "commit_bulk_publish missing 'sealedNonce'".to_owned())?,
+        )?,
+        "sealedNonce",
+    )?;
+    let sent_peer_count = hdr.get_u64("sentPeerCount").unwrap_or(0) as usize;
+    let sealed = SealedLogRecord {
+        id: meta_msg.id.clone(),
+        lamport: meta_msg.lamport,
+        ts: meta_msg.ts,
+        nonce,
+        ciphertext: sealed_ct.to_vec(),
+    };
+    let actions = node.commit_bulk_publish(meta_msg, sealed, sent_peer_count)?;
+    let actions_json = actions_to_json_array(&actions);
+    let status = node.status_json();
+    Ok(format!(
+        "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
+    ))
+}
+
+/// Main-thread commit after off-thread bulk RX decryption (< 1 ms, zero crypto/parsing of payload).
+pub fn dispatch_commit_bulk_rx(state: &mut Option<MeshNode>, in_bytes: &[u8]) -> String {
+    match dispatch_commit_bulk_rx_inner(state, in_bytes) {
+        Ok(resp) => resp,
+        Err(err) => error_json(&err),
+    }
+}
+
+fn dispatch_commit_bulk_rx_inner(
+    state: &mut Option<MeshNode>,
+    in_bytes: &[u8],
+) -> Result<String, String> {
+    let node = require_node(state)?;
+    let (hdr_str, sealed_ct) = split_framed_input(in_bytes)?;
+    let hdr = parse_json(hdr_str)?;
+    let from_peer = hdr
+        .get_str("fromPeer")
+        .ok_or_else(|| "commit_bulk_rx missing 'fromPeer'".to_owned())?;
+    let seq = hdr
+        .get_u64("seq")
+        .ok_or_else(|| "commit_bulk_rx missing 'seq'".to_owned())?;
+    let ttl = hdr.get_u64("ttl").unwrap_or(1) as u32;
+    let mut path = Vec::new();
+    if let Some(arr) = hdr.get("path").and_then(JsonValue::as_array) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                path.push(s.to_owned());
+            }
+        }
+    }
+    let meta = hdr
+        .get("meta")
+        .ok_or_else(|| "commit_bulk_rx missing 'meta'".to_owned())?;
+    let meta_msg = parse_meta_msg_from_json(meta)?;
+    let nonce = parse_fixed_12(
+        &base64url_decode(
+            hdr.get_str("sealedNonce")
+                .ok_or_else(|| "commit_bulk_rx missing 'sealedNonce'".to_owned())?,
+        )?,
+        "sealedNonce",
+    )?;
+    let sealed = SealedLogRecord {
+        id: meta_msg.id.clone(),
+        lamport: meta_msg.lamport,
+        ts: meta_msg.ts,
+        nonce,
+        ciphertext: sealed_ct.to_vec(),
+    };
+
+    let (inserted, forward_targets, next_path, next_ttl) =
+        node.commit_bulk_rx(from_peer, seq, ttl, path, meta_msg, sealed)?;
+    let status = node.status_json();
+    let mut out = String::with_capacity(status.len() + 256 + forward_targets.len() * 140);
+    let _ = write!(
+        out,
+        "{{\"ok\":true,\"inserted\":{inserted},\"nextTtl\":{next_ttl},\"nextPath\":["
+    );
+    for (i, hop) in next_path.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_json_string(&mut out, hop);
+    }
+    out.push_str("],\"forwardTargets\":[");
+    write_bulk_targets_json(&forward_targets, &mut out);
+    out.push_str("],\"status\":");
+    out.push_str(&status);
+    out.push('}');
+    Ok(out)
 }

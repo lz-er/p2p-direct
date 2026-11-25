@@ -12,7 +12,9 @@ use crate::crypto::{
 };
 use crate::deflate::{base64url_decode, base64url_encode, deflate_raw, inflate_auto};
 use crate::json::{JsonValue, write_json_string, write_json_value};
-use crate::log::{LogMessage, MSG_TYPE_DELETE, ReplicatedLog, SealedLogRecord};
+use crate::log::{
+    LogMessage, MSG_TYPE_DELETE, ReplicatedLog, SealedLogRecord, is_internal_log_type,
+};
 use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
     DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
@@ -255,11 +257,13 @@ pub fn actions_to_json_array(actions: &[MeshAction]) -> String {
     out
 }
 
-/// 64-slot sliding anti-replay window for authenticated per-link sequence numbers.
+/// 256-slot sliding anti-replay window for authenticated per-link sequence numbers.
+/// Wide enough that low-priority `p2p-bulk` GIF/video transfers can complete safely
+/// while fast chat, presence, and keepalive frames pass ahead on `p2p-mesh`.
 #[derive(Debug, Clone, Default)]
 struct ReplayWindow {
     max_seq: u64,
-    seen_mask: u64,
+    seen_bits: [u64; 4],
 }
 
 impl ReplayWindow {
@@ -271,30 +275,46 @@ impl ReplayWindow {
             return true;
         }
         let diff = self.max_seq - seq;
-        if diff >= 64 {
+        if diff >= 256 {
             return false;
         }
-        (self.seen_mask & (1u64 << diff)) == 0
+        let word = (diff / 64) as usize;
+        let bit = diff % 64;
+        (self.seen_bits[word] & (1u64 << bit)) == 0
     }
 
     fn accept(&mut self, seq: u64) {
         if self.max_seq == 0 {
             self.max_seq = seq;
-            self.seen_mask = 1;
+            self.seen_bits = [1, 0, 0, 0];
             return;
         }
         if seq > self.max_seq {
             let shift = seq - self.max_seq;
-            self.seen_mask = if shift >= 64 {
-                1
+            if shift >= 256 {
+                self.seen_bits = [1, 0, 0, 0];
             } else {
-                (self.seen_mask << shift) | 1
-            };
+                let word_shift = (shift / 64) as usize;
+                let bit_shift = (shift % 64) as u32;
+                let mut next = [0u64; 4];
+                for (i, slot) in next.iter_mut().enumerate().skip(word_shift) {
+                    let src = i - word_shift;
+                    let mut w = self.seen_bits[src] << bit_shift;
+                    if bit_shift > 0 && src > 0 {
+                        w |= self.seen_bits[src - 1] >> (64 - bit_shift);
+                    }
+                    *slot = w;
+                }
+                next[0] |= 1;
+                self.seen_bits = next;
+            }
             self.max_seq = seq;
         } else {
             let diff = self.max_seq - seq;
-            if diff < 64 {
-                self.seen_mask |= 1u64 << diff;
+            if diff < 256 {
+                let word = (diff / 64) as usize;
+                let bit = diff % 64;
+                self.seen_bits[word] |= 1u64 << bit;
             }
         }
     }
@@ -616,6 +636,7 @@ impl MeshNode {
         if self.mesh_key == new_mesh_key && self.passphrase_mode == passphrase_mode {
             return Ok(());
         }
+        self.log.materialize_deferred(&self.log_key);
         self.mesh_key = new_mesh_key;
         self.log_key = derive_log_key(&new_mesh_key);
         self.room_signal_key = derive_room_signal_key(&new_mesh_key);
@@ -701,9 +722,13 @@ impl MeshNode {
         self.seq
     }
 
-    /// Encrypts `frame` with the peer's directional X25519+MeshKey ChaCha20-Poly1305 session key.
-    fn emit_wire(&mut self, actions: &mut Vec<MeshAction>, peer_id: &str, frame: &WireFrame) {
-        let plaintext = frame.to_json_string();
+    /// Encrypts an already-serialized wire frame with the peer's directional ChaCha20-Poly1305 session key.
+    fn emit_wire_plaintext(
+        &mut self,
+        actions: &mut Vec<MeshAction>,
+        peer_id: &str,
+        plaintext: &str,
+    ) {
         let Some(peer) = self.peers.get_mut(peer_id) else {
             return;
         };
@@ -714,7 +739,7 @@ impl MeshNode {
             nonce,
             &self.peer_id,
             peer_id,
-            &plaintext,
+            plaintext,
         );
         self.stats.frames_sent = self.stats.frames_sent.saturating_add(1);
         self.stats.e2ee_frames_encrypted = self.stats.e2ee_frames_encrypted.saturating_add(1);
@@ -722,6 +747,12 @@ impl MeshNode {
             peer_id: peer_id.to_owned(),
             frame: env.to_json_string(),
         });
+    }
+
+    /// Encrypts `frame` with the peer's directional X25519+MeshKey ChaCha20-Poly1305 session key.
+    fn emit_wire(&mut self, actions: &mut Vec<MeshAction>, peer_id: &str, frame: &WireFrame) {
+        let plaintext = frame.to_json_string();
+        self.emit_wire_plaintext(actions, peer_id, &plaintext);
     }
 
     /// Imports an E2EE v2 snapshot (authenticating & decrypting every ChaCha20-Poly1305 record).
@@ -743,7 +774,7 @@ impl MeshNode {
 
     /// Exports decrypted structured JSON messages (only when explicitly requested by user).
     pub fn export_decrypted_json(&self) -> String {
-        self.log.export_snapshot_json()
+        self.log.export_snapshot_json_with_key(Some(&self.log_key))
     }
 
     /// Clears only this node's local replicated log so re-syncing pulls encrypted history from surviving peers.
@@ -800,19 +831,21 @@ impl MeshNode {
             lamport: self.log.lamport(),
         });
 
-        let wire = WireFrame::Msg {
-            origin: self.peer_id.clone(),
-            ttl: self.config.gossip_ttl,
-            path: vec![self.peer_id.clone()],
-            record: sealed,
-        };
-
         let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
-        for pid in peer_ids {
-            if let Some(peer) = self.peers.get_mut(&pid) {
-                peer.known_ids.insert(msg.id.clone());
+        if !peer_ids.is_empty() {
+            let wire = WireFrame::Msg {
+                origin: self.peer_id.clone(),
+                ttl: self.config.gossip_ttl,
+                path: vec![self.peer_id.clone()],
+                record: sealed,
+            };
+            let plaintext = wire.to_json_string();
+            for pid in peer_ids {
+                if let Some(peer) = self.peers.get_mut(&pid) {
+                    peer.known_ids.insert(msg.id.clone());
+                }
+                self.emit_wire_plaintext(&mut actions, &pid, &plaintext);
             }
-            self.emit_wire(&mut actions, &pid, &wire);
         }
 
         actions.push(MeshAction::Telemetry {
@@ -2002,7 +2035,7 @@ impl MeshNode {
             return Ok(());
         }
 
-        let inserted = match self.log.insert_sealed(record.clone(), &self.log_key) {
+        let inserted = match self.log.insert_sealed(record, &self.log_key) {
             Ok(opt) => opt,
             Err(err) => {
                 self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
@@ -2044,13 +2077,6 @@ impl MeshNode {
         next_path.push(self.peer_id.clone());
         let next_ttl = ttl - 1;
 
-        let forward_frame = WireFrame::Msg {
-            origin,
-            ttl: next_ttl,
-            path: next_path.clone(),
-            record,
-        };
-
         let targets: Vec<String> = self
             .peers
             .iter()
@@ -2062,12 +2088,28 @@ impl MeshNode {
             .map(|(pid, _)| pid.clone())
             .collect();
 
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let Some(sealed_for_forward) = self.log.get_sealed_by_id(&msg_id).cloned() else {
+            return Ok(());
+        };
+
+        let forward_frame = WireFrame::Msg {
+            origin,
+            ttl: next_ttl,
+            path: next_path,
+            record: sealed_for_forward,
+        };
+        let plaintext = forward_frame.to_json_string();
+
         for target in targets {
             if let Some(peer) = self.peers.get_mut(&target) {
                 peer.known_ids.insert(msg_id.clone());
             }
             self.stats.gossip_forwards = self.stats.gossip_forwards.saturating_add(1);
-            self.emit_wire(actions, &target, &forward_frame);
+            self.emit_wire_plaintext(actions, &target, &plaintext);
         }
 
         Ok(())
@@ -2637,10 +2679,255 @@ impl MeshNode {
         out
     }
 
+    /// Reserves message metadata, Lamport timestamp, nonces, and per-peer wire keys/sequences so
+    /// heavy ChaCha20-Poly1305 sealing of large GIF/video payloads can run on a dedicated Web Worker
+    /// without blocking real-time 48 kHz voice on the main thread.
+    pub fn prepare_bulk_publish(
+        &mut self,
+        msg_type: String,
+        ts_ms: u64,
+        custom_id: Option<String>,
+    ) -> Result<BulkPublishPrep, String> {
+        if msg_type.trim().is_empty() || is_internal_log_type(&msg_type) {
+            return Err("bulk publish only supports non-internal message types".to_owned());
+        }
+        let seq = self.next_seq();
+        let next_lp = self.log.lamport().saturating_add(1);
+        let id = match custom_id {
+            Some(cid) if !cid.trim().is_empty() => cid,
+            _ => format!("{}-{}-{}-{}", self.peer_id, next_lp, ts_ms, seq),
+        };
+        if self.log.contains_or_deleted(&id) {
+            return Err(format!("duplicate local message id '{id}'"));
+        }
+        self.log.observe_lamport(next_lp);
+        let log_nonce = self.csprng.next_nonce();
+
+        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+        let mut peer_targets = Vec::with_capacity(peer_ids.len());
+        for pid in peer_ids {
+            if let Some(peer) = self.peers.get_mut(&pid) {
+                let (tx_seq, wire_nonce) = peer.crypto.next_tx_seq_and_nonce();
+                peer.known_ids.insert(id.clone());
+                peer_targets.push(BulkPeerKeyTarget {
+                    peer_id: pid,
+                    tx_key: peer.crypto.tx_key,
+                    tx_seq,
+                    wire_nonce,
+                });
+            }
+        }
+
+        Ok(BulkPublishPrep {
+            id,
+            msg_type,
+            lamport: next_lp,
+            ts: ts_ms,
+            author: self.peer_id.clone(),
+            author_name: self.author_name.clone(),
+            log_key: self.log_key,
+            log_nonce,
+            gossip_ttl: self.config.gossip_ttl,
+            peer_targets,
+        })
+    }
+
+    /// Commits a worker-sealed bulk message record into the replicated log with deferred payload
+    /// materialization (zero main-thread encryption or multi-MB JSON parsing).
+    pub fn commit_bulk_publish(
+        &mut self,
+        meta_msg: LogMessage,
+        sealed: SealedLogRecord,
+        sent_peer_count: usize,
+    ) -> Result<Vec<MeshAction>, String> {
+        let msg_id = meta_msg.id.clone();
+        let lamport = meta_msg.lamport;
+        self.log.insert_deferred_sealed(meta_msg, sealed)?;
+        self.stats.frames_sent = self.stats.frames_sent.saturating_add(sent_peer_count as u64);
+        self.stats.e2ee_frames_encrypted = self
+            .stats
+            .e2ee_frames_encrypted
+            .saturating_add(sent_peer_count as u64);
+        Ok(vec![MeshAction::Telemetry {
+            event: "publish".to_owned(),
+            detail: format!(
+                "Sealed & gossiped {} (L={}) to {} peer(s) [off-thread bulk worker]",
+                msg_id, lamport, sent_peer_count
+            ),
+        }])
+    }
+
+    /// Validates peer connectivity and anti-replay window before dispatching a large encrypted
+    /// bulk wire frame to the off-thread crypto worker for ChaCha20-Poly1305 decryption.
+    pub fn prepare_bulk_rx(
+        &self,
+        from_peer: &str,
+        seq: u64,
+    ) -> Result<([u8; KEY_LEN], [u8; KEY_LEN]), String> {
+        let Some(peer) = self.peers.get(from_peer) else {
+            return Err(format!("received wire frame from unconnected peer '{from_peer}'"));
+        };
+        if !peer.crypto.replay_window.would_accept(seq) {
+            return Err(format!(
+                "rejected replayed or out-of-window wire sequence {seq} from {from_peer}"
+            ));
+        }
+        Ok((peer.crypto.rx_key, self.log_key))
+    }
+
+    /// Commits an already-authenticated bulk `WireFrame::Msg` opened by the off-thread crypto worker,
+    /// advancing anti-replay state, storing the sealed record for future sync, and returning any
+    /// multi-hop gossip forward targets so forwarding also runs off the main thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_bulk_rx(
+        &mut self,
+        from_peer: &str,
+        seq: u64,
+        ttl: u32,
+        path: Vec<String>,
+        meta_msg: LogMessage,
+        sealed: SealedLogRecord,
+    ) -> Result<(bool, Vec<BulkPeerKeyTarget>, Vec<String>, u32), String> {
+        let msg_id = meta_msg.id.clone();
+        let Some(peer) = self.peers.get_mut(from_peer) else {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(format!("received wire frame from unconnected peer '{from_peer}'"));
+        };
+        if !peer.crypto.replay_window.would_accept(seq) {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(format!(
+                "rejected replayed or out-of-window wire sequence {seq} from {from_peer}"
+            ));
+        }
+        peer.crypto.replay_window.accept(seq);
+        peer.known_ids.insert(msg_id.clone());
+        self.stats.frames_received = self.stats.frames_received.saturating_add(1);
+        self.stats.e2ee_frames_decrypted = self.stats.e2ee_frames_decrypted.saturating_add(1);
+
+        if self.log.contains_or_deleted(&msg_id) {
+            self.stats.gossip_duplicates_dropped =
+                self.stats.gossip_duplicates_dropped.saturating_add(1);
+            return Ok((false, Vec::new(), Vec::new(), 0));
+        }
+
+        let inserted = self.log.insert_deferred_sealed(meta_msg, sealed)?;
+        if !inserted {
+            self.stats.gossip_duplicates_dropped =
+                self.stats.gossip_duplicates_dropped.saturating_add(1);
+            return Ok((false, Vec::new(), Vec::new(), 0));
+        }
+
+        if ttl <= 1 || path.iter().any(|p| p == &self.peer_id) {
+            return Ok((true, Vec::new(), Vec::new(), 0));
+        }
+
+        let mut next_path = path;
+        if !next_path.iter().any(|p| p == from_peer) {
+            next_path.push(from_peer.to_owned());
+        }
+        next_path.push(self.peer_id.clone());
+        let next_ttl = ttl - 1;
+
+        let target_ids: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(pid, peer)| {
+                pid.as_str() != from_peer
+                    && !next_path.iter().any(|h| h == pid.as_str())
+                    && !peer.known_ids.contains(&msg_id)
+            })
+            .map(|(pid, _)| pid.clone())
+            .collect();
+
+        let mut forward_targets = Vec::with_capacity(target_ids.len());
+        for target in target_ids {
+            if let Some(peer) = self.peers.get_mut(&target) {
+                let (tx_seq, wire_nonce) = peer.crypto.next_tx_seq_and_nonce();
+                peer.known_ids.insert(msg_id.clone());
+                self.stats.gossip_forwards = self.stats.gossip_forwards.saturating_add(1);
+                self.stats.frames_sent = self.stats.frames_sent.saturating_add(1);
+                self.stats.e2ee_frames_encrypted =
+                    self.stats.e2ee_frames_encrypted.saturating_add(1);
+                forward_targets.push(BulkPeerKeyTarget {
+                    peer_id: target,
+                    tx_key: peer.crypto.tx_key,
+                    tx_seq,
+                    wire_nonce,
+                });
+            }
+        }
+
+        Ok((true, forward_targets, next_path, next_ttl))
+    }
+
     /// Serializes the entire ordered replicated log as a JSON string.
     pub fn log_json(&self) -> String {
         let mut out = String::with_capacity(self.log.len().saturating_mul(160) + 8);
-        self.log.write_messages_json_array(&mut out);
+        self.log
+            .write_messages_json_array_with_key(Some(&self.log_key), &mut out);
         out
+    }
+
+    /// Serializes only newly added or updated log entries relative to `known_versions`.
+    pub fn log_delta_json(&self, known_versions: &std::collections::HashMap<&str, u64>) -> String {
+        let mut out = String::with_capacity(self.log.len().saturating_mul(32) + 64);
+        self.log
+            .write_messages_delta_json_with_key(known_versions, Some(&self.log_key), &mut out);
+        out
+    }
+}
+
+/// Directional ChaCha20-Poly1305 key & nonce bundle for sealing one peer's wire envelope off-thread.
+#[derive(Debug, Clone)]
+pub struct BulkPeerKeyTarget {
+    pub peer_id: String,
+    pub tx_key: [u8; KEY_LEN],
+    pub tx_seq: u64,
+    pub wire_nonce: [u8; NONCE_LEN],
+}
+
+/// Metadata & key material returned by `prepare_bulk_publish` for off-thread worker sealing.
+#[derive(Debug, Clone)]
+pub struct BulkPublishPrep {
+    pub id: String,
+    pub msg_type: String,
+    pub lamport: u64,
+    pub ts: u64,
+    pub author: String,
+    pub author_name: String,
+    pub log_key: [u8; KEY_LEN],
+    pub log_nonce: [u8; NONCE_LEN],
+    pub gossip_ttl: u32,
+    pub peer_targets: Vec<BulkPeerKeyTarget>,
+}
+
+#[cfg(test)]
+mod replay_window_tests {
+    use super::ReplayWindow;
+
+    #[test]
+    fn accepts_out_of_order_bulk_frame_up_to_255_behind_and_rejects_replays() {
+        let mut rw = ReplayWindow::default();
+        assert!(!rw.would_accept(0));
+        assert!(rw.would_accept(1));
+        rw.accept(1);
+        assert!(!rw.would_accept(1));
+
+        // Simulate 200 fast chat/keepalive frames arriving on p2p-mesh while seq=2 (GIF) is in flight on p2p-bulk
+        for seq in 3..=202 {
+            assert!(rw.would_accept(seq));
+            rw.accept(seq);
+        }
+        // seq=2 is 200 slots behind max_seq=202 (< 256): MUST be accepted once, then rejected on replay!
+        assert!(rw.would_accept(2));
+        rw.accept(2);
+        assert!(!rw.would_accept(2));
+
+        // Advance past 256 slots beyond seq=5 -> seq=5 now rejected as too old
+        rw.accept(262);
+        assert!(!rw.would_accept(5));
+        assert!(rw.would_accept(250));
+        rw.accept(250);
+        assert!(!rw.would_accept(250));
     }
 }

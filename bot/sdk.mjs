@@ -264,8 +264,9 @@ export class P2PBot extends EventEmitter {
     this.roomRendezvous = null;
     this.connected = false;
 
-    this.directPeers = new Map(); // peerId -> { pc, dc, voiceDc, transport, authorName, lastActivityMs, superseded }
+    this.directPeers = new Map(); // peerId -> { pc, dc, voiceDc, bulkDc, transport, authorName, lastActivityMs, superseded }
     this.voiceChannels = new Map(); // peerId -> RTCDataChannel("p2p-voice")
+    this.bulkChannels = new Map(); // peerId -> RTCDataChannel("p2p-bulk")
     this.roomDialing = new Map();
     this.earlyRoomIce = new Map();
     this.relayPeers = new Map();
@@ -1184,12 +1185,7 @@ export class P2PBot extends EventEmitter {
       } else if (this.wasm) {
         peerEntry.lastActivityMs = Date.now();
         try {
-          const res = this.wasm.call({
-            cmd: "wire_message",
-            fromPeer: senderPeerId,
-            frame: fullFrameStr,
-            nowMs: Date.now(),
-          });
+          const res = this.wasm.wireMessage(senderPeerId, fullFrameStr, Date.now());
           this.status = res.status;
           this._executeActions(res.actions);
           this._reconcilePeers();
@@ -1275,6 +1271,7 @@ export class P2PBot extends EventEmitter {
       const pc = new RTCPeerConnection({ iceServers: this.iceServers });
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
       const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
+      const bulkDc = pc.createDataChannel("p2p-bulk", { ordered: true });
       const early = this.earlyRoomIce.get(targetPeerId) || [];
       this.earlyRoomIce.delete(targetPeerId);
 
@@ -1282,6 +1279,7 @@ export class P2PBot extends EventEmitter {
         pc,
         dc,
         voiceDc,
+        bulkDc,
         targetName,
         targetPubKey,
         remoteDescSet: false,
@@ -1294,6 +1292,7 @@ export class P2PBot extends EventEmitter {
       };
       this.roomDialing.set(targetPeerId, entry);
       this._attachVoiceDataChannel(targetPeerId, voiceDc);
+      this._attachBulkDataChannel(targetPeerId, bulkDc);
       this._attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, false, null);
 
       const sendIce = (candJson) => {
@@ -1393,6 +1392,10 @@ export class P2PBot extends EventEmitter {
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
           this._attachVoiceDataChannel(msg.from, ev.channel);
+          return;
+        }
+        if (ev.channel.label === "p2p-bulk") {
+          this._attachBulkDataChannel(msg.from, ev.channel);
           return;
         }
         entry.dc = ev.channel;
@@ -1514,6 +1517,7 @@ export class P2PBot extends EventEmitter {
       const pc = new RTCPeerConnection({ iceServers: this.iceServers });
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
       const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
+      const bulkDc = pc.createDataChannel("p2p-bulk", { ordered: true });
       const early = this.earlyRelayIce.get(targetPeerId) || [];
       this.earlyRelayIce.delete(targetPeerId);
 
@@ -1521,6 +1525,7 @@ export class P2PBot extends EventEmitter {
         pc,
         dc,
         voiceDc,
+        bulkDc,
         remoteDescSet: false,
         sdpSent: false,
         localIceQueue: [],
@@ -1529,6 +1534,7 @@ export class P2PBot extends EventEmitter {
       };
       this.relayPeers.set(targetPeerId, entry);
       this._attachVoiceDataChannel(targetPeerId, voiceDc);
+      this._attachBulkDataChannel(targetPeerId, bulkDc);
       this._attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, true, viaPeerId);
 
       const sendIce = (candJson) => {
@@ -1598,6 +1604,10 @@ export class P2PBot extends EventEmitter {
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
           this._attachVoiceDataChannel(fromPeerId, ev.channel);
+          return;
+        }
+        if (ev.channel.label === "p2p-bulk") {
+          this._attachBulkDataChannel(fromPeerId, ev.channel);
           return;
         }
         entry.dc = ev.channel;
@@ -1742,20 +1752,81 @@ export class P2PBot extends EventEmitter {
     };
   }
 
+  _attachBulkDataChannel(peerId, bulkDc) {
+    if (!bulkDc) return;
+    const prev = this.bulkChannels.get(peerId);
+    if (prev && prev !== bulkDc && prev.readyState === "open" && bulkDc.readyState !== "open") {
+      bulkDc.onopen = () => {
+        if (bulkDc.readyState === "open") {
+          this._attachBulkDataChannel(peerId, bulkDc);
+        }
+      };
+      return;
+    }
+    if (prev && prev !== bulkDc) {
+      if (bulkDc.transport === "relay" && prev.transport !== "relay" && prev.readyState === "open") {
+        try {
+          bulkDc.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      try {
+        prev.onmessage = null;
+        prev.onclose = null;
+        prev.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.bulkChannels.set(peerId, bulkDc);
+    const direct = this.directPeers.get(peerId);
+    if (direct && (bulkDc.transport === "relay") === (direct.transport === "relay")) {
+      direct.bulkDc = bulkDc;
+    }
+
+    const bulkAssemblies = new Map();
+    bulkDc.onmessage = (ev) => {
+      const live = this.directPeers.get(peerId);
+      if (!live || live.superseded || !this.wasm) return;
+      live.lastActivityMs = Date.now();
+      const raw = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
+      if (typeof live.handleIncomingRaw === "function") {
+        live.handleIncomingRaw(raw, bulkAssemblies);
+      }
+    };
+    bulkDc.onclose = () => {
+      bulkAssemblies.clear();
+      if (this.bulkChannels.get(peerId) === bulkDc) {
+        this.bulkChannels.delete(peerId);
+      }
+      const live = this.directPeers.get(peerId);
+      if (live && live.bulkDc === bulkDc) {
+        live.bulkDc = null;
+      }
+    };
+  }
+
   _attachDataChannel(pc, dc, peerId, authorName, peerPubKey, viaAutoMesh, introducedBy) {
     const transport = dc && dc.transport === "relay" ? "relay" : "direct";
     const curVoice = this.voiceChannels.get(peerId);
     const matchedVoice =
       curVoice && (curVoice.transport === "relay") === (transport === "relay") ? curVoice : null;
+    const curBulk = this.bulkChannels.get(peerId);
+    const matchedBulk =
+      curBulk && (curBulk.transport === "relay") === (transport === "relay") ? curBulk : null;
 
     const peerEntry = {
       pc,
       dc,
       transport,
       voiceDc: matchedVoice,
+      bulkDc: matchedBulk,
       authorName,
       lastActivityMs: Date.now(),
       superseded: false,
+      handleIncomingRaw: null,
     };
 
     let opened = false;
@@ -1785,6 +1856,7 @@ export class P2PBot extends EventEmitter {
           prev.dc.readyState === "open";
         prev.superseded = true;
         try {
+          if (prev.bulkDc) prev.bulkDc.close();
           if (prev.transport === "relay") {
             prev.dc?.close(true);
           } else {
@@ -1794,6 +1866,15 @@ export class P2PBot extends EventEmitter {
         } catch {
           // ignore
         }
+      }
+
+      const latestVoice = this.voiceChannels.get(peerId);
+      if (latestVoice && (latestVoice.transport === "relay") === (transport === "relay")) {
+        peerEntry.voiceDc = latestVoice;
+      }
+      const latestBulk = this.bulkChannels.get(peerId);
+      if (latestBulk && (latestBulk.transport === "relay") === (transport === "relay")) {
+        peerEntry.bulkDc = latestBulk;
       }
 
       const pendingOpen = this.relayPendingOpens.get(peerId);
@@ -1810,6 +1891,10 @@ export class P2PBot extends EventEmitter {
           if (dialing.voiceDc && dialing.voiceDc.readyState === "open") {
             this._attachVoiceDataChannel(peerId, dialing.voiceDc);
             peerEntry.voiceDc = dialing.voiceDc;
+          }
+          if (dialing.bulkDc && dialing.bulkDc.readyState === "open") {
+            this._attachBulkDataChannel(peerId, dialing.bulkDc);
+            peerEntry.bulkDc = dialing.bulkDc;
           }
           this.roomDialing.delete(peerId);
         }
@@ -1846,6 +1931,9 @@ export class P2PBot extends EventEmitter {
       if (this.voiceChannels.get(peerId) === peerEntry.voiceDc) {
         this.voiceChannels.delete(peerId);
       }
+      if (this.bulkChannels.get(peerId) === peerEntry.bulkDc) {
+        this.bulkChannels.delete(peerId);
+      }
       if (isOwning && this.wasm) {
         try {
           const res = this.wasm.call({ cmd: "peer_disconnected", peerId });
@@ -1868,12 +1956,7 @@ export class P2PBot extends EventEmitter {
     const dcChunkAssemblies = new Map();
     const deliverWireFrame = (frameStr) => {
       try {
-        const res = this.wasm.call({
-          cmd: "wire_message",
-          fromPeer: peerId,
-          frame: frameStr,
-          nowMs: Date.now(),
-        });
+        const res = this.wasm.wireMessage(peerId, frameStr, Date.now());
         this.status = res.status;
         this._executeActions(res.actions);
         this._reconcilePeers();
@@ -1882,10 +1965,7 @@ export class P2PBot extends EventEmitter {
       }
     };
 
-    dc.onmessage = (ev) => {
-      if (!this.wasm || closed || peerEntry.superseded) return;
-      peerEntry.lastActivityMs = Date.now();
-      const raw = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
+    const handleIncomingRaw = (raw, asmMap) => {
       if (raw.startsWith('{"kind":"dc_chunk"')) {
         try {
           const ch = JSON.parse(raw);
@@ -1897,25 +1977,25 @@ export class P2PBot extends EventEmitter {
             typeof ch.n === "number" &&
             typeof ch.d === "string" &&
             ch.n > 0 &&
-            ch.n <= 1024 &&
+            ch.n <= 2048 &&
             ch.i >= 0 &&
             ch.i < ch.n
           ) {
-            let asm = dcChunkAssemblies.get(ch.id);
+            let asm = asmMap.get(ch.id);
             if (!asm) {
-              if (dcChunkAssemblies.size >= 16) {
-                const oldestKey = dcChunkAssemblies.keys().next().value;
-                if (oldestKey !== undefined) dcChunkAssemblies.delete(oldestKey);
+              if (asmMap.size >= 16) {
+                const oldestKey = asmMap.keys().next().value;
+                if (oldestKey !== undefined) asmMap.delete(oldestKey);
               }
               asm = { n: ch.n, parts: new Array(ch.n), received: 0 };
-              dcChunkAssemblies.set(ch.id, asm);
+              asmMap.set(ch.id, asm);
             }
             if (asm.parts[ch.i] === undefined) {
               asm.parts[ch.i] = ch.d;
               asm.received += 1;
             }
             if (asm.received === asm.n) {
-              dcChunkAssemblies.delete(ch.id);
+              asmMap.delete(ch.id);
               deliverWireFrame(asm.parts.join(""));
             }
             return;
@@ -1925,6 +2005,14 @@ export class P2PBot extends EventEmitter {
         }
       }
       deliverWireFrame(raw);
+    };
+    peerEntry.handleIncomingRaw = handleIncomingRaw;
+
+    dc.onmessage = (ev) => {
+      if (!this.wasm || closed || peerEntry.superseded) return;
+      peerEntry.lastActivityMs = Date.now();
+      const raw = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
+      handleIncomingRaw(raw, dcChunkAssemblies);
     };
 
     dc.onclose = handleClose;

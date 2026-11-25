@@ -696,54 +696,146 @@ pub fn inflate_auto(input: &[u8]) -> Result<Vec<u8>, String> {
 const B64URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+const B64_DEC_WS_OR_PAD: u8 = 0xFE;
+const B64_DEC_INVALID: u8 = 0xFF;
+
+const fn build_b64_dec_table() -> [u8; 256] {
+    let mut table = [B64_DEC_INVALID; 256];
+    let mut i = 0usize;
+    while i < 26 {
+        table[(b'A' as usize) + i] = i as u8;
+        table[(b'a' as usize) + i] = (i + 26) as u8;
+        i += 1;
+    }
+    let mut d = 0usize;
+    while d < 10 {
+        table[(b'0' as usize) + d] = (d + 52) as u8;
+        d += 1;
+    }
+    table[b'-' as usize] = 62;
+    table[b'+' as usize] = 62;
+    table[b'_' as usize] = 63;
+    table[b'/' as usize] = 63;
+    table[b'=' as usize] = B64_DEC_WS_OR_PAD;
+    table[b' ' as usize] = B64_DEC_WS_OR_PAD;
+    table[b'\t' as usize] = B64_DEC_WS_OR_PAD;
+    table[b'\r' as usize] = B64_DEC_WS_OR_PAD;
+    table[b'\n' as usize] = B64_DEC_WS_OR_PAD;
+    table
+}
+
+const B64_DEC_TABLE: [u8; 256] = build_b64_dec_table();
+
+/// Appends unpadded URL-safe Base64 (RFC 4648 §5) directly into `out` without intermediate allocations.
+pub fn base64url_encode_into(input: &[u8], out: &mut String) {
+    let encoded_len = input.len().div_ceil(3) * 4;
+    let mut buf = Vec::with_capacity(encoded_len);
+    let (chunks, rem) = input.as_chunks::<3>();
+    for &[b0, b1, b2] in chunks {
+        buf.push(B64URL_ALPHABET[usize::from(b0 >> 2)]);
+        buf.push(B64URL_ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))]);
+        buf.push(B64URL_ALPHABET[usize::from(((b1 & 0x0F) << 2) | (b2 >> 6))]);
+        buf.push(B64URL_ALPHABET[usize::from(b2 & 0x3F)]);
+    }
+    match rem {
+        [b0] => {
+            buf.push(B64URL_ALPHABET[usize::from(b0 >> 2)]);
+            buf.push(B64URL_ALPHABET[usize::from((b0 & 0x03) << 4)]);
+        }
+        [b0, b1] => {
+            buf.push(B64URL_ALPHABET[usize::from(b0 >> 2)]);
+            buf.push(B64URL_ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))]);
+            buf.push(B64URL_ALPHABET[usize::from((b1 & 0x0F) << 2)]);
+        }
+        _ => {}
+    }
+    if let Ok(s) = std::str::from_utf8(&buf) {
+        out.push_str(s);
+    }
+}
+
 /// Encodes bytes using unpadded URL-safe Base64 (RFC 4648 §5).
 pub fn base64url_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-    while i < input.len() {
-        let b0 = input.get(i).copied().unwrap_or(0);
-        let b1 = input.get(i + 1).copied();
-        let b2 = input.get(i + 2).copied();
-
-        let n0 = usize::from(b0 >> 2);
-        let n1 = usize::from(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4));
-        if let Some(&c) = B64URL_ALPHABET.get(n0) {
-            out.push(c as char);
-        }
-        if let Some(&c) = B64URL_ALPHABET.get(n1) {
-            out.push(c as char);
-        }
-        if let Some(v1) = b1 {
-            let n2 = usize::from(((v1 & 0x0F) << 2) | (b2.unwrap_or(0) >> 6));
-            if let Some(&c) = B64URL_ALPHABET.get(n2) {
-                out.push(c as char);
-            }
-            if let Some(v2) = b2 {
-                let n3 = usize::from(v2 & 0x3F);
-                if let Some(&c) = B64URL_ALPHABET.get(n3) {
-                    out.push(c as char);
-                }
-            }
-        }
-        i += 3;
+    let encoded_len = input.len().div_ceil(3) * 4;
+    let mut buf = Vec::with_capacity(encoded_len);
+    let (chunks, rem) = input.as_chunks::<3>();
+    for &[b0, b1, b2] in chunks {
+        buf.push(B64URL_ALPHABET[usize::from(b0 >> 2)]);
+        buf.push(B64URL_ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))]);
+        buf.push(B64URL_ALPHABET[usize::from(((b1 & 0x0F) << 2) | (b2 >> 6))]);
+        buf.push(B64URL_ALPHABET[usize::from(b2 & 0x3F)]);
     }
-    out
+    match rem {
+        [b0] => {
+            buf.push(B64URL_ALPHABET[usize::from(b0 >> 2)]);
+            buf.push(B64URL_ALPHABET[usize::from((b0 & 0x03) << 4)]);
+        }
+        [b0, b1] => {
+            buf.push(B64URL_ALPHABET[usize::from(b0 >> 2)]);
+            buf.push(B64URL_ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))]);
+            buf.push(B64URL_ALPHABET[usize::from((b1 & 0x0F) << 2)]);
+        }
+        _ => {}
+    }
+    String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Decodes URL-safe (or standard) Base64, tolerating optional `=` padding and whitespace.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
-    let mut vals = Vec::with_capacity(input.len());
-    for b in input.bytes() {
-        match b {
-            b'A'..=b'Z' => vals.push(b - b'A'),
-            b'a'..=b'z' => vals.push(b - b'a' + 26),
-            b'0'..=b'9' => vals.push(b - b'0' + 52),
-            b'-' | b'+' => vals.push(62),
-            b'_' | b'/' => vals.push(63),
-            b'=' | b' ' | b'\t' | b'\r' | b'\n' => {}
-            other => {
-                return Err(format!("invalid base64url byte 0x{other:02x}"));
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity((bytes.len() / 4) * 3 + 2);
+    let (chunks, rem) = bytes.as_chunks::<4>();
+    let mut fast_ok = true;
+
+    for &[c0, c1, c2, c3] in chunks {
+        let v0 = B64_DEC_TABLE[usize::from(c0)];
+        let v1 = B64_DEC_TABLE[usize::from(c1)];
+        let v2 = B64_DEC_TABLE[usize::from(c2)];
+        let v3 = B64_DEC_TABLE[usize::from(c3)];
+        if (v0 | v1 | v2 | v3) & 0xC0 != 0 {
+            fast_ok = false;
+            break;
+        }
+        out.push((v0 << 2) | (v1 >> 4));
+        out.push((v1 << 4) | (v2 >> 2));
+        out.push((v2 << 6) | v3);
+    }
+
+    if fast_ok {
+        match rem {
+            [] => return Ok(out),
+            [b0, b1] => {
+                let v0 = B64_DEC_TABLE[usize::from(*b0)];
+                let v1 = B64_DEC_TABLE[usize::from(*b1)];
+                if (v0 | v1) & 0xC0 == 0 {
+                    out.push((v0 << 2) | (v1 >> 4));
+                    return Ok(out);
+                }
             }
+            [b0, b1, b2] => {
+                let v0 = B64_DEC_TABLE[usize::from(*b0)];
+                let v1 = B64_DEC_TABLE[usize::from(*b1)];
+                let v2 = B64_DEC_TABLE[usize::from(*b2)];
+                if (v0 | v1 | v2) & 0xC0 == 0 {
+                    out.push((v0 << 2) | (v1 >> 4));
+                    out.push((v1 << 4) | (v2 >> 2));
+                    return Ok(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Slow path for inputs containing padding `=`, whitespace, or invalid bytes
+    let mut vals = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        let v = B64_DEC_TABLE[usize::from(b)];
+        if v < 64 {
+            vals.push(v);
+        } else if v == B64_DEC_WS_OR_PAD {
+            continue;
+        } else {
+            return Err(format!("invalid base64url byte 0x{b:02x}"));
         }
     }
 
@@ -751,19 +843,22 @@ pub fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
         return Err("invalid base64url length (mod 4 == 1)".to_owned());
     }
 
-    let mut out = Vec::with_capacity((vals.len() / 4) * 3 + 2);
-    let mut i = 0usize;
-    while i < vals.len() {
-        let v0 = vals.get(i).copied().unwrap_or(0);
-        let v1 = vals.get(i + 1).copied().unwrap_or(0);
+    out.clear();
+    let (vchunks, vrem) = vals.as_chunks::<4>();
+    for &[v0, v1, v2, v3] in vchunks {
         out.push((v0 << 2) | (v1 >> 4));
-        if let Some(&v2) = vals.get(i + 2) {
-            out.push((v1 << 4) | (v2 >> 2));
-            if let Some(&v3) = vals.get(i + 3) {
-                out.push((v2 << 6) | v3);
-            }
+        out.push((v1 << 4) | (v2 >> 2));
+        out.push((v2 << 6) | v3);
+    }
+    match vrem {
+        [v0, v1] => {
+            out.push((v0 << 2) | (v1 >> 4));
         }
-        i += 4;
+        [v0, v1, v2] => {
+            out.push((v0 << 2) | (v1 >> 4));
+            out.push((v1 << 4) | (v2 >> 2));
+        }
+        _ => {}
     }
     Ok(out)
 }

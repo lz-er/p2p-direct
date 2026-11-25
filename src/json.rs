@@ -179,21 +179,35 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
 }
 
 pub fn write_json_string(out: &mut String, s: &str) {
+    out.reserve(s.len() + 2);
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x20 || b == b'"' || b == b'\\' {
+            if i > start {
+                out.push_str(&s[start..i]);
             }
-            c => out.push(c),
+            match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                0x08 => out.push_str("\\b"),
+                0x0C => out.push_str("\\f"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                c => {
+                    let _ = write!(out, "\\u{:04x}", u32::from(c));
+                }
+            }
+            start = i + 1;
         }
+        i += 1;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
     }
     out.push('"');
 }
@@ -374,8 +388,45 @@ impl<'a> Parser<'a> {
         if self.next_byte() != Some(b'"') {
             return Err(format!("expected '\"' at byte {}", self.pos));
         }
-        let mut out = String::new();
+        // Fast path: scan contiguous plain ASCII bytes (e.g., multi-MB base64 GIFs / ciphertexts)
+        let fast_start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if (0x20..0x80).contains(&b) && b != b'"' && b != b'\\' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if self.peek() == Some(b'"') {
+            let slice = &self.bytes[fast_start..self.pos];
+            self.pos += 1;
+            return std::str::from_utf8(slice)
+                .map(str::to_owned)
+                .map_err(|_| "invalid UTF-8 bytes in string".to_owned());
+        }
+
+        let mut out = String::with_capacity(self.pos.saturating_sub(fast_start) + 32);
+        if self.pos > fast_start {
+            let prefix = std::str::from_utf8(&self.bytes[fast_start..self.pos])
+                .map_err(|_| "invalid UTF-8 bytes in string".to_owned())?;
+            out.push_str(prefix);
+        }
+
         loop {
+            let span_start = self.pos;
+            while let Some(&b) = self.bytes.get(self.pos) {
+                if (0x20..0x80).contains(&b) && b != b'"' && b != b'\\' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if self.pos > span_start {
+                let span = std::str::from_utf8(&self.bytes[span_start..self.pos])
+                    .map_err(|_| "invalid UTF-8 bytes in string".to_owned())?;
+                out.push_str(span);
+            }
+
             let b = self
                 .next_byte()
                 .ok_or_else(|| "unterminated JSON string".to_owned())?;
@@ -430,9 +481,6 @@ impl<'a> Parser<'a> {
                     return Err(format!(
                         "unescaped control character 0x{c:02x} in string"
                     ));
-                }
-                first if first < 0x80 => {
-                    out.push(first as char);
                 }
                 first => {
                     let start = self.pos - 1;

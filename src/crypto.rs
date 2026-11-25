@@ -326,186 +326,294 @@ pub fn chacha20_block(key: &[u8; KEY_LEN], counter: u32, nonce: &[u8; NONCE_LEN]
     out
 }
 
+fn chacha20_block_words(key: &[u8; KEY_LEN], counter: u32, nonce: &[u8; NONCE_LEN]) -> [u32; 16] {
+    let initial: [u32; 16] = [
+        0x6170_7865,
+        0x3320_646e,
+        0x7962_2d32,
+        0x6b20_6574,
+        read_le_u32(key, 0),
+        read_le_u32(key, 4),
+        read_le_u32(key, 8),
+        read_le_u32(key, 12),
+        read_le_u32(key, 16),
+        read_le_u32(key, 20),
+        read_le_u32(key, 24),
+        read_le_u32(key, 28),
+        counter,
+        read_le_u32(nonce, 0),
+        read_le_u32(nonce, 4),
+        read_le_u32(nonce, 8),
+    ];
+
+    let mut working = initial;
+    for _ in 0..10 {
+        quarter_round(&mut working, 0, 4, 8, 12);
+        quarter_round(&mut working, 1, 5, 9, 13);
+        quarter_round(&mut working, 2, 6, 10, 14);
+        quarter_round(&mut working, 3, 7, 11, 15);
+        quarter_round(&mut working, 0, 5, 10, 15);
+        quarter_round(&mut working, 1, 6, 11, 12);
+        quarter_round(&mut working, 2, 7, 8, 13);
+        quarter_round(&mut working, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u32; 16];
+    for i in 0..16 {
+        out[i] = working[i].wrapping_add(initial[i]);
+    }
+    out
+}
+
+fn chacha20_xor_with_extra_cap(
+    key: &[u8; KEY_LEN],
+    initial_counter: u32,
+    nonce: &[u8; NONCE_LEN],
+    data: &[u8],
+    extra_cap: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len().saturating_add(extra_cap));
+    out.extend_from_slice(data);
+    let mut counter = initial_counter;
+    let (chunks, rem) = out.as_chunks_mut::<64>();
+    for chunk in chunks {
+        let ks = chacha20_block_words(key, counter, nonce);
+        counter = counter.wrapping_add(1);
+        for (i, word_bytes) in chunk.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let v = u32::from_le_bytes(*word_bytes) ^ ks[i];
+            *word_bytes = v.to_le_bytes();
+        }
+    }
+    if !rem.is_empty() {
+        let ks = chacha20_block(key, counter, nonce);
+        for (dst, &k) in rem.iter_mut().zip(ks.iter()) {
+            *dst ^= k;
+        }
+    }
+    out
+}
+
 pub fn chacha20_xor(
     key: &[u8; KEY_LEN],
     initial_counter: u32,
     nonce: &[u8; NONCE_LEN],
     data: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut counter = initial_counter;
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let keystream = chacha20_block(key, counter, nonce);
-        counter = counter.wrapping_add(1);
-        let chunk_len = (data.len() - offset).min(64);
-        for i in 0..chunk_len {
-            let b = data.get(offset + i).copied().unwrap_or(0);
-            let k = keystream.get(i).copied().unwrap_or(0);
-            out.push(b ^ k);
-        }
-        offset += chunk_len;
-    }
-    out
+    chacha20_xor_with_extra_cap(key, initial_counter, nonce, data, 0)
 }
 
-/// Poly1305 one-time MAC (RFC 8439 §2.5), constant-time 26-bit limb arithmetic.
-pub fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; TAG_LEN] {
-    let t0 = read_le_u32(otk, 0);
-    let t1 = read_le_u32(otk, 4);
-    let t2 = read_le_u32(otk, 8);
-    let t3 = read_le_u32(otk, 12);
+/// Streaming Poly1305 state (RFC 8439 §2.5) using constant-time 26-bit limbs in native `u64`.
+/// Allows authenticating AEAD `aad || pad || ciphertext || pad || lens` with zero heap allocation.
+struct Poly1305State {
+    r0: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+    r4: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+    s4: u64,
+    h0: u64,
+    h1: u64,
+    h2: u64,
+    h3: u64,
+    h4: u64,
+}
 
-    let r0 = u64::from(t0 & 0x03ff_ffff);
-    let r1 = u64::from(((t0 >> 26) | (t1 << 6)) & 0x03ff_ff03);
-    let r2 = u64::from(((t1 >> 20) | (t2 << 12)) & 0x03ff_c0ff);
-    let r3 = u64::from(((t2 >> 14) | (t3 << 18)) & 0x03f0_3fff);
-    let r4 = u64::from((t3 >> 8) & 0x000f_ffff);
+impl Poly1305State {
+    fn new(otk: &[u8; 32]) -> Self {
+        let t0 = read_le_u32(otk, 0);
+        let t1 = read_le_u32(otk, 4);
+        let t2 = read_le_u32(otk, 8);
+        let t3 = read_le_u32(otk, 12);
 
-    let s1 = r1 * 5;
-    let s2 = r2 * 5;
-    let s3 = r3 * 5;
-    let s4 = r4 * 5;
+        let r0 = u64::from(t0 & 0x03ff_ffff);
+        let r1 = u64::from(((t0 >> 26) | (t1 << 6)) & 0x03ff_ff03);
+        let r2 = u64::from(((t1 >> 20) | (t2 << 12)) & 0x03ff_c0ff);
+        let r3 = u64::from(((t2 >> 14) | (t3 << 18)) & 0x03f0_3fff);
+        let r4 = u64::from((t3 >> 8) & 0x000f_ffff);
 
-    let mut h0: u64 = 0;
-    let mut h1: u64 = 0;
-    let mut h2: u64 = 0;
-    let mut h3: u64 = 0;
-    let mut h4: u64 = 0;
-
-    let mut offset = 0usize;
-    while offset < msg.len() {
-        let remaining = msg.len() - offset;
-        let mut block = [0u8; 17];
-        let take = remaining.min(16);
-        if let (Some(dst), Some(src)) = (block.get_mut(..take), msg.get(offset..offset + take)) {
-            dst.copy_from_slice(src);
+        Self {
+            r0,
+            r1,
+            r2,
+            r3,
+            r4,
+            s1: r1 * 5,
+            s2: r2 * 5,
+            s3: r3 * 5,
+            s4: r4 * 5,
+            h0: 0,
+            h1: 0,
+            h2: 0,
+            h3: 0,
+            h4: 0,
         }
-        if let Some(slot) = block.get_mut(take) {
-            *slot = 1u8;
+    }
+
+    #[inline(always)]
+    fn feed_block(&mut self, b0: u32, b1: u32, b2: u32, b3: u32, hibit: u64) {
+        let h0 = self.h0 + u64::from(b0 & 0x03ff_ffff);
+        let h1 = self.h1 + u64::from(((b0 >> 26) | (b1 << 6)) & 0x03ff_ffff);
+        let h2 = self.h2 + u64::from(((b1 >> 20) | (b2 << 12)) & 0x03ff_ffff);
+        let h3 = self.h3 + u64::from(((b2 >> 14) | (b3 << 18)) & 0x03ff_ffff);
+        let h4 = self.h4 + (u64::from(b3 >> 8) | hibit);
+
+        let d0 = h0 * self.r0 + h1 * self.s4 + h2 * self.s3 + h3 * self.s2 + h4 * self.s1;
+        let mut d1 = h0 * self.r1 + h1 * self.r0 + h2 * self.s4 + h3 * self.s3 + h4 * self.s2;
+        let mut d2 = h0 * self.r2 + h1 * self.r1 + h2 * self.r0 + h3 * self.s4 + h4 * self.s3;
+        let mut d3 = h0 * self.r3 + h1 * self.r2 + h2 * self.r1 + h3 * self.r0 + h4 * self.s4;
+        let mut d4 = h0 * self.r4 + h1 * self.r3 + h2 * self.r2 + h3 * self.r1 + h4 * self.r0;
+
+        let mut c = d0 >> 26;
+        let mut nh0 = d0 & 0x03ff_ffff;
+        d1 += c;
+        c = d1 >> 26;
+        let mut nh1 = d1 & 0x03ff_ffff;
+        d2 += c;
+        c = d2 >> 26;
+        let nh2 = d2 & 0x03ff_ffff;
+        d3 += c;
+        c = d3 >> 26;
+        let nh3 = d3 & 0x03ff_ffff;
+        d4 += c;
+        c = d4 >> 26;
+        let nh4 = d4 & 0x03ff_ffff;
+        nh0 += c * 5;
+        c = nh0 >> 26;
+        nh0 &= 0x03ff_ffff;
+        nh1 += c;
+
+        self.h0 = nh0;
+        self.h1 = nh1;
+        self.h2 = nh2;
+        self.h3 = nh3;
+        self.h4 = nh4;
+    }
+
+    fn update_padded_16(&mut self, data: &[u8]) {
+        let (chunks, rem) = data.as_chunks::<16>();
+        for chunk in chunks {
+            self.feed_block(
+                u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+                u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]),
+                u32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]),
+                1u64 << 24,
+            );
         }
-        offset += take;
+        if !rem.is_empty() {
+            let mut block = [0u8; 16];
+            block[..rem.len()].copy_from_slice(rem);
+            self.feed_block(
+                u32::from_le_bytes([block[0], block[1], block[2], block[3]]),
+                u32::from_le_bytes([block[4], block[5], block[6], block[7]]),
+                u32::from_le_bytes([block[8], block[9], block[10], block[11]]),
+                u32::from_le_bytes([block[12], block[13], block[14], block[15]]),
+                1u64 << 24,
+            );
+        }
+    }
 
-        let b0 = read_le_u32(&block, 0);
-        let b1 = read_le_u32(&block, 4);
-        let b2 = read_le_u32(&block, 8);
-        let b3 = read_le_u32(&block, 12);
-        let hibit = u64::from(block[16]) << 24;
+    fn finish(self, otk: &[u8; 32]) -> [u8; TAG_LEN] {
+        let mut h0 = self.h0;
+        let mut h1 = self.h1;
+        let mut h2 = self.h2;
+        let mut h3 = self.h3;
+        let mut h4 = self.h4;
 
-        h0 += u64::from(b0 & 0x03ff_ffff);
-        h1 += u64::from(((b0 >> 26) | (b1 << 6)) & 0x03ff_ffff);
-        h2 += u64::from(((b1 >> 20) | (b2 << 12)) & 0x03ff_ffff);
-        h3 += u64::from(((b2 >> 14) | (b3 << 18)) & 0x03ff_ffff);
-        h4 += u64::from(b3 >> 8) | hibit;
-
-        let d0 = u128::from(h0) * u128::from(r0)
-            + u128::from(h1) * u128::from(s4)
-            + u128::from(h2) * u128::from(s3)
-            + u128::from(h3) * u128::from(s2)
-            + u128::from(h4) * u128::from(s1);
-        let mut d1 = u128::from(h0) * u128::from(r1)
-            + u128::from(h1) * u128::from(r0)
-            + u128::from(h2) * u128::from(s4)
-            + u128::from(h3) * u128::from(s3)
-            + u128::from(h4) * u128::from(s2);
-        let mut d2 = u128::from(h0) * u128::from(r2)
-            + u128::from(h1) * u128::from(r1)
-            + u128::from(h2) * u128::from(r0)
-            + u128::from(h3) * u128::from(s4)
-            + u128::from(h4) * u128::from(s3);
-        let mut d3 = u128::from(h0) * u128::from(r3)
-            + u128::from(h1) * u128::from(r2)
-            + u128::from(h2) * u128::from(r1)
-            + u128::from(h3) * u128::from(r0)
-            + u128::from(h4) * u128::from(s4);
-        let mut d4 = u128::from(h0) * u128::from(r4)
-            + u128::from(h1) * u128::from(r3)
-            + u128::from(h2) * u128::from(r2)
-            + u128::from(h3) * u128::from(r1)
-            + u128::from(h4) * u128::from(r0);
-
-        let mut c = (d0 >> 26) as u64;
-        h0 = (d0 as u64) & 0x03ff_ffff;
-        d1 += u128::from(c);
-        c = (d1 >> 26) as u64;
-        h1 = (d1 as u64) & 0x03ff_ffff;
-        d2 += u128::from(c);
-        c = (d2 >> 26) as u64;
-        h2 = (d2 as u64) & 0x03ff_ffff;
-        d3 += u128::from(c);
-        c = (d3 >> 26) as u64;
-        h3 = (d3 as u64) & 0x03ff_ffff;
-        d4 += u128::from(c);
-        c = (d4 >> 26) as u64;
-        h4 = (d4 as u64) & 0x03ff_ffff;
+        // Full carry chain
+        let mut c = h1 >> 26;
+        h1 &= 0x03ff_ffff;
+        h2 += c;
+        c = h2 >> 26;
+        h2 &= 0x03ff_ffff;
+        h3 += c;
+        c = h3 >> 26;
+        h3 &= 0x03ff_ffff;
+        h4 += c;
+        c = h4 >> 26;
+        h4 &= 0x03ff_ffff;
         h0 += c * 5;
         c = h0 >> 26;
         h0 &= 0x03ff_ffff;
         h1 += c;
+
+        // Constant-time conditional subtraction of p = 2^130 - 5
+        let mut g0 = h0.wrapping_add(5);
+        c = g0 >> 26;
+        g0 &= 0x03ff_ffff;
+        let mut g1 = h1.wrapping_add(c);
+        c = g1 >> 26;
+        g1 &= 0x03ff_ffff;
+        let mut g2 = h2.wrapping_add(c);
+        c = g2 >> 26;
+        g2 &= 0x03ff_ffff;
+        let mut g3 = h3.wrapping_add(c);
+        c = g3 >> 26;
+        g3 &= 0x03ff_ffff;
+        let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
+
+        let mask = (g4 >> 63).wrapping_sub(1);
+        g0 &= mask;
+        g1 &= mask;
+        g2 &= mask;
+        g3 &= mask;
+        let g4_masked = g4 & mask;
+        let nmask = !mask;
+        h0 = (h0 & nmask) | g0;
+        h1 = (h1 & nmask) | g1;
+        h2 = (h2 & nmask) | g2;
+        h3 = (h3 & nmask) | g3;
+        h4 = (h4 & nmask) | g4_masked;
+
+        // Assemble 128-bit h and add s
+        let mut f0 = ((h0) | (h1 << 26)) & 0xffff_ffff;
+        let mut f1 = ((h1 >> 6) | (h2 << 20)) & 0xffff_ffff;
+        let mut f2 = ((h2 >> 12) | (h3 << 14)) & 0xffff_ffff;
+        let mut f3 = ((h3 >> 18) | (h4 << 8)) & 0xffff_ffff;
+
+        f0 += u64::from(read_le_u32(otk, 16));
+        f1 += u64::from(read_le_u32(otk, 20)) + (f0 >> 32);
+        f2 += u64::from(read_le_u32(otk, 24)) + (f1 >> 32);
+        f3 += u64::from(read_le_u32(otk, 28)) + (f2 >> 32);
+
+        let mut tag = [0u8; TAG_LEN];
+        tag[0..4].copy_from_slice(&(f0 as u32).to_le_bytes());
+        tag[4..8].copy_from_slice(&(f1 as u32).to_le_bytes());
+        tag[8..12].copy_from_slice(&(f2 as u32).to_le_bytes());
+        tag[12..16].copy_from_slice(&(f3 as u32).to_le_bytes());
+        tag
     }
+}
 
-    // Full carry chain
-    let mut c = h1 >> 26;
-    h1 &= 0x03ff_ffff;
-    h2 += c;
-    c = h2 >> 26;
-    h2 &= 0x03ff_ffff;
-    h3 += c;
-    c = h3 >> 26;
-    h3 &= 0x03ff_ffff;
-    h4 += c;
-    c = h4 >> 26;
-    h4 &= 0x03ff_ffff;
-    h0 += c * 5;
-    c = h0 >> 26;
-    h0 &= 0x03ff_ffff;
-    h1 += c;
-
-    // Constant-time conditional subtraction of p = 2^130 - 5
-    let mut g0 = h0.wrapping_add(5);
-    c = g0 >> 26;
-    g0 &= 0x03ff_ffff;
-    let mut g1 = h1.wrapping_add(c);
-    c = g1 >> 26;
-    g1 &= 0x03ff_ffff;
-    let mut g2 = h2.wrapping_add(c);
-    c = g2 >> 26;
-    g2 &= 0x03ff_ffff;
-    let mut g3 = h3.wrapping_add(c);
-    c = g3 >> 26;
-    g3 &= 0x03ff_ffff;
-    let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
-
-    let mask = (g4 >> 63).wrapping_sub(1);
-    g0 &= mask;
-    g1 &= mask;
-    g2 &= mask;
-    g3 &= mask;
-    let g4_masked = g4 & mask;
-    let nmask = !mask;
-    h0 = (h0 & nmask) | g0;
-    h1 = (h1 & nmask) | g1;
-    h2 = (h2 & nmask) | g2;
-    h3 = (h3 & nmask) | g3;
-    h4 = (h4 & nmask) | g4_masked;
-
-    // Assemble 128-bit h and add s
-    let mut f0 = ((h0) | (h1 << 26)) & 0xffff_ffff;
-    let mut f1 = ((h1 >> 6) | (h2 << 20)) & 0xffff_ffff;
-    let mut f2 = ((h2 >> 12) | (h3 << 14)) & 0xffff_ffff;
-    let mut f3 = ((h3 >> 18) | (h4 << 8)) & 0xffff_ffff;
-
-    f0 += u64::from(read_le_u32(otk, 16));
-    f1 += u64::from(read_le_u32(otk, 20)) + (f0 >> 32);
-    f2 += u64::from(read_le_u32(otk, 24)) + (f1 >> 32);
-    f3 += u64::from(read_le_u32(otk, 28)) + (f2 >> 32);
-
-    let mut tag = [0u8; TAG_LEN];
-    tag[0..4].copy_from_slice(&(f0 as u32).to_le_bytes());
-    tag[4..8].copy_from_slice(&(f1 as u32).to_le_bytes());
-    tag[8..12].copy_from_slice(&(f2 as u32).to_le_bytes());
-    tag[12..16].copy_from_slice(&(f3 as u32).to_le_bytes());
-    tag
+/// Poly1305 one-time MAC (RFC 8439 §2.5), constant-time 26-bit limb arithmetic in native `u64`.
+pub fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; TAG_LEN] {
+    let mut state = Poly1305State::new(otk);
+    let (chunks, rem) = msg.as_chunks::<16>();
+    for chunk in chunks {
+        state.feed_block(
+            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+            u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]),
+            u32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]),
+            1u64 << 24,
+        );
+    }
+    if !rem.is_empty() {
+        let mut block = [0u8; 17];
+        block[..rem.len()].copy_from_slice(rem);
+        block[rem.len()] = 1u8;
+        state.feed_block(
+            u32::from_le_bytes([block[0], block[1], block[2], block[3]]),
+            u32::from_le_bytes([block[4], block[5], block[6], block[7]]),
+            u32::from_le_bytes([block[8], block[9], block[10], block[11]]),
+            u32::from_le_bytes([block[12], block[13], block[14], block[15]]),
+            u64::from(block[16]) << 24,
+        );
+    }
+    state.finish(otk)
 }
 
 fn poly1305_aead_tag(
@@ -518,18 +626,14 @@ fn poly1305_aead_tag(
     let mut otk = [0u8; 32];
     otk.copy_from_slice(&block0[..32]);
 
-    let aad_pad = (16 - (aad.len() % 16)) % 16;
-    let ct_pad = (16 - (ciphertext.len() % 16)) % 16;
-    let mut mac_data =
-        Vec::with_capacity(aad.len() + aad_pad + ciphertext.len() + ct_pad + 16);
-    mac_data.extend_from_slice(aad);
-    mac_data.resize(mac_data.len() + aad_pad, 0);
-    mac_data.extend_from_slice(ciphertext);
-    mac_data.resize(mac_data.len() + ct_pad, 0);
-    mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes());
-    mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
-
-    poly1305_mac(&otk, &mac_data)
+    let mut state = Poly1305State::new(&otk);
+    state.update_padded_16(aad);
+    state.update_padded_16(ciphertext);
+    let mut lens = [0u8; 16];
+    lens[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    lens[8..16].copy_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    state.update_padded_16(&lens);
+    state.finish(&otk)
 }
 
 /// Seals `plaintext` using RFC 8439 ChaCha20-Poly1305 AEAD. Returns `ciphertext || tag`.
@@ -539,7 +643,7 @@ pub fn aead_seal(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Vec<u8> {
-    let mut ciphertext = chacha20_xor(key, 1, nonce, plaintext);
+    let mut ciphertext = chacha20_xor_with_extra_cap(key, 1, nonce, plaintext, TAG_LEN);
     let tag = poly1305_aead_tag(key, nonce, aad, &ciphertext);
     ciphertext.extend_from_slice(&tag);
     ciphertext

@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use crate::crypto::{
     KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, parse_fixed_12,
 };
-use crate::deflate::{base64url_decode, base64url_encode};
+use crate::deflate::{base64url_decode, base64url_encode_into};
 use crate::json::{JsonValue, parse_json, write_json_string, write_json_value};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -55,6 +55,24 @@ impl LogMessage {
     pub fn to_json_string(&self) -> String {
         let mut out = String::with_capacity(192);
         self.write_json(&mut out);
+        out
+    }
+
+    pub fn to_meta_json_string(&self) -> String {
+        let mut out = String::with_capacity(192);
+        out.push_str("{\"id\":");
+        write_json_string(&mut out, &self.id);
+        out.push_str(",\"type\":");
+        write_json_string(&mut out, &self.msg_type);
+        let _ = write!(
+            out,
+            ",\"lamport\":{},\"ts\":{},\"author\":",
+            self.lamport, self.ts
+        );
+        write_json_string(&mut out, &self.author);
+        out.push_str(",\"authorName\":");
+        write_json_string(&mut out, &self.author_name);
+        out.push('}');
         out
     }
 
@@ -173,15 +191,15 @@ impl SealedLogRecord {
     pub fn write_json(&self, out: &mut String) {
         out.push_str("{\"id\":");
         write_json_string(out, &self.id);
-        let _ = write!(out, ",\"lamport\":{},\"ts\":{},\"n\":", self.lamport, self.ts);
-        write_json_string(out, &base64url_encode(&self.nonce));
-        out.push_str(",\"c\":");
-        write_json_string(out, &base64url_encode(&self.ciphertext));
-        out.push('}');
+        let _ = write!(out, ",\"lamport\":{},\"ts\":{},\"n\":\"", self.lamport, self.ts);
+        base64url_encode_into(&self.nonce, out);
+        out.push_str("\",\"c\":\"");
+        base64url_encode_into(&self.ciphertext, out);
+        out.push_str("\"}");
     }
 
     pub fn to_json_string(&self) -> String {
-        let mut out = String::with_capacity(self.ciphertext.len() * 2 + 96);
+        let mut out = String::with_capacity(self.ciphertext.len().div_ceil(3) * 4 + 128);
         self.write_json(&mut out);
         out
     }
@@ -236,6 +254,7 @@ fn extract_target_id(payload: &JsonValue) -> Option<&str> {
 struct StoredEntry {
     message: LogMessage,
     sealed: Option<SealedLogRecord>,
+    payload_deferred: bool,
 }
 
 /// Deterministic append-only replicated log ordered strictly by `(lamport, ts, id)`,
@@ -382,9 +401,60 @@ impl ReplicatedLog {
             StoredEntry {
                 message: msg,
                 sealed,
+                payload_deferred: false,
             },
         );
         Ok(true)
+    }
+
+    /// Inserts an already-authenticated AEAD-sealed bulk record with metadata only, deferring
+    /// in-memory `JsonValue` payload materialization until/unless explicitly requested.
+    pub fn insert_deferred_sealed(
+        &mut self,
+        meta_msg: LogMessage,
+        sealed: SealedLogRecord,
+    ) -> Result<bool, String> {
+        if meta_msg.id.trim().is_empty() {
+            return Err("message id must not be empty".to_owned());
+        }
+        if meta_msg.msg_type.trim().is_empty() || is_internal_log_type(&meta_msg.msg_type) {
+            return Err("deferred sealed insert only supports non-internal messages".to_owned());
+        }
+        if meta_msg.author.trim().is_empty() {
+            return Err("message author must not be empty".to_owned());
+        }
+        if sealed.id != meta_msg.id || sealed.lamport != meta_msg.lamport || sealed.ts != meta_msg.ts {
+            return Err("deferred sealed metadata mismatch".to_owned());
+        }
+        self.observe_lamport(meta_msg.lamport);
+        if self.by_id.contains_key(&meta_msg.id) || self.tombstones.contains(&meta_msg.id) {
+            return Ok(false);
+        }
+        let key = meta_msg.order_key();
+        self.by_id.insert(meta_msg.id.clone(), key.clone());
+        self.entries.insert(
+            key,
+            StoredEntry {
+                message: meta_msg,
+                sealed: Some(sealed),
+                payload_deferred: true,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Materializes any deferred bulk payloads by decrypting their sealed records under `log_key`
+    /// (called before rotating keys so `reseal_all` remains 100% lossless).
+    pub fn materialize_deferred(&mut self, log_key: &[u8; KEY_LEN]) {
+        for entry in self.entries.values_mut() {
+            if entry.payload_deferred
+                && let Some(ref sealed) = entry.sealed
+                && let Ok(full_msg) = sealed.open(log_key)
+            {
+                entry.message = full_msg;
+                entry.payload_deferred = false;
+            }
+        }
     }
 
     /// Verifies and decrypts an AEAD-sealed record, inserting it idempotently.
@@ -408,7 +478,9 @@ impl ReplicatedLog {
     /// Re-seals all stored messages under a new log key (used when adopting or rotating mesh keys).
     pub fn reseal_all(&mut self, log_key: &[u8; KEY_LEN], rng: &mut SafeCsprng) {
         for entry in self.entries.values_mut() {
-            entry.sealed = Some(SealedLogRecord::seal(&entry.message, log_key, rng));
+            if !entry.payload_deferred {
+                entry.sealed = Some(SealedLogRecord::seal(&entry.message, log_key, rng));
+            }
         }
     }
 
@@ -568,6 +640,15 @@ impl ReplicatedLog {
     /// omitting deletion tombstones and deterministically folding the latest `bot-update`
     /// onto its target message while preserving original chronological position.
     pub fn write_messages_json_array(&self, out: &mut String) {
+        self.write_messages_json_array_with_key(None, out);
+    }
+
+    /// Same as `write_messages_json_array`, transparently opening any deferred bulk records with `log_key`.
+    pub fn write_messages_json_array_with_key(
+        &self,
+        log_key: Option<&[u8; KEY_LEN]>,
+        out: &mut String,
+    ) {
         let mut latest_bot_updates: HashMap<&str, (&LogMessage, &JsonValue)> = HashMap::new();
         for entry in self.entries.values() {
             if entry.message.msg_type == MSG_TYPE_BOT_UPDATE
@@ -614,6 +695,11 @@ impl ReplicatedLog {
                     ",\"updatedLamport\":{},\"updatedTs\":{}}}",
                     upd_msg.lamport, upd_msg.ts
                 );
+            } else if entry.payload_deferred
+                && let (Some(key), Some(sealed)) = (log_key, entry.sealed.as_ref())
+                && let Ok(full_msg) = sealed.open(key)
+            {
+                full_msg.write_json(out);
             } else {
                 entry.message.write_json(out);
             }
@@ -621,15 +707,115 @@ impl ReplicatedLog {
         out.push(']');
     }
 
+    /// Serializes an incremental log delta (`{"order":[...],"changed":[...]}`) containing ONLY
+    /// messages whose ID is absent from `known_versions` or whose bot-update lamport changed.
+    /// Eliminates re-serializing multi-megabyte GIF/video attachments already cached in JS.
+    pub fn write_messages_delta_json(
+        &self,
+        known_versions: &HashMap<&str, u64>,
+        out: &mut String,
+    ) {
+        self.write_messages_delta_json_with_key(known_versions, None, out);
+    }
+
+    /// Same as `write_messages_delta_json`, transparently opening any unknown deferred bulk records.
+    pub fn write_messages_delta_json_with_key(
+        &self,
+        known_versions: &HashMap<&str, u64>,
+        log_key: Option<&[u8; KEY_LEN]>,
+        out: &mut String,
+    ) {
+        let mut latest_bot_updates: HashMap<&str, (&LogMessage, &JsonValue)> = HashMap::new();
+        for entry in self.entries.values() {
+            if entry.message.msg_type == MSG_TYPE_BOT_UPDATE
+                && let Some(target_id) = extract_target_id(&entry.message.payload)
+            {
+                let card = entry
+                    .message
+                    .payload
+                    .get("card")
+                    .unwrap_or(&entry.message.payload);
+                latest_bot_updates.insert(target_id, (&entry.message, card));
+            }
+        }
+
+        out.push_str("{\"order\":[");
+        let mut first_order = true;
+        for entry in self.entries.values() {
+            if is_internal_log_type(&entry.message.msg_type) {
+                continue;
+            }
+            if !first_order {
+                out.push(',');
+            }
+            first_order = false;
+            write_json_string(out, &entry.message.id);
+        }
+        out.push_str("],\"changed\":[");
+        let mut first_changed = true;
+        for entry in self.entries.values() {
+            if is_internal_log_type(&entry.message.msg_type) {
+                continue;
+            }
+            let upd = latest_bot_updates.get(entry.message.id.as_str());
+            let effective_ver = upd.map(|(u, _)| u.lamport).unwrap_or(0);
+            if known_versions
+                .get(entry.message.id.as_str())
+                .copied()
+                == Some(effective_ver)
+            {
+                continue;
+            }
+            if !first_changed {
+                out.push(',');
+            }
+            first_changed = false;
+            if let Some((upd_msg, card_payload)) = upd {
+                let m = &entry.message;
+                out.push_str("{\"id\":");
+                write_json_string(out, &m.id);
+                out.push_str(",\"type\":");
+                write_json_string(out, &m.msg_type);
+                let _ = write!(
+                    out,
+                    ",\"lamport\":{},\"ts\":{},\"author\":",
+                    m.lamport, m.ts
+                );
+                write_json_string(out, &m.author);
+                out.push_str(",\"authorName\":");
+                write_json_string(out, &m.author_name);
+                out.push_str(",\"payload\":");
+                write_json_value(out, card_payload);
+                let _ = write!(
+                    out,
+                    ",\"updatedLamport\":{},\"updatedTs\":{}}}",
+                    upd_msg.lamport, upd_msg.ts
+                );
+            } else if entry.payload_deferred
+                && let (Some(key), Some(sealed)) = (log_key, entry.sealed.as_ref())
+                && let Ok(full_msg) = sealed.open(key)
+            {
+                full_msg.write_json(out);
+            } else {
+                entry.message.write_json(out);
+            }
+        }
+        out.push_str("]}");
+    }
+
     /// Serializes a plaintext JSON snapshot (for explicit user decrypted export).
     pub fn export_snapshot_json(&self) -> String {
+        self.export_snapshot_json_with_key(None)
+    }
+
+    pub fn export_snapshot_json_with_key(&self, log_key: Option<&[u8; KEY_LEN]>) -> String {
         let mut out = String::with_capacity(self.entries.len().saturating_mul(160) + 64);
         let _ = write!(
             out,
             "{{\"version\":1,\"lamport\":{},\"messages\":",
             self.lamport
         );
-        self.write_messages_json_array(&mut out);
+        self.write_messages_json_array_with_key(log_key, &mut out);
         out.push('}');
         out
     }

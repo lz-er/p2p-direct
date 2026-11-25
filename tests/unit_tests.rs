@@ -1327,3 +1327,226 @@ fn voice_capture_48k_rust_dsp_dc_gate_limiter_and_fir_antialiasing() -> TestResu
     Ok(())
 }
 
+#[test]
+fn off_thread_bulk_worker_roundtrip_interops_with_standard_mesh() -> TestResult {
+    use p2p_direct::rpc::{
+        dispatch_commit_bulk_publish, dispatch_commit_bulk_rx, dispatch_rpc, worker_open_bulk,
+        worker_seal_bulk, worker_seal_forward,
+    };
+
+    let mk = base64url_encode(&[0x5Au8; 32]);
+    let init_node = |id: &str, name: &str, byte: u8| -> Result<(Option<MeshNode>, String), String> {
+        let mut st = None;
+        let sec = base64url_encode(&[byte; 32]);
+        let resp = dispatch_rpc(
+            &mut st,
+            &format!(
+                r#"{{"cmd":"init","peerId":"{id}","authorName":"{name}","room":"bulk","x25519Secret":"{sec}","meshKey":"{mk}","entropy":"{sec}"}}"#
+            ),
+        );
+        let v = parse_json(&resp)?;
+        let pk = v
+            .get("status")
+            .and_then(|s| s.get("e2ee"))
+            .and_then(|e| e.get_str("publicKey"))
+            .ok_or("missing publicKey")?
+            .to_owned();
+        Ok((st, pk))
+    };
+
+    let (mut a, pk_a) = init_node("alice", "Alice", 0x11)?;
+    let (mut b, pk_b) = init_node("bob", "Bob", 0x22)?;
+    let (mut c, pk_c) = init_node("carol", "Carol", 0x33)?;
+
+    // Connect chain A <-> B <-> C
+    let _ = dispatch_rpc(
+        &mut a,
+        &format!(r#"{{"cmd":"peer_connected","peerId":"bob","authorName":"Bob","peerPubKey":"{pk_b}"}}"#),
+    );
+    let _ = dispatch_rpc(
+        &mut b,
+        &format!(r#"{{"cmd":"peer_connected","peerId":"alice","authorName":"Alice","peerPubKey":"{pk_a}"}}"#),
+    );
+    let _ = dispatch_rpc(
+        &mut b,
+        &format!(r#"{{"cmd":"peer_connected","peerId":"carol","authorName":"Carol","peerPubKey":"{pk_c}"}}"#),
+    );
+    let _ = dispatch_rpc(
+        &mut c,
+        &format!(r#"{{"cmd":"peer_connected","peerId":"bob","authorName":"Bob","peerPubKey":"{pk_b}"}}"#),
+    );
+
+    // 1. Alice prepares bulk GIF publish (reserves lamport & tx_seq)
+    let prep_str = dispatch_rpc(
+        &mut a,
+        r#"{"cmd":"prepare_bulk_publish","type":"chat","ts":5000}"#,
+    );
+    let prep_val = parse_json(&prep_str)?;
+    assert_eq!(prep_val.get_bool("ok"), Some(true));
+    let prep = prep_val.get("prep").ok_or("missing prep")?;
+    let gif_id = prep.get_str("id").ok_or("missing prep id")?.to_owned();
+    let gif_lp = prep.get_u64("lamport").ok_or("missing prep lamport")?;
+    let log_nonce = prep.get_str("logNonce").ok_or("missing logNonce")?.to_owned();
+
+    // 2. Concurrent fast chat message on Alice overtakes bulk GIF on p2p-mesh!
+    let fast_pub_str = dispatch_rpc(
+        &mut a,
+        r#"{"cmd":"publish","type":"chat","payload":{"text":"fast overtake"},"ts":5001}"#,
+    );
+    let fast_pub = parse_json(&fast_pub_str)?;
+    let fast_frame = fast_pub
+        .get("actions")
+        .and_then(JsonValue::as_array)
+        .and_then(|arr| arr.iter().find_map(|x| x.get_str("frame")))
+        .ok_or("missing fast frame")?;
+    let fast_rx = parse_json(&dispatch_rpc(
+        &mut b,
+        &format!(
+            r#"{{"cmd":"wire_message","fromPeer":"alice","frame":{},"nowMs":5010}}"#,
+            JsonValue::string(fast_frame).to_json_string()
+        ),
+    ))?;
+    assert_eq!(fast_rx.get_bool("ok"), Some(true));
+
+    // 3. Alice's off-thread worker seals the bulk GIF
+    let msg_json = format!(
+        r#"{{"id":"{gif_id}","type":"chat","lamport":{gif_lp},"ts":5000,"author":"alice","authorName":"Alice","payload":{{"text":"big gif","images":[{{"name":"cool.gif","dataUrl":"data:image/gif;base64,R0lGODlhAQABAAAAACw="}}]}}}}"#
+    );
+    let targets = prep.get("targets").ok_or("missing targets")?;
+    let seal_hdr = format!(
+        r#"{{"meta":{{"id":"{gif_id}","type":"chat","lamport":{gif_lp},"ts":5000,"author":"alice","authorName":"Alice"}},"logKey":{},"logNonce":{},"gossipTtl":16,"targets":{}}}"#,
+        JsonValue::string(prep.get_str("logKey").ok_or("missing logKey")?).to_json_string(),
+        JsonValue::string(&log_nonce).to_json_string(),
+        targets.to_json_string()
+    );
+    let mut seal_in = Vec::new();
+    seal_in.extend_from_slice(&(seal_hdr.len() as u32).to_le_bytes());
+    seal_in.extend_from_slice(seal_hdr.as_bytes());
+    seal_in.extend_from_slice(msg_json.as_bytes());
+
+    let seal_out = worker_seal_bulk(&seal_in);
+    let resp_len = u32::from_le_bytes([seal_out[0], seal_out[1], seal_out[2], seal_out[3]]) as usize;
+    let seal_resp = parse_json(
+        std::str::from_utf8(&seal_out[4..4 + resp_len]).map_err(|e| e.to_string())?,
+    )?;
+    assert_eq!(seal_resp.get_bool("ok"), Some(true));
+    let sealed_ct = &seal_out[4 + resp_len..];
+    let wire_frame = seal_resp
+        .get("wireFrames")
+        .and_then(JsonValue::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|wf| wf.get_str("frame"))
+        .ok_or("missing worker wireFrame")?;
+
+    // Alice commits bulk publish (deferred payload in log)
+    let commit_pub_hdr = format!(
+        r#"{{"meta":{{"id":"{gif_id}","type":"chat","lamport":{gif_lp},"ts":5000,"author":"alice","authorName":"Alice"}},"sealedNonce":{},"sentPeerCount":1}}"#,
+        JsonValue::string(&log_nonce).to_json_string()
+    );
+    let mut commit_pub_in = Vec::new();
+    commit_pub_in.extend_from_slice(&(commit_pub_hdr.len() as u32).to_le_bytes());
+    commit_pub_in.extend_from_slice(commit_pub_hdr.as_bytes());
+    commit_pub_in.extend_from_slice(sealed_ct);
+    let cp_res = parse_json(&dispatch_commit_bulk_publish(&mut a, &commit_pub_in))?;
+    assert_eq!(cp_res.get_bool("ok"), Some(true));
+
+    // 4. Bob receives the slower bulk GIF out-of-order after fast chat, prepares + opens in worker
+    let env_seq = parse_json(wire_frame)?.get_u64("s").ok_or("missing seq")?;
+    let rx_prep = parse_json(&dispatch_rpc(
+        &mut b,
+        &format!(r#"{{"cmd":"prepare_bulk_rx","fromPeer":"alice","seq":{env_seq}}}"#),
+    ))?;
+    assert_eq!(rx_prep.get_bool("ok"), Some(true));
+
+    let open_hdr = format!(
+        r#"{{"fromPeer":"alice","selfPeerId":"bob","rxKey":{},"logKey":{}}}"#,
+        JsonValue::string(rx_prep.get_str("rxKey").ok_or("missing rxKey")?).to_json_string(),
+        JsonValue::string(rx_prep.get_str("logKey").ok_or("missing logKey")?).to_json_string()
+    );
+    let mut open_in = Vec::new();
+    open_in.extend_from_slice(&(open_hdr.len() as u32).to_le_bytes());
+    open_in.extend_from_slice(open_hdr.as_bytes());
+    open_in.extend_from_slice(wire_frame.as_bytes());
+
+    let open_out = worker_open_bulk(&open_in);
+    let mlen = u32::from_le_bytes([open_out[0], open_out[1], open_out[2], open_out[3]]) as usize;
+    let open_meta = parse_json(
+        std::str::from_utf8(&open_out[4..4 + mlen]).map_err(|e| e.to_string())?,
+    )?;
+    assert_eq!(open_meta.get_str("kind"), Some("msg"));
+    let jlen_off = 4 + mlen;
+    let jlen = u32::from_le_bytes([
+        open_out[jlen_off],
+        open_out[jlen_off + 1],
+        open_out[jlen_off + 2],
+        open_out[jlen_off + 3],
+    ]) as usize;
+    let opened_msg_json =
+        std::str::from_utf8(&open_out[jlen_off + 4..jlen_off + 4 + jlen])
+            .map_err(|e| e.to_string())?;
+    assert!(opened_msg_json.contains("R0lGODlhAQABAAAAACw="));
+    let opened_sealed_ct = &open_out[jlen_off + 4 + jlen..];
+
+    // Bob commits bulk rx & gets Carol as multi-hop forward target!
+    let commit_rx_hdr = format!(
+        r#"{{"fromPeer":"alice","seq":{},"ttl":{},"path":{},"meta":{},"sealedNonce":{}}}"#,
+        open_meta.get_u64("seq").ok_or("seq")?,
+        open_meta.get_u64("ttl").ok_or("ttl")?,
+        open_meta.get("path").ok_or("path")?.to_json_string(),
+        open_meta.get("meta").ok_or("meta")?.to_json_string(),
+        JsonValue::string(open_meta.get_str("sealedNonce").ok_or("sealedNonce")?).to_json_string()
+    );
+    let mut commit_rx_in = Vec::new();
+    commit_rx_in.extend_from_slice(&(commit_rx_hdr.len() as u32).to_le_bytes());
+    commit_rx_in.extend_from_slice(commit_rx_hdr.as_bytes());
+    commit_rx_in.extend_from_slice(opened_sealed_ct);
+    let cr_res = parse_json(&dispatch_commit_bulk_rx(&mut b, &commit_rx_in))?;
+    assert_eq!(cr_res.get_bool("ok"), Some(true));
+    assert_eq!(cr_res.get_bool("inserted"), Some(true));
+
+    // Bob's get_state transparently decrypts deferred GIF payload!
+    let bob_state = dispatch_rpc(&mut b, r#"{"cmd":"get_state"}"#);
+    assert!(bob_state.contains("R0lGODlhAQABAAAAACw="));
+    assert!(bob_state.contains("fast overtake"));
+
+    // 5. Bob's worker seals forward frame for Carol, and Carol opens it via standard wire_message!
+    let fwd_hdr = format!(
+        r#"{{"selfPeerId":"bob","origin":{},"ttl":{},"path":{},"recordMeta":{{"id":"{gif_id}","lamport":{gif_lp},"ts":5000,"nonce":{}}},"targets":{}}}"#,
+        JsonValue::string(open_meta.get_str("origin").ok_or("origin")?).to_json_string(),
+        cr_res.get_u64("nextTtl").ok_or("nextTtl")?,
+        cr_res.get("nextPath").ok_or("nextPath")?.to_json_string(),
+        JsonValue::string(open_meta.get_str("sealedNonce").ok_or("sn")?).to_json_string(),
+        cr_res.get("forwardTargets").ok_or("ft")?.to_json_string()
+    );
+    let mut fwd_in = Vec::new();
+    fwd_in.extend_from_slice(&(fwd_hdr.len() as u32).to_le_bytes());
+    fwd_in.extend_from_slice(fwd_hdr.as_bytes());
+    fwd_in.extend_from_slice(opened_sealed_ct);
+    let fwd_res = parse_json(&worker_seal_forward(&fwd_in))?;
+    let carol_frame = fwd_res
+        .get("wireFrames")
+        .and_then(JsonValue::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|wf| wf.get_str("frame"))
+        .ok_or("missing carol forward frame")?;
+    let carol_rx = parse_json(&dispatch_rpc(
+        &mut c,
+        &format!(
+            r#"{{"cmd":"wire_message","fromPeer":"bob","frame":{},"nowMs":5050}}"#,
+            JsonValue::string(carol_frame).to_json_string()
+        ),
+    ))?;
+    assert_eq!(carol_rx.get_bool("ok"), Some(true));
+    assert!(dispatch_rpc(&mut c, r#"{"cmd":"get_state"}"#).contains("R0lGODlhAQABAAAAACw="));
+
+    // 6. Key rotation on Alice preserves deferred GIF record losslessly!
+    let new_mk = base64url_encode(&[0x77u8; 32]);
+    let rekey = parse_json(&dispatch_rpc(
+        &mut a,
+        &format!(r#"{{"cmd":"set_mesh_key","meshKey":"{new_mk}","passphraseMode":false}}"#),
+    ))?;
+    assert_eq!(rekey.get_bool("ok"), Some(true));
+    assert!(dispatch_rpc(&mut a, r#"{"cmd":"get_state"}"#).contains("R0lGODlhAQABAAAAACw="));
+    Ok(())
+}
+

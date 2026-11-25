@@ -559,6 +559,8 @@ const METRO_TILE_THEMES = [
 const VOICE_EQ_WEIGHTS = [0.32, 0.54, 0.76, 0.92, 1.0, 1.0, 0.92, 0.76, 0.54, 0.32];
 const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 const SAFE_VIDEO_DATA_URL_RE = /^data:video\/(mp4|webm|ogg|quicktime);base64,[A-Za-z0-9+/=]+$/;
+const SAFE_IMAGE_DATA_URL_PREFIX_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,/;
+const SAFE_VIDEO_DATA_URL_PREFIX_RE = /^data:video\/(mp4|webm|ogg|quicktime);base64,/;
 const SAFE_HTTP_URL_RE = /^https?:\/\/[^\s<>"']+$/i;
 const URL_REGEX = /https?:\/\/[^\s<>"']+/gi;
 const MAX_MEDIA_PER_MESSAGE = 3;
@@ -566,9 +568,17 @@ const MAX_STATIC_IMAGE_CHARS = 54000;
 const MAX_GIF_RAW_BYTES = 4 * 1024 * 1024;
 const MAX_VIDEO_RAW_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_MEDIA_BYTES = 10 * 1024 * 1024;
-const DC_CHUNK_THRESHOLD = 48000;
-const DC_CHUNK_SIZE = 32768;
-const DC_CHUNK_MAX_PARTS = 1024;
+const BULK_FRAME_THRESHOLD = 16384; // Frames > 16 KB (GIFs, images, videos, big sync batches) use low-prio p2p-bulk
+const DC_CHUNK_THRESHOLD = 16384;
+const DC_CHUNK_SIZE = 16384; // Small 16 KB chunks so SCTP/relay immediately preempts for 20ms voice packets
+const DC_CHUNK_MAX_PARTS = 2048;
+const BULK_DIRECT_MAX_BUFFERED_VOICE = 24576; // 24 KB SCTP ceiling while voice is active (prevents bufferbloat)
+const BULK_DIRECT_MAX_BUFFERED_IDLE = 196608; // 192 KB SCTP ceiling when voice is idle
+const BULK_DIRECT_TICK_VOICE_MS = 25; // 1 × 16 KB chunk / 25ms (~640 KB/s) while voice is active
+const BULK_DIRECT_TICK_IDLE_MS = 8; // up to 4 × 16 KB chunks / 8ms when idle
+const RELAY_BULK_CHUNK_SIZE_VOICE = 12288; // 12 KB relay bulk chunks during active voice
+const RELAY_BULK_TICK_VOICE_MS = 55; // 1 × 12 KB chunk / 55ms during active voice (yields to voice bundles)
+const RELAY_BULK_TICK_IDLE_MS = 20; // up to 3 chunks / 20ms when voice is idle
 
 const SPEAK_STAR_SVG =
   '<svg class="speak-star" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="12,1 14.8,8.2 22,5 16.8,12 22,19 14.8,15.8 12,23 9.2,15.8 2,19 7.2,12 2,5 9.2,8.2"/></svg>';
@@ -587,9 +597,21 @@ const LINK_ARROW_SVG =
 const TRASH_SVG =
   '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><line x1="10" y1="11" x2="10" y2="16"/><line x1="14" y1="11" x2="14" y2="16"/></svg>';
 
+function isSafeImageDataUrl(src) {
+  if (typeof src !== "string") return false;
+  if (src.length <= 65536) return SAFE_IMAGE_DATA_URL_RE.test(src);
+  return SAFE_IMAGE_DATA_URL_PREFIX_RE.test(src) && src.indexOf('"') < 0 && src.indexOf("<") < 0;
+}
+
+function isSafeVideoDataUrl(src) {
+  if (typeof src !== "string") return false;
+  if (src.length <= 65536) return SAFE_VIDEO_DATA_URL_RE.test(src);
+  return SAFE_VIDEO_DATA_URL_PREFIX_RE.test(src) && src.indexOf('"') < 0 && src.indexOf("<") < 0;
+}
+
 function isSafeImageSrc(src) {
   if (typeof src !== "string") return false;
-  return SAFE_IMAGE_DATA_URL_RE.test(src) || /^https:\/\/[^\s<>"']+$/i.test(src);
+  return isSafeImageDataUrl(src) || /^https:\/\/[^\s<>"']+$/i.test(src);
 }
 
 function formatBotRichText(raw) {
@@ -956,6 +978,29 @@ function dataUrlToBlob(dataUrl) {
   }
 }
 
+async function dataUrlToBlobAsync(dataUrl) {
+  if (typeof dataUrl !== "string") return null;
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) return null;
+  const header = dataUrl.slice(0, comma);
+  const mimeMatch = /^data:([^;,]+);base64$/i.exec(header);
+  if (!mimeMatch) return null;
+  try {
+    if (typeof fetch === "function") {
+      const resp = await fetch(dataUrl);
+      const rawBlob = await resp.blob();
+      if (rawBlob && rawBlob.size > 0) {
+        return rawBlob.type === mimeMatch[1]
+          ? rawBlob
+          : new Blob([rawBlob], { type: mimeMatch[1] });
+      }
+    }
+  } catch {
+    // fall back to synchronous decode
+  }
+  return dataUrlToBlob(dataUrl);
+}
+
 function probeVideoMetadata(file) {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(file);
@@ -1014,7 +1059,7 @@ async function prepareMediaFile(file, mime, remainingBytes) {
       fileToDataUrl(file, mime),
       probeVideoMetadata(file),
     ]);
-    if (!SAFE_VIDEO_DATA_URL_RE.test(dataUrl)) {
+    if (!isSafeVideoDataUrl(dataUrl)) {
       throw new Error("Unsupported video encoding");
     }
     return {
@@ -1052,7 +1097,7 @@ async function prepareMediaFile(file, mime, remainingBytes) {
       throw new Error("Exceeds 10 MB per-message attachment limit — send staged media first");
     }
     const dataUrl = await fileToDataUrl(file, mime);
-    if (!SAFE_IMAGE_DATA_URL_RE.test(dataUrl)) {
+    if (!isSafeImageDataUrl(dataUrl)) {
       throw new Error("Unsupported animated image encoding");
     }
     let width = 0;
@@ -1079,7 +1124,7 @@ async function prepareMediaFile(file, mime, remainingBytes) {
 
   const charBudget = Math.min(MAX_STATIC_IMAGE_CHARS, Math.floor((remainingBytes * 4) / 3));
   const compressed = await compressImageFile(file, Math.max(12000, charBudget));
-  if (!SAFE_IMAGE_DATA_URL_RE.test(compressed.dataUrl)) {
+  if (!isSafeImageDataUrl(compressed.dataUrl)) {
     throw new Error("Unsupported image encoding");
   }
   return compressed;
@@ -1219,9 +1264,11 @@ class P2PDirectApp {
     this.latestOffer = null;
     this.latestAnswer = null;
 
-    // Live WebRTC transport maps
+    // Live WebRTC transport maps (3-tier QoS: high voice > medium chat/control > very-low bulk media)
     this.directPeers = new Map();
-    this.voiceChannels = new Map(); // peerId -> RTCDataChannel("p2p-voice")
+    this.voiceChannels = new Map(); // peerId -> RTCDataChannel("p2p-voice") [high priority]
+    this.bulkChannels = new Map(); // peerId -> RTCDataChannel("p2p-bulk") [very-low priority]
+    this.lastVoiceTrafficAtMs = 0;
     this.relayPeers = new Map();
     this.earlyRelayIce = new Map();
 
@@ -1312,6 +1359,48 @@ class P2PDirectApp {
 
   createPeerConnection() {
     return new RTCPeerConnection(this.iceConfig || ICE_CONFIG);
+  }
+
+  _createDataChannelSafe(pc, label, opts) {
+    try {
+      return pc.createDataChannel(label, opts);
+    } catch {
+      const { priority: _ignored, ...fallbackOpts } = opts || {};
+      return pc.createDataChannel(label, fallbackOpts);
+    }
+  }
+
+  /**
+   * Creates 3 QoS-separated WebRTC DataChannels over the peer connection:
+   * - `p2p-voice`: unordered, 0 retransmits, HIGH SCTP priority (realtime Opus/ADPCM audio)
+   * - `p2p-mesh`: ordered, MEDIUM SCTP priority (small chat messages, sync, presence, keepalive)
+   * - `p2p-bulk`: ordered, VERY-LOW SCTP priority (GIFs, images, videos, large data > 16 KB)
+   */
+  createPeerDataChannels(pc) {
+    const dc = this._createDataChannelSafe(pc, "p2p-mesh", {
+      ordered: true,
+      priority: "medium",
+    });
+    const voiceDc = this._createDataChannelSafe(pc, "p2p-voice", {
+      ordered: false,
+      maxRetransmits: 0,
+      priority: "high",
+    });
+    const bulkDc = this._createDataChannelSafe(pc, "p2p-bulk", {
+      ordered: true,
+      priority: "very-low",
+    });
+    return { dc, voiceDc, bulkDc };
+  }
+
+  noteVoiceTraffic() {
+    this.lastVoiceTrafficAtMs = Date.now();
+  }
+
+  isVoiceChannelBusy() {
+    if (this.voice.inVoice) return true;
+    if (Date.now() - this.lastVoiceTrafficAtMs < 1500) return true;
+    return Boolean((this.status?.peers || []).some((p) => p.inVoice));
   }
 
   bindElements() {
@@ -3307,7 +3396,7 @@ class P2PDirectApp {
       }
     }
     for (const [key, asm] of this.relayChunkAssemblies.entries()) {
-      if (now - asm.ts > 30_000) {
+      if (now - asm.ts > 60_000) {
         this.relayChunkAssemblies.delete(key);
       }
     }
@@ -3470,14 +3559,14 @@ class P2PDirectApp {
     if (this.localDialing.has(targetPeerId)) return;
     try {
       const pc = this.createPeerConnection();
-      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
-      const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
+      const { dc, voiceDc, bulkDc } = this.createPeerDataChannels(pc);
       const early = this.earlyLocalIce.get(targetPeerId) || [];
       this.earlyLocalIce.delete(targetPeerId);
       const entry = {
         pc,
         dc,
         voiceDc,
+        bulkDc,
         remoteDescSet: false,
         sdpSent: false,
         localIceQueue: [],
@@ -3486,6 +3575,7 @@ class P2PDirectApp {
       };
       this.localDialing.set(targetPeerId, entry);
       this.attachVoiceDataChannel(targetPeerId, voiceDc);
+      this.attachBulkDataChannel(targetPeerId, bulkDc);
       this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, false, null, true);
 
       const sendIce = (candJson) => {
@@ -3559,6 +3649,10 @@ class P2PDirectApp {
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
           this.attachVoiceDataChannel(msg.fromPeerId, ev.channel);
+          return;
+        }
+        if (ev.channel.label === "p2p-bulk") {
+          this.attachBulkDataChannel(msg.fromPeerId, ev.channel);
           return;
         }
         entry.dc = ev.channel;
@@ -3686,9 +3780,8 @@ class P2PDirectApp {
     try {
       const inviteId = randomId("inv");
       const pc = this.createPeerConnection();
-      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
-      const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
-      this.pendingOffers.set(inviteId, { inviteId, pc, dc, voiceDc, code: "", url: "" });
+      const { dc, voiceDc, bulkDc } = this.createPeerDataChannels(pc);
+      this.pendingOffers.set(inviteId, { inviteId, pc, dc, voiceDc, bulkDc, code: "", url: "" });
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -3862,7 +3955,109 @@ class P2PDirectApp {
     this.renderTelemetry();
   }
 
-  publishMessage(msgType, payload) {
+  _insertLocalMessageOrdered(msgObj) {
+    if (!msgObj || !msgObj.id || !Array.isArray(this.logMessages)) return false;
+    if (this.logMessages.some((m) => m.id === msgObj.id)) return false;
+    const lp = Number(msgObj.lamport) || 0;
+    const ts = Number(msgObj.ts) || 0;
+    const id = String(msgObj.id);
+    // Insert in canonical (lamport, ts, id) order matching Rust ReplicatedLog
+    let pos = this.logMessages.length;
+    while (pos > 0) {
+      const prev = this.logMessages[pos - 1];
+      const plp = Number(prev.lamport) || 0;
+      const pts = Number(prev.ts) || 0;
+      const pid = String(prev.id || "");
+      const cmp =
+        plp !== lp ? plp - lp : pts !== ts ? pts - ts : pid < id ? -1 : pid > id ? 1 : 0;
+      if (cmp <= 0) break;
+      pos -= 1;
+    }
+    this.logMessages.splice(pos, 0, msgObj);
+    return true;
+  }
+
+  async _publishBulkOffThread(msgType, payload) {
+    let prep;
+    try {
+      const prepRes = this.wasm.call({
+        cmd: "prepare_bulk_publish",
+        type: msgType,
+        ts: Date.now(),
+        entropy: randomBase64Url(16),
+      });
+      prep = prepRes.prep;
+    } catch (err) {
+      // Fallback to synchronous publish if prep fails
+      this._publishSyncFallback(msgType, payload);
+      return;
+    }
+
+    const meta = {
+      id: prep.id,
+      type: prep.type,
+      lamport: prep.lamport,
+      ts: prep.ts,
+      author: prep.author,
+      authorName: prep.authorName,
+    };
+    const fullMessage = { ...meta, payload };
+
+    // Capture live peer object references at prep time so reconnected peers never receive stale keys
+    const targetPeerRefs = new Map();
+    for (const t of prep.targets || []) {
+      const peer = this.directPeers.get(t.peerId);
+      if (peer) targetPeerRefs.set(t.peerId, peer);
+    }
+
+    // Show local message immediately (off-thread blob decode keeps render < 3 ms)
+    this._insertLocalMessageOrdered(fullMessage);
+    setTimeout(() => this.renderMessageUpdate(), 0);
+
+    try {
+      const sealed = await this.wasm.sealBulkAsync(
+        {
+          meta,
+          logKey: prep.logKey,
+          logNonce: prep.logNonce,
+          gossipTtl: prep.gossipTtl,
+          targets: prep.targets || [],
+        },
+        fullMessage
+      );
+
+      let sentCount = 0;
+      const readyWireFrames = [];
+      for (const wf of sealed.wireFrames) {
+        const expectedPeer = targetPeerRefs.get(wf.peerId);
+        const livePeer = this.directPeers.get(wf.peerId);
+        if (livePeer && livePeer === expectedPeer && livePeer.dc?.readyState === "open") {
+          readyWireFrames.push({ peer: livePeer, frame: wf.frame });
+          sentCount += 1;
+        }
+      }
+
+      const commitRes = this.wasm.commitBulkPublish(
+        {
+          meta,
+          sealedNonce: prep.logNonce,
+          sentPeerCount: sentCount,
+        },
+        sealed.sealedCt
+      );
+      this.status = commitRes.status;
+      this.executeActions(commitRes.actions, { skipLogRefresh: true });
+      for (const item of readyWireFrames) {
+        this._sendWireFrameToPeer(item.peer, item.frame);
+      }
+      this.renderStats();
+    } catch (err) {
+      this.addTelemetry("error", `Off-thread bulk seal fallback: ${err.message}`);
+      this.renderStats();
+    }
+  }
+
+  _publishSyncFallback(msgType, payload) {
     try {
       const res = this.wasm.call({
         cmd: "publish",
@@ -3870,20 +4065,65 @@ class P2PDirectApp {
         payload,
         ts: Date.now(),
         entropy: randomBase64Url(16),
+        omitMessagePayload: true,
       });
       this.status = res.status;
-      this.executeActions(res.actions);
-      this.refreshLogFromWasm();
-      this.renderAll();
+      const msgObj = res.messageMeta ? { ...res.messageMeta, payload } : res.message;
+      const inserted = msgObj ? this._insertLocalMessageOrdered(msgObj) : false;
+      this.executeActions(res.actions, { skipLogRefresh: inserted });
+      this.renderMessageUpdate();
     } catch (err) {
       this.showComposerError(err.message);
     }
   }
 
+  publishMessage(msgType, payload) {
+    const hasBulkMedia =
+      msgType !== "msg-delete" &&
+      msgType !== "bot-update" &&
+      payload &&
+      typeof payload === "object" &&
+      ((Array.isArray(payload.images) && payload.images.length > 0) ||
+        (Array.isArray(payload.videos) && payload.videos.length > 0));
+    if (hasBulkMedia && this.wasm && this.wasm.hasBulkWorker()) {
+      this._publishBulkOffThread(msgType, payload);
+      return;
+    }
+    this._publishSyncFallback(msgType, payload);
+  }
+
   refreshLogFromWasm() {
-    const state = this.wasm.call({ cmd: "get_state" });
-    this.status = state.status;
-    this.logMessages = state.log;
+    const existing = Array.isArray(this.logMessages) ? this.logMessages : [];
+    const byId = new Map();
+    const knownVersions = {};
+    for (const m of existing) {
+      if (m && m.id) {
+        byId.set(m.id, m);
+        knownVersions[m.id] = Number(m.updatedLamport) || 0;
+      }
+    }
+    const res = this.wasm.call({ cmd: "get_log_delta", knownVersions });
+    this.status = res.status;
+    const delta = res.delta;
+    if (!delta || !Array.isArray(delta.order)) {
+      const state = this.wasm.call({ cmd: "get_state" });
+      this.status = state.status;
+      this.logMessages = state.log;
+      return;
+    }
+    if (Array.isArray(delta.changed)) {
+      for (const msg of delta.changed) {
+        if (msg && msg.id) {
+          byId.set(msg.id, msg);
+        }
+      }
+    }
+    const nextLog = [];
+    for (const id of delta.order) {
+      const item = byId.get(id);
+      if (item) nextLog.push(item);
+    }
+    this.logMessages = nextLog;
   }
 
   wipeLocalLog() {
@@ -4708,42 +4948,47 @@ class P2PDirectApp {
       },
     };
 
-    const dfQueue = [];
-    let dfPumpTimer = null;
-    const pumpDfQueue = () => {
-      if (dfPumpTimer) {
-        clearTimeout(dfPumpTimer);
-        dfPumpTimer = null;
+    let lastVoiceFlushMs = 0;
+
+    // Medium-priority control & small chat relay queue (never waits behind large GIF/video bulk frames)
+    const ctrlQueue = [];
+    let ctrlPumpTimer = null;
+    const pumpCtrlQueue = () => {
+      if (ctrlPumpTimer) {
+        clearTimeout(ctrlPumpTimer);
+        ctrlPumpTimer = null;
       }
       if (virtualDc.readyState !== "open" || !app.roomRendezvous || !app.activeRoom) {
-        dfQueue.length = 0;
+        ctrlQueue.length = 0;
         return;
       }
       const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
+      const voiceBusy = app.isVoiceChannelBusy();
       let sentThisTick = 0;
-      while (dfQueue.length > 0 && sentThisTick < 4) {
-        const nextPkt = dfQueue[0];
+      while (ctrlQueue.length > 0 && sentThisTick < 4) {
+        const nextPkt = ctrlQueue[0];
         const sent = app.roomRendezvous.publishBinary(nextPkt, {
           preferredUrls,
-          maxBrokers: dfQueue.length > 6 ? 1 : 2,
-          queueIfOffline: dfQueue.length <= 4,
+          maxBrokers: voiceBusy ? 1 : 2,
+          queueIfOffline: true,
+          priority: "normal",
         });
-        if (sent === 0 && dfQueue.length > 1) {
-          // Relay socket briefly congested — retry next tick without dropping chunks
-          dfPumpTimer = setTimeout(pumpDfQueue, 35);
+        if (sent === 0 && ctrlQueue.length > 1) {
+          ctrlPumpTimer = setTimeout(pumpCtrlQueue, 25);
           return;
         }
-        dfQueue.shift();
+        ctrlQueue.shift();
         sentThisTick += 1;
       }
-      if (dfQueue.length > 0) {
-        dfPumpTimer = setTimeout(pumpDfQueue, 20);
+      if (ctrlQueue.length > 0) {
+        ctrlPumpTimer = setTimeout(pumpCtrlQueue, 15);
       }
     };
 
     const virtualDc = {
       label: "p2p-mesh",
       transport: "relay",
+      priority: "medium",
       readyState: "open",
       bufferedAmount: 0,
       onmessage: null,
@@ -4760,29 +5005,31 @@ class P2PDirectApp {
           String(frameStr),
           RELAY_DATA_CHUNK_SIZE
         );
-        if (chunks.length <= 4 && dfQueue.length === 0) {
+        const voiceBusy = app.isVoiceChannelBusy();
+        if (chunks.length <= 2 && ctrlQueue.length === 0) {
           const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
           for (const chunkPkt of chunks) {
             app.roomRendezvous.publishBinary(chunkPkt, {
               preferredUrls,
-              maxBrokers: 2,
+              maxBrokers: voiceBusy ? 1 : 2,
               queueIfOffline: true,
+              priority: "normal",
             });
           }
           return;
         }
         for (const chunkPkt of chunks) {
-          dfQueue.push(chunkPkt);
+          ctrlQueue.push(chunkPkt);
         }
-        pumpDfQueue();
+        pumpCtrlQueue();
       },
       close(silentRemote = false) {
         if (this.readyState === "closed") return;
         this.readyState = "closed";
-        dfQueue.length = 0;
-        if (dfPumpTimer) {
-          clearTimeout(dfPumpTimer);
-          dfPumpTimer = null;
+        ctrlQueue.length = 0;
+        if (ctrlPumpTimer) {
+          clearTimeout(ctrlPumpTimer);
+          ctrlPumpTimer = null;
         }
         const entry = app.directPeers.get(peerId);
         const superseded = Boolean(entry && entry.dc === this && entry.superseded);
@@ -4792,6 +5039,105 @@ class P2PDirectApp {
             from: app.status.peerId,
             to: peerId,
           });
+        }
+        if (typeof this.onclose === "function") {
+          const cb = this.onclose;
+          this.onclose = null;
+          cb();
+        }
+      },
+    };
+
+    // Low-priority bulk relay queue for GIFs, images, videos & large frames (> 16 KB)
+    // Yields to voice bundles, uses smaller 12 KB chunks during voice, and steers onto a secondary broker
+    const bulkDfQueue = [];
+    let bulkPumpTimer = null;
+    let bulkQueuedBytes = 0;
+    const pumpBulkDfQueue = () => {
+      if (bulkPumpTimer) {
+        clearTimeout(bulkPumpTimer);
+        bulkPumpTimer = null;
+      }
+      if (virtualBulkDc.readyState !== "open" || !app.roomRendezvous || !app.activeRoom) {
+        bulkDfQueue.length = 0;
+        bulkQueuedBytes = 0;
+        virtualBulkDc.bufferedAmount = 0;
+        return;
+      }
+      const voiceBusy = app.isVoiceChannelBusy();
+      // Always yield if a high-priority voice bundle was flushed within the last 15ms
+      if (voiceBusy && Date.now() - lastVoiceFlushMs < 15) {
+        bulkPumpTimer = setTimeout(pumpBulkDfQueue, 20);
+        return;
+      }
+      const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
+      const maxPerTick = voiceBusy ? 1 : 3;
+      const tickMs = voiceBusy ? RELAY_BULK_TICK_VOICE_MS : RELAY_BULK_TICK_IDLE_MS;
+      let sentThisTick = 0;
+      while (bulkDfQueue.length > 0 && sentThisTick < maxPerTick) {
+        const nextPkt = bulkDfQueue[0];
+        const sent = app.roomRendezvous.publishBinary(nextPkt, {
+          preferredUrls,
+          maxBrokers: 1,
+          queueIfOffline: false,
+          priority: "low",
+          avoidPrimaryVoiceBroker: voiceBusy,
+        });
+        if (sent === 0) {
+          // Secondary relay socket briefly above 8 KB cap — retry next tick without dropping chunks
+          bulkPumpTimer = setTimeout(pumpBulkDfQueue, voiceBusy ? 45 : 30);
+          return;
+        }
+        bulkDfQueue.shift();
+        bulkQueuedBytes = Math.max(0, bulkQueuedBytes - nextPkt.byteLength);
+        virtualBulkDc.bufferedAmount = bulkQueuedBytes;
+        app.recordTopologyPacket(peerId, "tx", "bulk", nextPkt.byteLength);
+        sentThisTick += 1;
+      }
+      if (bulkDfQueue.length > 0) {
+        bulkPumpTimer = setTimeout(pumpBulkDfQueue, tickMs);
+      }
+    };
+
+    const virtualBulkDc = {
+      label: "p2p-bulk",
+      transport: "relay",
+      priority: "very-low",
+      readyState: "open",
+      bufferedAmount: 0,
+      onmessage: null,
+      onopen: null,
+      onclose: null,
+      onerror: null,
+      send(frameStr) {
+        if (this.readyState !== "open" || !app.roomRendezvous || !app.activeRoom) return;
+        const msgId = (app.relayDataMsgSeq = (app.relayDataMsgSeq + 1) >>> 0) || 1;
+        const chunkBytes = app.isVoiceChannelBusy()
+          ? RELAY_BULK_CHUNK_SIZE_VOICE
+          : RELAY_DATA_CHUNK_SIZE;
+        const chunks = encodeRelayDataChunks(
+          myTag.bytes,
+          peerInfo.tagBytes,
+          msgId,
+          String(frameStr),
+          chunkBytes
+        );
+        for (const chunkPkt of chunks) {
+          bulkDfQueue.push(chunkPkt);
+          bulkQueuedBytes += chunkPkt.byteLength;
+        }
+        this.bufferedAmount = bulkQueuedBytes;
+        pumpBulkDfQueue();
+      },
+      close() {
+        if (this.readyState === "closed") return;
+        this.readyState = "closed";
+        bulkDfQueue.length = 0;
+        bulkQueuedBytes = 0;
+        this.bufferedAmount = 0;
+        if (bulkPumpTimer) {
+          clearTimeout(bulkPumpTimer);
+          bulkPumpTimer = null;
         }
         if (typeof this.onclose === "function") {
           const cb = this.onclose;
@@ -4817,11 +5163,14 @@ class P2PDirectApp {
       peerVoiceBundleSeq = ((peerVoiceBundleSeq + 1) >>> 0) || 1;
       const bundle = encodeRelayVoiceBundle(myTag.bytes, peerInfo.tagBytes, peerVoiceBundleSeq, batch);
       const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
+      lastVoiceFlushMs = Date.now();
+      app.noteVoiceTraffic();
       app.roomRendezvous.publishBinary(bundle, {
         preferredUrls,
         maxBrokers: 1,
         queueIfOffline: false,
         stripe: true,
+        priority: "high",
       });
       if (voiceQueue.length > 0) {
         voiceFlushTimer = setTimeout(flushVoiceQueue, VOICE_RELAY_BATCH_MS + 15);
@@ -4831,6 +5180,7 @@ class P2PDirectApp {
     const virtualVoiceDc = {
       label: "p2p-voice",
       transport: "relay",
+      priority: "high",
       binaryType: "arraybuffer",
       readyState: "open",
       bufferedAmount: 0,
@@ -4868,6 +5218,7 @@ class P2PDirectApp {
     };
 
     this.attachVoiceDataChannel(peerId, virtualVoiceDc);
+    this.attachBulkDataChannel(peerId, virtualBulkDc);
     this.attachDataChannel(
       virtualPc,
       virtualDc,
@@ -5102,19 +5453,7 @@ class P2PDirectApp {
         peerEntry.dc.onmessage({ data: fullFrameStr });
       } else {
         peerEntry.lastActivityMs = Date.now();
-        try {
-          const res = this.wasm.call({
-            cmd: "wire_message",
-            fromPeer: senderPeerId,
-            frame: fullFrameStr,
-            nowMs: Date.now(),
-          });
-          this.status = res.status;
-          this.executeActions(res.actions);
-          this.renderAll();
-        } catch {
-          // ignore late duplicate wire frame during direct handoff
-        }
+        this._deliverWireFrameSmart(peerEntry, senderPeerId, fullFrameStr, true);
       }
       return;
     }
@@ -5239,8 +5578,7 @@ class P2PDirectApp {
     let entry = null;
     try {
       const pc = this.createPeerConnection();
-      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
-      const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
+      const { dc, voiceDc, bulkDc } = this.createPeerDataChannels(pc);
       const early = this.earlyRoomIce.get(targetPeerId) || [];
       this.earlyRoomIce.delete(targetPeerId);
 
@@ -5248,6 +5586,7 @@ class P2PDirectApp {
         pc,
         dc,
         voiceDc,
+        bulkDc,
         targetName,
         targetPubKey,
         isUpgradeProbe: Boolean(isUpgradeProbe),
@@ -5265,6 +5604,7 @@ class P2PDirectApp {
       };
       this.roomDialing.set(targetPeerId, entry);
       this.attachVoiceDataChannel(targetPeerId, voiceDc);
+      this.attachBulkDataChannel(targetPeerId, bulkDc);
       this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, false, null, true);
 
       const enqueueTrickle = this._createBatchedIceSender(targetPeerId, entry);
@@ -5388,6 +5728,10 @@ class P2PDirectApp {
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
           this.attachVoiceDataChannel(msg.from, ev.channel);
+          return;
+        }
+        if (ev.channel.label === "p2p-bulk") {
+          this.attachBulkDataChannel(msg.from, ev.channel);
           return;
         }
         entry.dc = ev.channel;
@@ -5714,9 +6058,8 @@ class P2PDirectApp {
     try {
       const inviteId = randomId("inv");
       const pc = this.createPeerConnection();
-      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
-      const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
-      const pending = { inviteId, pc, dc, voiceDc, code: "", url: "" };
+      const { dc, voiceDc, bulkDc } = this.createPeerDataChannels(pc);
+      const pending = { inviteId, pc, dc, voiceDc, bulkDc, code: "", url: "" };
       this.pendingOffers.set(inviteId, pending);
 
       const offer = await pc.createOffer();
@@ -5814,6 +6157,10 @@ class P2PDirectApp {
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
           this.attachVoiceDataChannel(sig.peerId, ev.channel);
+          return;
+        }
+        if (ev.channel.label === "p2p-bulk") {
+          this.attachBulkDataChannel(sig.peerId, ev.channel);
           return;
         }
         this.attachDataChannel(
@@ -5914,6 +6261,9 @@ class P2PDirectApp {
 
       if (pending.voiceDc) {
         this.attachVoiceDataChannel(sig.peerId, pending.voiceDc);
+      }
+      if (pending.bulkDc) {
+        this.attachBulkDataChannel(sig.peerId, pending.bulkDc);
       }
       this.attachDataChannel(
         pending.pc,
@@ -7765,10 +8115,10 @@ class P2PDirectApp {
       this._applySpeakerVisualizer(p.peerId, level, defaultState, phase + p.peerId.charCodeAt(2));
     }
 
-    // Refresh packet counters every ~4th visualizer frame (~280ms)
+    // Refresh packet counters every ~4th visualizer frame (~280ms) using lightweight get_status (never serializes chat/GIF log)
     if (this.voice.meterTicks % 4 === 0) {
       try {
-        const st = this.wasm.call({ cmd: "get_state" }).status;
+        const st = this.wasm.call({ cmd: "get_status" }).status;
         this.status = st;
         this.renderStats();
         if (st?.stats) {
@@ -7782,6 +8132,148 @@ class P2PDirectApp {
   }
 
   /* ================= Direct E2EE DataChannel & Relayed Auto-Mesh ================= */
+
+  attachBulkDataChannel(peerId, bulkDc) {
+    if (!bulkDc) return;
+    const prev = this.bulkChannels.get(peerId);
+    // Keep existing open bulk channel alive during background Direct P2P upgrade probes
+    if (prev && prev !== bulkDc && prev.readyState === "open" && bulkDc.readyState !== "open") {
+      bulkDc.onopen = () => {
+        if (bulkDc.readyState === "open") {
+          this.attachBulkDataChannel(peerId, bulkDc);
+        }
+      };
+      return;
+    }
+    if (prev && prev !== bulkDc) {
+      // Never downgrade an open Direct WebRTC bulk channel to a virtual E2EE relay bulk channel
+      if (bulkDc.transport === "relay" && prev.transport !== "relay" && prev.readyState === "open") {
+        try {
+          bulkDc.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      try {
+        prev.onmessage = null;
+        prev.onopen = null;
+        prev.onclose = null;
+        prev.onerror = null;
+        prev.onbufferedamountlow = null;
+        prev.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.bulkChannels.set(peerId, bulkDc);
+    const direct = this.directPeers.get(peerId);
+    if (direct && (bulkDc.transport === "relay") === (direct.transport === "relay")) {
+      direct.bulkDc = bulkDc;
+    }
+
+    if (bulkDc.transport !== "relay" && typeof bulkDc === "object") {
+      try {
+        bulkDc.bufferedAmountLowThreshold = this.isVoiceChannelBusy() ? 8192 : 65536;
+        bulkDc.onbufferedamountlow = () => {
+          const live = this.directPeers.get(peerId);
+          if (live && live.bulkDc === bulkDc) {
+            this._pumpBulkDirectSendQueue(live);
+          }
+        };
+      } catch {
+        // ignore if unsupported
+      }
+    }
+
+    bulkDc.onmessage = (ev) => {
+      if (typeof ev.data !== "string") return;
+      const live = this.directPeers.get(peerId);
+      if (!live || live.superseded) return;
+      this._handleIncomingDataPayload(live, ev.data, "bulk");
+    };
+
+    const onBulkReady = () => {
+      const live = this.directPeers.get(peerId);
+      if (live && (bulkDc.transport === "relay") === (live.transport === "relay")) {
+        live.bulkDc = bulkDc;
+        if (live.bulkSendQueue && live.bulkSendQueue.length > 0) {
+          this._pumpBulkDirectSendQueue(live);
+        }
+      }
+    };
+    if (bulkDc.readyState === "open") {
+      onBulkReady();
+    } else {
+      bulkDc.onopen = onBulkReady;
+    }
+
+    bulkDc.onclose = () => {
+      if (this.bulkChannels.get(peerId) === bulkDc) {
+        this.bulkChannels.delete(peerId);
+      }
+      const live = this.directPeers.get(peerId);
+      if (live && live.bulkDc === bulkDc) {
+        live.bulkDc = null;
+      }
+    };
+    bulkDc.onerror = () => {
+      // Non-fatal: primary p2p-mesh channel remains healthy as fallback
+    };
+  }
+
+  _handleIncomingDataPayload(peerEntry, rawStr, kind = "data") {
+    if (!peerEntry || peerEntry.superseded || typeof rawStr !== "string") return;
+    peerEntry.lastActivityMs = Date.now();
+    this.recordTopologyPacket(peerEntry.peerId, "rx", kind, rawStr.length);
+
+    if (rawStr.startsWith('{"kind":"dc_chunk"')) {
+      try {
+        const ch = JSON.parse(rawStr);
+        if (
+          ch &&
+          ch.kind === "dc_chunk" &&
+          typeof ch.id === "number" &&
+          typeof ch.i === "number" &&
+          typeof ch.n === "number" &&
+          typeof ch.d === "string" &&
+          ch.n > 0 &&
+          ch.n <= DC_CHUNK_MAX_PARTS &&
+          ch.i >= 0 &&
+          ch.i < ch.n
+        ) {
+          const asmMap =
+            kind === "bulk" ? peerEntry.bulkChunkAssemblies : peerEntry.dcChunkAssemblies;
+          let asm = asmMap.get(ch.id);
+          if (!asm) {
+            if (asmMap.size >= 16) {
+              const oldestKey = asmMap.keys().next().value;
+              if (oldestKey !== undefined) asmMap.delete(oldestKey);
+            }
+            asm = { n: ch.n, parts: new Array(ch.n), received: 0 };
+            asmMap.set(ch.id, asm);
+          }
+          if (asm.parts[ch.i] === undefined) {
+            asm.parts[ch.i] = ch.d;
+            asm.received += 1;
+          }
+          if (asm.received === asm.n) {
+            asmMap.delete(ch.id);
+            if (typeof peerEntry.deliverWireFrame === "function") {
+              peerEntry.deliverWireFrame(asm.parts.join(""));
+            }
+          }
+          return;
+        }
+      } catch {
+        return;
+      }
+    }
+
+    if (typeof peerEntry.deliverWireFrame === "function") {
+      peerEntry.deliverWireFrame(rawStr);
+    }
+  }
 
   attachDataChannel(
     pc,
@@ -7807,6 +8299,9 @@ class P2PDirectApp {
     const curVoice = this.voiceChannels.get(peerId);
     const matchedVoice =
       curVoice && (curVoice.transport === "relay") === (transport === "relay") ? curVoice : null;
+    const curBulk = this.bulkChannels.get(peerId);
+    const matchedBulk =
+      curBulk && (curBulk.transport === "relay") === (transport === "relay") ? curBulk : null;
 
     const peerEntry = {
       peerId,
@@ -7816,6 +8311,7 @@ class P2PDirectApp {
       dc,
       transport,
       voiceDc: matchedVoice,
+      bulkDc: matchedBulk,
       viaAutoMesh,
       introducedBy,
       lastActivityMs: Date.now(),
@@ -7823,6 +8319,10 @@ class P2PDirectApp {
       dcSendQueue: [],
       dcSendTimer: null,
       dcChunkAssemblies: new Map(),
+      bulkSendQueue: [],
+      bulkSendTimer: null,
+      bulkChunkAssemblies: new Map(),
+      deliverWireFrame: null,
     };
 
     const clearPeerSendQueue = () => {
@@ -7830,14 +8330,25 @@ class P2PDirectApp {
         clearTimeout(peerEntry.dcSendTimer);
         peerEntry.dcSendTimer = null;
       }
+      if (peerEntry.bulkSendTimer) {
+        clearTimeout(peerEntry.bulkSendTimer);
+        peerEntry.bulkSendTimer = null;
+      }
       peerEntry.dcSendQueue.length = 0;
       peerEntry.dcChunkAssemblies.clear();
+      peerEntry.bulkSendQueue.length = 0;
+      peerEntry.bulkChunkAssemblies.clear();
     };
 
     if (transport === "direct" && dc && typeof dc === "object") {
       try {
-        dc.bufferedAmountLowThreshold = 131072;
-        dc.onbufferedamountlow = () => this._pumpDirectSendQueue(peerEntry);
+        dc.bufferedAmountLowThreshold = 32768;
+        dc.onbufferedamountlow = () => {
+          this._pumpDirectSendQueue(peerEntry);
+          if (!peerEntry.bulkDc || peerEntry.bulkDc.readyState !== "open") {
+            this._pumpBulkDirectSendQueue(peerEntry);
+          }
+        };
       } catch {
         // ignore if unsupported
       }
@@ -7882,13 +8393,24 @@ class P2PDirectApp {
           clearTimeout(existing.dcSendTimer);
           existing.dcSendTimer = null;
         }
+        if (existing.bulkSendTimer) {
+          clearTimeout(existing.bulkSendTimer);
+          existing.bulkSendTimer = null;
+        }
         if (existing.dcSendQueue) existing.dcSendQueue.length = 0;
         if (existing.dcChunkAssemblies) existing.dcChunkAssemblies.clear();
+        if (existing.bulkSendQueue) existing.bulkSendQueue.length = 0;
+        if (existing.bulkChunkAssemblies) existing.bulkChunkAssemblies.clear();
         try {
           existing.dc.onclose = null;
           existing.dc.onerror = null;
           existing.pc.onconnectionstatechange = null;
           existing.pc.oniceconnectionstatechange = null;
+          if (existing.bulkDc) {
+            existing.bulkDc.onclose = null;
+            existing.bulkDc.onerror = null;
+            existing.bulkDc.close();
+          }
           if (existing.transport === "relay") {
             existing.dc.close(true);
           } else {
@@ -7904,6 +8426,10 @@ class P2PDirectApp {
       const latestVoice = this.voiceChannels.get(peerId);
       if (latestVoice && (latestVoice.transport === "relay") === (transport === "relay")) {
         peerEntry.voiceDc = latestVoice;
+      }
+      const latestBulk = this.bulkChannels.get(peerId);
+      if (latestBulk && (latestBulk.transport === "relay") === (transport === "relay")) {
+        peerEntry.bulkDc = latestBulk;
       }
 
       const pendingOpen = this.relayPendingOpens.get(peerId);
@@ -7925,6 +8451,10 @@ class P2PDirectApp {
           if (dialingEntry.voiceDc && dialingEntry.voiceDc.readyState === "open") {
             this.attachVoiceDataChannel(peerId, dialingEntry.voiceDc);
             peerEntry.voiceDc = dialingEntry.voiceDc;
+          }
+          if (dialingEntry.bulkDc && dialingEntry.bulkDc.readyState === "open") {
+            this.attachBulkDataChannel(peerId, dialingEntry.bulkDc);
+            peerEntry.bulkDc = dialingEntry.bulkDc;
           }
           this.roomDialing.delete(peerId);
         }
@@ -8024,6 +8554,12 @@ class P2PDirectApp {
         ) {
           peerEntry.voiceDc.close();
         }
+        if (
+          peerEntry.bulkDc &&
+          (isOwningPeer || (peerEntry.bulkDc.transport === "relay") === (transport === "relay"))
+        ) {
+          peerEntry.bulkDc.close();
+        }
         pc.close();
       } catch {
         // ignore
@@ -8035,6 +8571,9 @@ class P2PDirectApp {
         this.directPeers.delete(peerId);
         if (this.voiceChannels.get(peerId) === peerEntry.voiceDc) {
           this.voiceChannels.delete(peerId);
+        }
+        if (this.bulkChannels.get(peerId) === peerEntry.bulkDc) {
+          this.bulkChannels.delete(peerId);
         }
         this.disposePeerVoiceMixer(peerId);
         this._clearRelayVoiceReorderForPeer(peerId);
@@ -8093,71 +8632,13 @@ class P2PDirectApp {
     };
 
     const deliverWireFrame = (frameStr) => {
-      try {
-        const res = this.wasm.call({
-          cmd: "wire_message",
-          fromPeer: peerId,
-          frame: frameStr,
-          nowMs: Date.now(),
-        });
-        this.status = res.status;
-        const liveInfo = this.status.peers.find((p) => p.peerId === peerId);
-        if (liveInfo && liveInfo.authorName && liveInfo.authorName !== peerEntry.authorName) {
-          peerEntry.authorName = liveInfo.authorName;
-        }
-        this.executeActions(res.actions);
-        this.renderAll();
-      } catch (err) {
-        this.addTelemetry("error", `E2EE wire rejection from ${peerId}: ${err.message}`);
-        this.renderStats();
-      }
+      this._deliverWireFrameSmart(peerEntry, peerId, frameStr, false);
     };
+    peerEntry.deliverWireFrame = deliverWireFrame;
 
     dc.onmessage = (ev) => {
       if (typeof ev.data !== "string" || peerEntry.superseded) return;
-      peerEntry.lastActivityMs = Date.now();
-      this.recordTopologyPacket(peerId, "rx", "data", ev.data.length);
-
-      if (ev.data.startsWith('{"kind":"dc_chunk"')) {
-        try {
-          const ch = JSON.parse(ev.data);
-          if (
-            ch &&
-            ch.kind === "dc_chunk" &&
-            typeof ch.id === "number" &&
-            typeof ch.i === "number" &&
-            typeof ch.n === "number" &&
-            typeof ch.d === "string" &&
-            ch.n > 0 &&
-            ch.n <= DC_CHUNK_MAX_PARTS &&
-            ch.i >= 0 &&
-            ch.i < ch.n
-          ) {
-            let asm = peerEntry.dcChunkAssemblies.get(ch.id);
-            if (!asm) {
-              if (peerEntry.dcChunkAssemblies.size >= 16) {
-                const oldestKey = peerEntry.dcChunkAssemblies.keys().next().value;
-                if (oldestKey !== undefined) peerEntry.dcChunkAssemblies.delete(oldestKey);
-              }
-              asm = { n: ch.n, parts: new Array(ch.n), received: 0 };
-              peerEntry.dcChunkAssemblies.set(ch.id, asm);
-            }
-            if (asm.parts[ch.i] === undefined) {
-              asm.parts[ch.i] = ch.d;
-              asm.received += 1;
-            }
-            if (asm.received === asm.n) {
-              peerEntry.dcChunkAssemblies.delete(ch.id);
-              deliverWireFrame(asm.parts.join(""));
-            }
-            return;
-          }
-        } catch {
-          return;
-        }
-      }
-
-      deliverWireFrame(ev.data);
+      this._handleIncomingDataPayload(peerEntry, ev.data, "data");
     };
 
     dc.onclose = handleClose;
@@ -8180,14 +8661,29 @@ class P2PDirectApp {
       clearTimeout(entry.dcSendTimer);
       entry.dcSendTimer = null;
     }
+    if (entry.bulkSendTimer) {
+      clearTimeout(entry.bulkSendTimer);
+      entry.bulkSendTimer = null;
+    }
     if (entry.dcSendQueue) entry.dcSendQueue.length = 0;
     if (entry.dcChunkAssemblies) entry.dcChunkAssemblies.clear();
+    if (entry.bulkSendQueue) entry.bulkSendQueue.length = 0;
+    if (entry.bulkChunkAssemblies) entry.bulkChunkAssemblies.clear();
     this.directPeers.delete(peerId);
     const vdc = this.voiceChannels.get(peerId);
     if (vdc) {
       this.voiceChannels.delete(peerId);
       try {
         vdc.close();
+      } catch {
+        // ignore
+      }
+    }
+    const bdc = this.bulkChannels.get(peerId);
+    if (bdc) {
+      this.bulkChannels.delete(peerId);
+      try {
+        bdc.close();
       } catch {
         // ignore
       }
@@ -8221,8 +8717,9 @@ class P2PDirectApp {
       clearTimeout(peer.dcSendTimer);
       peer.dcSendTimer = null;
     }
+    const maxBuf = this.isVoiceChannelBusy() ? 65536 : 262144;
     while (peer.dcSendQueue.length > 0) {
-      if ((peer.dc.bufferedAmount || 0) >= 524288) {
+      if ((peer.dc.bufferedAmount || 0) >= maxBuf) {
         peer.dcSendTimer = setTimeout(() => this._pumpDirectSendQueue(peer), 15);
         return;
       }
@@ -8238,20 +8735,264 @@ class P2PDirectApp {
     }
   }
 
+  /**
+   * Voice-First Traffic Shaper for the low-priority `p2p-bulk` DataChannel (GIFs, videos, large frames).
+   * - While voice is active: caps SCTP buffer to 24 KB, sends at most 1 × 16 KB chunk every 25 ms,
+   *   and yields immediately whenever `p2p-voice` has queued bytes or `p2p-mesh` has pending control traffic.
+   * - When voice is idle: opens up to 192 KB / 4 chunks per 8 ms for fast full-speed delivery.
+   */
+  _pumpBulkDirectSendQueue(peer) {
+    if (!peer || peer.superseded) {
+      if (peer?.bulkSendTimer) {
+        clearTimeout(peer.bulkSendTimer);
+        peer.bulkSendTimer = null;
+      }
+      if (peer?.bulkSendQueue) peer.bulkSendQueue.length = 0;
+      return;
+    }
+    if (peer.bulkSendTimer) {
+      clearTimeout(peer.bulkSendTimer);
+      peer.bulkSendTimer = null;
+    }
+    const q = peer.bulkSendQueue;
+    if (!q || q.length === 0) return;
+
+    const useBulkDc = Boolean(peer.bulkDc && peer.bulkDc.readyState === "open");
+    const ch = useBulkDc ? peer.bulkDc : peer.dc;
+    if (!ch || ch.readyState !== "open") {
+      q.length = 0;
+      return;
+    }
+
+    const voiceBusy = this.isVoiceChannelBusy();
+    const maxBuf = voiceBusy ? BULK_DIRECT_MAX_BUFFERED_VOICE : BULK_DIRECT_MAX_BUFFERED_IDLE;
+    const maxPerTick = voiceBusy ? 1 : 4;
+    const tickMs = voiceBusy ? BULK_DIRECT_TICK_VOICE_MS : BULK_DIRECT_TICK_IDLE_MS;
+
+    try {
+      ch.bufferedAmountLowThreshold = voiceBusy ? 8192 : 65536;
+    } catch {
+      // ignore if unsupported
+    }
+
+    // Strict voice-first preemption: yield immediately if high-prio voice or medium-prio chat has queued bytes
+    if (voiceBusy) {
+      const voiceBacklog = peer.voiceDc && (peer.voiceDc.bufferedAmount || 0) > 0;
+      const ctrlBacklog = peer.dc && peer.dc !== ch && (peer.dc.bufferedAmount || 0) > 8192;
+      if (voiceBacklog || ctrlBacklog) {
+        peer.bulkSendTimer = setTimeout(() => this._pumpBulkDirectSendQueue(peer), 20);
+        return;
+      }
+    }
+
+    let sentThisTick = 0;
+    while (q.length > 0 && sentThisTick < maxPerTick) {
+      if ((ch.bufferedAmount || 0) >= maxBuf) {
+        peer.bulkSendTimer = setTimeout(() => this._pumpBulkDirectSendQueue(peer), voiceBusy ? 25 : 12);
+        return;
+      }
+      const head = q[0];
+      let pkt;
+      if (typeof head === "string") {
+        pkt = q.shift();
+      } else {
+        // Lazy on-demand 16 KB chunk slicing (zero upfront multi-MB burst allocation)
+        const d = head.frameStr.slice(head.i * DC_CHUNK_SIZE, (head.i + 1) * DC_CHUNK_SIZE);
+        pkt = JSON.stringify({ kind: "dc_chunk", id: head.id, i: head.i, n: head.total, d });
+        head.i += 1;
+        if (head.i >= head.total) {
+          q.shift();
+        }
+      }
+      try {
+        ch.send(pkt);
+        this.recordTopologyPacket(peer.peerId, "tx", useBulkDc ? "bulk" : "data", pkt.length);
+        sentThisTick += 1;
+      } catch (err) {
+        this.addTelemetry("error", `Bulk send failed to ${peer.peerId}: ${err.message}`);
+        q.length = 0;
+        return;
+      }
+    }
+
+    if (q.length > 0) {
+      peer.bulkSendTimer = setTimeout(() => this._pumpBulkDirectSendQueue(peer), tickMs);
+    }
+  }
+
+  _deliverWireFrameSync(peerEntry, peerId, frameStr, silentOnError = false) {
+    try {
+      const res = this.wasm.wireMessage(peerId, frameStr, Date.now());
+      this.status = res.status;
+      const liveInfo = this.status.peers.find((p) => p.peerId === peerId);
+      if (liveInfo && liveInfo.authorName && liveInfo.authorName !== peerEntry.authorName) {
+        peerEntry.authorName = liveInfo.authorName;
+      }
+      this.executeActions(res.actions);
+      const onlyMsgUpdate =
+        Array.isArray(res.actions) &&
+        res.actions.some((a) => a.action === "log_updated") &&
+        res.actions.every(
+          (a) => a.action === "log_updated" || a.action === "send_wire" || a.action === "telemetry"
+        );
+      if (onlyMsgUpdate) {
+        this.renderMessageUpdate();
+      } else {
+        this.renderAll();
+      }
+    } catch (err) {
+      if (!silentOnError) {
+        this.addTelemetry("error", `E2EE wire rejection from ${peerId}: ${err.message}`);
+        this.renderStats();
+      }
+    }
+  }
+
+  async _deliverWireFrameBulkOffThread(peerEntry, peerId, frameStr, silentOnError = false) {
+    const seqMatch = /"s"\s*:\s*(\d+)/.exec(frameStr.slice(0, 128));
+    if (!seqMatch) {
+      this._deliverWireFrameSync(peerEntry, peerId, frameStr, silentOnError);
+      return;
+    }
+    const seq = Number(seqMatch[1]);
+    let rxPrep;
+    try {
+      rxPrep = this.wasm.call({
+        cmd: "prepare_bulk_rx",
+        fromPeer: peerId,
+        seq,
+      });
+    } catch (err) {
+      if (!silentOnError) {
+        this.addTelemetry("error", `E2EE wire rejection from ${peerId}: ${err.message}`);
+        this.renderStats();
+      }
+      return;
+    }
+
+    try {
+      const opened = await this.wasm.openBulkAsync(
+        {
+          fromPeer: peerId,
+          selfPeerId: rxPrep.selfPeerId,
+          rxKey: rxPrep.rxKey,
+          logKey: rxPrep.logKey,
+        },
+        frameStr
+      );
+
+      if (opened.kind !== "msg") {
+        // SyncBatch / msg-delete / bot-update / control frames fall back cleanly to MeshNode
+        this._deliverWireFrameSync(peerEntry, peerId, frameStr, silentOnError);
+        return;
+      }
+
+      const mr = opened.metaResp;
+      const commitRes = this.wasm.commitBulkRx(
+        {
+          fromPeer: peerId,
+          seq: mr.seq,
+          ttl: mr.ttl,
+          path: mr.path,
+          meta: mr.meta,
+          sealedNonce: mr.sealedNonce,
+        },
+        opened.sealedCt
+      );
+      this.status = commitRes.status;
+
+      if (commitRes.inserted) {
+        const msgObj = JSON.parse(opened.msgJsonStr);
+        this._insertLocalMessageOrdered(msgObj);
+        setTimeout(() => this.renderMessageUpdate(), 0);
+      } else {
+        this.renderStats();
+      }
+
+      // Multi-hop 3+ peer gossip forwarding also seals off the main thread!
+      if (Array.isArray(commitRes.forwardTargets) && commitRes.forwardTargets.length > 0) {
+        const fwdPeerRefs = new Map();
+        for (const t of commitRes.forwardTargets) {
+          const p = this.directPeers.get(t.peerId);
+          if (p) fwdPeerRefs.set(t.peerId, p);
+        }
+        const fwdFrames = await this.wasm.sealForwardAsync(
+          {
+            selfPeerId: rxPrep.selfPeerId,
+            origin: mr.origin,
+            ttl: commitRes.nextTtl,
+            path: commitRes.nextPath,
+            recordMeta: {
+              id: mr.meta.id,
+              lamport: mr.meta.lamport,
+              ts: mr.meta.ts,
+              nonce: mr.sealedNonce,
+            },
+            targets: commitRes.forwardTargets,
+          },
+          opened.sealedCt
+        );
+        for (const wf of fwdFrames) {
+          const expected = fwdPeerRefs.get(wf.peerId);
+          const live = this.directPeers.get(wf.peerId);
+          if (live && live === expected && live.dc?.readyState === "open") {
+            this._sendWireFrameToPeer(live, wf.frame);
+          }
+        }
+      }
+    } catch (err) {
+      if (!silentOnError) {
+        this.addTelemetry("error", `E2EE wire rejection from ${peerId}: ${err.message}`);
+        this.renderStats();
+      }
+    }
+  }
+
+  _deliverWireFrameSmart(peerEntry, peerId, frameStr, silentOnError = false) {
+    if (
+      frameStr &&
+      frameStr.length > BULK_FRAME_THRESHOLD &&
+      this.wasm &&
+      this.wasm.hasBulkWorker()
+    ) {
+      this._deliverWireFrameBulkOffThread(peerEntry, peerId, frameStr, silentOnError);
+      return;
+    }
+    this._deliverWireFrameSync(peerEntry, peerId, frameStr, silentOnError);
+  }
+
   _sendWireFrameToPeer(peer, frameStr) {
     if (!peer || !peer.dc || peer.dc.readyState !== "open") return;
+    const isBulk = frameStr.length > BULK_FRAME_THRESHOLD;
+
     if (peer.transport === "relay") {
       try {
-        peer.dc.send(frameStr);
-        this.recordTopologyPacket(peer.peerId, "tx", "data", frameStr.length);
+        if (isBulk && peer.bulkDc && peer.bulkDc.readyState === "open") {
+          peer.bulkDc.send(frameStr);
+        } else {
+          peer.dc.send(frameStr);
+          this.recordTopologyPacket(peer.peerId, "tx", "data", frameStr.length);
+        }
       } catch (err) {
         this.addTelemetry("error", `Send failed to ${peer.peerId}: ${err.message}`);
       }
       return;
     }
 
+    // Large frames (GIFs, images, videos, big sync batches > 16 KB) ALWAYS go over the low-prio bulk queue
+    if (isBulk) {
+      const bq = peer.bulkSendQueue || (peer.bulkSendQueue = []);
+      const id = (this.dcChunkSeq = (this.dcChunkSeq + 1) >>> 0) || 1;
+      const total = Math.ceil(frameStr.length / DC_CHUNK_SIZE);
+      bq.push({ id, frameStr, i: 0, total });
+      this._pumpBulkDirectSendQueue(peer);
+      return;
+    }
+
+    // Small chat / presence / sync / keepalive frames go straight on medium-prio p2p-mesh (never blocked by GIFs)
     const q = peer.dcSendQueue || (peer.dcSendQueue = []);
-    if (frameStr.length <= DC_CHUNK_THRESHOLD && q.length === 0 && (peer.dc.bufferedAmount || 0) < 262144) {
+    const fastBufLimit = this.isVoiceChannelBusy() ? 32768 : 131072;
+    if (q.length === 0 && (peer.dc.bufferedAmount || 0) < fastBufLimit) {
       try {
         peer.dc.send(frameStr);
         this.recordTopologyPacket(peer.peerId, "tx", "data", frameStr.length);
@@ -8261,20 +9002,11 @@ class P2PDirectApp {
       return;
     }
 
-    if (frameStr.length <= DC_CHUNK_THRESHOLD) {
-      q.push(frameStr);
-    } else {
-      const id = (this.dcChunkSeq = (this.dcChunkSeq + 1) >>> 0) || 1;
-      const total = Math.ceil(frameStr.length / DC_CHUNK_SIZE);
-      for (let i = 0; i < total; i++) {
-        const d = frameStr.slice(i * DC_CHUNK_SIZE, (i + 1) * DC_CHUNK_SIZE);
-        q.push(JSON.stringify({ kind: "dc_chunk", id, i, n: total, d }));
-      }
-    }
+    q.push(frameStr);
     this._pumpDirectSendQueue(peer);
   }
 
-  executeActions(actions) {
+  executeActions(actions, opts = {}) {
     if (!Array.isArray(actions)) return;
     let logChanged = false;
 
@@ -8329,7 +9061,7 @@ class P2PDirectApp {
       }
     }
 
-    if (logChanged) {
+    if (logChanged && !opts.skipLogRefresh) {
       this.refreshLogFromWasm();
     }
   }
@@ -8361,8 +9093,7 @@ class P2PDirectApp {
     }
     try {
       const pc = this.createPeerConnection();
-      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
-      const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
+      const { dc, voiceDc, bulkDc } = this.createPeerDataChannels(pc);
       const early = this.earlyRelayIce.get(targetPeerId) || [];
       this.earlyRelayIce.delete(targetPeerId);
       const entry = {
@@ -8373,6 +9104,7 @@ class P2PDirectApp {
         pc,
         dc,
         voiceDc,
+        bulkDc,
         remoteDescSet: false,
         sdpSent: false,
         localIceQueue: [],
@@ -8380,6 +9112,7 @@ class P2PDirectApp {
       };
       this.relayPeers.set(targetPeerId, entry);
       this.attachVoiceDataChannel(targetPeerId, voiceDc);
+      this.attachBulkDataChannel(targetPeerId, bulkDc);
       this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, true, viaPeerId, false);
 
       pc.onicecandidate = (ev) => {
@@ -8449,6 +9182,10 @@ class P2PDirectApp {
       pc.ondatachannel = (ev) => {
         if (ev.channel.label === "p2p-voice") {
           this.attachVoiceDataChannel(fromPeerId, ev.channel);
+          return;
+        }
+        if (ev.channel.label === "p2p-bulk") {
+          this.attachBulkDataChannel(fromPeerId, ev.channel);
           return;
         }
         entry.dc = ev.channel;
@@ -8566,6 +9303,16 @@ class P2PDirectApp {
     this.renderVoicePanel();
     this.renderPeers();
     this.renderTopology();
+    this.renderStats();
+    this.renderTypeFilterOptions();
+    this.renderLog();
+  }
+
+  /**
+   * Fast-path render for chat/GIF/video messages: skips full SVG topology / voice / wizard
+   * rebuilds so incoming/outgoing media paints in ~1-3 ms without perturbing live audio.
+   */
+  renderMessageUpdate() {
     this.renderStats();
     this.renderTypeFilterOptions();
     this.renderLog();
@@ -9150,6 +9897,9 @@ class P2PDirectApp {
   }
 
   recordTopologyPacket(peerId, dir, kind, bytes = 0) {
+    if (kind === "voice") {
+      this.noteVoiceTraffic();
+    }
     if (!peerId || !this.status) return;
     const now = performance.now();
     let st = this.topo.linkStats.get(peerId);
@@ -9189,7 +9939,7 @@ class P2PDirectApp {
     if (!this.isTopologyVisible()) return;
 
     // Coalesce rapid packet bursts cleanly so voice streams render as crisp rhythmic pulses
-    const minIntervalMs = kind === "voice" ? 115 : 55;
+    const minIntervalMs = kind === "voice" ? 115 : kind === "bulk" ? 95 : 55;
     const throttleKey = `${peerId}:${dir}:${kind}`;
     const lastSpawn = this.topo.lastParticleAt.get(throttleKey) || 0;
     if (now - lastSpawn < minIntervalMs) return;
@@ -9208,8 +9958,8 @@ class P2PDirectApp {
       toId: dir === "tx" ? peerId : selfId,
       kind,
       t: 0,
-      durationMs: isRelayed ? 620 : 390,
-      color: kind === "voice" ? "var(--acid)" : "var(--coral)",
+      durationMs: isRelayed ? 620 : kind === "bulk" ? 460 : 390,
+      color: kind === "voice" ? "var(--acid)" : kind === "bulk" ? "var(--ochre)" : "var(--coral)",
     });
 
     if (!this.topo.rafId) {
@@ -9861,6 +10611,12 @@ class P2PDirectApp {
       : "Idle (0 pkt/s)";
     const totalText = st ? `TX ${st.txTotal} · RX ${st.rxTotal} pkts` : "0 / 0 pkts";
 
+    const livePeerEntry = this.directPeers.get(selId);
+    const hasBulkLane = Boolean(livePeerEntry?.bulkDc && livePeerEntry.bulkDc.readyState === "open");
+    const qosSummary = hasBulkLane
+      ? "Voice [High] · Chat [Med] · Bulk GIF/Media [Low]"
+      : "Voice [High] · Data [Med]";
+
     box.innerHTML = `
       <div class="topo-insp-head">
         <div class="topo-insp-title">
@@ -9873,7 +10629,7 @@ class P2PDirectApp {
       <div class="topo-insp-grid">
         <div class="topo-insp-cell span-2">
           <span class="topo-insp-k">Transport &amp; Technology</span>
-          <span class="topo-insp-v">${escapeHtml(tech.detailLabel)}</span>
+          <span class="topo-insp-v">${escapeHtml(tech.detailLabel)} · ${escapeHtml(qosSummary)}</span>
         </div>
         <div class="topo-insp-cell">
           <span class="topo-insp-k">Encryption</span>
@@ -10143,15 +10899,16 @@ class P2PDirectApp {
 
     if (Array.isArray(payload.images) && payload.images.length > 0) {
       const validImages = payload.images.filter(
-        (img) => img && typeof img.dataUrl === "string" && SAFE_IMAGE_DATA_URL_RE.test(img.dataUrl)
+        (img) => img && typeof img.dataUrl === "string" && isSafeImageDataUrl(img.dataUrl)
       );
       for (const img of validImages) {
         const alt = escapeHtml(img.name || "Shared image");
         const isAnimated = Boolean(img.animated || img.dataUrl.startsWith("data:image/gif;"));
         if (isAnimated) {
           const idx = gifBindings.length;
-          const blob = dataUrlToBlob(img.dataUrl);
-          const srcUrl = blob ? URL.createObjectURL(blob) : img.dataUrl;
+          const asyncDecode = img.dataUrl.length > 65536;
+          const blob = asyncDecode ? null : dataUrlToBlob(img.dataUrl);
+          const srcUrl = asyncDecode ? "" : blob ? URL.createObjectURL(blob) : img.dataUrl;
           if (blob && msgId) {
             this._registerMessageMediaUrl(msgId, srcUrl);
           }
@@ -10162,17 +10919,19 @@ class P2PDirectApp {
           gifBindings.push({
             idx,
             blob,
+            asyncDecode,
             dataUrl: img.dataUrl,
             currentUrl: srcUrl,
             alt: img.name || "Animated GIF",
             metaLabel,
           });
+          const srcAttr = srcUrl ? ` src="${srcUrl}"` : "";
           mediaCards.push(`
             <div class="chat-media-card is-gif" data-gif-card="${idx}">
               <div class="chat-media-stage">
                 <span class="chat-media-badge">GIF</span>
                 <button type="button" class="chat-image-btn" data-gif-expand="${idx}" aria-label="View full size GIF">
-                  <img class="chat-image-thumb" data-gif-img="${idx}" src="${srcUrl}" alt="${alt}" loading="lazy" />
+                  <img class="chat-image-thumb" data-gif-img="${idx}"${srcAttr} alt="${alt}" loading="lazy" />
                 </button>
                 <canvas class="gif-freeze-canvas hidden" data-gif-canvas="${idx}" aria-hidden="true"></canvas>
               </div>
@@ -10196,12 +10955,13 @@ class P2PDirectApp {
 
     if (Array.isArray(payload.videos) && payload.videos.length > 0) {
       const validVideos = payload.videos.filter(
-        (vid) => vid && typeof vid.dataUrl === "string" && SAFE_VIDEO_DATA_URL_RE.test(vid.dataUrl)
+        (vid) => vid && typeof vid.dataUrl === "string" && isSafeVideoDataUrl(vid.dataUrl)
       );
       for (const vid of validVideos) {
         const idx = videoBindings.length;
-        const blob = dataUrlToBlob(vid.dataUrl);
-        const srcUrl = blob ? URL.createObjectURL(blob) : vid.dataUrl;
+        const asyncDecode = vid.dataUrl.length > 65536;
+        const blob = asyncDecode ? null : dataUrlToBlob(vid.dataUrl);
+        const srcUrl = asyncDecode ? "" : blob ? URL.createObjectURL(blob) : vid.dataUrl;
         if (blob && msgId) {
           this._registerMessageMediaUrl(msgId, srcUrl);
         }
@@ -10216,19 +10976,20 @@ class P2PDirectApp {
         videoBindings.push({
           idx,
           blob,
+          asyncDecode,
           dataUrl: vid.dataUrl,
           srcUrl,
           alt: vid.name || "Shared video",
           metaLabel,
         });
+        const vidSrcAttr = srcUrl ? ` src="${srcUrl}"` : "";
         mediaCards.push(`
           <div class="chat-media-card is-video" data-video-card="${idx}">
             <div class="chat-media-stage">
               <span class="chat-media-badge">VIDEO</span>
               <video
                 class="chat-video-player"
-                data-video-el="${idx}"
-                src="${srcUrl}"
+                data-video-el="${idx}"${vidSrcAttr}
                 controls
                 playsinline
                 preload="metadata"
@@ -10453,6 +11214,22 @@ class P2PDirectApp {
       const pauseBtn = article.querySelector(`[data-gif-pause="${g.idx}"]`);
       let isPaused = false;
 
+      if (g.asyncDecode && !g.blob && imgEl) {
+        dataUrlToBlobAsync(g.dataUrl).then((blob) => {
+          if (!this.logMessages.some((item) => item.id === m.id)) return;
+          if (blob) {
+            const url = URL.createObjectURL(blob);
+            g.blob = blob;
+            g.currentUrl = url;
+            this._registerMessageMediaUrl(m.id, url);
+            imgEl.src = url;
+          } else {
+            g.currentUrl = g.dataUrl;
+            imgEl.src = g.dataUrl;
+          }
+        });
+      }
+
       const replayGif = () => {
         if (!imgEl) return;
         isPaused = false;
@@ -10512,7 +11289,7 @@ class P2PDirectApp {
         expBtn.addEventListener("click", () => {
           this.openLightbox({
             kind: "gif",
-            src: g.currentUrl,
+            src: g.currentUrl || g.dataUrl,
             blob: g.blob,
             dataUrl: g.dataUrl,
             alt: g.alt,
@@ -10529,6 +11306,22 @@ class P2PDirectApp {
       const loopBtn = article.querySelector(`[data-video-loop="${v.idx}"]`);
       const replayBtns = article.querySelectorAll(`[data-video-replay="${v.idx}"]`);
       const expandBtn = article.querySelector(`[data-video-expand="${v.idx}"]`);
+
+      if (v.asyncDecode && !v.blob && videoEl) {
+        dataUrlToBlobAsync(v.dataUrl).then((blob) => {
+          if (!this.logMessages.some((item) => item.id === m.id)) return;
+          if (blob) {
+            const url = URL.createObjectURL(blob);
+            v.blob = blob;
+            v.srcUrl = url;
+            this._registerMessageMediaUrl(m.id, url);
+            videoEl.src = url;
+          } else {
+            v.srcUrl = v.dataUrl;
+            videoEl.src = v.dataUrl;
+          }
+        });
+      }
 
       const replayVideo = () => {
         if (!videoEl) return;
@@ -10589,7 +11382,7 @@ class P2PDirectApp {
           }
           this.openLightbox({
             kind: "video",
-            src: v.srcUrl,
+            src: v.srcUrl || v.dataUrl,
             blob: v.blob,
             dataUrl: v.dataUrl,
             alt: v.alt,
