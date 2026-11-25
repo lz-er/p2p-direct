@@ -8,6 +8,74 @@
 
 const LEGACY_DB_NAME = "p2p_direct_mesh_v2";
 const LEGACY_LS_PREFIX = "p2p_direct_profile_v2:";
+const SESSION_NAME_KEY = "p2p-direct-name";
+
+function sanitizeAuthorName(raw) {
+  const clean = String(raw || "").trim().slice(0, 32);
+  return clean || null;
+}
+
+/**
+ * Loads the user's display name for the current browser session.
+ * Uses a browser-session cookie (no Expires / Max-Age, shared across tabs until
+ * browser close) with a sessionStorage fallback — never persisted permanently.
+ */
+export function loadSessionAuthorName() {
+  try {
+    if (typeof document !== "undefined" && typeof document.cookie === "string") {
+      const prefix = `${SESSION_NAME_KEY}=`;
+      const parts = document.cookie.split(";");
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed.startsWith(prefix)) {
+          const decoded = decodeURIComponent(trimmed.slice(prefix.length));
+          const clean = sanitizeAuthorName(decoded);
+          if (clean) return clean;
+        }
+      }
+    }
+  } catch {
+    // ignore cookie restrictions
+  }
+
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      const clean = sanitizeAuthorName(sessionStorage.getItem(SESSION_NAME_KEY));
+      if (clean) return clean;
+    }
+  } catch {
+    // ignore storage restrictions
+  }
+
+  return null;
+}
+
+/**
+ * Saves the user's display name for the current browser session only.
+ * Shared across tabs/new openings within the same browser session; clears on browser close.
+ */
+export function saveSessionAuthorName(name) {
+  const clean = sanitizeAuthorName(name);
+  if (!clean) return;
+
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(SESSION_NAME_KEY, clean);
+    }
+  } catch {
+    // ignore storage restrictions
+  }
+
+  try {
+    if (typeof document !== "undefined") {
+      const secureAttr =
+        typeof location !== "undefined" && location.protocol === "https:" ? "; Secure" : "";
+      document.cookie = `${SESSION_NAME_KEY}=${encodeURIComponent(clean)}; path=/; SameSite=Lax${secureAttr}`;
+    }
+  } catch {
+    // ignore cookie restrictions
+  }
+}
 
 function randomBytes(len) {
   const arr = new Uint8Array(len);
@@ -66,15 +134,21 @@ export function purgeLegacyClientStorage() {
 }
 
 /**
- * Creates a fresh ephemeral in-memory session identity (never persisted to disk).
+ * Creates a fresh ephemeral in-memory session identity (never persisted to disk),
+ * reusing the browser-session display name when present.
  */
 export function createEphemeralProfile() {
   const peerId = `p-${randomHex(6)}`;
   const suffix = peerId.slice(2, 6).toUpperCase();
+  const savedName = loadSessionAuthorName();
+  const authorName = savedName || `Node-${suffix}`;
+  if (!savedName) {
+    saveSessionAuthorName(authorName);
+  }
 
   return {
     peerId,
-    authorName: `Node-${suffix}`,
+    authorName,
     room: "mesh-main",
     autoMeshEnabled: true,
     x25519Secret: randomBase64Url(32),

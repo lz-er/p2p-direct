@@ -4,6 +4,7 @@ import {
   createEphemeralProfile,
   purgeLegacyClientStorage,
   randomBase64Url,
+  saveSessionAuthorName,
 } from "./storage.js";
 
 const ICE_CONFIG = {
@@ -366,6 +367,10 @@ class P2PDirectApp {
     this.profile = null;
     this.status = null;
     this.logMessages = [];
+    this.logRenderState = {
+      mode: "", // "empty" | "raw" | "chat"
+      key: "",
+    };
     this.advancedMode = false;
     this.rawJsonMode = false;
     this.composerMode = "chat";
@@ -785,12 +790,20 @@ class P2PDirectApp {
     this.el["btn-voice-listen"].addEventListener("click", () => this.joinVoiceChat({ listenOnly: true }));
 
     // Identity & Mesh controls
+    this.el["author-name-input"].addEventListener("input", () => {
+      const typed = this.el["author-name-input"].value.trim();
+      if (typed) {
+        saveSessionAuthorName(typed);
+      }
+    });
+
     this.el["author-name-input"].addEventListener("change", () => {
       const next = this.el["author-name-input"].value.trim();
       if (!next) {
         this.el["author-name-input"].value = this.status.authorName;
         return;
       }
+      saveSessionAuthorName(next);
       const res = this.wasm.call({ cmd: "set_profile", authorName: next });
       this.status = res.status;
       this.profile.authorName = next;
@@ -5022,6 +5035,47 @@ class P2PDirectApp {
     return parts.join("");
   }
 
+  buildLogEntryElement(m, isSelf, isNew) {
+    const stripeTheme = peerTileTheme(m.author, isSelf);
+    const isChat =
+      m.type === "chat" &&
+      m.payload &&
+      (typeof m.payload.text === "string" || Array.isArray(m.payload.images));
+    const bodyHtml = isChat
+      ? this.renderChatPayload(m.payload)
+      : `<pre class="log-json-pre">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
+    const typeTag = isChat
+      ? ""
+      : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
+
+    const article = document.createElement("article");
+    article.className = `log-entry${isSelf ? " is-self" : ""}${isNew ? " is-new" : ""}`;
+    article.dataset.msgId = m.id;
+    article.innerHTML = `
+      <div class="msg-stripe ${stripeTheme}" aria-hidden="true"></div>
+      <div class="log-entry-main">
+        <div class="log-entry-head">
+          <div class="log-author-group">
+            <span class="log-author">${escapeHtml(m.authorName)}</span>
+            ${typeTag}
+          </div>
+          <span class="log-order-tuple" title="Order (lamport ${m.lamport}) · ${escapeHtml(m.id)}">
+            ${escapeHtml(formatTime(m.ts))}
+          </span>
+        </div>
+        ${bodyHtml}
+      </div>
+    `;
+
+    for (const btn of article.querySelectorAll("[data-lightbox-src]")) {
+      btn.addEventListener("click", () =>
+        this.openLightbox(btn.dataset.lightboxSrc, btn.dataset.lightboxAlt)
+      );
+    }
+
+    return article;
+  }
+
   renderLog() {
     const feed = this.el["log-feed"];
     const query = this.advancedMode ? this.el["log-search-input"].value.trim().toLowerCase() : "";
@@ -5051,61 +5105,82 @@ class P2PDirectApp {
       const emptyPrompt = this.advancedMode
         ? "No messages yet. Write a message, drop a link, press Ctrl+V to share an image, or send structured JSON."
         : "No messages yet. Write a message, drop a link, or press Ctrl+V to share an image.";
-      feed.innerHTML =
+      const emptyText =
         this.logMessages.length === 0
-          ? `<div class="empty-state">${emptyPrompt}</div>`
-          : '<div class="empty-state">No messages match your current filter.</div>';
+          ? emptyPrompt
+          : "No messages match your current filter.";
+      const emptyKey = `empty:${emptyText}`;
+      if (this.logRenderState.mode === "empty" && this.logRenderState.key === emptyKey) {
+        return;
+      }
+      feed.innerHTML = `<div class="empty-state">${emptyText}</div>`;
+      this.logRenderState = { mode: "empty", key: emptyKey };
       return;
     }
 
     if (this.advancedMode && this.rawJsonMode) {
+      const rawKey = `raw:${filtered.map((m) => m.id).join(",")}`;
+      if (this.logRenderState.mode === "raw" && this.logRenderState.key === rawKey) {
+        return;
+      }
       const jsonl = filtered.map((m) => JSON.stringify(m)).join("\n");
       feed.innerHTML = `<pre class="raw-jsonl-view">${escapeHtml(jsonl)}</pre>`;
+      this.logRenderState = { mode: "raw", key: rawKey };
       return;
     }
 
-    const myId = this.status?.peerId;
-    feed.innerHTML = filtered
-      .map((m) => {
-        const isSelf = m.author === myId;
-        const stripeTheme = peerTileTheme(m.author, isSelf);
-        const isChat =
-          m.type === "chat" &&
-          m.payload &&
-          (typeof m.payload.text === "string" || Array.isArray(m.payload.images));
-        const bodyHtml = isChat
-          ? this.renderChatPayload(m.payload)
-          : `<pre class="log-json-pre">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
-        const typeTag = isChat
-          ? ""
-          : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
-        return `
-          <article class="log-entry${isSelf ? " is-self" : ""}" data-msg-id="${escapeHtml(m.id)}">
-            <div class="msg-stripe ${stripeTheme}" aria-hidden="true"></div>
-            <div class="log-entry-main">
-              <div class="log-entry-head">
-                <div class="log-author-group">
-                  <span class="log-author">${escapeHtml(m.authorName)}</span>
-                  ${typeTag}
-                </div>
-                <span class="log-order-tuple" title="Order (lamport ${m.lamport}) · ${escapeHtml(m.id)}">
-                  ${escapeHtml(formatTime(m.ts))}
-                </span>
-              </div>
-              ${bodyHtml}
-            </div>
-          </article>
-        `;
-      })
-      .join("");
-
-    for (const btn of feed.querySelectorAll("[data-lightbox-src]")) {
-      btn.addEventListener("click", () =>
-        this.openLightbox(btn.dataset.lightboxSrc, btn.dataset.lightboxAlt)
-      );
+    const myId = this.status?.peerId || "";
+    const chatKey = `chat:${myId}:${filtered.map((m) => m.id).join(",")}`;
+    if (this.logRenderState.mode === "chat" && this.logRenderState.key === chatKey) {
+      return;
     }
 
-    feed.scrollTop = feed.scrollHeight;
+    const prevMode = this.logRenderState.mode;
+    const wasNearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 64;
+
+    if (prevMode !== "chat") {
+      feed.innerHTML = "";
+    }
+
+    const existingNodes = new Map();
+    for (const child of Array.from(feed.children)) {
+      const msgId = child.dataset?.msgId;
+      if (msgId) {
+        existingNodes.set(msgId, child);
+      } else {
+        child.remove();
+      }
+    }
+
+    const wantedIds = new Set(filtered.map((m) => m.id));
+    for (const [id, node] of existingNodes.entries()) {
+      if (!wantedIds.has(id)) {
+        node.remove();
+        existingNodes.delete(id);
+      }
+    }
+
+    let addedSelfMessage = false;
+    const animateNew = prevMode === "chat" || prevMode === "empty";
+    for (let i = 0; i < filtered.length; i++) {
+      const m = filtered[i];
+      const isSelf = m.author === myId;
+      let node = existingNodes.get(m.id);
+      if (!node) {
+        node = this.buildLogEntryElement(m, isSelf, animateNew);
+        if (isSelf) addedSelfMessage = true;
+      }
+      const refNode = feed.children[i] || null;
+      if (refNode !== node) {
+        feed.insertBefore(node, refNode);
+      }
+    }
+
+    this.logRenderState = { mode: "chat", key: chatKey };
+
+    if (prevMode !== "chat" || wasNearBottom || addedSelfMessage) {
+      feed.scrollTop = feed.scrollHeight;
+    }
   }
 }
 

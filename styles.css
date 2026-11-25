@@ -1679,6 +1679,9 @@ html[data-advanced="true"] .workbench {
   grid-template-columns: 6px minmax(0, 1fr);
   border-bottom: 1px solid var(--rule-soft);
   background: var(--bg-surface);
+}
+
+.log-entry.is-new {
   animation: curtainIn 160ms ease-out;
 }
 
