@@ -188,10 +188,15 @@ impl RelaySignalBody {
 }
 
 pub const VOICE_PACKET_MAGIC: [u8; 2] = *b"V1";
+pub const VOICE_V2_PACKET_MAGIC: [u8; 2] = *b"V2";
 pub const VOICE_PACKET_HEADER_LEN: usize = 2 + 8 + NONCE_LEN;
 
 fn voice_aad_bytes(sender_id: &str, receiver_id: &str, seq: u64) -> Vec<u8> {
     format!("p2p-voice-v1|{sender_id}->{receiver_id}|{seq}").into_bytes()
+}
+
+fn voice_v2_aad_bytes(sender_id: &str, receiver_id: &str, seq: u64) -> Vec<u8> {
+    format!("p2p-voice-v2|{sender_id}->{receiver_id}|{seq}").into_bytes()
 }
 
 /// Seals a raw IMA ADPCM voice frame into a compact binary ChaCha20-Poly1305 packet:
@@ -214,13 +219,37 @@ pub fn seal_voice_packet(
     out
 }
 
-/// Parses a binary `V1` E2EE voice packet header into `(seq, nonce, ciphertext_with_tag)`.
-pub fn parse_voice_packet_header(packet: &[u8]) -> Result<(u64, [u8; NONCE_LEN], &[u8]), String> {
+/// Seals an opaque high-definition codec payload (e.g. 48 kHz Opus) into a binary `V2`
+/// ChaCha20-Poly1305 packet:
+/// `[b'V', b'2', seq_u64_le (8B), nonce (12B), ciphertext + 16B Poly1305 tag]`.
+pub fn seal_voice_v2_packet(
+    tx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: [u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    raw_payload: &[u8],
+) -> Vec<u8> {
+    let aad = voice_v2_aad_bytes(sender_id, receiver_id, seq);
+    let ciphertext = aead_seal(tx_key, &nonce, &aad, raw_payload);
+    let mut out = Vec::with_capacity(VOICE_PACKET_HEADER_LEN + ciphertext.len());
+    out.extend_from_slice(&VOICE_V2_PACKET_MAGIC);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    out
+}
+
+fn parse_voice_header_with_magic<'a>(
+    packet: &'a [u8],
+    expected_magic: &[u8; 2],
+    label: &str,
+) -> Result<(u64, [u8; NONCE_LEN], &'a [u8]), String> {
     if packet.len() < VOICE_PACKET_HEADER_LEN + 16 {
-        return Err("voice packet shorter than V1 E2EE minimum length".to_owned());
+        return Err(format!("voice packet shorter than {label} E2EE minimum length"));
     }
-    if packet.get(0..2) != Some(&VOICE_PACKET_MAGIC[..]) {
-        return Err("rejected voice packet without V1 E2EE magic header".to_owned());
+    if packet.get(0..2) != Some(&expected_magic[..]) {
+        return Err(format!("rejected voice packet without {label} E2EE magic header"));
     }
     let seq_slice = packet
         .get(2..10)
@@ -239,6 +268,18 @@ pub fn parse_voice_packet_header(packet: &[u8]) -> Result<(u64, [u8; NONCE_LEN],
     Ok((seq, nonce, ct))
 }
 
+/// Parses a binary `V1` E2EE voice packet header into `(seq, nonce, ciphertext_with_tag)`.
+pub fn parse_voice_packet_header(packet: &[u8]) -> Result<(u64, [u8; NONCE_LEN], &[u8]), String> {
+    parse_voice_header_with_magic(packet, &VOICE_PACKET_MAGIC, "V1")
+}
+
+/// Parses a binary `V2` E2EE voice packet header into `(seq, nonce, ciphertext_with_tag)`.
+pub fn parse_voice_v2_packet_header(
+    packet: &[u8],
+) -> Result<(u64, [u8; NONCE_LEN], &[u8]), String> {
+    parse_voice_header_with_magic(packet, &VOICE_V2_PACKET_MAGIC, "V2")
+}
+
 /// Authenticates and decrypts the ADPCM payload of a parsed `V1` E2EE voice packet.
 pub fn open_voice_packet_ciphertext(
     rx_key: &[u8; KEY_LEN],
@@ -249,6 +290,19 @@ pub fn open_voice_packet_ciphertext(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, String> {
     let aad = voice_aad_bytes(sender_id, receiver_id, seq);
+    aead_open(rx_key, nonce, &aad, ciphertext)
+}
+
+/// Authenticates and decrypts the raw codec payload of a parsed `V2` E2EE voice packet.
+pub fn open_voice_v2_packet_ciphertext(
+    rx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: &[u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let aad = voice_v2_aad_bytes(sender_id, receiver_id, seq);
     aead_open(rx_key, nonce, &aad, ciphertext)
 }
 

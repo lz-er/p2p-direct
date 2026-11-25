@@ -69,11 +69,18 @@ const DIRECT_HARD_TIMEOUT_MS = 14000;
 const RELAY_INACTIVITY_TIMEOUT_MS = 22000;
 const DIRECT_UPGRADE_INTERVAL_MS = 45000;
 const DIRECT_UPGRADE_MAX_ATTEMPTS = 2;
-const VOICE_RELAY_BATCH_MS = 80;
-const VOICE_RELAY_MAX_FRAMES = 4;
+const VOICE_RELAY_BATCH_MS = 60;
+const VOICE_RELAY_MAX_FRAMES = 3;
 
 const VOICE_SAMPLE_RATE = 16000;
-const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16kHz wideband
+const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16kHz legacy ADPCM V1 (bots & fallback browsers)
+const VOICE_HD_SAMPLE_RATE = 48000;
+const VOICE_HD_FRAME_SAMPLES = 960; // 20ms @ 48kHz fullband Opus V2
+const VOICE_V2_CODEC_OPUS48 = 1;
+const VOICE_V2_HEADER_BYTES = 8; // [codecId:u8, sampleRateKhz:u8, rms:u16le, tsSamples:u32le]
+const VOICE_OPUS_BITRATE_DIRECT = 96000; // 96 kbps VBR fullband 48kHz mono (~240B/frame)
+const VOICE_OPUS_BITRATE_RAW = 128000;   // 128 kbps VBR studio/music preset on Direct P2P
+const VOICE_OPUS_BITRATE_RELAY = 64000;  // 64 kbps VBR fullband 48kHz mono (~160B/frame, smaller than 16kHz ADPCM)
 
 const AUDIO_PRESETS = Object.freeze({
   voice: {
@@ -111,49 +118,368 @@ const AUDIO_PRESETS = Object.freeze({
   },
 });
 
-const VOICE_CAPTURE_WORKLET_CODE = `
+const VOICE_WORKLETS_CODE = `
 class P2PVoiceCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.targetRate = ${VOICE_SAMPLE_RATE};
-    this.frameSize = ${VOICE_FRAME_SAMPLES};
+    this.targetRate = ${VOICE_HD_SAMPLE_RATE};
+    this.frameSize = ${VOICE_HD_FRAME_SAMPLES};
+    this.isDirect = Math.abs(sampleRate - this.targetRate) < 1;
     this.step = sampleRate / this.targetRate;
-    this.inBuf = [];
-    this.phase = 0;
-    this.frame = new Int16Array(this.frameSize);
+    this.ringCap = 8192;
+    this.ringMask = 8191;
+    this.ring = new Float32Array(this.ringCap);
+    this.writeIdx = 0;
+    this.readPos = 0;
+    this.frame = new Float32Array(this.frameSize);
     this.frameIdx = 0;
+    this.needPreLpf = sampleRate > this.targetRate + 100;
+    this.lpfAlpha = this.needPreLpf
+      ? Math.min(1, (2 * Math.PI * 20000) / (sampleRate + 2 * Math.PI * 20000))
+      : 1;
+    this.lpfState = 0;
   }
+
   process(inputs) {
     const input = inputs[0];
     if (!input || !input[0] || input[0].length === 0) {
       return true;
     }
     const ch = input[0];
-    for (let i = 0; i < ch.length; i++) {
-      this.inBuf.push(ch[i]);
+    const len = ch.length;
+
+    if (this.isDirect) {
+      for (let i = 0; i < len; i++) {
+        this.frame[this.frameIdx++] = ch[i];
+        if (this.frameIdx >= this.frameSize) {
+          const out = new Float32Array(this.frame);
+          this.port.postMessage(out, [out.buffer]);
+          this.frameIdx = 0;
+        }
+      }
+      return true;
     }
-    while (this.phase + 1 < this.inBuf.length) {
-      const idx = Math.floor(this.phase);
-      const frac = this.phase - idx;
-      const sample = this.inBuf[idx] * (1 - frac) + this.inBuf[idx + 1] * frac;
-      const clamped = Math.max(-1, Math.min(1, sample));
-      this.frame[this.frameIdx++] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
-      this.phase += this.step;
+
+    const ring = this.ring;
+    const mask = this.ringMask;
+    let w = this.writeIdx;
+    if (this.needPreLpf) {
+      const a = this.lpfAlpha;
+      let y = this.lpfState;
+      for (let i = 0; i < len; i++) {
+        y += a * (ch[i] - y);
+        ring[w & mask] = y;
+        w++;
+      }
+      this.lpfState = y;
+    } else {
+      for (let i = 0; i < len; i++) {
+        ring[w & mask] = ch[i];
+        w++;
+      }
+    }
+    this.writeIdx = w;
+
+    if (this.writeIdx - this.readPos > this.ringCap - 256) {
+      this.readPos = this.writeIdx - this.frameSize * 2;
+    }
+
+    while (this.readPos + 2 < this.writeIdx) {
+      const idx = Math.floor(this.readPos);
+      const t = this.readPos - idx;
+      const y0 = ring[(idx - 1) & mask];
+      const y1 = ring[idx & mask];
+      const y2 = ring[(idx + 1) & mask];
+      const y3 = ring[(idx + 2) & mask];
+      const a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+      const a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+      const a2 = -0.5 * y0 + 0.5 * y2;
+      const sample = ((a0 * t + a1) * t + a2) * t + y1;
+      this.frame[this.frameIdx++] = sample > 1 ? 1 : sample < -1 ? -1 : sample;
+      this.readPos += this.step;
       if (this.frameIdx >= this.frameSize) {
-        const out = this.frame.slice();
+        const out = new Float32Array(this.frame);
         this.port.postMessage(out, [out.buffer]);
         this.frameIdx = 0;
       }
     }
-    const drop = Math.floor(this.phase);
-    if (drop > 0) {
-      this.inBuf = this.inBuf.slice(drop);
-      this.phase -= drop;
+
+    if (this.readPos > 1048576) {
+      const shift = Math.floor(this.readPos / this.ringCap) * this.ringCap;
+      this.readPos -= shift;
+      this.writeIdx -= shift;
     }
     return true;
   }
 }
+
+class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.cap = 32768;
+    this.mask = 32767;
+    this.ring = new Float32Array(this.cap);
+    this.writeIdx = 0;
+    this.readPos = 0;
+    this.playing = false;
+    this.targetMs = 26;
+    this.maxMs = 140;
+    this.targetSamples = Math.round((this.targetMs * sampleRate) / 1000);
+    this.maxSamples = Math.round((this.maxMs * sampleRate) / 1000);
+    this.jitterMs = 0;
+    this.lastBurstFrame = -1;
+    this.curBurstMs = 0;
+    this.prevBurstMs = 20;
+    this.fadeInTotal = Math.max(64, Math.round(sampleRate * 0.004));
+    this.fadeInPos = this.fadeInTotal;
+    this.plcCount = 0;
+    this.plcMax = Math.max(128, Math.round(sampleRate * 0.01));
+    this.lastOut = 0;
+    this.xfadeLen = 64;
+    this.xfadeBuf = new Float32Array(this.xfadeLen);
+    this.xfadePos = this.xfadeLen;
+    this.rsRate = 0;
+    this.rsPrev0 = 0;
+    this.rsPrev1 = 0;
+    this.rsPrev2 = 0;
+    this.rsPhase = 0;
+    this.curRate = 1.0;
+
+    this.port.onmessage = (ev) => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.type === "config") {
+        if (typeof msg.targetMs === "number" && msg.targetMs > 0) {
+          this.targetMs = msg.targetMs;
+          this.targetSamples = Math.round((this.targetMs * sampleRate) / 1000);
+        }
+        if (typeof msg.maxMs === "number" && msg.maxMs > 0) {
+          this.maxMs = msg.maxMs;
+          this.maxSamples = Math.round((this.maxMs * sampleRate) / 1000);
+        }
+        return;
+      }
+      if (msg.type === "reset") {
+        this.writeIdx = 0;
+        this.readPos = 0;
+        this.playing = false;
+        this.jitterMs = 0;
+        this.lastBurstFrame = -1;
+        this.curBurstMs = 0;
+        this.prevBurstMs = 20;
+        this.plcCount = 0;
+        this.lastOut = 0;
+        this.xfadePos = this.xfadeLen;
+        this.rsRate = 0;
+        this.rsPhase = 0;
+        this.curRate = 1.0;
+        return;
+      }
+      if (msg.type === "pcm" && msg.samples && msg.samples.length > 0) {
+        this.pushPcm(msg.samples, msg.rate || sampleRate);
+      }
+    };
+  }
+
+  effectiveTargetSamples() {
+    const dynamicMs = this.targetMs + Math.min(this.jitterMs * 1.25, this.maxMs * 0.45);
+    const dynSamples = Math.round((dynamicMs * sampleRate) / 1000);
+    return Math.min(Math.round(this.maxSamples * 0.7), Math.max(this.targetSamples, dynSamples));
+  }
+
+  pushPcm(samples, inRate) {
+    const n = samples.length;
+    const frameMs = (n * 1000) / inRate;
+    if (this.lastBurstFrame < 0) {
+      this.lastBurstFrame = currentFrame;
+      this.curBurstMs = frameMs;
+      this.prevBurstMs = frameMs;
+    } else {
+      const elapsedMs = ((currentFrame - this.lastBurstFrame) * 1000) / sampleRate;
+      if (elapsedMs <= 4) {
+        // Same bundled burst (e.g. relay VB frame bundle)
+        this.curBurstMs += frameMs;
+      } else if (elapsedMs > 400) {
+        this.jitterMs = 0;
+        this.prevBurstMs = frameMs;
+        this.curBurstMs = frameMs;
+        this.lastBurstFrame = currentFrame;
+      } else {
+        const expectedMs = this.curBurstMs > 0 ? this.curBurstMs : this.prevBurstMs;
+        const diff = Math.abs(elapsedMs - expectedMs);
+        this.jitterMs = this.jitterMs * 0.9 + Math.min(diff, 100) * 0.1;
+        this.prevBurstMs = expectedMs;
+        this.curBurstMs = frameMs;
+        this.lastBurstFrame = currentFrame;
+      }
+    }
+
+    const ring = this.ring;
+    const mask = this.mask;
+    let w = this.writeIdx;
+
+    if (Math.abs(inRate - sampleRate) < 1) {
+      for (let i = 0; i < n; i++) {
+        ring[w & mask] = samples[i];
+        w++;
+      }
+    } else {
+      if (this.rsRate !== inRate) {
+        this.rsRate = inRate;
+        this.rsPrev0 = samples[0];
+        this.rsPrev1 = samples[0];
+        this.rsPrev2 = samples[0];
+        this.rsPhase = 0;
+      }
+      const step = inRate / sampleRate;
+      const getS = (idx) => {
+        if (idx >= 0) return idx < n ? samples[idx] : samples[n - 1];
+        if (idx === -1) return this.rsPrev2;
+        if (idx === -2) return this.rsPrev1;
+        return this.rsPrev0;
+      };
+      let pos = this.rsPhase - 2;
+      const limit = Math.max(0, n - 2);
+      while (pos < limit) {
+        const idx = Math.floor(pos);
+        const t = pos - idx;
+        const y0 = getS(idx - 1);
+        const y1 = getS(idx);
+        const y2 = getS(idx + 1);
+        const y3 = getS(idx + 2);
+        const a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+        const a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+        const a2 = -0.5 * y0 + 0.5 * y2;
+        const s = ((a0 * t + a1) * t + a2) * t + y1;
+        ring[w & mask] = s > 1 ? 1 : s < -1 ? -1 : s;
+        w++;
+        pos += step;
+      }
+      this.rsPhase = (pos + 2) - n;
+      if (n >= 3) {
+        this.rsPrev0 = samples[n - 3];
+        this.rsPrev1 = samples[n - 2];
+        this.rsPrev2 = samples[n - 1];
+      } else {
+        for (let i = 0; i < n; i++) {
+          this.rsPrev0 = this.rsPrev1;
+          this.rsPrev1 = this.rsPrev2;
+          this.rsPrev2 = samples[i];
+        }
+      }
+    }
+    this.writeIdx = w;
+
+    const avail = this.writeIdx - this.readPos;
+    const hardCap = Math.min(this.cap - 1024, Math.max(this.maxSamples, this.targetSamples * 3));
+    if (avail > hardCap) {
+      if (this.playing) {
+        const base = Math.floor(this.readPos);
+        for (let i = 0; i < this.xfadeLen; i++) {
+          this.xfadeBuf[i] = ring[(base + i) & mask];
+        }
+        this.xfadePos = 0;
+      }
+      this.readPos = this.writeIdx - this.effectiveTargetSamples();
+    }
+  }
+
+  process(_inputs, outputs) {
+    const out = outputs[0]?.[0];
+    if (!out || out.length === 0) {
+      return true;
+    }
+    const len = out.length;
+    const ring = this.ring;
+    const mask = this.mask;
+    const effTarget = this.effectiveTargetSamples();
+    let avail = this.writeIdx - this.readPos;
+
+    if (!this.playing) {
+      if (avail < effTarget) {
+        out.fill(0);
+        return true;
+      }
+      this.playing = true;
+      this.fadeInPos = 0;
+      this.plcCount = 0;
+      this.curRate = 1.0;
+    }
+
+    const err = avail - effTarget;
+    const deadband = Math.max(240, effTarget * 0.25);
+    let desiredRate = 1.0;
+    if (err > deadband) {
+      const over = err - deadband;
+      const maxBoost = avail > this.maxSamples * 0.75 ? 0.012 : 0.004;
+      desiredRate = 1.0 + Math.min(maxBoost, over / (sampleRate * 2.2));
+    } else if (err < -deadband) {
+      const under = -err - deadband;
+      desiredRate = 1.0 - Math.min(0.004, under / (sampleRate * 2.2));
+    }
+    this.curRate = this.curRate * 0.92 + desiredRate * 0.08;
+    const step = this.curRate;
+
+    for (let i = 0; i < len; i++) {
+      avail = this.writeIdx - this.readPos;
+      let sample = 0;
+      if (avail >= 2) {
+        this.plcCount = 0;
+        const idx = Math.floor(this.readPos);
+        const frac = this.readPos - idx;
+        if (frac < 1e-6) {
+          sample = ring[idx & mask];
+        } else {
+          const s0 = ring[idx & mask];
+          const s1 = ring[(idx + 1) & mask];
+          sample = s0 + (s1 - s0) * frac;
+        }
+        this.readPos += step;
+        this.lastOut = sample;
+      } else if (avail >= 1) {
+        this.plcCount = 0;
+        sample = ring[Math.floor(this.readPos) & mask];
+        this.readPos = this.writeIdx;
+        this.lastOut = sample;
+      } else {
+        this.plcCount++;
+        if (this.plcCount <= this.plcMax) {
+          const t = this.plcCount / this.plcMax;
+          const env = 0.5 * (1 + Math.cos(Math.PI * t));
+          sample = this.lastOut * env;
+        } else {
+          sample = 0;
+          this.lastOut = 0;
+          this.playing = false;
+        }
+      }
+
+      if (this.xfadePos < this.xfadeLen) {
+        const w = this.xfadePos / this.xfadeLen;
+        sample = this.xfadeBuf[this.xfadePos] * (1 - w) + sample * w;
+        this.xfadePos++;
+      }
+
+      if (this.fadeInPos < this.fadeInTotal) {
+        const w = 0.5 * (1 - Math.cos((Math.PI * this.fadeInPos) / this.fadeInTotal));
+        sample *= w;
+        this.fadeInPos++;
+      }
+
+      out[i] = sample;
+    }
+
+    if (this.readPos > 1048576) {
+      const shift = Math.floor(this.readPos / this.cap) * this.cap;
+      this.readPos -= shift;
+      this.writeIdx -= shift;
+    }
+    return true;
+  }
+}
+
 registerProcessor("p2p-voice-capture", P2PVoiceCaptureProcessor);
+registerProcessor("p2p-voice-playback", P2PVoicePlaybackProcessor);
 `;
 
 const STRUCTURED_PRESETS = {
@@ -226,6 +552,90 @@ function computePcmRms(int16Pcm) {
     sumSq += s * s;
   }
   return Math.round(Math.sqrt(sumSq / int16Pcm.length));
+}
+
+function computeFloat32RmsI16Scale(float32Pcm) {
+  if (!float32Pcm || float32Pcm.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < float32Pcm.length; i++) {
+    const s = float32Pcm[i];
+    sumSq += s * s;
+  }
+  return Math.min(32767, Math.round(Math.sqrt(sumSq / float32Pcm.length) * 32768));
+}
+
+// 15-tap Blackman-windowed sinc low-pass FIR (fc = 7.0 kHz @ 48 kHz) for alias-free 3:1 V1 downsampling
+const VOICE_V1_FIR_TAPS = (() => {
+  const numTaps = 15;
+  const mid = (numTaps - 1) / 2;
+  const fc = 7000 / VOICE_HD_SAMPLE_RATE;
+  const taps = new Float32Array(numTaps);
+  let sum = 0;
+  for (let i = 0; i < numTaps; i++) {
+    const n = i - mid;
+    const sinc = n === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * n) / (Math.PI * n);
+    const w =
+      0.42 -
+      0.5 * Math.cos((2 * Math.PI * i) / (numTaps - 1)) +
+      0.08 * Math.cos((4 * Math.PI * i) / (numTaps - 1));
+    taps[i] = sinc * w;
+    sum += taps[i];
+  }
+  for (let i = 0; i < numTaps; i++) {
+    taps[i] /= sum;
+  }
+  return taps;
+})();
+
+function extractFloat32FromAudioData(audioData) {
+  const n = audioData.numberOfFrames;
+  const ch = audioData.numberOfChannels || 1;
+  const fmt = audioData.format || "f32-planar";
+  if (fmt === "f32-planar" || (fmt === "f32" && ch === 1)) {
+    const out = new Float32Array(n);
+    audioData.copyTo(out, { planeIndex: 0 });
+    return out;
+  }
+  if (fmt === "f32") {
+    const interleaved = new Float32Array(n * ch);
+    audioData.copyTo(interleaved, { planeIndex: 0 });
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = interleaved[i * ch];
+    return out;
+  }
+  if (fmt === "s16-planar" || (fmt === "s16" && ch === 1)) {
+    const tmp = new Int16Array(n);
+    audioData.copyTo(tmp, { planeIndex: 0 });
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = tmp[i] / 32768;
+    return out;
+  }
+  if (fmt === "s16") {
+    const tmp = new Int16Array(n * ch);
+    audioData.copyTo(tmp, { planeIndex: 0 });
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = tmp[i * ch] / 32768;
+    return out;
+  }
+  if (fmt === "s32-planar" || fmt === "s32") {
+    const stride = fmt === "s32" ? ch : 1;
+    const tmp = new Int32Array(n * stride);
+    audioData.copyTo(tmp, { planeIndex: 0 });
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = tmp[i * stride] / 2147483648;
+    return out;
+  }
+  if (fmt === "u8-planar" || fmt === "u8") {
+    const stride = fmt === "u8" ? ch : 1;
+    const tmp = new Uint8Array(n * stride);
+    audioData.copyTo(tmp, { planeIndex: 0 });
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = (tmp[i * stride] - 128) / 128;
+    return out;
+  }
+  const fallback = new Float32Array(n);
+  audioData.copyTo(fallback, { planeIndex: 0, format: "f32-planar" });
+  return fallback;
 }
 
 function randomId(prefix) {
@@ -555,12 +965,23 @@ class P2PDirectApp {
     // Personal audio settings (session-only; zero permanent storage)
     this.audioSettings = loadSessionAudioSettings();
 
+    // Negotiated voice codec capability per peer ("opus48" | "adpcm16")
+    this.peerVoiceCodec = new Map();
+
     // Real-time multi-peer voice channel state
     this.voice = {
       inVoice: false,
       muted: false,
       deafened: false,
       listenOnly: false,
+      opusSupported: false,
+      opusUseRichConfig: false,
+      opusEncoder: null,
+      opusEncoderBitrate: 0,
+      opusTxSampleCounter: 0,
+      opusPendingMeta: [],
+      workletsLoaded: false,
+      workletsLoadingPromise: null,
       audioCtx: null,
       micStream: null,
       micSource: null,
@@ -573,12 +994,16 @@ class P2PDirectApp {
       captureNode: null,
       silentGain: null,
       masterGain: null,
+      masterLimiter: null,
       gateOpenUntil: 0,
       gateClosed: false,
+      gateWasOpen: false,
+      gateFadeOutPending: false,
+      v1DownsampleTail: new Float32Array(VOICE_V1_FIR_TAPS.length - 1),
       settingsOpen: false,
       preCallMonitor: null, // { ctx, stream, source, highPass, presence, compressor, micGain, monitorGain, analyser, timer }
       audioDevices: [],
-      peerMixers: new Map(), // peerId -> { gainNode, volume, muted, nextPlayTime, rms, smoothLevel, lastAudioAt, packetsReceived }
+      peerMixers: new Map(), // peerId -> { gainNode, playbackNode, opusDecoder, codec, isRelayed, volume, muted, nextPlayTime, rms, smoothLevel, lastAudioAt, packetsReceived, decodedFrames }
       joinOrder: [], // ordered participant keys (peerId or "self") so cards never jump when joining
       localRms: 0,
       localSmoothLevel: 0,
@@ -1353,9 +1778,11 @@ class P2PDirectApp {
 
     this.wasm = await SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm");
     this.iceConfig = buildIceConfig();
+    await this.probeVoiceOpusSupport();
+    this.updateVoiceCodecMeta();
     this.addTelemetry(
       "engine",
-      "In-memory encrypted session ready (Direct P2P STUN + automatic E2EE Relay fallback — zero TURN)"
+      `In-memory encrypted session ready (Direct P2P STUN + E2EE Relay fallback · ${this.voice.opusSupported ? "48 kHz Opus HD" : "16 kHz ADPCM fallback"})`
     );
 
     const initRes = this.wasm.call({
@@ -2100,6 +2527,7 @@ class P2PDirectApp {
       connectedPeers: Array.from(this.directPeers.keys()),
       peerCount: this.directPeers.size,
       logCount: this.logMessages.length,
+      vcodec: this.getLocalVoiceCodec(),
       requestReply: Boolean(requestReply),
     });
   }
@@ -2114,6 +2542,9 @@ class P2PDirectApp {
 
     switch (msg.type) {
       case "mesh-beacon": {
+        if (msg.peerId && msg.vcodec) {
+          this.recordPeerVoiceCodec(msg.peerId, msg.vcodec);
+        }
         const myFp = this.status.e2ee.keyFingerprint;
         if (msg.requestReply) {
           this.broadcastMeshBeacon(false);
@@ -3198,6 +3629,7 @@ class P2PDirectApp {
       pk: this.status.e2ee.publicKey,
       peers: Array.from(this.directPeers.keys()),
       relays: status.connectedUrls || [],
+      vcodec: this.getLocalVoiceCodec(),
       reply: Boolean(requestReply),
       ts: Date.now(),
     });
@@ -3233,6 +3665,7 @@ class P2PDirectApp {
     switch (msg.t) {
       case "hello": {
         if (!msg.from || !msg.pk) return;
+        this.recordPeerVoiceCodec(msg.from, msg.vcodec === "opus48" ? "opus48" : "adpcm16");
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
 
@@ -3265,6 +3698,7 @@ class P2PDirectApp {
       case "offer": {
         await this._ensureRoomMyTag();
         if (msg.from && msg.pk) {
+          this.recordPeerVoiceCodec(msg.from, msg.vcodec === "opus48" ? "opus48" : "adpcm16");
           await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
         }
         await this.acceptRoomOffer(msg);
@@ -3272,6 +3706,9 @@ class P2PDirectApp {
       }
 
       case "answer": {
+        if (msg.from) {
+          this.recordPeerVoiceCodec(msg.from, msg.vcodec === "opus48" ? "opus48" : "adpcm16");
+        }
         await this.applyRoomAnswer(msg);
         break;
       }
@@ -3292,6 +3729,7 @@ class P2PDirectApp {
 
       case "relay-open": {
         if (!msg.from || !msg.pk) return;
+        this.recordPeerVoiceCodec(msg.from, msg.vcodec === "opus48" ? "opus48" : "adpcm16");
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
         const existing = this.directPeers.get(msg.from);
@@ -3306,6 +3744,7 @@ class P2PDirectApp {
           name: this.status.authorName,
           pk: this.status.e2ee.publicKey,
           relays: status?.connectedUrls || [],
+          vcodec: this.getLocalVoiceCodec(),
         });
         await this.openRelayVirtualPeer(msg.from, msg.name || "Peer", msg.pk);
         break;
@@ -3313,6 +3752,7 @@ class P2PDirectApp {
 
       case "relay-ack": {
         if (!msg.from || !msg.pk) return;
+        this.recordPeerVoiceCodec(msg.from, msg.vcodec === "opus48" ? "opus48" : "adpcm16");
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
         const pending = this.relayPendingOpens.get(msg.from);
@@ -3382,6 +3822,7 @@ class P2PDirectApp {
         name: this.status.authorName,
         pk: this.status.e2ee.publicKey,
         relays: status?.connectedUrls || [],
+        vcodec: this.getLocalVoiceCodec(),
       });
     };
 
@@ -3843,6 +4284,7 @@ class P2PDirectApp {
         name: this.status.authorName,
         pk: this.status.e2ee.publicKey,
         relays: status?.connectedUrls || [],
+        vcodec: this.getLocalVoiceCodec(),
         sdp: fullSdp,
       });
 
@@ -3982,6 +4424,7 @@ class P2PDirectApp {
         name: this.status.authorName,
         pk: this.status.e2ee.publicKey,
         relays: status?.connectedUrls || [],
+        vcodec: this.getLocalVoiceCodec(),
         sdp: fullSdp,
       });
 
@@ -4604,6 +5047,7 @@ class P2PDirectApp {
     this.syncAudioSettingsUI();
     this.applyLiveAudioDspParams(true);
     this.applyMicTrackConstraints();
+    this.updateVoiceCodecMeta();
     this.showToast(
       `Audio preset: ${presetName === "raw" ? "Raw / Music" : presetName[0].toUpperCase() + presetName.slice(1)}`
     );
@@ -4617,6 +5061,7 @@ class P2PDirectApp {
     this.syncAudioSettingsUI();
     this.applyLiveAudioDspParams(true);
     this.applyMicTrackConstraints();
+    this.updateVoiceCodecMeta();
     this.showToast("Audio settings reset to defaults");
   }
 
@@ -4649,7 +5094,8 @@ class P2PDirectApp {
       echoCancellation: Boolean(s.echoCancellation),
       noiseSuppression: Boolean(s.noiseSuppression),
       autoGainControl: Boolean(s.autoGainControl),
-      channelCount: 1,
+      channelCount: { ideal: 1 },
+      sampleRate: { ideal: VOICE_HD_SAMPLE_RATE },
     };
     if (s.deviceId) {
       audio.deviceId = { ideal: s.deviceId };
@@ -5025,23 +5471,219 @@ class P2PDirectApp {
     };
   }
 
+  async probeVoiceOpusSupport() {
+    this.voice.opusSupported = false;
+    this.voice.opusUseRichConfig = false;
+    if (
+      typeof AudioEncoder !== "function" ||
+      typeof AudioDecoder !== "function" ||
+      typeof AudioData !== "function" ||
+      typeof EncodedAudioChunk !== "function" ||
+      typeof AudioEncoder.isConfigSupported !== "function" ||
+      typeof AudioDecoder.isConfigSupported !== "function"
+    ) {
+      return false;
+    }
+    try {
+      const decSupport = await AudioDecoder.isConfigSupported({
+        codec: "opus",
+        sampleRate: VOICE_HD_SAMPLE_RATE,
+        numberOfChannels: 1,
+      });
+      if (!decSupport || !decSupport.supported) {
+        return false;
+      }
+      const richCfg = {
+        codec: "opus",
+        sampleRate: VOICE_HD_SAMPLE_RATE,
+        numberOfChannels: 1,
+        bitrate: VOICE_OPUS_BITRATE_DIRECT,
+        bitrateMode: "variable",
+        opus: {
+          frameDuration: 20000,
+          application: "audio",
+          complexity: 8,
+          useinbandfec: true,
+        },
+      };
+      try {
+        const richSupport = await AudioEncoder.isConfigSupported(richCfg);
+        if (richSupport && richSupport.supported) {
+          this.voice.opusSupported = true;
+          this.voice.opusUseRichConfig = true;
+          return true;
+        }
+      } catch {
+        // Older WebCodecs implementations may reject nested opus options; fall through to basic config
+      }
+      const basicSupport = await AudioEncoder.isConfigSupported({
+        codec: "opus",
+        sampleRate: VOICE_HD_SAMPLE_RATE,
+        numberOfChannels: 1,
+        bitrate: VOICE_OPUS_BITRATE_DIRECT,
+      });
+      if (basicSupport && basicSupport.supported) {
+        this.voice.opusSupported = true;
+        this.voice.opusUseRichConfig = false;
+        return true;
+      }
+    } catch {
+      this.voice.opusSupported = false;
+    }
+    return false;
+  }
+
+  getLocalVoiceCodec() {
+    return this.voice.opusSupported ? "opus48" : "adpcm16";
+  }
+
+  recordPeerVoiceCodec(peerId, codec) {
+    if (!peerId) return;
+    const normalized = codec === "opus48" ? "opus48" : "adpcm16";
+    this.peerVoiceCodec.set(peerId, normalized);
+  }
+
+  getPeerVoiceCodec(peerId) {
+    const known = this.peerVoiceCodec.get(peerId);
+    if (known) return known;
+    const peerInfo = this.status?.peers?.find((p) => p.peerId === peerId);
+    if (peerInfo?.isBot) return "adpcm16";
+    return this.voice.opusSupported ? "opus48" : "adpcm16";
+  }
+
+  computeDesiredOpusBitrate() {
+    const voicePeers = (this.status?.peers || []).filter((p) => p.inVoice);
+    let anyOpusOnRelay = false;
+    for (const p of voicePeers) {
+      if (this.getPeerVoiceCodec(p.peerId) !== "opus48") continue;
+      const direct = this.directPeers.get(p.peerId);
+      if (direct && direct.transport === "relay") {
+        anyOpusOnRelay = true;
+        break;
+      }
+    }
+    if (anyOpusOnRelay) return VOICE_OPUS_BITRATE_RELAY;
+    if (this.audioSettings.preset === "raw") return VOICE_OPUS_BITRATE_RAW;
+    return VOICE_OPUS_BITRATE_DIRECT;
+  }
+
+  updateVoiceCodecMeta() {
+    const el = this.el["voice-codec-meta"];
+    if (!el) return;
+    if (!this.voice.opusSupported) {
+      el.textContent = "End-to-end encrypted · 16 kHz ADPCM (fallback)";
+      return;
+    }
+    const bitrate = this.voice.opusEncoderBitrate || this.computeDesiredOpusBitrate();
+    const kbps = Math.round(bitrate / 1000);
+    const suffix = bitrate === VOICE_OPUS_BITRATE_RELAY ? " (Relay)" : "";
+    el.textContent = `End-to-end encrypted · 48 kHz Opus · ${kbps} kbps${suffix}`;
+  }
+
   ensureVoiceAudioContext() {
     if (!this.voice.audioCtx) {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) {
         throw new Error("Web Audio API is not supported in this browser.");
       }
-      const ctx = new AudioCtx();
+      let ctx;
+      try {
+        ctx = new AudioCtx({
+          latencyHint: "interactive",
+          sampleRate: VOICE_HD_SAMPLE_RATE,
+        });
+      } catch {
+        try {
+          ctx = new AudioCtx({ latencyHint: "interactive" });
+        } catch {
+          ctx = new AudioCtx();
+        }
+      }
       const masterGain = ctx.createGain();
       masterGain.gain.value = this.voice.deafened ? 0 : this.audioSettings.outputGain / 100;
-      masterGain.connect(ctx.destination);
+
+      // Transparent brickwall safety limiter prevents multi-speaker digital clipping
+      let masterLimiter = null;
+      if (typeof ctx.createDynamicsCompressor === "function") {
+        masterLimiter = ctx.createDynamicsCompressor();
+        masterLimiter.threshold.value = -2.0;
+        masterLimiter.knee.value = 6.0;
+        masterLimiter.ratio.value = 12.0;
+        masterLimiter.attack.value = 0.002;
+        masterLimiter.release.value = 0.06;
+        masterGain.connect(masterLimiter);
+        masterLimiter.connect(ctx.destination);
+      } else {
+        masterGain.connect(ctx.destination);
+      }
+
       this.voice.audioCtx = ctx;
       this.voice.masterGain = masterGain;
+      this.voice.masterLimiter = masterLimiter;
+      this.voice.workletsLoaded = false;
+      this.voice.workletsLoadingPromise = null;
     }
     if (this.voice.audioCtx.state === "suspended") {
       this.voice.audioCtx.resume().catch(() => {});
     }
     return this.voice.audioCtx;
+  }
+
+  async ensureVoiceWorkletsLoaded(ctx) {
+    if (!ctx || !ctx.audioWorklet || typeof AudioWorkletNode !== "function") {
+      return false;
+    }
+    if (this.voice.workletsLoaded && this.voice.audioCtx === ctx) {
+      return true;
+    }
+    if (this.voice.workletsLoadingPromise) {
+      return this.voice.workletsLoadingPromise;
+    }
+    this.voice.workletsLoadingPromise = (async () => {
+      try {
+        const blob = new Blob([VOICE_WORKLETS_CODE], { type: "application/javascript" });
+        const url = URL.createObjectURL(blob);
+        try {
+          await ctx.audioWorklet.addModule(url);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+        if (this.voice.audioCtx === ctx) {
+          this.voice.workletsLoaded = true;
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      } finally {
+        this.voice.workletsLoadingPromise = null;
+      }
+    })();
+    return this.voice.workletsLoadingPromise;
+  }
+
+  _attachPlaybackWorklet(ctx, mixer, isRelayed) {
+    if (mixer.playbackNode || !this.voice.workletsLoaded || typeof AudioWorkletNode !== "function") {
+      return Boolean(mixer.playbackNode);
+    }
+    try {
+      const node = new AudioWorkletNode(ctx, "p2p-voice-playback", {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      node.connect(mixer.gainNode);
+      node.port.postMessage({
+        type: "config",
+        targetMs: isRelayed ? 68 : 26,
+        maxMs: isRelayed ? 240 : 140,
+      });
+      mixer.playbackNode = node;
+      mixer.isRelayed = Boolean(isRelayed);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   ensurePeerVoiceMixer(peerId) {
@@ -5051,8 +5693,14 @@ class P2PDirectApp {
       const gainNode = ctx.createGain();
       gainNode.gain.value = 1.0;
       gainNode.connect(this.voice.masterGain);
+      const direct = this.directPeers.get(peerId);
+      const isRelayed = direct?.transport === "relay";
       mixer = {
         gainNode,
+        playbackNode: null,
+        opusDecoder: null,
+        codec: this.getPeerVoiceCodec(peerId),
+        isRelayed: Boolean(isRelayed),
         volume: 1.0,
         muted: false,
         nextPlayTime: 0,
@@ -5060,10 +5708,295 @@ class P2PDirectApp {
         smoothLevel: 0,
         lastAudioAt: 0,
         packetsReceived: 0,
+        decodedFrames: 0,
       };
+      this._attachPlaybackWorklet(ctx, mixer, isRelayed);
       this.voice.peerMixers.set(peerId, mixer);
     }
     return mixer;
+  }
+
+  disposePeerVoiceMixer(peerId) {
+    const mixer = this.voice.peerMixers.get(peerId);
+    if (!mixer) return;
+    if (mixer.opusDecoder) {
+      try {
+        if (mixer.opusDecoder.state !== "closed") {
+          mixer.opusDecoder.close();
+        }
+      } catch {
+        // ignore
+      }
+      mixer.opusDecoder = null;
+    }
+    if (mixer.playbackNode) {
+      try {
+        mixer.playbackNode.port.postMessage({ type: "reset" });
+        mixer.playbackNode.disconnect();
+      } catch {
+        // ignore
+      }
+      mixer.playbackNode = null;
+    }
+    try {
+      mixer.gainNode.disconnect();
+    } catch {
+      // ignore
+    }
+    this.voice.peerMixers.delete(peerId);
+  }
+
+  _buildOpusEncoderConfig(bitrate) {
+    if (this.voice.opusUseRichConfig) {
+      return {
+        codec: "opus",
+        sampleRate: VOICE_HD_SAMPLE_RATE,
+        numberOfChannels: 1,
+        bitrate,
+        bitrateMode: "variable",
+        opus: {
+          frameDuration: 20000,
+          application: "audio",
+          complexity: 8,
+          useinbandfec: true,
+        },
+      };
+    }
+    return {
+      codec: "opus",
+      sampleRate: VOICE_HD_SAMPLE_RATE,
+      numberOfChannels: 1,
+      bitrate,
+    };
+  }
+
+  ensureLocalOpusEncoder() {
+    if (!this.voice.opusSupported) return null;
+    const desiredBitrate = this.computeDesiredOpusBitrate();
+    let enc = this.voice.opusEncoder;
+
+    if (enc && enc.state === "configured") {
+      if (this.voice.opusEncoderBitrate !== desiredBitrate) {
+        try {
+          enc.configure(this._buildOpusEncoderConfig(desiredBitrate));
+          this.voice.opusEncoderBitrate = desiredBitrate;
+          this.updateVoiceCodecMeta();
+        } catch {
+          // keep current bitrate if live reconfigure unsupported
+        }
+      }
+      return enc;
+    }
+
+    if (enc) {
+      try {
+        if (enc.state !== "closed") enc.close();
+      } catch {
+        // ignore
+      }
+      this.voice.opusEncoder = null;
+    }
+
+    try {
+      this.voice.opusPendingMeta = [];
+      enc = new AudioEncoder({
+        output: (chunk) => {
+          this._onEncodedOpusChunk(chunk);
+        },
+        error: () => {
+          this.voice.opusEncoder = null;
+          this.voice.opusEncoderBitrate = 0;
+          this.voice.opusPendingMeta = [];
+        },
+      });
+      enc.configure(this._buildOpusEncoderConfig(desiredBitrate));
+      this.voice.opusEncoder = enc;
+      this.voice.opusEncoderBitrate = desiredBitrate;
+      this.updateVoiceCodecMeta();
+      return enc;
+    } catch {
+      this.voice.opusEncoder = null;
+      this.voice.opusEncoderBitrate = 0;
+      return null;
+    }
+  }
+
+  _onEncodedOpusChunk(chunk) {
+    if (!this.voice.inVoice || this.voice.muted || !this.wasm || !chunk || chunk.byteLength === 0) {
+      return;
+    }
+    let meta = null;
+    const queue = this.voice.opusPendingMeta;
+    if (queue.length > 0) {
+      const idx = queue.findIndex((m) => m.tsUs === chunk.timestamp);
+      if (idx >= 0) {
+        meta = queue.splice(0, idx + 1)[idx];
+      } else {
+        meta = queue.shift();
+      }
+    }
+    const rms = meta ? meta.rms : this.voice.localRms;
+    const tsSamples = meta ? meta.tsSamples : 0;
+
+    const payload = new Uint8Array(VOICE_V2_HEADER_BYTES + chunk.byteLength);
+    payload[0] = VOICE_V2_CODEC_OPUS48;
+    payload[1] = Math.round(VOICE_HD_SAMPLE_RATE / 1000);
+    const dv = new DataView(payload.buffer, payload.byteOffset, VOICE_V2_HEADER_BYTES);
+    dv.setUint16(2, Math.min(65535, rms), true);
+    dv.setUint32(4, tsSamples >>> 0, true);
+    try {
+      chunk.copyTo(payload.subarray(VOICE_V2_HEADER_BYTES));
+    } catch {
+      return;
+    }
+
+    const packets = this.wasm.sealVoiceRaw(payload);
+    for (const { peerId, data } of packets) {
+      if (this.getPeerVoiceCodec(peerId) !== "opus48") continue;
+      const vdc = this.voiceChannels.get(peerId);
+      if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
+        try {
+          vdc.send(data);
+        } catch {
+          // drop frame cleanly under congestion
+        }
+      }
+    }
+  }
+
+  ensurePeerOpusDecoder(peerId, mixer) {
+    if (!this.voice.opusSupported) return null;
+    if (mixer.opusDecoder && mixer.opusDecoder.state === "configured") {
+      return mixer.opusDecoder;
+    }
+    if (mixer.opusDecoder) {
+      try {
+        if (mixer.opusDecoder.state !== "closed") mixer.opusDecoder.close();
+      } catch {
+        // ignore
+      }
+      mixer.opusDecoder = null;
+    }
+    try {
+      const dec = new AudioDecoder({
+        output: (audioData) => {
+          try {
+            if (!this.voice.inVoice || !this.voice.audioCtx) return;
+            const liveMixer = this.voice.peerMixers.get(peerId);
+            if (!liveMixer || this.voice.deafened || liveMixer.muted) return;
+            const float32 = extractFloat32FromAudioData(audioData);
+            const rate = audioData.sampleRate || VOICE_HD_SAMPLE_RATE;
+            liveMixer.decodedFrames += 1;
+            const decRms = computeFloat32RmsI16Scale(float32);
+            if (decRms > 0) {
+              liveMixer.rms = decRms;
+            }
+            const direct = this.directPeers.get(peerId);
+            const isRelayed = direct?.transport === "relay";
+            this._pushDecodedPcmToMixer(liveMixer, float32, rate, isRelayed);
+          } catch {
+            // ignore frame extraction error
+          } finally {
+            try {
+              audioData.close();
+            } catch {
+              // ignore
+            }
+          }
+        },
+        error: () => {
+          const liveMixer = this.voice.peerMixers.get(peerId);
+          if (liveMixer && liveMixer.opusDecoder === dec) {
+            liveMixer.opusDecoder = null;
+          }
+        },
+      });
+      dec.configure({
+        codec: "opus",
+        sampleRate: VOICE_HD_SAMPLE_RATE,
+        numberOfChannels: 1,
+      });
+      mixer.opusDecoder = dec;
+      return dec;
+    } catch {
+      mixer.opusDecoder = null;
+      return null;
+    }
+  }
+
+  _pushDecodedPcmToMixer(mixer, float32, sampleRate, isRelayed) {
+    const ctx = this.voice.audioCtx;
+    if (!ctx || !float32 || float32.length === 0) return;
+    if (ctx.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+    if (!mixer.playbackNode && this.voice.workletsLoaded) {
+      this._attachPlaybackWorklet(ctx, mixer, isRelayed);
+    }
+    if (mixer.playbackNode) {
+      if (mixer.isRelayed !== Boolean(isRelayed)) {
+        mixer.isRelayed = Boolean(isRelayed);
+        mixer.playbackNode.port.postMessage({
+          type: "config",
+          targetMs: isRelayed ? 68 : 26,
+          maxMs: isRelayed ? 240 : 140,
+        });
+      }
+      mixer.playbackNode.port.postMessage(
+        { type: "pcm", samples: float32, rate: sampleRate },
+        [float32.buffer]
+      );
+      return;
+    }
+
+    // Fallback when AudioWorklet is unavailable: soft-edged AudioBufferSourceNode
+    const len = float32.length;
+    const edge = Math.min(32, Math.floor(len / 8));
+    const buf = ctx.createBuffer(1, len, sampleRate);
+    const ch = buf.getChannelData(0);
+    ch.set(float32);
+    for (let i = 0; i < edge; i++) {
+      const w = i / edge;
+      ch[i] *= w;
+      ch[len - 1 - i] *= w;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(mixer.gainNode);
+    const now = ctx.currentTime;
+    const targetBufferSec = isRelayed ? 0.075 : 0.032;
+    const maxDriftSec = isRelayed ? 0.28 : 0.16;
+    if (mixer.nextPlayTime < now + 0.004 || mixer.nextPlayTime > now + maxDriftSec) {
+      mixer.nextPlayTime = now + targetBufferSec;
+    }
+    src.start(mixer.nextPlayTime);
+    mixer.nextPlayTime += buf.duration;
+  }
+
+  downsample48kTo16kI16(float48k) {
+    const taps = VOICE_V1_FIR_TAPS;
+    const numTaps = taps.length; // 15
+    const tailLen = numTaps - 1; // 14
+    const tail = this.voice.v1DownsampleTail;
+    const outLen = Math.floor(float48k.length / 3);
+    const out = new Int16Array(outLen);
+
+    for (let o = 0; o < outLen; o++) {
+      const endIdx = o * 3;
+      let acc = 0;
+      for (let k = 0; k < numTaps; k++) {
+        const srcIdx = endIdx - k;
+        const x = srcIdx >= 0 ? float48k[srcIdx] : tail[tailLen + srcIdx];
+        acc += x * taps[k];
+      }
+      const clamped = acc > 1 ? 1 : acc < -1 ? -1 : acc;
+      out[o] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+    }
+
+    if (float48k.length >= tailLen) {
+      tail.set(float48k.subarray(float48k.length - tailLen));
+    }
+    return out;
   }
 
   async joinVoiceChat({ listenOnly = false } = {}) {
@@ -5078,6 +6011,9 @@ class P2PDirectApp {
       if (ctx.state === "suspended") {
         await ctx.resume();
       }
+      // Register both capture & playback AudioWorkletProcessors once per AudioContext
+      // (ensures Listen-Only mode also gets the smooth off-main-thread playback jitter buffer)
+      await this.ensureVoiceWorkletsLoaded(ctx);
 
       let micStream = null;
       let effectiveListenOnly = listenOnly;
@@ -5100,6 +6036,11 @@ class P2PDirectApp {
       this.voice.localSpeakingAt = 0;
       this.voice.gateOpenUntil = 0;
       this.voice.gateClosed = false;
+      this.voice.gateWasOpen = false;
+      this.voice.gateFadeOutPending = false;
+      this.voice.opusTxSampleCounter = 0;
+      this.voice.opusPendingMeta = [];
+      this.voice.v1DownsampleTail.fill(0);
       this.voice.meterTicks = 0;
 
       if (this.voice.masterGain) {
@@ -5131,10 +6072,15 @@ class P2PDirectApp {
         this.voice.meterTimer = setInterval(() => this.updateVoiceMeters(), 70);
       }
 
+      this.updateVoiceCodecMeta();
       this.syncAudioSettingsUI();
       this.renderAll();
       this.showToast(
-        effectiveListenOnly ? "Joined voice channel (listen-only)" : "Joined voice channel"
+        effectiveListenOnly
+          ? "Joined voice channel (listen-only)"
+          : this.voice.opusSupported
+            ? "Joined voice channel (48 kHz Opus HD)"
+            : "Joined voice channel"
       );
     } catch (err) {
       this.cleanupVoiceAudioResources();
@@ -5200,21 +6146,15 @@ class P2PDirectApp {
 
     // Prefer modern off-main-thread AudioWorkletProcessor; fall back to ScriptProcessorNode cleanly
     let workletOk = false;
-    if (ctx.audioWorklet && typeof AudioWorkletNode === "function") {
+    const loaded = await this.ensureVoiceWorkletsLoaded(ctx);
+    if (loaded && typeof AudioWorkletNode === "function") {
       try {
-        const blob = new Blob([VOICE_CAPTURE_WORKLET_CODE], { type: "application/javascript" });
-        const url = URL.createObjectURL(blob);
-        try {
-          await ctx.audioWorklet.addModule(url);
-        } finally {
-          URL.revokeObjectURL(url);
-        }
         const workletNode = new AudioWorkletNode(ctx, "p2p-voice-capture");
         workletNode.port.onmessage = (ev) => {
-          if (ev.data instanceof Int16Array) {
-            this.onCapturedPcmFrame(ev.data);
+          if (ev.data instanceof Float32Array) {
+            this.onCapturedFloat32Frame(ev.data);
           } else if (ev.data && ev.data.buffer) {
-            this.onCapturedPcmFrame(new Int16Array(ev.data.buffer));
+            this.onCapturedFloat32Frame(new Float32Array(ev.data.buffer));
           }
         };
         this.wireDspChain(dspNodes, workletNode, ctx.destination, this.voice.monitorActive);
@@ -5228,34 +6168,38 @@ class P2PDirectApp {
 
     if (!workletOk && typeof ctx.createScriptProcessor === "function") {
       const proc = ctx.createScriptProcessor(1024, 1, 1);
-      const step = ctx.sampleRate / VOICE_SAMPLE_RATE;
-      let inBuf = [];
-      let phase = 0;
-      const frame = new Int16Array(VOICE_FRAME_SAMPLES);
+      const step = ctx.sampleRate / VOICE_HD_SAMPLE_RATE;
+      const ringCap = 8192;
+      const ringMask = ringCap - 1;
+      const ring = new Float32Array(ringCap);
+      let writeIdx = 0;
+      let readPos = 0;
+      const frame = new Float32Array(VOICE_HD_FRAME_SAMPLES);
       let frameIdx = 0;
 
       proc.onaudioprocess = (ev) => {
         if (!this.voice.inVoice) return;
         const ch = ev.inputBuffer.getChannelData(0);
         for (let i = 0; i < ch.length; i++) {
-          inBuf.push(ch[i]);
+          ring[writeIdx & ringMask] = ch[i];
+          writeIdx++;
         }
-        while (phase + 1 < inBuf.length) {
-          const idx = Math.floor(phase);
-          const frac = phase - idx;
-          const sample = inBuf[idx] * (1 - frac) + inBuf[idx + 1] * frac;
-          const clamped = Math.max(-1, Math.min(1, sample));
-          frame[frameIdx++] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
-          phase += step;
-          if (frameIdx >= VOICE_FRAME_SAMPLES) {
-            this.onCapturedPcmFrame(frame.slice());
+        while (readPos + 1 < writeIdx) {
+          const idx = Math.floor(readPos);
+          const frac = readPos - idx;
+          const s0 = ring[idx & ringMask];
+          const s1 = ring[(idx + 1) & ringMask];
+          frame[frameIdx++] = s0 + (s1 - s0) * frac;
+          readPos += step;
+          if (frameIdx >= VOICE_HD_FRAME_SAMPLES) {
+            this.onCapturedFloat32Frame(frame.slice());
             frameIdx = 0;
           }
         }
-        const drop = Math.floor(phase);
-        if (drop > 0) {
-          inBuf = inBuf.slice(drop);
-          phase -= drop;
+        if (readPos > 1048576) {
+          const shift = Math.floor(readPos / ringCap) * ringCap;
+          readPos -= shift;
+          writeIdx -= shift;
         }
       };
       this.wireDspChain(dspNodes, proc, ctx.destination, this.voice.monitorActive);
@@ -5264,44 +6208,142 @@ class P2PDirectApp {
     }
   }
 
-  onCapturedPcmFrame(int16Pcm) {
-    if (!this.voice.inVoice || !this.wasm) return;
-    const rawRms = this.voice.muted ? 0 : computePcmRms(int16Pcm);
+  onCapturedFloat32Frame(float32Pcm) {
+    if (!this.voice.inVoice || !this.wasm || !float32Pcm || float32Pcm.length === 0) return;
+    const rawRms = this.voice.muted ? 0 : computeFloat32RmsI16Scale(float32Pcm);
     const now = Date.now();
     const gatePct = this.audioSettings.noiseGate;
-    let gated = false;
-    if (!this.voice.muted && gatePct > 0) {
-      const thresholdRms = (gatePct / 100) * 14000;
-      if (rawRms >= thresholdRms) {
-        this.voice.gateOpenUntil = now + 180;
-      }
-      if (now > this.voice.gateOpenUntil) {
-        gated = true;
-      }
-    }
-    this.voice.gateClosed = gated;
 
+    // Smooth hysteresis noise gate: 5ms fade-in on open, 280ms hold, 20ms cosine fade-out tail (zero clicks!)
+    let gated = false;
+    let applyFadeIn = false;
+    let applyFadeOut = false;
+
+    if (!this.voice.muted && gatePct > 0) {
+      const openThreshold = (gatePct / 100) * 14000;
+      const holdThreshold = openThreshold * 0.65;
+      const trigger = this.voice.gateWasOpen ? holdThreshold : openThreshold;
+      if (rawRms >= trigger) {
+        this.voice.gateOpenUntil = now + 280;
+        if (!this.voice.gateWasOpen) {
+          applyFadeIn = true;
+          this.voice.gateWasOpen = true;
+        }
+        this.voice.gateFadeOutPending = false;
+      } else if (now > this.voice.gateOpenUntil) {
+        if (this.voice.gateWasOpen && !this.voice.gateFadeOutPending) {
+          // Transmit one smooth 20ms cosine fade-out tail frame before pausing TX
+          applyFadeOut = true;
+          this.voice.gateWasOpen = false;
+          this.voice.gateFadeOutPending = true;
+        } else {
+          gated = true;
+          this.voice.gateWasOpen = false;
+        }
+      }
+    } else {
+      this.voice.gateWasOpen = !this.voice.muted;
+      this.voice.gateFadeOutPending = false;
+    }
+
+    this.voice.gateClosed = gated;
     if (this.voice.settingsOpen) {
       this.updateAudioMeterUi(rawRms, gated, "Live");
     }
 
-    if (gated) {
+    if (gated || this.voice.muted) {
       this.voice.localRms = 0;
       return;
     }
 
-    const { rms, packets } = this.wasm.sealVoicePcm(int16Pcm);
-    this.voice.localRms = this.voice.muted ? 0 : rms;
-    if (!this.voice.muted && rms > 220) {
+    if (applyFadeIn) {
+      const ramp = Math.min(240, float32Pcm.length); // 5ms @ 48 kHz
+      for (let i = 0; i < ramp; i++) {
+        float32Pcm[i] *= 0.5 * (1 - Math.cos((Math.PI * i) / ramp));
+      }
+    } else if (applyFadeOut) {
+      const len = float32Pcm.length;
+      for (let i = 0; i < len; i++) {
+        float32Pcm[i] *= 0.5 * (1 + Math.cos((Math.PI * i) / len));
+      }
+    }
+
+    const activeRms = applyFadeOut ? 0 : rawRms;
+    this.voice.localRms = activeRms;
+    if (activeRms > 220) {
       this.voice.localSpeakingAt = now;
     }
-    for (const { peerId, data } of packets) {
-      const vdc = this.voiceChannels.get(peerId);
-      if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
-        try {
-          vdc.send(data);
-        } catch {
-          // drop frame cleanly under congestion
+
+    // Partition active voice peers into HD 48 kHz Opus (V2) vs legacy/bot 16 kHz ADPCM (V1)
+    const remoteVoicePeers = (this.status?.peers || []).filter((p) => p.inVoice);
+    if (remoteVoicePeers.length === 0) {
+      return;
+    }
+
+    let needOpusV2 = false;
+    let needAdpcmV1 = false;
+    for (const p of remoteVoicePeers) {
+      if (this.voice.opusSupported && this.getPeerVoiceCodec(p.peerId) === "opus48") {
+        needOpusV2 = true;
+      } else {
+        needAdpcmV1 = true;
+      }
+    }
+
+    // Fast path 1: Studio 48 kHz Opus V2 via WebCodecs + Rust ChaCha20-Poly1305 AEAD
+    if (needOpusV2) {
+      const enc = this.ensureLocalOpusEncoder();
+      if (enc && enc.state === "configured") {
+        if (enc.encodeQueueSize <= 4) {
+          const tsSamples = this.voice.opusTxSampleCounter >>> 0;
+          const tsUs = Math.round((this.voice.opusTxSampleCounter * 1_000_000) / VOICE_HD_SAMPLE_RATE);
+          this.voice.opusTxSampleCounter += float32Pcm.length;
+          if (this.voice.opusPendingMeta.length >= 12) {
+            this.voice.opusPendingMeta.shift();
+          }
+          this.voice.opusPendingMeta.push({ tsUs, tsSamples, rms: activeRms });
+          let audioData = null;
+          try {
+            audioData = new AudioData({
+              format: "f32-planar",
+              sampleRate: VOICE_HD_SAMPLE_RATE,
+              numberOfFrames: float32Pcm.length,
+              numberOfChannels: 1,
+              timestamp: tsUs,
+              data: float32Pcm,
+            });
+            enc.encode(audioData);
+          } catch {
+            needAdpcmV1 = true;
+          } finally {
+            if (audioData) {
+              try {
+                audioData.close();
+              } catch {
+                // ignore
+              }
+            }
+          }
+        }
+      } else {
+        needAdpcmV1 = true;
+      }
+    }
+
+    // Fast path 2: Anti-aliased 16 kHz V1 ADPCM ONLY when a Node.js bot or legacy browser is in voice
+    if (needAdpcmV1) {
+      const int16Pcm = this.downsample48kTo16kI16(float32Pcm);
+      const { packets } = this.wasm.sealVoicePcm(int16Pcm);
+      const sendToOpusToo = !this.voice.opusSupported || !this.voice.opusEncoder;
+      for (const { peerId, data } of packets) {
+        if (!sendToOpusToo && this.getPeerVoiceCodec(peerId) === "opus48") continue;
+        const vdc = this.voiceChannels.get(peerId);
+        if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
+          try {
+            vdc.send(data);
+          } catch {
+            // drop frame cleanly under congestion
+          }
         }
       }
     }
@@ -5315,11 +6357,67 @@ class P2PDirectApp {
     if (!this.voice.inVoice || !this.wasm) return;
 
     const processBytes = (pktBytes) => {
-      if (!this.voice.inVoice || !this.wasm) return;
+      if (!this.voice.inVoice || !this.wasm || !pktBytes || pktBytes.byteLength < 4) return;
+      const isRelayed = direct?.transport === "relay";
+
+      // V2 High-Definition 48 kHz Opus E2EE packet ("V2")
+      if (pktBytes[0] === 0x56 && pktBytes[1] === 0x32) {
+        this.recordPeerVoiceCodec(peerId, "opus48");
+        const plain = this.wasm.openVoiceRaw(peerId, pktBytes);
+        if (!plain || plain.byteLength <= VOICE_V2_HEADER_BYTES) return;
+        if (plain[0] !== VOICE_V2_CODEC_OPUS48) return;
+
+        const dv = new DataView(plain.buffer, plain.byteOffset, VOICE_V2_HEADER_BYTES);
+        const sampleRate = (plain[1] || 48) * 1000;
+        const headerRms = dv.getUint16(2, true);
+        const tsSamples = dv.getUint32(4, true);
+        const opusData = plain.subarray(VOICE_V2_HEADER_BYTES);
+
+        const mixer = this.ensurePeerVoiceMixer(peerId);
+        mixer.codec = "opus48";
+        mixer.rms = headerRms;
+        mixer.packetsReceived += 1;
+        mixer.lastAudioAt = Date.now();
+
+        if (this.voice.deafened || mixer.muted || !this.voice.audioCtx) {
+          return;
+        }
+        const dec = this.ensurePeerOpusDecoder(peerId, mixer);
+        if (!dec || dec.state !== "configured" || dec.decodeQueueSize > 6) {
+          return;
+        }
+        try {
+          dec.decode(
+            new EncodedAudioChunk({
+              type: "key",
+              timestamp: Math.round((tsSamples * 1_000_000) / sampleRate),
+              data: opusData,
+            })
+          );
+        } catch {
+          // Reset decoder cleanly if a damaged stream frame occurred
+          if (mixer.opusDecoder === dec) {
+            try {
+              if (dec.state !== "closed") dec.close();
+            } catch {
+              // ignore
+            }
+            mixer.opusDecoder = null;
+          }
+        }
+        return;
+      }
+
+      // V1 Legacy / Node.js Bot 16 kHz IMA-ADPCM E2EE packet ("V1")
       const decoded = this.wasm.openVoicePacket(peerId, pktBytes);
       if (!decoded || !decoded.pcm || decoded.pcm.length === 0) return;
 
+      if (!this.peerVoiceCodec.has(peerId)) {
+        this.recordPeerVoiceCodec(peerId, "adpcm16");
+      }
+
       const mixer = this.ensurePeerVoiceMixer(peerId);
+      mixer.codec = "adpcm16";
       mixer.rms = decoded.rms;
       mixer.packetsReceived += 1;
       mixer.lastAudioAt = Date.now();
@@ -5328,30 +6426,11 @@ class P2PDirectApp {
         return;
       }
 
-      const ctx = this.voice.audioCtx;
-      if (ctx.state === "suspended") {
-        ctx.resume().catch(() => {});
-      }
-
-      const buf = ctx.createBuffer(1, decoded.pcm.length, VOICE_SAMPLE_RATE);
-      const ch = buf.getChannelData(0);
+      const float32 = new Float32Array(decoded.pcm.length);
       for (let i = 0; i < decoded.pcm.length; i++) {
-        ch[i] = decoded.pcm[i] / 32768;
+        float32[i] = decoded.pcm[i] / 32768;
       }
-
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(mixer.gainNode);
-
-      const now = ctx.currentTime;
-      const isRelayed = direct?.transport === "relay";
-      const targetBufferSec = isRelayed ? 0.11 : 0.045;
-      const maxDriftSec = isRelayed ? 0.38 : 0.25;
-      if (mixer.nextPlayTime < now + 0.005 || mixer.nextPlayTime > now + maxDriftSec) {
-        mixer.nextPlayTime = now + targetBufferSec;
-      }
-      src.start(mixer.nextPlayTime);
-      mixer.nextPlayTime += buf.duration;
+      this._pushDecodedPcmToMixer(mixer, float32, VOICE_SAMPLE_RATE, isRelayed);
     };
 
     if (rawData instanceof ArrayBuffer) {
@@ -5378,6 +6457,8 @@ class P2PDirectApp {
     if (this.voice.muted) {
       this.voice.localRms = 0;
       this.voice.localSmoothLevel = 0;
+      this.voice.gateWasOpen = false;
+      this.voice.gateFadeOutPending = false;
     }
     const res = this.wasm.call({
       cmd: "set_voice_state",
@@ -5397,6 +6478,17 @@ class P2PDirectApp {
     if (this.voice.masterGain) {
       this.voice.masterGain.gain.value = this.voice.deafened ? 0 : this.audioSettings.outputGain / 100;
     }
+    if (this.voice.deafened) {
+      for (const mixer of this.voice.peerMixers.values()) {
+        if (mixer.playbackNode) {
+          try {
+            mixer.playbackNode.port.postMessage({ type: "reset" });
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
     this.renderVoicePanel(true);
     this.updateVoiceMeters();
   }
@@ -5413,6 +6505,13 @@ class P2PDirectApp {
     if (!mixer) return;
     mixer.muted = !mixer.muted;
     mixer.gainNode.gain.value = mixer.muted ? 0 : mixer.volume;
+    if (mixer.muted && mixer.playbackNode) {
+      try {
+        mixer.playbackNode.port.postMessage({ type: "reset" });
+      } catch {
+        // ignore
+      }
+    }
     this.renderVoicePanel(true);
     this.updateVoiceMeters();
   }
@@ -5423,6 +6522,18 @@ class P2PDirectApp {
       this.voice.meterTimer = null;
     }
     this.teardownMicCaptureGraph();
+    if (this.voice.opusEncoder) {
+      try {
+        if (this.voice.opusEncoder.state !== "closed") {
+          this.voice.opusEncoder.close();
+        }
+      } catch {
+        // ignore
+      }
+      this.voice.opusEncoder = null;
+      this.voice.opusEncoderBitrate = 0;
+    }
+    this.voice.opusPendingMeta = [];
     this.voice.monitorActive = false;
     if (this.voice.micStream) {
       for (const track of this.voice.micStream.getTracks()) {
@@ -5434,14 +6545,18 @@ class P2PDirectApp {
       }
       this.voice.micStream = null;
     }
-    for (const mixer of this.voice.peerMixers.values()) {
+    for (const pid of Array.from(this.voice.peerMixers.keys())) {
+      this.disposePeerVoiceMixer(pid);
+    }
+    this.voice.peerMixers.clear();
+    if (this.voice.masterLimiter) {
       try {
-        mixer.gainNode.disconnect();
+        this.voice.masterLimiter.disconnect();
       } catch {
         // ignore
       }
+      this.voice.masterLimiter = null;
     }
-    this.voice.peerMixers.clear();
     if (this.voice.masterGain) {
       try {
         this.voice.masterGain.disconnect();
@@ -5458,6 +6573,9 @@ class P2PDirectApp {
       }
       this.voice.audioCtx = null;
     }
+    this.voice.workletsLoaded = false;
+    this.voice.workletsLoadingPromise = null;
+    this.updateVoiceCodecMeta();
     this.updateAudioMeterUi(0, false, "Idle");
     this.syncAudioSettingsUI();
   }
@@ -5472,6 +6590,8 @@ class P2PDirectApp {
     this.voice.localRms = 0;
     this.voice.localSmoothLevel = 0;
     this.voice.gateClosed = false;
+    this.voice.gateWasOpen = false;
+    this.voice.gateFadeOutPending = false;
     this.voice.joinOrder = this.voice.joinOrder.filter((id) => id !== "self");
     this.voice.renderedKeys.delete("self");
     this.voice.lastRosterKey = "";
@@ -5811,15 +6931,7 @@ class P2PDirectApp {
         if (this.voiceChannels.get(peerId) === peerEntry.voiceDc) {
           this.voiceChannels.delete(peerId);
         }
-        const mixer = this.voice.peerMixers.get(peerId);
-        if (mixer) {
-          try {
-            mixer.gainNode.disconnect();
-          } catch {
-            // ignore
-          }
-          this.voice.peerMixers.delete(peerId);
-        }
+        this.disposePeerVoiceMixer(peerId);
         const res = this.wasm.call({ cmd: "peer_disconnected", peerId });
         this.status = res.status;
         this.executeActions(res.actions);
@@ -5922,15 +7034,7 @@ class P2PDirectApp {
         // ignore
       }
     }
-    const mixer = this.voice.peerMixers.get(peerId);
-    if (mixer) {
-      try {
-        mixer.gainNode.disconnect();
-      } catch {
-        // ignore
-      }
-      this.voice.peerMixers.delete(peerId);
-    }
+    this.disposePeerVoiceMixer(peerId);
     try {
       entry.dc.close();
       entry.pc.close();

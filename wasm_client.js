@@ -10,6 +10,8 @@ const OP_STREAM_EXEC = 3;
 const OP_READ_OUT_CHUNK = 4;
 const OP_VOICE_ENCODE_SEAL = 5;
 const OP_VOICE_OPEN_DECODE = 6;
+const OP_VOICE_SEAL_RAW = 7;
+const OP_VOICE_OPEN_RAW = 8;
 
 const STATUS_OK = 1;
 const EXPECTED_BUF_CAP = 262144;
@@ -237,6 +239,75 @@ export class SafeRustWasmMesh {
     }
     const pcmBytes = new Uint8Array(this.memory.buffer, this.outPtr + 4, byteCount).slice();
     return { rms, pcm: new Int16Array(pcmBytes.buffer) };
+  }
+
+  /**
+   * Pure binary fast-path: seals an opaque high-definition codec payload (e.g. 48 kHz Opus)
+   * into per-peer V2 ChaCha20-Poly1305 packets for every peer currently in voice chat.
+   */
+  sealVoiceRaw(rawPayloadUint8) {
+    if (!rawPayloadUint8 || rawPayloadUint8.byteLength === 0) {
+      return [];
+    }
+    const byteLen = Math.min(rawPayloadUint8.byteLength, this.bufCap);
+    new Uint8Array(this.memory.buffer, this.inPtr, byteLen).set(
+      rawPayloadUint8.subarray(0, byteLen)
+    );
+
+    const hdr = this._invoke(OP_VOICE_SEAL_RAW, byteLen);
+    const outLen = hdr[7];
+    if (hdr[8] !== STATUS_OK || outLen < 2) {
+      return [];
+    }
+
+    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
+    const outBytes = new Uint8Array(this.memory.buffer, this.outPtr, outLen);
+    const peerCount = dv.getUint16(0, true);
+    const packets = [];
+    let offset = 2;
+
+    for (let i = 0; i < peerCount; i++) {
+      if (offset + 2 > outLen) break;
+      const pidLen = dv.getUint16(offset, true);
+      offset += 2;
+      if (offset + pidLen + 2 > outLen) break;
+      const peerId = textDecoder.decode(outBytes.subarray(offset, offset + pidLen));
+      offset += pidLen;
+      const pktLen = dv.getUint16(offset, true);
+      offset += 2;
+      if (offset + pktLen > outLen) break;
+      const data = outBytes.slice(offset, offset + pktLen);
+      offset += pktLen;
+      packets.push({ peerId, data });
+    }
+    return packets;
+  }
+
+  /**
+   * Pure binary fast-path: authenticates, anti-replay checks, and decrypts an incoming V2
+   * binary voice packet from `peerId`, returning the raw codec payload Uint8Array or null.
+   */
+  openVoiceRaw(peerId, packetUint8) {
+    if (!peerId || !packetUint8 || packetUint8.byteLength === 0) {
+      return null;
+    }
+    const pidBytes = textEncoder.encode(peerId);
+    const totalIn = 2 + pidBytes.length + packetUint8.byteLength;
+    if (totalIn > this.bufCap || pidBytes.length > 65535) {
+      return null;
+    }
+    const inBuf = new Uint8Array(this.memory.buffer, this.inPtr, totalIn);
+    inBuf[0] = pidBytes.length & 0xff;
+    inBuf[1] = (pidBytes.length >> 8) & 0xff;
+    inBuf.set(pidBytes, 2);
+    inBuf.set(packetUint8, 2 + pidBytes.length);
+
+    const hdr = this._invoke(OP_VOICE_OPEN_RAW, totalIn);
+    const outLen = hdr[7];
+    if (hdr[8] !== STATUS_OK || outLen === 0) {
+      return null;
+    }
+    return new Uint8Array(this.memory.buffer, this.outPtr, outLen).slice();
   }
 
   rehandshake() {

@@ -18,6 +18,8 @@ const OP_STREAM_EXEC: u32 = 3;
 const OP_READ_OUT_CHUNK: u32 = 4;
 const OP_VOICE_ENCODE_SEAL: u32 = 5;
 const OP_VOICE_OPEN_DECODE: u32 = 6;
+const OP_VOICE_SEAL_RAW: u32 = 7;
+const OP_VOICE_OPEN_RAW: u32 = 8;
 
 const STATUS_OK: u32 = 1;
 const STATUS_ERR: u32 = 2;
@@ -213,6 +215,71 @@ fn execute_voice_open_decode(hdr: &BridgeHeader, rt: &mut RuntimeState, in_bytes
     }
 }
 
+fn execute_voice_seal_raw(hdr: &BridgeHeader, rt: &mut RuntimeState, in_bytes: &[u8]) {
+    let Some(node) = rt.node.as_mut() else {
+        publish_binary_out(hdr, &[], false);
+        return;
+    };
+    let packets = node.seal_voice_raw(in_bytes);
+
+    let mut fit_count: u16 = 0;
+    let mut body_bytes: Vec<u8> = Vec::with_capacity(packets.len().saturating_mul(260));
+    for (peer_id, pkt) in packets {
+        let pid_bytes = peer_id.as_bytes();
+        if pid_bytes.len() > usize::from(u16::MAX) || pkt.len() > usize::from(u16::MAX) {
+            continue;
+        }
+        let needed = 2 + body_bytes.len() + 2 + pid_bytes.len() + 2 + pkt.len();
+        if needed > BUF_CAP {
+            break;
+        }
+        body_bytes.extend_from_slice(&(pid_bytes.len() as u16).to_le_bytes());
+        body_bytes.extend_from_slice(pid_bytes);
+        body_bytes.extend_from_slice(&(pkt.len() as u16).to_le_bytes());
+        body_bytes.extend_from_slice(&pkt);
+        fit_count = fit_count.saturating_add(1);
+    }
+
+    let mut out = Vec::with_capacity(2 + body_bytes.len());
+    out.extend_from_slice(&fit_count.to_le_bytes());
+    out.extend_from_slice(&body_bytes);
+    publish_binary_out(hdr, &out, true);
+}
+
+fn execute_voice_open_raw(hdr: &BridgeHeader, rt: &mut RuntimeState, in_bytes: &[u8]) {
+    let Some(node) = rt.node.as_mut() else {
+        publish_binary_out(hdr, &[], false);
+        return;
+    };
+    let (Some(&b0), Some(&b1)) = (in_bytes.first(), in_bytes.get(1)) else {
+        publish_binary_out(hdr, &[], false);
+        return;
+    };
+    let pid_len = usize::from(u16::from_le_bytes([b0, b1]));
+    let pid_end = 2usize.saturating_add(pid_len);
+    let Some(pid_slice) = in_bytes.get(2..pid_end) else {
+        publish_binary_out(hdr, &[], false);
+        return;
+    };
+    let Ok(peer_id) = std::str::from_utf8(pid_slice) else {
+        publish_binary_out(hdr, &[], false);
+        return;
+    };
+    let Some(pkt_slice) = in_bytes.get(pid_end..) else {
+        publish_binary_out(hdr, &[], false);
+        return;
+    };
+
+    match node.open_voice_v2_packet(peer_id, pkt_slice) {
+        Ok(raw_payload) => {
+            publish_binary_out(hdr, &raw_payload, true);
+        }
+        Err(_) => {
+            publish_binary_out(hdr, &[], false);
+        }
+    }
+}
+
 fn main() {
     let hdr = black_box(&HEADER);
     let op = hdr.op.load(Ordering::SeqCst);
@@ -297,6 +364,26 @@ fn main() {
             RUNTIME.with(|cell| {
                 if let Ok(mut rt) = cell.try_borrow_mut() {
                     execute_voice_open_decode(hdr, &mut rt, &in_bytes);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_VOICE_SEAL_RAW => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    execute_voice_seal_raw(hdr, &mut rt, &in_bytes);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_VOICE_OPEN_RAW => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    execute_voice_open_raw(hdr, &mut rt, &in_bytes);
                 } else {
                     hdr.status.store(STATUS_ERR, Ordering::SeqCst);
                 }

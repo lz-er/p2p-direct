@@ -15,7 +15,8 @@ use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
     DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
     WireFrame, chunk_inv_ids, chunk_sealed_records, open_voice_packet_ciphertext,
-    parse_voice_packet_header, seal_voice_packet,
+    open_voice_v2_packet_ciphertext, parse_voice_packet_header, parse_voice_v2_packet_header,
+    seal_voice_packet, seal_voice_v2_packet,
 };
 
 #[derive(Debug, Clone)]
@@ -1184,6 +1185,91 @@ impl MeshNode {
         let rms = compute_rms_i16(&pcm);
         self.stats.voice_packets_received = self.stats.voice_packets_received.saturating_add(1);
         Ok((rms, pcm))
+    }
+
+    /// Seals an opaque encoded high-definition voice payload (e.g. 48 kHz Opus from WebCodecs)
+    /// into a binary `V2` ChaCha20-Poly1305 packet for each connected peer currently in voice chat.
+    pub fn seal_voice_raw(&mut self, raw_payload: &[u8]) -> Vec<(String, Vec<u8>)> {
+        if !self.in_voice || self.voice_muted || raw_payload.is_empty() {
+            return Vec::new();
+        }
+        let voice_peer_count = self.peers.values().filter(|p| p.in_voice).count();
+        if voice_peer_count == 0 {
+            return Vec::new();
+        }
+        let mut packets = Vec::with_capacity(voice_peer_count);
+        for (pid, peer) in self.peers.iter_mut() {
+            if !peer.in_voice {
+                continue;
+            }
+            let (seq, nonce) = peer.crypto.next_voice_tx_seq_and_nonce();
+            let pkt = seal_voice_v2_packet(
+                &peer.crypto.voice_tx_key,
+                seq,
+                nonce,
+                &self.peer_id,
+                pid,
+                raw_payload,
+            );
+            self.stats.voice_packets_sent = self.stats.voice_packets_sent.saturating_add(1);
+            packets.push((pid.clone(), pkt));
+        }
+        packets
+    }
+
+    /// Authenticates, anti-replay-checks, and decrypts an incoming binary `V2` raw voice packet.
+    pub fn open_voice_v2_packet(
+        &mut self,
+        from_peer: &str,
+        packet: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if !self.in_voice {
+            return Ok(Vec::new());
+        }
+        let (seq, nonce, ct) = match parse_voice_v2_packet_header(packet) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+        let (voice_rx_key, replay_ok) = match self.peers.get(from_peer) {
+            Some(peer) => (
+                peer.crypto.voice_rx_key,
+                peer.crypto.voice_replay_window.would_accept(seq),
+            ),
+            None => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(format!(
+                    "received V2 voice packet from unconnected peer '{from_peer}'"
+                ));
+            }
+        };
+        if !replay_ok {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(format!(
+                "rejected replayed or out-of-window V2 voice sequence {seq} from {from_peer}"
+            ));
+        }
+        let plain = match open_voice_v2_packet_ciphertext(
+            &voice_rx_key,
+            seq,
+            &nonce,
+            from_peer,
+            &self.peer_id,
+            ct,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+        if let Some(peer) = self.peers.get_mut(from_peer) {
+            peer.crypto.voice_replay_window.accept(seq);
+        }
+        self.stats.voice_packets_received = self.stats.voice_packets_received.saturating_add(1);
+        Ok(plain)
     }
 
     /// Called when a direct WebRTC DataChannel closes or errors.

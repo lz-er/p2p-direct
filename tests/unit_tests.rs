@@ -18,10 +18,12 @@ use p2p_direct::deflate::{
 };
 use p2p_direct::json::{JsonValue, parse_json};
 use p2p_direct::log::{LogMessage, ReplicatedLog, SealedLogRecord};
+use p2p_direct::mesh::{MeshConfig, MeshNode};
 use p2p_direct::protocol::{
     EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType, WireFrame, chunk_inv_ids,
-    chunk_sealed_records, open_voice_packet_ciphertext, parse_voice_packet_header,
-    seal_voice_packet,
+    chunk_sealed_records, open_voice_packet_ciphertext, open_voice_v2_packet_ciphertext,
+    parse_voice_packet_header, parse_voice_v2_packet_header, seal_voice_packet,
+    seal_voice_v2_packet,
 };
 use p2p_direct::rpc::dispatch_rpc;
 
@@ -1050,5 +1052,99 @@ fn replicated_log_bot_update_lww_folding_and_scrub_on_delete() -> TestResult {
     assert_eq!(log.len(), 1);
     assert!(log.get_by_id("bot-msg-1").is_none());
     assert!(log.get_by_id("upd-1").is_none());
+    Ok(())
+}
+
+#[test]
+fn voice_v2_raw_opus_e2ee_roundtrip_and_replay_protection() -> TestResult {
+    let sk_a = [0x31u8; 32];
+    let sk_b = [0x42u8; 32];
+    let pk_a = x25519_public_key(&sk_a);
+    let pk_b = x25519_public_key(&sk_b);
+    let mesh_key = [0x66u8; 32];
+
+    // Protocol-level V2 packet header, AAD direction binding, and V1/V2 domain separation
+    let (a_tx, _a_rx) = derive_voice_link_keys(&sk_a, &pk_b, &mesh_key, "peer-a", "peer-b")?;
+    let (_b_tx, b_rx) = derive_voice_link_keys(&sk_b, &pk_a, &mesh_key, "peer-b", "peer-a")?;
+    let sample_opus_payload = [1u8, 48, 0xE8, 0x03, 0xC0, 0x03, 0x00, 0x00, 0xFC, 0xAA, 0xBB, 0xCC];
+    let pkt_v2 = seal_voice_v2_packet(&a_tx, 7, [0x21u8; 12], "peer-a", "peer-b", &sample_opus_payload);
+    assert_eq!(pkt_v2.get(0..2), Some(&b"V2"[..]));
+    assert!(parse_voice_packet_header(&pkt_v2).is_err()); // V1 parser rejects V2 magic
+    let (seq, nonce, ct) = parse_voice_v2_packet_header(&pkt_v2)?;
+    assert_eq!(seq, 7);
+    // V1 opener rejects V2 ciphertext (different AAD domain)
+    assert!(open_voice_packet_ciphertext(&b_rx, seq, &nonce, "peer-a", "peer-b", ct).is_err());
+    // Wrong direction rejected
+    assert!(open_voice_v2_packet_ciphertext(&b_rx, seq, &nonce, "peer-b", "peer-a", ct).is_err());
+    let opened = open_voice_v2_packet_ciphertext(&b_rx, seq, &nonce, "peer-a", "peer-b", ct)?;
+    assert_eq!(opened.as_slice(), &sample_opus_payload);
+
+    // End-to-end MeshNode seal_voice_raw / open_voice_v2_packet + tamper + replay rejection
+    let mut node_a = MeshNode::new(
+        "peer-a".to_owned(),
+        "Alice".to_owned(),
+        "hd-room".to_owned(),
+        sk_a,
+        mesh_key,
+        b"seed-a",
+        MeshConfig::default(),
+    );
+    let mut node_b = MeshNode::new(
+        "peer-b".to_owned(),
+        "Bob".to_owned(),
+        "hd-room".to_owned(),
+        sk_b,
+        mesh_key,
+        b"seed-b",
+        MeshConfig::default(),
+    );
+
+    let actions_a = node_a.on_peer_connected("peer-b".to_owned(), "Bob".to_owned(), pk_b, false, None)?;
+    let actions_b = node_b.on_peer_connected("peer-a".to_owned(), "Alice".to_owned(), pk_a, false, None)?;
+    // Exchange Hello frames so both nodes know each other
+    for act in actions_a {
+        if let p2p_direct::mesh::MeshAction::SendWire { peer_id, frame } = act {
+            assert_eq!(peer_id, "peer-b");
+            let _ = node_b.on_wire_message("peer-a", &frame, 1_000);
+        }
+    }
+    for act in actions_b {
+        if let p2p_direct::mesh::MeshAction::SendWire { peer_id, frame } = act {
+            assert_eq!(peer_id, "peer-a");
+            let _ = node_a.on_wire_message("peer-b", &frame, 1_000);
+        }
+    }
+
+    // Both join voice chat and exchange VoiceState frames
+    for act in node_a.set_voice_state(true, false) {
+        if let p2p_direct::mesh::MeshAction::SendWire { frame, .. } = act {
+            let _ = node_b.on_wire_message("peer-a", &frame, 1_001);
+        }
+    }
+    for act in node_b.set_voice_state(true, false) {
+        if let p2p_direct::mesh::MeshAction::SendWire { frame, .. } = act {
+            let _ = node_a.on_wire_message("peer-b", &frame, 1_001);
+        }
+    }
+
+    let sealed = node_a.seal_voice_raw(&sample_opus_payload);
+    assert_eq!(sealed.len(), 1);
+    let (to_peer, wire_pkt) = sealed.into_iter().next().ok_or("missing sealed V2 packet")?;
+    assert_eq!(to_peer, "peer-b");
+    assert_eq!(wire_pkt.get(0..2), Some(&b"V2"[..]));
+
+    // Tampered ciphertext must fail authentication and NOT poison replay window
+    let mut tampered = wire_pkt.clone();
+    if let Some(last) = tampered.last_mut() {
+        *last ^= 0xFF;
+    }
+    assert!(node_b.open_voice_v2_packet("peer-a", &tampered).is_err());
+
+    // Authentic packet succeeds
+    let plain = node_b.open_voice_v2_packet("peer-a", &wire_pkt)?;
+    assert_eq!(plain.as_slice(), &sample_opus_payload);
+
+    // Replayed packet MUST be rejected by anti-replay window
+    assert!(node_b.open_voice_v2_packet("peer-a", &wire_pkt).is_err());
     Ok(())
 }
