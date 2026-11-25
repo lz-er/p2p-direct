@@ -1,0 +1,30 @@
+[package]
+name = "p2p-direct"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-dependency safe Rust WebAssembly P2P replicated log and WebRTC auto-mesh engine"
+license = "MIT"
+
+[lib]
+name = "p2p_direct"
+path = "src/lib.rs"
+
+[[bin]]
+name = "p2p_mesh"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
