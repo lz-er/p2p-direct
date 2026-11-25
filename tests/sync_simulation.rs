@@ -935,3 +935,99 @@ fn sim_multi_peer_realtime_e2ee_voice_chat() -> TestResult {
     assert_eq!(bob_entry.get_bool("voiceMuted"), Some(false));
     Ok(())
 }
+
+#[test]
+fn sim_long_lived_room_invite_first_joiner_and_subsequent_joiners() -> TestResult {
+    use p2p_direct::codec::{
+        PROTOCOL_VERSION, SignalCodeKind, SignalCodePayload, decode_signal_code,
+        encode_fragment_url,
+    };
+    use p2p_direct::crypto::SafeCsprng;
+
+    // 1. A long-lived #room=P2P1:... invite link is generated once (e.g., ahead of time)
+    let room_mesh_key = sha256(b"long-lived-room-secret-key-2026");
+    let mut rng = SafeCsprng::from_seed(b"sim-room-invite-seed");
+    let invite_payload = SignalCodePayload {
+        version: PROTOCOL_VERSION,
+        kind: SignalCodeKind::Room,
+        peer_id: String::new(),
+        author_name: String::new(),
+        room: "Permanent Study Mesh".to_owned(),
+        invite_id: String::new(),
+        pub_key: [0u8; 32],
+        mesh_key: Some(room_mesh_key),
+        sdp: String::new(),
+        relay: None,
+    };
+    let room_url = encode_fragment_url(
+        "https://lz-er.github.io/p2p-direct/",
+        &invite_payload,
+        None,
+        &mut rng,
+    )?;
+
+    let mut sim = SimNetwork::new(5_000);
+
+    // 2. First person (Alice) opens the link -> creates the mesh & publishes initial history
+    let (dec_a, _) = decode_signal_code(&room_url, None)?;
+    let key_a = dec_a.mesh_key.ok_or("missing key for Alice")?;
+    sim.add_node_with_key("peer-a", "Alice", key_a, MeshConfig::default());
+    sim.publish(
+        "peer-a",
+        "chat",
+        parse_json(r#"{"text":"I opened the room first and created the mesh!"}"#)?,
+        None,
+    )?;
+    let topic_a = sim.node("peer-a")?.room_topic().to_owned();
+
+    // 3. Second person (Bob) opens the EXACT same link -> derives identical opaque topic,
+    //    exchanges AEAD-sealed R1: rendezvous signals, connects P2P, and backfills Alice's message!
+    let (dec_b, _) = decode_signal_code(&room_url, None)?;
+    let key_b = dec_b.mesh_key.ok_or("missing key for Bob")?;
+    sim.add_node_with_key("peer-b", "Bob", key_b, MeshConfig::default());
+    assert_eq!(sim.node("peer-b")?.room_topic(), topic_a);
+
+    let sealed_hello_b = sim
+        .node_mut("peer-b")?
+        .seal_room_signal(r#"{"t":"hello","from":"peer-b","name":"Bob"}"#);
+    assert!(sealed_hello_b.starts_with("R1:"));
+    assert!(!sealed_hello_b.contains("Bob"));
+    assert!(!sealed_hello_b.contains("peer-b"));
+
+    let opened_on_a = sim.node_mut("peer-a")?.open_room_signal(&sealed_hello_b)?;
+    let parsed_hello = parse_json(&opened_on_a)?;
+    assert_eq!(parsed_hello.get_str("from"), Some("peer-b"));
+
+    sim.connect("peer-a", "peer-b", false, None)?;
+    sim.drain()?;
+    sim.assert_all_converged(1)?;
+
+    // 4. Original first-joiner (Alice) leaves completely; Bob keeps the room alive and posts a message
+    sim.remove_node("peer-a")?;
+    sim.publish(
+        "peer-b",
+        "chat",
+        parse_json(r#"{"text":"Alice left, but the room stays alive!"}"#)?,
+        None,
+    )?;
+
+    // 5. Third person (Carol) arrives later with ONLY the same #room= link -> connects to Bob
+    //    and receives BOTH Alice's original message AND Bob's message!
+    let (dec_c, _) = decode_signal_code(&room_url, None)?;
+    let key_c = dec_c.mesh_key.ok_or("missing key for Carol")?;
+    sim.add_node_with_key("peer-c", "Carol", key_c, MeshConfig::default());
+    assert_eq!(sim.node("peer-c")?.room_topic(), topic_a);
+
+    let sealed_offer_bc = sim
+        .node_mut("peer-b")?
+        .seal_room_signal(r#"{"t":"offer","from":"peer-b","to":"peer-c","sdp":"v=0\r\nSECRET-SDP\r\n"}"#);
+    assert!(!sealed_offer_bc.contains("SECRET-SDP"));
+    let opened_on_c = sim.node_mut("peer-c")?.open_room_signal(&sealed_offer_bc)?;
+    assert!(opened_on_c.contains("SECRET-SDP"));
+
+    sim.connect("peer-b", "peer-c", false, None)?;
+    sim.drain()?;
+    sim.assert_all_converged(2)?;
+    Ok(())
+}
+

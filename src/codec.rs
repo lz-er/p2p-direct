@@ -13,6 +13,7 @@ const E2E_INVITE_AAD: &[u8] = b"P2P1-E2E1";
 pub enum SignalCodeKind {
     Offer,
     Answer,
+    Room,
 }
 
 impl SignalCodeKind {
@@ -20,6 +21,7 @@ impl SignalCodeKind {
         match self {
             Self::Offer => "offer",
             Self::Answer => "answer",
+            Self::Room => "room",
         }
     }
 
@@ -27,6 +29,7 @@ impl SignalCodeKind {
         match self {
             Self::Offer => "offer",
             Self::Answer => "answer",
+            Self::Room => "room",
         }
     }
 
@@ -34,6 +37,7 @@ impl SignalCodeKind {
         match s {
             "offer" => Some(Self::Offer),
             "answer" => Some(Self::Answer),
+            "room" | "join" => Some(Self::Room),
             _ => None,
         }
     }
@@ -50,10 +54,34 @@ pub struct SignalCodePayload {
     pub pub_key: [u8; KEY_LEN],
     pub mesh_key: Option<[u8; KEY_LEN]>,
     pub sdp: String,
+    pub relay: Option<String>,
 }
 
 impl SignalCodePayload {
     pub fn to_compact_json(&self) -> String {
+        if self.kind == SignalCodeKind::Room {
+            let mut out = String::with_capacity(140);
+            out.push_str("{\"v\":");
+            out.push_str(&self.version.to_string());
+            out.push_str(",\"k\":\"room\"");
+            if !self.room.is_empty() {
+                out.push_str(",\"r\":");
+                write_json_string(&mut out, &self.room);
+            }
+            if let Some(mk) = &self.mesh_key {
+                out.push_str(",\"k2\":");
+                write_json_string(&mut out, &base64url_encode(mk));
+            }
+            if let Some(relay) = &self.relay
+                && !relay.trim().is_empty()
+            {
+                out.push_str(",\"u\":");
+                write_json_string(&mut out, relay.trim());
+            }
+            out.push('}');
+            return out;
+        }
+
         let mut out = String::with_capacity(self.sdp.len() + 256);
         out.push_str("{\"v\":");
         out.push_str(&self.version.to_string());
@@ -72,6 +100,12 @@ impl SignalCodePayload {
         if let Some(mk) = &self.mesh_key {
             out.push_str(",\"k2\":");
             write_json_string(&mut out, &base64url_encode(mk));
+        }
+        if let Some(relay) = &self.relay
+            && !relay.trim().is_empty()
+        {
+            out.push_str(",\"u\":");
+            write_json_string(&mut out, relay.trim());
         }
         out.push_str(",\"s\":");
         write_json_string(&mut out, &self.sdp);
@@ -106,18 +140,24 @@ fn compact_sdp_for_wire(sdp: &str) -> String {
     out
 }
 
-/// Encodes a WebRTC offer or answer payload into a deflate-compressed `P2P1:` code.
+/// Encodes a WebRTC offer, answer, or long-lived room invite into a deflate-compressed `P2P1:` code.
 /// When `wrap_key` is `Some`, the compressed payload is additionally AEAD-encrypted with ChaCha20-Poly1305.
 pub fn encode_signal_code(
     payload: &SignalCodePayload,
     wrap_key: Option<&[u8; KEY_LEN]>,
     rng: &mut SafeCsprng,
 ) -> Result<String, String> {
-    if payload.peer_id.trim().is_empty() {
-        return Err("peer_id must not be empty".to_owned());
-    }
-    if payload.sdp.trim().is_empty() {
-        return Err("sdp must not be empty".to_owned());
+    if payload.kind == SignalCodeKind::Room {
+        if wrap_key.is_none() && payload.mesh_key.is_none() {
+            return Err("room invite requires a mesh_key or passphrase wrap_key".to_owned());
+        }
+    } else {
+        if payload.peer_id.trim().is_empty() {
+            return Err("peer_id must not be empty".to_owned());
+        }
+        if payload.sdp.trim().is_empty() {
+            return Err("sdp must not be empty".to_owned());
+        }
     }
     let normalized = SignalCodePayload {
         version: PROTOCOL_VERSION,
@@ -132,7 +172,16 @@ pub fn encode_signal_code(
         } else {
             payload.mesh_key
         },
-        sdp: compact_sdp_for_wire(&payload.sdp),
+        sdp: if payload.kind == SignalCodeKind::Room {
+            String::new()
+        } else {
+            compact_sdp_for_wire(&payload.sdp)
+        },
+        relay: payload
+            .relay
+            .as_ref()
+            .map(|r| r.trim().to_owned())
+            .filter(|r| !r.is_empty()),
     };
     let json = normalized.to_compact_json();
     let compressed = deflate_raw(json.as_bytes());
@@ -152,7 +201,7 @@ pub fn encode_signal_code(
     Ok(format!("{CODE_PREFIX}{encoded}"))
 }
 
-/// Builds a shareable URL with `#offer=P2P1:...` or `#answer=P2P1:...` fragment.
+/// Builds a shareable URL with `#offer=P2P1:...`, `#answer=P2P1:...`, or `#room=P2P1:...` fragment.
 pub fn encode_fragment_url(
     base_url: &str,
     payload: &SignalCodePayload,
@@ -167,13 +216,17 @@ pub fn encode_fragment_url(
     Ok(format!("{base}#{}={code}", payload.kind.fragment_key()))
 }
 
-/// Extracts an `#offer=` or `#answer=` value from a URL or raw hash fragment.
+/// Extracts an `#offer=`, `#answer=`, `#room=`, or `#join=` value from a URL or raw hash fragment.
 pub fn extract_fragment_code(input: &str) -> Option<(SignalCodeKind, String)> {
     let trimmed = input.trim();
     let hash_part = match trimmed.split_once('#') {
         Some((_, after)) => after,
         None => {
-            if trimmed.starts_with("offer=") || trimmed.starts_with("answer=") {
+            if trimmed.starts_with("offer=")
+                || trimmed.starts_with("answer=")
+                || trimmed.starts_with("room=")
+                || trimmed.starts_with("join=")
+            {
                 trimmed
             } else {
                 return None;
@@ -193,7 +246,7 @@ pub fn extract_fragment_code(input: &str) -> Option<(SignalCodeKind, String)> {
     None
 }
 
-/// Decodes either a raw `P2P1:...` code or a full URL / `#offer=` / `#answer=` fragment.
+/// Decodes either a raw `P2P1:...` code or a full URL / `#offer=` / `#answer=` / `#room=` fragment.
 /// Returns `(payload, was_passphrase_encrypted)`.
 pub fn decode_signal_code(
     input: &str,
@@ -263,6 +316,40 @@ pub fn decode_signal_code(
         ));
     }
 
+    let mesh_key = match val.get_str("k2") {
+        Some(k2_b64) if !k2_b64.is_empty() => {
+            Some(parse_fixed_32(&base64url_decode(k2_b64)?, "mesh key")?)
+        }
+        _ => None,
+    };
+
+    let room = val.get_str("r").unwrap_or("default").to_owned();
+    let relay = val
+        .get_str("u")
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+
+    if kind == SignalCodeKind::Room {
+        if mesh_key.is_none() && !was_encrypted {
+            return Err("room invite is missing its encryption key 'k2'".to_owned());
+        }
+        return Ok((
+            SignalCodePayload {
+                version,
+                kind,
+                peer_id: val.get_str("p").unwrap_or("").to_owned(),
+                author_name: val.get_str("n").unwrap_or("").to_owned(),
+                room,
+                invite_id: val.get_str("i").unwrap_or("").to_owned(),
+                pub_key: [0u8; KEY_LEN],
+                mesh_key,
+                sdp: String::new(),
+                relay,
+            },
+            was_encrypted,
+        ));
+    }
+
     let peer_id = val
         .get_str("p")
         .ok_or_else(|| "missing peer id 'p'".to_owned())?
@@ -276,15 +363,7 @@ pub fn decode_signal_code(
         .ok_or_else(|| "missing X25519 public key field 'x'".to_owned())?;
     let pub_key = parse_fixed_32(&base64url_decode(pub_key_b64)?, "X25519 public key")?;
 
-    let mesh_key = match val.get_str("k2") {
-        Some(k2_b64) if !k2_b64.is_empty() => {
-            Some(parse_fixed_32(&base64url_decode(k2_b64)?, "mesh key")?)
-        }
-        _ => None,
-    };
-
     let author_name = val.get_str("n").unwrap_or("Peer").to_owned();
-    let room = val.get_str("r").unwrap_or("default").to_owned();
     let invite_id = val.get_str("i").unwrap_or("").to_owned();
     let sdp = val
         .get_str("s")
@@ -305,6 +384,7 @@ pub fn decode_signal_code(
             pub_key,
             mesh_key,
             sdp: normalize_sdp(&sdp),
+            relay,
         },
         was_encrypted,
     ))

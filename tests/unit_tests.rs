@@ -319,6 +319,7 @@ fn p2p1_codec_url_fragments_and_passphrase_encryption() -> TestResult {
         pub_key,
         mesh_key: Some(mesh_key),
         sdp: SAMPLE_SDP.to_owned(),
+        relay: None,
     };
 
     // Standard P2P1 invite carrying X25519 pubKey + meshKey in #offer= fragment
@@ -365,6 +366,144 @@ fn p2p1_codec_url_fragments_and_passphrase_encryption() -> TestResult {
     assert_eq!(dec_enc.pub_key, pub_key);
     assert_eq!(dec_enc.mesh_key, None);
     assert_eq!(dec_enc.sdp, SAMPLE_SDP);
+    Ok(())
+}
+
+#[test]
+fn long_lived_room_invite_codec_and_encrypted_rendezvous_signals() -> TestResult {
+    let mut rng = SafeCsprng::from_seed(b"unit-test-room-invite");
+    let mesh_key = [0x6Bu8; 32];
+
+    let room_payload = SignalCodePayload {
+        version: PROTOCOL_VERSION,
+        kind: SignalCodeKind::Room,
+        peer_id: String::new(),
+        author_name: String::new(),
+        room: "Friday Hangout".to_owned(),
+        invite_id: String::new(),
+        pub_key: [0u8; 32],
+        mesh_key: Some(mesh_key),
+        sdp: String::new(),
+        relay: Some("wss://relay.example/mqtt".to_owned()),
+    };
+
+    let url = encode_fragment_url(
+        "https://lz-er.github.io/p2p-direct/",
+        &room_payload,
+        None,
+        &mut rng,
+    )?;
+    assert!(url.starts_with("https://lz-er.github.io/p2p-direct/#room=P2P1:"));
+    // Compact room invite link without SDP stays very short
+    assert!(url.len() < 260, "expected compact room URL, got {} chars", url.len());
+
+    let (kind, code) = extract_fragment_code(&url).ok_or("missing #room fragment")?;
+    assert_eq!(kind, SignalCodeKind::Room);
+    let (decoded, was_enc) = decode_signal_code(&url, None)?;
+    assert!(!was_enc);
+    assert_eq!(decoded.kind, SignalCodeKind::Room);
+    assert_eq!(decoded.room, "Friday Hangout");
+    assert_eq!(decoded.mesh_key, Some(mesh_key));
+    assert_eq!(decoded.relay.as_deref(), Some("wss://relay.example/mqtt"));
+
+    // #join= alias is also accepted for room invites
+    let join_alias = format!("https://lz-er.github.io/p2p-direct/#join={code}");
+    let (dec_alias, _) = decode_signal_code(&join_alias, None)?;
+    assert_eq!(dec_alias.kind, SignalCodeKind::Room);
+    assert_eq!(dec_alias.mesh_key, Some(mesh_key));
+
+    // Passphrase-protected long-lived room invite omits meshKey and requires matching passphrase
+    let pass_mk = derive_mesh_key_from_passphrase("secret-room-pass");
+    let wrap = derive_invite_wrap_key(&pass_mk);
+    let enc_room_url = encode_fragment_url(
+        "https://lz-er.github.io/p2p-direct/",
+        &room_payload,
+        Some(&wrap),
+        &mut rng,
+    )?;
+    assert!(decode_signal_code(&enc_room_url, None).is_err());
+    let (dec_pass_room, is_pass_enc) = decode_signal_code(&enc_room_url, Some(&wrap))?;
+    assert!(is_pass_enc);
+    assert_eq!(dec_pass_room.kind, SignalCodeKind::Room);
+    assert_eq!(dec_pass_room.mesh_key, None);
+    assert_eq!(dec_pass_room.room, "Friday Hangout");
+
+    // RPC end-to-end: encode_room_invite, seal_room_signal, open_room_signal
+    let mut node_a = None;
+    let mut node_b = None;
+    let mut node_eve = None;
+    let mk_b64 = base64url_encode(&mesh_key);
+    let eve_mk_b64 = base64url_encode(&[0xEEu8; 32]);
+    let init_a = format!(
+        r#"{{"cmd":"init","peerId":"p-a","authorName":"Alice","room":"Lounge","x25519Secret":"{}","meshKey":"{mk_b64}","entropy":"{}"}}"#,
+        base64url_encode(&[0x11u8; 32]),
+        base64url_encode(&[0xA1u8; 32]),
+    );
+    let init_b = format!(
+        r#"{{"cmd":"init","peerId":"p-b","authorName":"Bob","room":"Lounge","x25519Secret":"{}","meshKey":"{mk_b64}","entropy":"{}"}}"#,
+        base64url_encode(&[0x22u8; 32]),
+        base64url_encode(&[0xB2u8; 32]),
+    );
+    let init_eve = format!(
+        r#"{{"cmd":"init","peerId":"p-eve","authorName":"Eve","room":"Lounge","x25519Secret":"{}","meshKey":"{eve_mk_b64}","entropy":"{}"}}"#,
+        base64url_encode(&[0x33u8; 32]),
+        base64url_encode(&[0xC3u8; 32]),
+    );
+    assert_eq!(parse_json(&dispatch_rpc(&mut node_a, &init_a))?.get_bool("ok"), Some(true));
+    assert_eq!(parse_json(&dispatch_rpc(&mut node_b, &init_b))?.get_bool("ok"), Some(true));
+    assert_eq!(parse_json(&dispatch_rpc(&mut node_eve, &init_eve))?.get_bool("ok"), Some(true));
+
+    let inv_resp = parse_json(&dispatch_rpc(
+        &mut node_a,
+        r#"{"cmd":"encode_room_invite","room":"Lounge","baseUrl":"https://lz-er.github.io/p2p-direct/"}"#,
+    ))?;
+    assert_eq!(inv_resp.get_bool("ok"), Some(true));
+    let inv_topic = inv_resp.get_str("roomTopic").ok_or("missing roomTopic")?;
+    assert_eq!(inv_topic.len(), 32);
+    // Opaque topic must not contain room name
+    assert!(!inv_topic.to_lowercase().contains("lounge"));
+
+    // Alice seals an SDP offer signal; ciphertext must leak ZERO SDP or IP info
+    let sig_plain = r#"{"t":"offer","from":"p-a","to":"p-b","sdp":"v=0\r\nc=IN IP4 198.51.100.99\r\n"}"#;
+    let seal_req = format!(
+        r#"{{"cmd":"seal_room_signal","payload":{}}}"#,
+        JsonValue::string(sig_plain).to_json_string()
+    );
+    let seal_resp = parse_json(&dispatch_rpc(&mut node_a, &seal_req))?;
+    assert_eq!(seal_resp.get_bool("ok"), Some(true));
+    let sealed = seal_resp.get_str("sealed").ok_or("missing sealed")?;
+    assert!(sealed.starts_with("R1:"));
+    assert!(!sealed.contains("198.51.100.99"));
+    assert!(!sealed.contains("v=0"));
+    assert!(!sealed.contains("offer"));
+
+    // Bob (same room key) decrypts cleanly
+    let open_req = format!(
+        r#"{{"cmd":"open_room_signal","sealed":{}}}"#,
+        JsonValue::string(sealed).to_json_string()
+    );
+    let open_b = parse_json(&dispatch_rpc(&mut node_b, &open_req))?;
+    assert_eq!(open_b.get_bool("ok"), Some(true));
+    assert_eq!(open_b.get_str("payload"), Some(sig_plain));
+
+    // Eve (different room key) MUST fail Poly1305 AEAD verification
+    let open_eve = parse_json(&dispatch_rpc(&mut node_eve, &open_req))?;
+    assert_eq!(open_eve.get_bool("ok"), Some(false));
+
+    // Tampered R1 ciphertext MUST fail verification on Bob
+    let mut tampered = sealed.to_owned().into_bytes();
+    if let Some(last) = tampered.last_mut() {
+        *last = if *last == b'A' { b'B' } else { b'A' };
+    }
+    let tampered_str = String::from_utf8(tampered).map_err(|_| "utf8")?;
+    let tamper_req = format!(
+        r#"{{"cmd":"open_room_signal","sealed":{}}}"#,
+        JsonValue::string(&tampered_str).to_json_string()
+    );
+    assert_eq!(
+        parse_json(&dispatch_rpc(&mut node_b, &tamper_req))?.get_bool("ok"),
+        Some(false)
+    );
     Ok(())
 }
 

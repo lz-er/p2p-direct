@@ -5,9 +5,10 @@ use crate::audio::{compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm};
 use crate::crypto::{
     KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, derive_invite_wrap_key,
     derive_link_keys, derive_log_key, derive_mesh_key_from_passphrase, derive_relay_signal_key,
-    derive_voice_link_keys, key_fingerprint, pair_safety_code, x25519_public_key,
+    derive_room_signal_key, derive_room_topic, derive_voice_link_keys, key_fingerprint,
+    pair_safety_code, parse_fixed_12, x25519_public_key,
 };
-use crate::deflate::base64url_encode;
+use crate::deflate::{base64url_decode, base64url_encode, deflate_raw, inflate_auto};
 use crate::json::{JsonValue, write_json_string, write_json_value};
 use crate::log::{LogMessage, ReplicatedLog, SealedLogRecord};
 use crate::protocol::{
@@ -336,6 +337,8 @@ pub struct MeshNode {
     x25519_public: [u8; KEY_LEN],
     mesh_key: [u8; KEY_LEN],
     log_key: [u8; KEY_LEN],
+    room_signal_key: [u8; KEY_LEN],
+    room_topic: String,
     key_fp: String,
     passphrase_mode: bool,
     in_voice: bool,
@@ -364,6 +367,8 @@ impl MeshNode {
     ) -> Self {
         let x25519_public = x25519_public_key(&x25519_secret);
         let log_key = derive_log_key(&mesh_key);
+        let room_signal_key = derive_room_signal_key(&mesh_key);
+        let room_topic = derive_room_topic(&mesh_key);
         let key_fp = key_fingerprint(&mesh_key);
         let mut seed_buf = Vec::with_capacity(64 + entropy_seed.len());
         seed_buf.extend_from_slice(&x25519_public);
@@ -378,6 +383,8 @@ impl MeshNode {
             x25519_public,
             mesh_key,
             log_key,
+            room_signal_key,
+            room_topic,
             key_fp,
             passphrase_mode: false,
             in_voice: false,
@@ -418,6 +425,10 @@ impl MeshNode {
         &self.key_fp
     }
 
+    pub fn room_topic(&self) -> &str {
+        &self.room_topic
+    }
+
     pub fn passphrase_mode(&self) -> bool {
         self.passphrase_mode
     }
@@ -446,10 +457,82 @@ impl MeshNode {
         &mut self.csprng
     }
 
+    /// Deflates and ChaCha20-Poly1305 AEAD-seals a room rendezvous signaling payload
+    /// under `derive_room_signal_key(&self.mesh_key)` bound to `self.room_topic`.
+    pub fn seal_room_signal(&mut self, plaintext: &str) -> String {
+        let compressed = deflate_raw(plaintext.as_bytes());
+        let nonce = self.csprng.next_nonce();
+        let aad = format!("p2p-room-sig-v1|{}", self.room_topic);
+        let sealed = aead_seal(&self.room_signal_key, &nonce, aad.as_bytes(), &compressed);
+        let mut framed = Vec::with_capacity(NONCE_LEN + sealed.len());
+        framed.extend_from_slice(&nonce);
+        framed.extend_from_slice(&sealed);
+        format!("R1:{}", base64url_encode(&framed))
+    }
+
+    /// Authenticates, decrypts, and inflates an `R1:` room rendezvous signaling payload.
+    pub fn open_room_signal(&mut self, sealed: &str) -> Result<String, String> {
+        let body = sealed
+            .trim()
+            .strip_prefix("R1:")
+            .ok_or_else(|| "room signal must start with 'R1:'".to_owned())?;
+        let raw = base64url_decode(body)?;
+        let nonce_slice = raw
+            .get(..NONCE_LEN)
+            .ok_or_else(|| "truncated room signal nonce".to_owned())?;
+        let ct_slice = raw
+            .get(NONCE_LEN..)
+            .ok_or_else(|| "truncated room signal ciphertext".to_owned())?;
+        let nonce = parse_fixed_12(nonce_slice, "room signal nonce")?;
+        let aad = format!("p2p-room-sig-v1|{}", self.room_topic);
+        let compressed = match aead_open(&self.room_signal_key, &nonce, aad.as_bytes(), ct_slice) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+        let plain_bytes = inflate_auto(&compressed)?;
+        String::from_utf8(plain_bytes)
+            .map_err(|_| "decrypted room signal is not valid UTF-8".to_owned())
+    }
+
     pub fn set_author_name(&mut self, name: String) {
         if !name.trim().is_empty() {
             self.author_name = name;
         }
+    }
+
+    /// Broadcasts an updated encrypted `Hello` frame to all currently connected direct peers
+    /// so profile changes (such as display name) propagate live across Voice Chat and Peer lists.
+    pub fn broadcast_hello_update(&mut self) -> Vec<MeshAction> {
+        let mut actions = Vec::new();
+        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+        for pid in peer_ids {
+            let other_peers: Vec<PeerSummary> = self
+                .peers
+                .values()
+                .filter(|p| p.peer_id != pid)
+                .map(|p| PeerSummary {
+                    peer_id: p.peer_id.clone(),
+                    author_name: p.author_name.clone(),
+                    pub_key: p.crypto.pub_key,
+                })
+                .collect();
+            let hello = WireFrame::Hello {
+                peer_id: self.peer_id.clone(),
+                author_name: self.author_name.clone(),
+                room: self.room.clone(),
+                pub_key: self.x25519_public,
+                lamport: self.log.lamport(),
+                log_count: self.log.len(),
+                in_voice: self.in_voice,
+                voice_muted: self.voice_muted,
+                peers: other_peers,
+            };
+            self.emit_wire(&mut actions, &pid, &hello);
+        }
+        actions
     }
 
     pub fn set_room(&mut self, room: String) {
@@ -470,6 +553,8 @@ impl MeshNode {
         }
         self.mesh_key = new_mesh_key;
         self.log_key = derive_log_key(&new_mesh_key);
+        self.room_signal_key = derive_room_signal_key(&new_mesh_key);
+        self.room_topic = derive_room_topic(&new_mesh_key);
         self.key_fp = key_fingerprint(&new_mesh_key);
         self.passphrase_mode = passphrase_mode;
         self.log.reseal_all(&self.log_key, &mut self.csprng);
@@ -1987,6 +2072,8 @@ impl MeshNode {
         write_json_string(&mut out, &self.room);
         out.push_str(",\"e2ee\":{\"cipher\":\"X25519 + ChaCha20-Poly1305\",\"keyFingerprint\":");
         write_json_string(&mut out, &self.key_fp);
+        out.push_str(",\"roomTopic\":");
+        write_json_string(&mut out, &self.room_topic);
         out.push_str(",\"publicKey\":");
         write_json_string(&mut out, &base64url_encode(&self.x25519_public));
         let _ = write!(

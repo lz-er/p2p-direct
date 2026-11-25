@@ -351,19 +351,84 @@
                 </div>
               </div>
 
-              <!-- Mode 0: Clear Role Picker -->
+              <!-- Long-Lived Reusable Room Link -->
+              <div id="room-link-card" class="room-link-card">
+                <div id="room-link-setup" class="room-link-setup">
+                  <div class="room-card-head">
+                    <span class="room-card-title">Long-Lived Room Link</span>
+                    <span class="badge auto">Reusable</span>
+                  </div>
+                  <p class="step-hint" style="margin-bottom: 8px">
+                    Create one link for a room. Whoever opens it first starts the room, and everyone else joins automatically.
+                  </p>
+                  <div class="room-create-row">
+                    <input
+                      id="room-name-input"
+                      class="text-input"
+                      type="text"
+                      maxlength="32"
+                      placeholder="Room name (optional)…"
+                      autocomplete="off"
+                    />
+                    <button type="button" id="btn-create-room-link" class="btn btn-live btn-sm">
+                      Create Link
+                    </button>
+                  </div>
+                </div>
+
+                <div id="room-link-active" class="room-link-active hidden">
+                  <div class="room-card-head">
+                    <span class="room-card-title" id="room-active-name">Shared Room</span>
+                    <span class="badge pending" id="room-relay-badge">Connecting…</span>
+                  </div>
+                  <p class="step-hint" id="room-active-hint" style="margin-bottom: 8px">
+                    Share this link — anyone who opens it joins this room automatically.
+                  </p>
+                  <input
+                    id="room-link-output"
+                    class="room-link-input"
+                    type="text"
+                    readonly
+                    aria-label="Long-lived room invite link"
+                  />
+                  <div class="btn-row" style="margin-top: 8px">
+                    <button type="button" id="btn-room-copy-url" class="btn btn-live btn-sm">
+                      Copy Room Link
+                    </button>
+                    <button type="button" id="btn-room-share" class="btn btn-sm hidden">
+                      Share…
+                    </button>
+                    <button
+                      type="button"
+                      id="btn-room-new"
+                      class="btn btn-sm"
+                      title="Start a separate new room with a fresh invite link"
+                    >
+                      New Room
+                    </button>
+                    <button
+                      type="button"
+                      id="btn-room-leave"
+                      class="btn btn-sm btn-danger"
+                      title="Leave this room link"
+                    >
+                      Leave
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Mode 0: Clear Role Picker for 1-to-1 Offline Manual Connect -->
               <div id="wizard-role-picker" class="role-picker">
-                <p class="step-hint" style="margin-bottom: 10px">
-                  Connect directly browser-to-browser with no server.
-                </p>
+                <div class="connect-divider"><span>Or 1-to-1 manual connect</span></div>
                 <div class="role-grid">
                   <button type="button" id="btn-wizard-start-host" class="role-card primary">
                     <span class="role-card-title">Invite a Peer</span>
-                    <span class="role-card-desc">Create an invite link to send to someone else</span>
+                    <span class="role-card-desc">Step-by-step direct link without any relay</span>
                   </button>
                   <button type="button" id="btn-wizard-start-join" class="role-card">
                     <span class="role-card-title">Join with Invite</span>
-                    <span class="role-card-desc">Paste an invite link or <code>P2P1:</code> code you received</span>
+                    <span class="role-card-desc">Paste a room link, invite link, or <code>P2P1:</code> code</span>
                   </button>
                 </div>
               </div>

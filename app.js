@@ -1,4 +1,5 @@
 import { SafeRustWasmMesh } from "./wasm_client.js";
+import { MultiRelayRendezvous, resolveRelayUrls } from "./mqtt_relay.js";
 import {
   acquireProfileSlot,
   loadProfileState,
@@ -303,6 +304,17 @@ function basePageUrl() {
   return `${window.location.origin}${window.location.pathname}${window.location.search}`;
 }
 
+function shareableBaseUrl() {
+  try {
+    const u = new URL(window.location.href);
+    u.hash = "";
+    u.searchParams.delete("profile");
+    return u.toString();
+  } catch {
+    return basePageUrl();
+  }
+}
+
 function rmsToLevel(rms) {
   if (!rms || rms <= 0) return 0;
   const norm = Math.min(1, rms / 5500);
@@ -388,6 +400,16 @@ class P2PDirectApp {
     this.localDialing = new Map();
     this.earlyLocalIce = new Map();
 
+    // Long-lived reusable room link & encrypted MQTT rendezvous state
+    this.activeRoom = null; // { name, code, url, topic, relay, encrypted }
+    this.roomRendezvous = null;
+    this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0 };
+    this.roomDialing = new Map();
+    this.earlyRoomIce = new Map();
+    this.seenRoomSignalIds = new Map();
+    this.lastHelloReplyPerPeer = new Map();
+    this.pendingRoomCode = null;
+
     // Background-resilient Web Worker keepalive
     this.keepaliveWorker = null;
     this.keepaliveFallbackTimer = null;
@@ -444,6 +466,19 @@ class P2PDirectApp {
       "rejoin-desc",
       "btn-create-rejoin",
       "btn-dismiss-rejoin",
+      "room-link-card",
+      "room-link-setup",
+      "room-name-input",
+      "btn-create-room-link",
+      "room-link-active",
+      "room-active-name",
+      "room-relay-badge",
+      "room-active-hint",
+      "room-link-output",
+      "btn-room-copy-url",
+      "btn-room-share",
+      "btn-room-new",
+      "btn-room-leave",
       "wizard-role-picker",
       "btn-wizard-start-host",
       "btn-wizard-start-join",
@@ -569,6 +604,42 @@ class P2PDirectApp {
       }
     });
 
+    // Long-lived reusable room link controls
+    this.el["btn-create-room-link"].addEventListener("click", () =>
+      this.createLongLivedRoom({ freshKey: false })
+    );
+    this.el["room-name-input"].addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        this.createLongLivedRoom({ freshKey: false });
+      }
+    });
+    this.el["room-link-output"].addEventListener("click", () => {
+      this.el["room-link-output"].select();
+    });
+    this.el["btn-room-copy-url"].addEventListener("click", () => {
+      if (!this.activeRoom) return;
+      this.copyText(
+        this.activeRoom.url,
+        "Copied room link — anyone who opens it joins automatically"
+      );
+    });
+    this.el["btn-room-share"].addEventListener("click", async () => {
+      if (!this.activeRoom || typeof navigator.share !== "function") return;
+      try {
+        await navigator.share({
+          title: `Join ${this.activeRoom.name || "my room"} on p2p-direct`,
+          url: this.activeRoom.url,
+        });
+      } catch {
+        // user canceled share sheet
+      }
+    });
+    this.el["btn-room-new"].addEventListener("click", () =>
+      this.createLongLivedRoom({ freshKey: true })
+    );
+    this.el["btn-room-leave"].addEventListener("click", () => this.leaveLongLivedRoom());
+
     // Quick local join & cross-device rejoin banners
     this.el["btn-join-local-mesh"].addEventListener("click", () => this.joinDiscoveredLocalMesh());
     this.el["btn-create-rejoin"].addEventListener("click", () => this.createManualInvite(true));
@@ -600,7 +671,7 @@ class P2PDirectApp {
       if (!this.latestOffer || typeof navigator.share !== "function") return;
       try {
         await navigator.share({
-          title: "Join my E2EE p2p-direct mesh",
+          title: "Join my p2p-direct room",
           url: this.latestOffer.url,
         });
         this.markHostInviteShared();
@@ -617,7 +688,13 @@ class P2PDirectApp {
     this.el["host-answer-input"].addEventListener("paste", () => {
       setTimeout(() => {
         const val = this.el["host-answer-input"].value.trim();
-        if (val.includes("P2P1:") || val.includes("#answer=") || val.includes("#offer=")) {
+        if (
+          val.includes("P2P1:") ||
+          val.includes("#answer=") ||
+          val.includes("#offer=") ||
+          val.includes("#room=") ||
+          val.includes("#join=")
+        ) {
           this.handleHostAnswerSubmit(val);
         }
       }, 0);
@@ -635,7 +712,13 @@ class P2PDirectApp {
     this.el["join-offer-input"].addEventListener("paste", () => {
       setTimeout(() => {
         const val = this.el["join-offer-input"].value.trim();
-        if (val.includes("P2P1:") || val.includes("#offer=") || val.includes("#answer=")) {
+        if (
+          val.includes("P2P1:") ||
+          val.includes("#offer=") ||
+          val.includes("#answer=") ||
+          val.includes("#room=") ||
+          val.includes("#join=")
+        ) {
           this.handleJoinOfferSubmit(val);
         }
       }, 0);
@@ -681,11 +764,13 @@ class P2PDirectApp {
       const res = this.wasm.call({ cmd: "set_profile", authorName: next });
       this.status = res.status;
       this.profile.authorName = next;
+      this.executeActions(res.actions);
       this.schedulePersist();
       this.renderHeader();
       this.renderVoicePanel(true);
       this.renderTopology();
       this.broadcastMeshBeacon(false);
+      this.announceRoomHello(false);
       this.showToast(`Updated display name to ${next}`);
     });
 
@@ -881,6 +966,20 @@ class P2PDirectApp {
       if (this.voice.inVoice) {
         this.leaveVoiceChat(/* silent = */ true);
       }
+      if (this.roomRendezvous) {
+        try {
+          this.roomRendezvous.stop();
+        } catch {
+          // ignore
+        }
+      }
+      for (const entry of this.roomDialing.values()) {
+        try {
+          entry.pc.close();
+        } catch {
+          // ignore
+        }
+      }
       if (this.keepaliveWorker) {
         try {
           this.keepaliveWorker.terminate();
@@ -971,8 +1070,18 @@ class P2PDirectApp {
     this.startKeepaliveWorker();
     this.renderAll();
 
-    // Handle any #offer= or #answer= fragment present in the initial URL
+    // Handle any #room=, #offer=, or #answer= fragment present in the initial URL
     await this.handleUrlHashFragment();
+
+    // If reopening a tab that belonged to a long-lived room, reconnect automatically
+    if (!this.activeRoom && this.profile.activeRoom) {
+      this.activateCurrentMeshAsRoom({
+        roomName: this.profile.activeRoom.name || this.status.room,
+        relay: this.profile.activeRoom.relay || null,
+        updateHash: false,
+        silent: true,
+      });
+    }
 
     // Broadcast presence so reopened tabs on the same browser auto-rejoin immediately
     this.broadcastMeshBeacon(true);
@@ -990,7 +1099,11 @@ class P2PDirectApp {
 
   applyTheme(theme, persist = true) {
     const isDark = theme === "dark";
-    document.documentElement.setAttribute("data-theme", isDark ? "dark" : "light");
+    const root = document.documentElement;
+    root.classList.add("theme-switching");
+    root.setAttribute("data-theme", isDark ? "dark" : "light");
+    void root.offsetHeight;
+    root.classList.remove("theme-switching");
     if (this.el["icon-moon"] && this.el["icon-sun"]) {
       this.el["icon-moon"].classList.toggle("hidden", isDark);
       this.el["icon-sun"].classList.toggle("hidden", !isDark);
@@ -1172,6 +1285,7 @@ class P2PDirectApp {
     const isHost = w.mode === "host";
     const isJoin = w.mode === "join";
 
+    this.el["room-link-card"].classList.toggle("hidden", !isIdle);
     this.el["wizard-role-picker"].classList.toggle("hidden", !isIdle);
     this.el["wizard-host-flow"].classList.toggle("hidden", !isHost);
     this.el["wizard-join-flow"].classList.toggle("hidden", !isJoin);
@@ -1277,6 +1391,11 @@ class P2PDirectApp {
         }
       }
 
+      // Periodically advertise encrypted room presence so future joiners discover us even in background tabs
+      if (this.activeRoom && this.roomRendezvous && this.keepaliveTickCount % 2 === 0) {
+        this.announceRoomHello(this.directPeers.size === 0);
+      }
+
       if (this.keepaliveTickCount % 4 === 0) {
         try {
           const tickRes = this.wasm.call({
@@ -1313,7 +1432,7 @@ class P2PDirectApp {
       };
       this.keepaliveWorker = worker;
       URL.revokeObjectURL(url);
-      this.addTelemetry("keepalive", "Started background Web Worker E2EE keepalive (4s interval)");
+      this.addTelemetry("keepalive", "Started background Web Worker keepalive (4s interval)");
     } catch {
       this.keepaliveFallbackTimer = setInterval(onTick, KEEPALIVE_INTERVAL_MS);
     }
@@ -1336,6 +1455,9 @@ class P2PDirectApp {
     } else {
       this.broadcastMeshBeacon(true);
     }
+    if (this.activeRoom && this.roomRendezvous) {
+      this.announceRoomHello(true);
+    }
     if (this.voice.inVoice && this.voice.audioCtx && this.voice.audioCtx.state === "suspended") {
       this.voice.audioCtx.resume().catch(() => {});
     }
@@ -1350,6 +1472,21 @@ class P2PDirectApp {
           // ignore
         }
         this.localDialing.delete(pid);
+      }
+    }
+    for (const [pid, entry] of this.roomDialing.entries()) {
+      if (now - entry.startedAt > 18_000) {
+        try {
+          entry.pc.close();
+        } catch {
+          // ignore
+        }
+        this.roomDialing.delete(pid);
+      }
+    }
+    for (const [sid, ts] of this.seenRoomSignalIds.entries()) {
+      if (now - ts > 60_000) {
+        this.seenRoomSignalIds.delete(sid);
       }
     }
   }
@@ -1415,12 +1552,12 @@ class P2PDirectApp {
             Array.isArray(msg.connectedPeers) && msg.connectedPeers.includes(this.status.peerId);
           const isHealthy =
             existing && existing.dc && existing.dc.readyState === "open" && remoteConnectedToUs;
-          if (!isHealthy && !this.localDialing.has(msg.peerId)) {
+          if (!isHealthy && !this.localDialing.has(msg.peerId) && !this.roomDialing.has(msg.peerId)) {
             if (this.status.peerId < msg.peerId) {
               this.startLocalAutoRejoinOffer(msg.peerId, msg.authorName, msg.pubKey);
             }
           }
-        } else if (!msg.passphraseMode && this.directPeers.size === 0 && this.logMessages.length === 0) {
+        } else if (!msg.passphraseMode && !this.activeRoom && this.directPeers.size === 0 && this.logMessages.length === 0) {
           this.discoveredLocalMeshes.set(msg.peerId, msg);
           this.renderConnectBanners();
         }
@@ -1753,7 +1890,7 @@ class P2PDirectApp {
 
   /* ================= Passphrase & E2EE Key Controls ================= */
 
-  applyPassphrase() {
+  async applyPassphrase() {
     const pass = this.el["e2ee-passphrase-input"].value;
     if (!pass) {
       this.showToast("Enter a passphrase first, or click Auto for an automatic 256-bit key.");
@@ -1770,13 +1907,30 @@ class P2PDirectApp {
       this.profile.passphraseMode = true;
       this.discoveredLocalMeshes.clear();
       this.flushPersist();
+
+      if (this.pendingRoomCode) {
+        const pendingCode = this.pendingRoomCode;
+        this.pendingRoomCode = null;
+        await this.joinLongLivedRoomLink(pendingCode);
+        return;
+      }
+
+      if (this.activeRoom) {
+        this.activateCurrentMeshAsRoom({
+          roomName: this.activeRoom.name,
+          relay: this.activeRoom.relay,
+          updateHash: true,
+          silent: true,
+        });
+      }
+
       this.renderAll();
       this.broadcastMeshBeacon(true);
       this.addTelemetry(
         "e2ee",
         `Derived 256-bit key via PBKDF2-HMAC-SHA256 (${this.status.e2ee.keyFingerprint}); P2P1 codes are passphrase-encrypted`
       );
-      this.showToast(`Passphrase E2EE active · FP ${this.status.e2ee.keyFingerprint}`);
+      this.showToast(`Passphrase encryption active · FP ${this.status.e2ee.keyFingerprint}`);
     } catch (err) {
       this.addTelemetry("error", `Passphrase error: ${err.message}`);
     }
@@ -1795,13 +1949,21 @@ class P2PDirectApp {
     this.profile.meshKey = res.meshKey;
     this.profile.passphraseMode = false;
     this.flushPersist();
+    if (this.activeRoom) {
+      this.activateCurrentMeshAsRoom({
+        roomName: this.activeRoom.name,
+        relay: this.activeRoom.relay,
+        updateHash: true,
+        silent: true,
+      });
+    }
     this.renderAll();
     this.broadcastMeshBeacon(true);
     this.addTelemetry(
       "e2ee",
       `Switched to automatic 256-bit mesh key (${this.status.e2ee.keyFingerprint})`
     );
-    this.showToast(`Auto 256-bit E2EE active · FP ${this.status.e2ee.keyFingerprint}`);
+    this.showToast(`Auto 256-bit key active · FP ${this.status.e2ee.keyFingerprint}`);
   }
 
   switchComposerMode(mode) {
@@ -1868,6 +2030,36 @@ class P2PDirectApp {
     this.saveTimer = setTimeout(() => this.flushPersist(), 120);
   }
 
+  _saveCurrentRoomSnapshotToCache(snapshot) {
+    if (!this.profile || !this.status?.e2ee?.keyFingerprint) return;
+    if (!this.profile.roomSnapshots || typeof this.profile.roomSnapshots !== "object") {
+      this.profile.roomSnapshots = {};
+    }
+    const fp = this.status.e2ee.keyFingerprint;
+    const hasData =
+      (snapshot?.records && snapshot.records.length > 0) ||
+      (this.profile.knownPeers && this.profile.knownPeers.length > 0);
+    if (!hasData) return;
+
+    this.profile.roomSnapshots[fp] = {
+      room: this.status.room || "Shared Room",
+      snapshot,
+      knownPeers: (this.profile.knownPeers || []).slice(0, 12),
+      updatedAt: Date.now(),
+    };
+    const keys = Object.keys(this.profile.roomSnapshots);
+    if (keys.length > 12) {
+      keys.sort(
+        (a, b) =>
+          (this.profile.roomSnapshots[b]?.updatedAt || 0) -
+          (this.profile.roomSnapshots[a]?.updatedAt || 0)
+      );
+      for (const staleKey of keys.slice(12)) {
+        delete this.profile.roomSnapshots[staleKey];
+      }
+    }
+  }
+
   flushPersist() {
     if (!this.wasm || !this.profile) return;
     if (this.saveTimer) {
@@ -1878,8 +2070,13 @@ class P2PDirectApp {
       const exp = this.wasm.call({ cmd: "export_snapshot" });
       this.profile.snapshot = exp.snapshot;
       this.profile.authorName = this.status.authorName;
+      this.profile.room = this.status.room || "mesh-main";
       this.profile.autoMeshEnabled = this.status.autoMeshEnabled;
       this.profile.passphraseMode = Boolean(this.status.e2ee?.passphraseMode);
+      this.profile.activeRoom = this.activeRoom
+        ? { name: this.activeRoom.name, relay: this.activeRoom.relay || null }
+        : null;
+      this._saveCurrentRoomSnapshotToCache(exp.snapshot);
       saveProfileState(this.profile);
     } catch {
       // ignore persistence error
@@ -1948,6 +2145,681 @@ class P2PDirectApp {
     this.showToast(`Exported ${this.logMessages.length} decrypted log entries`);
   }
 
+  /* ================= Long-Lived Reusable Room Links & Encrypted Rendezvous ================= */
+
+  _disconnectAllPeersForRoomSwitch() {
+    if (this.voice.inVoice) {
+      this.leaveVoiceChat(/* silent = */ true);
+    }
+    for (const entry of this.roomDialing.values()) {
+      try {
+        entry.pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.roomDialing.clear();
+    this.earlyRoomIce.clear();
+    this.seenRoomSignalIds.clear();
+    this.lastHelloReplyPerPeer.clear();
+
+    for (const entry of this.localDialing.values()) {
+      try {
+        entry.pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.localDialing.clear();
+    this.earlyLocalIce.clear();
+
+    for (const entry of this.relayPeers.values()) {
+      try {
+        entry.pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.relayPeers.clear();
+    this.earlyRelayIce.clear();
+
+    for (const p of this.pendingOffers.values()) {
+      try {
+        p.dc.close();
+        if (p.voiceDc) p.voiceDc.close();
+        p.pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.pendingOffers.clear();
+    this.latestOffer = null;
+
+    for (const a of this.pendingAnswers.values()) {
+      try {
+        a.pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.pendingAnswers.clear();
+    this.latestAnswer = null;
+
+    const oldPeerIds = Array.from(this.directPeers.keys());
+    for (const pid of oldPeerIds) {
+      const entry = this.directPeers.get(pid);
+      if (entry) {
+        entry.superseded = true;
+        try {
+          entry.dc.onclose = null;
+          entry.dc.onerror = null;
+          entry.pc.onconnectionstatechange = null;
+          entry.pc.oniceconnectionstatechange = null;
+          entry.dc.close();
+          if (entry.voiceDc) entry.voiceDc.close();
+          entry.pc.close();
+        } catch {
+          // ignore
+        }
+      }
+      this.directPeers.delete(pid);
+    }
+    for (const vdc of this.voiceChannels.values()) {
+      try {
+        vdc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.voiceChannels.clear();
+
+    for (const p of (this.status?.peers || []).slice()) {
+      try {
+        const res = this.wasm.call({ cmd: "peer_disconnected", peerId: p.peerId });
+        this.status = res.status;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  switchToMeshKey(newMeshKey, passphraseMode, roomName) {
+    const cleanRoom = (roomName || "").trim() || "Shared Room";
+    const sameKey =
+      newMeshKey === this.profile.meshKey &&
+      Boolean(passphraseMode) === Boolean(this.status.e2ee?.passphraseMode);
+
+    if (sameKey) {
+      if (cleanRoom && cleanRoom !== this.status.room) {
+        const prof = this.wasm.call({ cmd: "set_profile", room: cleanRoom });
+        this.status = prof.status;
+        this.profile.room = cleanRoom;
+      }
+      return false;
+    }
+
+    // Persist current room's encrypted snapshot under its key fingerprint before switching
+    try {
+      const exp = this.wasm.call({ cmd: "export_snapshot" });
+      this._saveCurrentRoomSnapshotToCache(exp.snapshot);
+    } catch {
+      // ignore
+    }
+
+    this._disconnectAllPeersForRoomSwitch();
+    this.discoveredLocalMeshes.clear();
+
+    // Clear log before adopting the new room key so unrelated messages never cross rooms
+    this.wasm.call({ cmd: "clear_log" });
+    const keyRes = this.wasm.call({
+      cmd: "set_mesh_key",
+      meshKey: newMeshKey,
+      passphraseMode: Boolean(passphraseMode),
+      entropy: randomBase64Url(32),
+    });
+    this.status = keyRes.status;
+
+    const profRes = this.wasm.call({ cmd: "set_profile", room: cleanRoom });
+    this.status = profRes.status;
+    this.profile.meshKey = newMeshKey;
+    this.profile.passphraseMode = Boolean(passphraseMode);
+    this.profile.room = cleanRoom;
+
+    const newFp = this.status.e2ee.keyFingerprint;
+    const cached = this.profile.roomSnapshots?.[newFp];
+    if (cached && cached.snapshot && Array.isArray(cached.snapshot.records) && cached.snapshot.records.length > 0) {
+      try {
+        const imp = this.wasm.call({ cmd: "import_snapshot", snapshot: cached.snapshot });
+        this.status = imp.status;
+        this.logMessages = imp.log;
+        this.profile.knownPeers = Array.isArray(cached.knownPeers) ? cached.knownPeers.slice() : [];
+        this.addTelemetry("room", `Restored ${imp.added} encrypted message(s) for room "${cleanRoom}"`);
+      } catch {
+        this.refreshLogFromWasm();
+        this.profile.knownPeers = [];
+      }
+    } else {
+      this.refreshLogFromWasm();
+      this.profile.knownPeers = [];
+    }
+
+    this.flushPersist();
+    return true;
+  }
+
+  createLongLivedRoom({ freshKey = false } = {}) {
+    const typedName = (this.el["room-name-input"]?.value || "").trim();
+    const params = new URLSearchParams(window.location.search);
+    const queryRelay = (params.get("relay") || "").trim() || null;
+
+    let roomName = typedName;
+    if (freshKey) {
+      const freshMeshKey = randomBase64Url(32);
+      if (!roomName) {
+        roomName = `Room ${freshMeshKey.slice(0, 4).toUpperCase()}`;
+      }
+      this.switchToMeshKey(freshMeshKey, false, roomName);
+    } else if (!roomName) {
+      roomName =
+        this.status.room && this.status.room !== "mesh-main" && this.status.room !== "default"
+          ? this.status.room
+          : "Shared Room";
+    }
+
+    if (this.el["room-name-input"]) {
+      this.el["room-name-input"].value = "";
+    }
+    this.el["connect-notice"].classList.add("hidden");
+    this.activateCurrentMeshAsRoom({
+      roomName,
+      relay: queryRelay,
+      updateHash: true,
+      silent: false,
+      joined: false,
+    });
+    this.broadcastMeshBeacon(true);
+  }
+
+  async joinLongLivedRoomLink(rawInput) {
+    const trimmed = (rawInput || "").trim();
+    if (!trimmed) return false;
+    try {
+      const passInput = this.el["e2ee-passphrase-input"].value;
+      const decoded = this.wasm.call({
+        cmd: "decode_signal",
+        input: trimmed,
+        passphrase: passInput || undefined,
+      });
+      const sig = decoded.signal;
+      if (sig.kind !== "room") {
+        throw new Error(`Expected a room invite link, got '${sig.kind}'`);
+      }
+
+      let targetMeshKey = this.profile.meshKey;
+      let targetPassMode = Boolean(this.status.e2ee?.passphraseMode);
+      if (!sig.encrypted && sig.meshKey) {
+        targetMeshKey = sig.meshKey;
+        targetPassMode = false;
+      } else if (sig.encrypted) {
+        if (passInput && !targetPassMode) {
+          const passRes = this.wasm.call({
+            cmd: "set_passphrase",
+            passphrase: passInput,
+            entropy: randomBase64Url(32),
+          });
+          targetMeshKey = passRes.meshKey;
+          targetPassMode = true;
+        }
+      }
+
+      this.pendingRoomCode = null;
+      const roomName =
+        sig.room && sig.room !== "default" && sig.room !== "mesh-main"
+          ? sig.room
+          : "Shared Room";
+      this.switchToMeshKey(targetMeshKey, targetPassMode, roomName);
+
+      const params = new URLSearchParams(window.location.search);
+      const effectiveRelay = (params.get("relay") || "").trim() || sig.relay || null;
+
+      this.el["connect-notice"].classList.add("hidden");
+      this.activateCurrentMeshAsRoom({
+        roomName,
+        relay: effectiveRelay,
+        updateHash: true,
+        silent: false,
+        joined: true,
+      });
+      this.broadcastMeshBeacon(true);
+      return true;
+    } catch (err) {
+      const msg = err?.message || "Invalid room link";
+      if (msg.toLowerCase().includes("passphrase")) {
+        this.pendingRoomCode = trimmed;
+        this.el["e2ee-key-details"].open = true;
+        this.el["e2ee-passphrase-input"].focus();
+      }
+      this.showNotice("connect-notice", "error", msg);
+      return false;
+    }
+  }
+
+  activateCurrentMeshAsRoom({
+    roomName,
+    relay = null,
+    updateHash = true,
+    silent = false,
+    joined = false,
+  } = {}) {
+    const cleanName = (roomName || this.status.room || "Shared Room").trim() || "Shared Room";
+    const encoded = this.wasm.call({
+      cmd: "encode_room_invite",
+      room: cleanName,
+      relay: relay || undefined,
+      baseUrl: shareableBaseUrl(),
+      entropy: randomBase64Url(16),
+    });
+    this.status = encoded.status;
+    this.activeRoom = {
+      name: encoded.room,
+      code: encoded.code,
+      url: encoded.url,
+      topic: encoded.roomTopic,
+      relay: relay || null,
+      encrypted: Boolean(encoded.encrypted),
+    };
+    this.profile.room = encoded.room;
+    this.profile.activeRoom = { name: encoded.room, relay: relay || null };
+
+    if (updateHash) {
+      try {
+        history.replaceState(null, "", `${basePageUrl()}#room=${encoded.code}`);
+      } catch {
+        // ignore restricted history API
+      }
+    }
+
+    this.startRoomRendezvous(encoded.roomTopic, relay);
+    this.flushPersist();
+    this.renderAll();
+
+    this.addTelemetry(
+      "room",
+      `${joined ? "Joined" : "Created"} long-lived room "${encoded.room}" (topic ${encoded.roomTopic.slice(0, 10)}…)`
+    );
+    if (!silent) {
+      this.showToast(
+        joined
+          ? `Joined "${encoded.room}" — connecting to peers automatically`
+          : `Room link ready for "${encoded.room}"`
+      );
+    }
+  }
+
+  leaveLongLivedRoom() {
+    if (this.roomRendezvous) {
+      this.roomRendezvous.stop();
+      this.roomRendezvous = null;
+    }
+    for (const entry of this.roomDialing.values()) {
+      try {
+        entry.pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.roomDialing.clear();
+    this.earlyRoomIce.clear();
+    this.seenRoomSignalIds.clear();
+    this.lastHelloReplyPerPeer.clear();
+    this.activeRoom = null;
+    this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0 };
+    this.profile.activeRoom = null;
+    try {
+      history.replaceState(null, "", basePageUrl());
+    } catch {
+      // ignore
+    }
+    this.flushPersist();
+    this.renderAll();
+    this.addTelemetry("room", "Stopped listening on long-lived room link");
+    this.showToast("Left room invite link");
+  }
+
+  startRoomRendezvous(roomTopic, customRelay) {
+    const urls = resolveRelayUrls(customRelay);
+    if (
+      this.roomRendezvous &&
+      this.roomRendezvous.roomTopic === roomTopic &&
+      JSON.stringify(this.roomRendezvous.urls) === JSON.stringify(urls)
+    ) {
+      this.announceRoomHello(true);
+      return;
+    }
+    if (this.roomRendezvous) {
+      this.roomRendezvous.stop();
+      this.roomRendezvous = null;
+    }
+
+    this.roomRendezvous = new MultiRelayRendezvous({
+      roomTopic,
+      urls,
+      onMessage: (sealedPayload) => {
+        this.handleSealedRoomSignal(sealedPayload);
+      },
+      onBrokerReady: (_client, status) => {
+        this.roomRelayStatus = status;
+        this.renderRoomCard();
+        this.announceRoomHello(true);
+      },
+      onStatusChange: (status) => {
+        this.roomRelayStatus = status;
+        this.renderRoomCard();
+      },
+    });
+    this.roomRendezvous.start();
+  }
+
+  sendRoomSignal(msgObj) {
+    if (!this.activeRoom || !this.roomRendezvous || !this.wasm) return;
+    try {
+      const enriched = msgObj.sid ? msgObj : { ...msgObj, sid: randomId("rs") };
+      const sealedRes = this.wasm.call({
+        cmd: "seal_room_signal",
+        payload: JSON.stringify(enriched),
+        entropy: randomBase64Url(16),
+      });
+      this.roomRendezvous.publish(sealedRes.sealed);
+    } catch {
+      // ignore serialization/seal errors during teardown
+    }
+  }
+
+  announceRoomHello(requestReply) {
+    if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
+    this.sendRoomSignal({
+      t: "hello",
+      from: this.status.peerId,
+      name: this.status.authorName,
+      pk: this.status.e2ee.publicKey,
+      peers: Array.from(this.directPeers.keys()),
+      reply: Boolean(requestReply),
+      ts: Date.now(),
+    });
+  }
+
+  async handleSealedRoomSignal(sealedPayload) {
+    if (!this.activeRoom || !this.wasm || !this.status) return;
+    let msg;
+    try {
+      const opened = this.wasm.call({
+        cmd: "open_room_signal",
+        sealed: sealedPayload,
+      });
+      msg = JSON.parse(opened.payload);
+    } catch {
+      // Ignore undecryptable or tampered packets from unrelated peers
+      return;
+    }
+
+    if (!msg || typeof msg !== "object" || !msg.t || msg.from === this.status.peerId) {
+      return;
+    }
+    if (msg.to && msg.to !== this.status.peerId) {
+      return;
+    }
+    if (msg.sid) {
+      if (this.seenRoomSignalIds.has(msg.sid)) {
+        return;
+      }
+      this.seenRoomSignalIds.set(msg.sid, Date.now());
+    }
+
+    switch (msg.t) {
+      case "hello": {
+        if (!msg.from || !msg.pk) return;
+        const existing = this.directPeers.get(msg.from);
+        const remoteConnectedToUs =
+          Array.isArray(msg.peers) && msg.peers.includes(this.status.peerId);
+        const isHealthy =
+          existing && existing.dc && existing.dc.readyState === "open" && remoteConnectedToUs;
+
+        const now = Date.now();
+        const lastReply = this.lastHelloReplyPerPeer.get(msg.from) || 0;
+        if ((msg.reply || (!isHealthy && this.status.peerId > msg.from)) && now - lastReply >= 1400) {
+          this.lastHelloReplyPerPeer.set(msg.from, now);
+          this.announceRoomHello(false);
+        }
+
+        if (
+          !isHealthy &&
+          !this.roomDialing.has(msg.from) &&
+          !this.localDialing.has(msg.from) &&
+          !this.relayPeers.has(msg.from)
+        ) {
+          if (this.status.peerId < msg.from) {
+            this.startRoomOffer(msg.from, msg.name || "Peer", msg.pk);
+          }
+        }
+        break;
+      }
+
+      case "offer": {
+        await this.acceptRoomOffer(msg);
+        break;
+      }
+
+      case "answer": {
+        await this.applyRoomAnswer(msg);
+        break;
+      }
+
+      case "ice": {
+        await this.applyRoomIce(msg.from, msg.cand);
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  async startRoomOffer(targetPeerId, targetName, targetPubKey) {
+    if (this.roomDialing.has(targetPeerId) || this.localDialing.has(targetPeerId)) return;
+    try {
+      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
+      const voiceDc = pc.createDataChannel("p2p-voice", { ordered: false, maxRetransmits: 0 });
+      const early = this.earlyRoomIce.get(targetPeerId) || [];
+      this.earlyRoomIce.delete(targetPeerId);
+
+      const entry = {
+        pc,
+        dc,
+        voiceDc,
+        remoteDescSet: false,
+        sdpSent: false,
+        localIceQueue: [],
+        pendingIce: early,
+        startedAt: Date.now(),
+      };
+      this.roomDialing.set(targetPeerId, entry);
+      this.attachVoiceDataChannel(targetPeerId, voiceDc);
+      this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, false, null, true);
+
+      const sendIce = (candJson) => {
+        this.sendRoomSignal({
+          t: "ice",
+          from: this.status.peerId,
+          to: targetPeerId,
+          cand: candJson,
+        });
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        const candJson = ev.candidate.toJSON();
+        if (!entry.sdpSent) {
+          entry.localIceQueue.push(candJson);
+          return;
+        }
+        sendIce(candJson);
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      this.sendRoomSignal({
+        t: "offer",
+        from: this.status.peerId,
+        to: targetPeerId,
+        name: this.status.authorName,
+        pk: this.status.e2ee.publicKey,
+        sdp: offer.sdp,
+      });
+
+      entry.sdpSent = true;
+      while (entry.localIceQueue.length > 0) {
+        sendIce(entry.localIceQueue.shift());
+      }
+      this.addTelemetry("room", `Dialing ${targetName} (${targetPeerId}) via encrypted room link`);
+    } catch {
+      this.roomDialing.delete(targetPeerId);
+    }
+  }
+
+  async acceptRoomOffer(msg) {
+    if (!msg.from || !msg.sdp || !msg.pk) return;
+    const prev = this.roomDialing.get(msg.from);
+    if (prev) {
+      try {
+        prev.pc.close();
+      } catch {
+        // ignore
+      }
+      this.roomDialing.delete(msg.from);
+    }
+    try {
+      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const early = this.earlyRoomIce.get(msg.from) || [];
+      this.earlyRoomIce.delete(msg.from);
+
+      const entry = {
+        pc,
+        dc: null,
+        remoteDescSet: false,
+        sdpSent: false,
+        localIceQueue: [],
+        pendingIce: early,
+        startedAt: Date.now(),
+      };
+      this.roomDialing.set(msg.from, entry);
+
+      pc.ondatachannel = (ev) => {
+        if (ev.channel.label === "p2p-voice") {
+          this.attachVoiceDataChannel(msg.from, ev.channel);
+          return;
+        }
+        entry.dc = ev.channel;
+        this.attachDataChannel(
+          pc,
+          ev.channel,
+          msg.from,
+          msg.name || "Peer",
+          msg.pk,
+          false,
+          null,
+          true
+        );
+      };
+
+      const sendIce = (candJson) => {
+        this.sendRoomSignal({
+          t: "ice",
+          from: this.status.peerId,
+          to: msg.from,
+          cand: candJson,
+        });
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        const candJson = ev.candidate.toJSON();
+        if (!entry.sdpSent) {
+          entry.localIceQueue.push(candJson);
+          return;
+        }
+        sendIce(candJson);
+      };
+
+      await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+      entry.remoteDescSet = true;
+      await this.flushPendingIce(entry);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      this.sendRoomSignal({
+        t: "answer",
+        from: this.status.peerId,
+        to: msg.from,
+        name: this.status.authorName,
+        pk: this.status.e2ee.publicKey,
+        sdp: answer.sdp,
+      });
+
+      entry.sdpSent = true;
+      while (entry.localIceQueue.length > 0) {
+        sendIce(entry.localIceQueue.shift());
+      }
+    } catch {
+      this.roomDialing.delete(msg.from);
+    }
+  }
+
+  async applyRoomAnswer(msg) {
+    const entry = this.roomDialing.get(msg.from);
+    if (!entry || !msg.sdp) return;
+    try {
+      if (entry.pc.signalingState === "have-local-offer") {
+        await entry.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        entry.remoteDescSet = true;
+        await this.flushPendingIce(entry);
+      }
+    } catch {
+      // ignore race
+    }
+  }
+
+  async applyRoomIce(fromPeerId, candidate) {
+    if (!fromPeerId || !candidate) return;
+    const entry = this.roomDialing.get(fromPeerId);
+    if (!entry) {
+      const direct = this.directPeers.get(fromPeerId);
+      if (direct && direct.pc) {
+        try {
+          await direct.pc.addIceCandidate(candidate);
+        } catch {
+          // ignore late ICE
+        }
+        return;
+      }
+      const list = this.earlyRoomIce.get(fromPeerId) || [];
+      list.push(candidate);
+      this.earlyRoomIce.set(fromPeerId, list);
+      return;
+    }
+    if (!entry.remoteDescSet) {
+      entry.pendingIce.push(candidate);
+      return;
+    }
+    try {
+      await entry.pc.addIceCandidate(candidate);
+    } catch {
+      // ignore benign ICE errors
+    }
+  }
+
   /* ================= URL Fragments & Guided Signal Handling ================= */
 
   async handleUrlHashFragment() {
@@ -1956,6 +2828,11 @@ class P2PDirectApp {
     try {
       const frag = this.wasm.call({ cmd: "extract_fragment", hash });
       if (!frag.found) return;
+
+      if (frag.kind === "room") {
+        await this.joinLongLivedRoomLink(frag.code);
+        return;
+      }
 
       try {
         history.replaceState(null, "", basePageUrl());
@@ -1989,7 +2866,13 @@ class P2PDirectApp {
         passphrase: passInput || undefined,
       });
     } catch (err) {
-      this.handleDecodeFailure(err);
+      this.handleDecodeFailure(err, trimmed);
+      return;
+    }
+
+    if (decoded.signal.kind === "room") {
+      this.resetWizard();
+      await this.joinLongLivedRoomLink(trimmed);
       return;
     }
 
@@ -2009,7 +2892,7 @@ class P2PDirectApp {
   async handleJoinOfferSubmit(rawInput) {
     const trimmed = (rawInput || "").trim();
     if (!trimmed) {
-      this.showNotice("connect-notice", "warn", "Paste an #offer= invite link or P2P1: invite code first.");
+      this.showNotice("connect-notice", "warn", "Paste a room link, #offer= link, or P2P1: code first.");
       return;
     }
     let decoded;
@@ -2021,7 +2904,13 @@ class P2PDirectApp {
         passphrase: passInput || undefined,
       });
     } catch (err) {
-      this.handleDecodeFailure(err);
+      this.handleDecodeFailure(err, trimmed);
+      return;
+    }
+
+    if (decoded.signal.kind === "room") {
+      this.resetWizard();
+      await this.joinLongLivedRoomLink(trimmed);
       return;
     }
 
@@ -2081,9 +2970,12 @@ class P2PDirectApp {
     }
   }
 
-  handleDecodeFailure(err) {
+  handleDecodeFailure(err, rawInput = "") {
     const msg = err?.message || "Invalid P2P1 signal code";
     if (msg.toLowerCase().includes("passphrase")) {
+      if (rawInput && (rawInput.includes("#room=") || rawInput.includes("#join="))) {
+        this.pendingRoomCode = rawInput;
+      }
       this.el["e2ee-key-details"].open = true;
       this.el["e2ee-passphrase-input"].focus();
     }
@@ -2956,6 +3848,8 @@ class P2PDirectApp {
       this.earlyRelayIce.delete(peerId);
       this.localDialing.delete(peerId);
       this.earlyLocalIce.delete(peerId);
+      this.roomDialing.delete(peerId);
+      this.earlyRoomIce.delete(peerId);
       this.pendingAnswers.delete(peerId);
       if (this.latestAnswer && this.latestAnswer.peerId === peerId) {
         this.latestAnswer = null;
@@ -2987,8 +3881,8 @@ class P2PDirectApp {
       this.renderAll();
       this.showToast(
         viaAutoMesh
-          ? `Auto-meshed directly (E2EE) with ${peerEntry.authorName}`
-          : `Connected (E2EE) to ${peerEntry.authorName}`
+          ? `Connected directly with ${peerEntry.authorName}`
+          : `Connected to ${peerEntry.authorName}`
       );
     };
 
@@ -3033,6 +3927,10 @@ class P2PDirectApp {
       const loc = this.localDialing.get(peerId);
       if (loc && loc.pc === pc) {
         this.localDialing.delete(peerId);
+      }
+      const rm = this.roomDialing.get(peerId);
+      if (rm && rm.pc === pc) {
+        this.roomDialing.delete(peerId);
       }
     };
 
@@ -3219,7 +4117,12 @@ class P2PDirectApp {
   }
 
   async startRelayedOffer(targetPeerId, targetName, targetPubKey, viaPeerId) {
-    if (this.directPeers.has(targetPeerId) || this.relayPeers.has(targetPeerId)) {
+    if (
+      this.directPeers.has(targetPeerId) ||
+      this.relayPeers.has(targetPeerId) ||
+      this.roomDialing.has(targetPeerId) ||
+      this.localDialing.has(targetPeerId)
+    ) {
       return;
     }
     try {
@@ -3422,6 +4325,7 @@ class P2PDirectApp {
 
   renderAll() {
     this.renderHeader();
+    this.renderRoomCard();
     this.renderWizard();
     this.renderConnectBanners();
     this.renderVoicePanel();
@@ -3430,6 +4334,47 @@ class P2PDirectApp {
     this.renderStats();
     this.renderTypeFilterOptions();
     this.renderLog();
+  }
+
+  renderRoomCard() {
+    if (!this.el["room-link-card"]) return;
+    const isActive = Boolean(this.activeRoom);
+    this.el["room-link-card"].classList.toggle("is-active", isActive);
+    this.el["room-link-setup"].classList.toggle("hidden", isActive);
+    this.el["room-link-active"].classList.toggle("hidden", !isActive);
+
+    if (!isActive) return;
+
+    const peerCount = this.status?.peers?.length || 0;
+    const relayState = this.roomRelayStatus?.state || "connecting";
+    const relayCount = this.roomRelayStatus?.connectedCount || 0;
+
+    this.el["room-active-name"].textContent = this.activeRoom.name || "Shared Room";
+    this.el["room-link-output"].value = this.activeRoom.url;
+    this.el["btn-room-share"].classList.toggle("hidden", typeof navigator.share !== "function");
+
+    const badge = this.el["room-relay-badge"];
+    if (peerCount > 0) {
+      badge.textContent = `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
+      badge.className = "badge auto";
+    } else if (relayState === "live" && relayCount > 0) {
+      badge.textContent = "Listening";
+      badge.className = "badge auto";
+    } else {
+      badge.textContent = "Connecting…";
+      badge.className = "badge pending";
+    }
+
+    if (peerCount > 0) {
+      this.el["room-active-hint"].textContent =
+        "Share this link anytime — new people who open it join this room automatically.";
+    } else if (this.activeRoom.encrypted) {
+      this.el["room-active-hint"].textContent =
+        "Passphrase-protected room ready. Share this link and your passphrase — anyone who opens it joins automatically.";
+    } else {
+      this.el["room-active-hint"].textContent =
+        "You're the first one here. Share this link — everyone who opens it will join you automatically.";
+    }
   }
 
   renderHeader() {
@@ -3468,7 +4413,7 @@ class P2PDirectApp {
     if (!this.status) return;
 
     const localTarget =
-      this.directPeers.size === 0 && this.logMessages.length === 0
+      !this.activeRoom && this.directPeers.size === 0 && this.logMessages.length === 0
         ? this.discoveredLocalMeshes.values().next().value
         : null;
     if (localTarget) {
@@ -3483,6 +4428,7 @@ class P2PDirectApp {
 
     const known = this.profile?.knownPeers || [];
     const showRejoin =
+      !this.activeRoom &&
       !this.rejoinDismissed &&
       this.directPeers.size === 0 &&
       known.length > 0 &&
@@ -3839,6 +4785,7 @@ class P2PDirectApp {
           item.event === "peer_connected" ||
           item.event === "e2ee" ||
           item.event === "rejoin" ||
+          item.event === "room" ||
           item.event.includes("voice")
         ) {
           cls += " event-auto";

@@ -93,8 +93,13 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
         }
         "set_profile" => {
             let node = require_node(state)?;
-            if let Some(name) = val.get_str("authorName") {
+            let mut name_changed = false;
+            if let Some(name) = val.get_str("authorName")
+                && !name.trim().is_empty()
+                && name != node.author_name()
+            {
                 node.set_author_name(name.to_owned());
+                name_changed = true;
             }
             if let Some(room) = val.get_str("room") {
                 node.set_room(room.to_owned());
@@ -102,8 +107,16 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             if let Some(enabled) = val.get_bool("autoMeshEnabled") {
                 node.set_auto_mesh_enabled(enabled);
             }
+            let actions = if name_changed {
+                node.broadcast_hello_update()
+            } else {
+                Vec::new()
+            };
+            let actions_json = actions_to_json_array(&actions);
             let status = node.status_json();
-            Ok(format!("{{\"ok\":true,\"status\":{status}}}"))
+            Ok(format!(
+                "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
+            ))
         }
         "set_passphrase" => {
             let node = require_node(state)?;
@@ -377,6 +390,7 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                     None
                 },
                 sdp,
+                relay: None,
             };
             let code = encode_signal_code(&payload, wrap_key.as_ref(), node.rng_mut())?;
             let url = if base_url.is_empty() {
@@ -398,6 +412,99 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             );
             Ok(out)
         }
+        "encode_room_invite" => {
+            let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
+            if let Some(r) = val.get_str("room")
+                && !r.trim().is_empty()
+            {
+                node.set_room(r.trim().to_owned());
+            }
+            let relay = val
+                .get_str("relay")
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let base_url = val.get_str("baseUrl").unwrap_or("");
+            let wrap_key = node.invite_wrap_key();
+            let payload = SignalCodePayload {
+                version: PROTOCOL_VERSION,
+                kind: SignalCodeKind::Room,
+                peer_id: String::new(),
+                author_name: String::new(),
+                room: node.room().to_owned(),
+                invite_id: String::new(),
+                pub_key: [0u8; crate::crypto::KEY_LEN],
+                mesh_key: if wrap_key.is_none() {
+                    Some(node.mesh_key())
+                } else {
+                    None
+                },
+                sdp: String::new(),
+                relay,
+            };
+            let code = encode_signal_code(&payload, wrap_key.as_ref(), node.rng_mut())?;
+            let url = if base_url.is_empty() {
+                format!("#room={code}")
+            } else {
+                encode_fragment_url(base_url, &payload, wrap_key.as_ref(), node.rng_mut())?
+            };
+            let status = node.status_json();
+            let mut out = String::with_capacity(code.len() + url.len() + status.len() + 160);
+            out.push_str("{\"ok\":true,\"code\":");
+            write_json_string(&mut out, &code);
+            out.push_str(",\"url\":");
+            write_json_string(&mut out, &url);
+            out.push_str(",\"room\":");
+            write_json_string(&mut out, node.room());
+            out.push_str(",\"roomTopic\":");
+            write_json_string(&mut out, node.room_topic());
+            out.push_str(",\"keyFingerprint\":");
+            write_json_string(&mut out, node.key_fingerprint());
+            let _ = write!(
+                out,
+                ",\"encrypted\":{},\"codeChars\":{},\"status\":{status}}}",
+                wrap_key.is_some(),
+                code.len()
+            );
+            Ok(out)
+        }
+        "seal_room_signal" => {
+            let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
+            let payload_str = match val.get("payload") {
+                Some(JsonValue::String(s)) => s.clone(),
+                Some(other) => other.to_json_string(),
+                None => return Err("seal_room_signal missing 'payload'".to_owned()),
+            };
+            let sealed = node.seal_room_signal(&payload_str);
+            let mut out = String::with_capacity(sealed.len() + 96);
+            out.push_str("{\"ok\":true,\"sealed\":");
+            write_json_string(&mut out, &sealed);
+            out.push_str(",\"topic\":");
+            write_json_string(&mut out, node.room_topic());
+            out.push('}');
+            Ok(out)
+        }
+        "open_room_signal" => {
+            let node = require_node(state)?;
+            let sealed = val
+                .get_str("sealed")
+                .ok_or_else(|| "open_room_signal missing 'sealed'".to_owned())?;
+            let payload = node.open_room_signal(sealed)?;
+            let mut out = String::with_capacity(payload.len() + 48);
+            out.push_str("{\"ok\":true,\"payload\":");
+            write_json_string(&mut out, &payload);
+            out.push('}');
+            Ok(out)
+        }
         "decode_signal" => {
             let input = val
                 .get_str("input")
@@ -409,7 +516,7 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 _ => state.as_ref().and_then(MeshNode::invite_wrap_key),
             };
             let (sig, was_encrypted) = decode_signal_code(input, wrap_key.as_ref())?;
-            let mut out = String::with_capacity(sig.sdp.len() + 288);
+            let mut out = String::with_capacity(sig.sdp.len() + 320);
             let _ = write!(
                 out,
                 "{{\"ok\":true,\"signal\":{{\"version\":{},\"kind\":",
@@ -429,6 +536,11 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             out.push_str(",\"meshKey\":");
             match &sig.mesh_key {
                 Some(mk) => write_json_string(&mut out, &base64url_encode(mk)),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"relay\":");
+            match &sig.relay {
+                Some(r) => write_json_string(&mut out, r),
                 None => out.push_str("null"),
             }
             let _ = write!(out, ",\"encrypted\":{was_encrypted},\"sdp\":");

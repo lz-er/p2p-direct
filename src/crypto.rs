@@ -928,6 +928,29 @@ pub fn derive_log_key(mesh_key: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
     hkdf_sha256_32(b"p2p-direct-v1", mesh_key, b"replicated-log-aead")
 }
 
+/// Derives an opaque 32-hex-char rendezvous topic unlinkable to the mesh key or room name.
+pub fn derive_room_topic(mesh_key: &[u8; KEY_LEN]) -> String {
+    let digest = hkdf_sha256_32(
+        b"p2p-direct-room-v1",
+        mesh_key,
+        b"room-rendezvous-topic",
+    );
+    let mut out = String::with_capacity(32);
+    for &b in &digest[..16] {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Derives a dedicated 256-bit ChaCha20-Poly1305 key for encrypting room rendezvous signaling.
+pub fn derive_room_signal_key(mesh_key: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    hkdf_sha256_32(
+        b"p2p-direct-room-v1",
+        mesh_key,
+        b"room-rendezvous-aead",
+    )
+}
+
 /// Derives directional (tx, rx) ChaCha20-Poly1305 session keys from X25519 ECDH + mesh key.
 pub fn derive_link_keys(
     my_secret: &[u8; KEY_LEN],

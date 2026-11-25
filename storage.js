@@ -173,7 +173,9 @@ export function createDefaultProfile(slot) {
     x25519Secret: randomBase64Url(32),
     meshKey: randomBase64Url(32),
     passphraseMode: false,
+    activeRoom: null,
     knownPeers: [],
+    roomSnapshots: {},
     snapshot: { version: 2, e2ee: "chacha20-poly1305", lamport: 0, records: [] },
     updatedAt: Date.now(),
   };
@@ -191,6 +193,12 @@ function ensureCryptoFields(record) {
   }
   if (!Array.isArray(record.knownPeers)) {
     record.knownPeers = [];
+  }
+  if (!record.roomSnapshots || typeof record.roomSnapshots !== "object") {
+    record.roomSnapshots = {};
+  }
+  if (record.activeRoom === undefined) {
+    record.activeRoom = null;
   }
   return record;
 }
