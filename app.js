@@ -971,6 +971,7 @@ class P2PDirectApp {
     this.el["btn-toggle-raw"].addEventListener("click", () => {
       this.rawJsonMode = !this.rawJsonMode;
       this.el["btn-toggle-raw"].textContent = this.rawJsonMode ? "Chat View" : "Raw JSON";
+      this.el["btn-toggle-raw"].classList.toggle("is-active", this.rawJsonMode);
       this.renderLog();
     });
 
@@ -1119,6 +1120,7 @@ class P2PDirectApp {
         this.rawJsonMode = false;
         if (this.el["btn-toggle-raw"]) {
           this.el["btn-toggle-raw"].textContent = "Raw JSON";
+          this.el["btn-toggle-raw"].classList.remove("is-active");
         }
       }
       if (this.composerMode !== "chat") {
@@ -4769,6 +4771,7 @@ class P2PDirectApp {
 
     const parts = [];
     for (const p of direct) {
+      const peerTheme = peerTileTheme(p.peerId, false);
       const originBadge = p.viaAutoMesh
         ? `<span class="badge auto" title="Auto-connected via ${escapeHtml(p.introducedBy || "peer")}">auto</span>`
         : '<span class="badge">direct</span>';
@@ -4777,7 +4780,7 @@ class P2PDirectApp {
         : "";
       const rttLabel = typeof p.rttMs === "number" ? ` · ${p.rttMs}ms` : "";
       parts.push(`
-        <li class="peer-item" data-peer-id="${escapeHtml(p.peerId)}">
+        <li class="peer-item ${peerTheme}" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
             <div class="peer-name">${escapeHtml(p.authorName)} ${originBadge} ${voiceBadge}</div>
             <div class="peer-id">${escapeHtml(p.peerId)} · code ${escapeHtml(p.safetyCode || "—")}${rttLabel}</div>
@@ -4789,7 +4792,7 @@ class P2PDirectApp {
 
     for (const pend of pending) {
       parts.push(`
-        <li class="peer-item">
+        <li class="peer-item is-pending">
           <div class="peer-main">
             <div class="peer-name">${escapeHtml(pend.authorName)} <span class="badge pending">connecting via ${escapeHtml(pend.viaPeerId)}</span></div>
             <div class="peer-id">${escapeHtml(pend.peerId)}</div>
@@ -4842,7 +4845,7 @@ class P2PDirectApp {
     const cx = 170;
     const cy = 80;
     const rx = 112;
-    const ry = 52;
+    const ry = 50;
     if (nodes.length === 1) {
       nodes[0].x = cx;
       nodes[0].y = cy;
@@ -4853,6 +4856,23 @@ class P2PDirectApp {
         nodes[i].y = cy + ry * Math.sin(angle);
       }
     }
+
+    const themeColorVar = {
+      "tile-coral": "var(--coral)",
+      "tile-cobalt": "var(--cobalt)",
+      "tile-ochre": "var(--ochre)",
+      "tile-cyan": "var(--cyan)",
+      "tile-mint": "var(--mint)",
+    };
+
+    const gridDefs = `
+      <defs>
+        <pattern id="topo-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="var(--rule-soft)" stroke-width="1" />
+        </pattern>
+      </defs>
+      <rect width="340" height="160" fill="url(#topo-grid)" />
+    `;
 
     const edgeSet = new Set();
     const lines = [];
@@ -4865,15 +4885,15 @@ class P2PDirectApp {
       edgeSet.add(key);
       if (style === "pending") {
         lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-warn)" stroke-width="1.6" stroke-dasharray="4 4" />`
+          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-warn)" stroke-width="2" stroke-dasharray="4 4" />`
         );
       } else if (style === "remote") {
         lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-opacity="0.42" stroke-width="1.5" />`
+          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-opacity="0.45" stroke-width="1.8" />`
         );
       } else {
         lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-width="2.1" />`
+          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-width="2.4" />`
         );
       }
     };
@@ -4891,29 +4911,32 @@ class P2PDirectApp {
       addEdge(pend.viaPeerId, pend.peerId, "remote");
     }
 
-    const circles = nodes.map((n) => {
+    const blocks = nodes.map((n) => {
       const fill =
         n.kind === "self"
           ? "var(--ink-primary)"
           : n.kind === "pending"
             ? "var(--accent-warn)"
-            : "var(--accent-live)";
-      const r = n.kind === "self" ? 9 : 7.5;
-      const shortLabel = n.label.length > 16 ? `${n.label.slice(0, 15)}…` : n.label;
-      const labelY = n.y > cy ? n.y + 18 : n.y - 12;
-      const voiceRing = n.inVoice
-        ? `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r + 4}" fill="none" stroke="var(--accent-live)" stroke-width="1.6" stroke-opacity="0.6" />`
+            : themeColorVar[peerTileTheme(n.id, false)] || "var(--accent-live)";
+      const size = n.kind === "self" ? 16 : 14;
+      const half = size / 2;
+      const shortLabel = (n.label.length > 16 ? `${n.label.slice(0, 15)}…` : n.label).toUpperCase();
+      const labelY = n.y > cy ? n.y + 22 : n.y - 14;
+      const frameSize = size + 8;
+      const frameHalf = frameSize / 2;
+      const voiceFrame = n.inVoice
+        ? `<rect x="${(n.x - frameHalf).toFixed(1)}" y="${(n.y - frameHalf).toFixed(1)}" width="${frameSize}" height="${frameSize}" fill="none" stroke="var(--accent-live)" stroke-width="2" />`
         : "";
       return `
         <g>
-          ${voiceRing}
-          <circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r}" fill="${fill}" stroke="var(--bg-surface)" stroke-width="2" />
-          <text x="${n.x.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-size="10.5" font-weight="600" fill="var(--ink-primary)">${escapeHtml(shortLabel)}</text>
+          ${voiceFrame}
+          <rect x="${(n.x - half).toFixed(1)}" y="${(n.y - half).toFixed(1)}" width="${size}" height="${size}" fill="${fill}" stroke="var(--bg-surface)" stroke-width="2" />
+          <text x="${n.x.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" font-weight="700" letter-spacing="0.06em" fill="var(--ink-primary)">${escapeHtml(shortLabel)}</text>
         </g>
       `;
     });
 
-    svg.innerHTML = `${lines.join("")}${circles.join("")}`;
+    svg.innerHTML = `${gridDefs}${lines.join("")}${blocks.join("")}`;
   }
 
   renderTelemetry() {
