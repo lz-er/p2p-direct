@@ -14,7 +14,6 @@ const BASE_STUN_SERVERS = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "stun:stun.relay.metered.ca:80" },
 ];
 
 const ICE_CONFIG = {
@@ -22,63 +21,129 @@ const ICE_CONFIG = {
   iceCandidatePoolSize: 2,
 };
 
-// Public coturn shared-secret fallback (Metered Open Relay Project) — used strictly as an
-// automatic WebRTC fallback when Symmetric NAT / mobile CGNAT / missing router NAT hairpinning
-// blocks direct P2P. All traffic stays double end-to-end encrypted (DTLS + Rust ChaCha20-Poly1305).
-const OPENRELAY_STATIC_HOST = "staticauth.openrelay.metered.ca";
-const OPENRELAY_STATIC_SECRET = "openrelayprojectsecret";
+const SESSION_TURN_ENDPOINT_KEY = "p2p-direct-turn-endpoint";
 
-async function computeHmacSha1Base64(secret, message) {
-  if (typeof crypto === "undefined" || !crypto.subtle) return null;
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-1" },
-    false,
-    ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
-  const bytes = new Uint8Array(sig);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) {
-    bin += String.fromCharCode(bytes[i]);
+function resolveTurnEndpointUrl(explicitUrl = null) {
+  const clean = (raw) => {
+    if (!raw || typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+        return parsed.toString();
+      }
+    } catch {
+      // ignore invalid URL
+    }
+    return null;
+  };
+
+  if (explicitUrl !== null) return clean(explicitUrl);
+  if (typeof window === "undefined") return null;
+
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = clean(params.get("turn"));
+    if (fromQuery) return fromQuery;
+  } catch {
+    // ignore
   }
-  return btoa(bin);
+
+  try {
+    const fromSession = clean(sessionStorage.getItem(SESSION_TURN_ENDPOINT_KEY));
+    if (fromSession) return fromSession;
+  } catch {
+    // ignore
+  }
+
+  if (typeof window.__P2P_TURN_ENDPOINT__ === "string") {
+    const fromGlobal = clean(window.__P2P_TURN_ENDPOINT__);
+    if (fromGlobal) return fromGlobal;
+  }
+
+  // Automatically discover Cloudflare Realtime TURN worker when served from *.dequ.org
+  const host = (window.location.hostname || "").toLowerCase();
+  if (host === "dequ.org" || host.endsWith(".dequ.org")) {
+    return "https://turn.dequ.org/";
+  }
+
+  return null;
 }
 
-async function buildIceConfig() {
+function normalizeIceServerList(data) {
+  const raw = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.iceServers)
+      ? data.iceServers
+      : data?.iceServers
+        ? [data.iceServers]
+        : [];
+  return raw.filter((s) => s && (typeof s.urls === "string" || Array.isArray(s.urls)));
+}
+
+async function fetchTurnIceServers(endpointUrl, timeoutMs = 2000) {
+  if (!endpointUrl || typeof fetch !== "function") return [];
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  try {
+    const res = await fetch(endpointUrl, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return normalizeIceServerList(data);
+  } catch {
+    return [];
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function buildIceConfig(explicitTurnEndpoint = null) {
   if (typeof window !== "undefined" && Array.isArray(window.__P2P_ICE_SERVERS__)) {
-    return { iceServers: window.__P2P_ICE_SERVERS__, iceCandidatePoolSize: 2 };
+    return {
+      iceServers: window.__P2P_ICE_SERVERS__,
+      iceCandidatePoolSize: 2,
+      turnEndpoint: null,
+      turnLoaded: false,
+    };
   }
   const servers = BASE_STUN_SERVERS.slice();
-  try {
-    const expiry = Math.floor(Date.now() / 1000) + 12 * 3600;
-    const username = `${expiry}:p2pd`;
-    const credential = await computeHmacSha1Base64(OPENRELAY_STATIC_SECRET, username);
-    if (credential) {
-      servers.push({
-        urls: [
-          `turn:${OPENRELAY_STATIC_HOST}:80`,
-          `turn:${OPENRELAY_STATIC_HOST}:80?transport=tcp`,
-          `turn:${OPENRELAY_STATIC_HOST}:443`,
-          `turn:${OPENRELAY_STATIC_HOST}:443?transport=tcp`,
-          `turns:${OPENRELAY_STATIC_HOST}:443?transport=tcp`,
-        ],
-        username,
-        credential,
+  const endpoint = resolveTurnEndpointUrl(explicitTurnEndpoint);
+  let turnLoaded = false;
+  if (endpoint) {
+    const fetched = await fetchTurnIceServers(endpoint, 2000);
+    if (fetched.length > 0) {
+      servers.push(...fetched);
+      turnLoaded = fetched.some((s) => {
+        const list = Array.isArray(s.urls) ? s.urls : [s.urls];
+        return list.some((u) => typeof u === "string" && /^turns?:/i.test(u));
       });
     }
-  } catch {
-    // Gracefully fall back to STUN-only if SubtleCrypto is unavailable
   }
-  return { iceServers: servers, iceCandidatePoolSize: 2 };
+  return {
+    iceServers: servers,
+    iceCandidatePoolSize: 2,
+    turnEndpoint: endpoint,
+    turnLoaded,
+  };
 }
 
 function classifyIceCandidateType(candStr) {
   if (!candStr || typeof candStr !== "string") return "other";
   const m = candStr.match(/\btyp\s+(host|srflx|prflx|relay)\b/i);
-  return m ? m[1].toLowerCase() : "other";
+  const typ = m ? m[1].toLowerCase() : "other";
+  if (typ === "host") {
+    const parts = candStr.trim().split(/\s+/);
+    const addr = parts[4] || "";
+    if (addr.endsWith(".local")) return "host(mdns)";
+    if (addr.includes(":")) return "host(ipv6)";
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(addr)) return "host(ipv4)";
+  }
+  return typ;
 }
 
 const BROADCAST_CHANNEL_NAME = "p2p-direct-signal-v1";
@@ -756,6 +821,10 @@ class P2PDirectApp {
       "stat-batches",
       "stat-voice",
       "telemetry-log",
+      "turn-endpoint-input",
+      "btn-turn-apply",
+      "btn-turn-test",
+      "turn-test-status",
       "chat-panel",
       "chat-composer-dropzone",
       "chat-image-tray",
@@ -792,6 +861,20 @@ class P2PDirectApp {
     this.el["btn-advanced-toggle"].addEventListener("click", () => this.toggleAdvancedMode());
     if (this.el["btn-pwa-install"]) {
       this.el["btn-pwa-install"].addEventListener("click", () => this.promptPwaInstall());
+    }
+    if (this.el["btn-turn-apply"]) {
+      this.el["btn-turn-apply"].addEventListener("click", () => this.applyCustomTurnEndpoint());
+    }
+    if (this.el["turn-endpoint-input"]) {
+      this.el["turn-endpoint-input"].addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          this.applyCustomTurnEndpoint();
+        }
+      });
+    }
+    if (this.el["btn-turn-test"]) {
+      this.el["btn-turn-test"].addEventListener("click", () => this.runIceSelfTest());
     }
     this.el["lobby-create-form"].addEventListener("submit", (ev) => {
       ev.preventDefault();
@@ -1351,13 +1434,12 @@ class P2PDirectApp {
     ]);
     this.wasm = wasm;
     this.iceConfig = iceCfg;
-    const hasTurn = (iceCfg.iceServers || []).some((s) => {
-      const list = Array.isArray(s.urls) ? s.urls : [s.urls];
-      return list.some((u) => typeof u === "string" && /^turns?:/i.test(u));
-    });
+    this.syncTurnStatusUi(iceCfg);
     this.addTelemetry(
       "engine",
-      `In-memory encrypted session ready (${hasTurn ? "STUN + TURN fallback" : "STUN"} ICE)`
+      iceCfg.turnLoaded
+        ? `In-memory encrypted session ready (STUN + TURN active via ${iceCfg.turnEndpoint})`
+        : "In-memory encrypted session ready (STUN-only — deploy cloudflare/turn-worker.js at turn.dequ.org for CGNAT/mobile TURN)"
     );
 
     const initRes = this.wasm.call({
@@ -1390,6 +1472,112 @@ class P2PDirectApp {
     this.broadcastMeshBeacon(true);
 
     window.__p2pDirect = this;
+  }
+
+  syncTurnStatusUi(iceCfg) {
+    const input = this.el["turn-endpoint-input"];
+    const hint = this.el["turn-test-status"];
+    if (input && !input.value && iceCfg?.turnEndpoint) {
+      input.value = iceCfg.turnEndpoint;
+    }
+    if (!hint) return;
+    if (iceCfg?.turnLoaded) {
+      hint.textContent = `TURN relay active via ${iceCfg.turnEndpoint} — direct P2P preferred, TURN fallback ready.`;
+    } else if (iceCfg?.turnEndpoint) {
+      hint.textContent = `STUN-only (${iceCfg.turnEndpoint} unreachable). Deploy cloudflare/turn-worker.js for mobile/CGNAT TURN.`;
+    } else {
+      hint.textContent =
+        "STUN-only ICE. Paste a TURN credential endpoint (e.g. https://turn.dequ.org) for mobile CGNAT / strict WiFi.";
+    }
+  }
+
+  async applyCustomTurnEndpoint() {
+    const raw = (this.el["turn-endpoint-input"]?.value || "").trim();
+    try {
+      if (raw) {
+        sessionStorage.setItem(SESSION_TURN_ENDPOINT_KEY, raw);
+      } else {
+        sessionStorage.removeItem(SESSION_TURN_ENDPOINT_KEY);
+      }
+    } catch {
+      // ignore restricted sessionStorage
+    }
+    const iceCfg = await buildIceConfig(raw || null);
+    this.iceConfig = iceCfg;
+    this.syncTurnStatusUi(iceCfg);
+    if (iceCfg.turnLoaded) {
+      this.addTelemetry("room", `Loaded TURN credentials from ${iceCfg.turnEndpoint}`);
+      this.showToast("TURN relay loaded — reconnecting room peers…");
+      if (this.activeRoom && this.roomRendezvous) {
+        this.announceRoomHello(true);
+      }
+    } else if (raw) {
+      this.addTelemetry("error", `No TURN iceServers returned by ${raw}`);
+      this.showToast("TURN endpoint unreachable or returned no servers");
+    } else {
+      this.showToast("Cleared custom TURN endpoint (using default)");
+    }
+  }
+
+  async runIceSelfTest() {
+    const hint = this.el["turn-test-status"];
+    const btn = this.el["btn-turn-test"];
+    if (btn) btn.disabled = true;
+    if (hint) hint.textContent = "Testing STUN / TURN ICE gathering (2.5s)…";
+    const found = new Set();
+    const errs = [];
+    let pc = null;
+    try {
+      pc = this.createPeerConnection();
+      pc.createDataChannel("ice-test");
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        pc.onicecandidate = (ev) => {
+          if (!ev.candidate) {
+            finish();
+            return;
+          }
+          found.add(classifyIceCandidateType(ev.candidate.candidate));
+        };
+        pc.onicecandidateerror = (ev) => {
+          if (ev && ev.errorCode && ev.url) {
+            const msg = `${ev.errorCode} (${ev.url})`;
+            if (!errs.includes(msg)) errs.push(msg);
+          }
+        };
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === "complete") finish();
+        };
+        pc.createOffer()
+          .then((o) => pc.setLocalDescription(o))
+          .catch(() => finish());
+        const timer = setTimeout(finish, 2600);
+      });
+    } finally {
+      if (pc) {
+        try {
+          pc.close();
+        } catch {
+          // ignore
+        }
+      }
+      if (btn) btn.disabled = false;
+    }
+
+    const list = Array.from(found);
+    const hasRelay = found.has("relay");
+    const summary = `ICE Test: [${list.join(", ") || "none"}] — ${
+      hasRelay ? "TURN relay working!" : "NO TURN relay candidate"
+    }${errs.length ? ` · errors: ${errs.slice(0, 2).join("; ")}` : ""}`;
+    if (hint) hint.textContent = summary;
+    this.addTelemetry(hasRelay ? "room" : "error", summary);
+    this.showToast(hasRelay ? "ICE test passed (TURN relay active)" : "ICE test: STUN only (no TURN relay)");
   }
 
   /* ================= PWA Installation & Static Shell Service Worker ================= */
@@ -4414,6 +4602,15 @@ class P2PDirectApp {
       if (micStream) {
         await this.startMicCaptureGraph(ctx, micStream);
         this.refreshAudioInputDevices();
+        // Granting mic permission unmasks real LAN host(ipv4) ICE candidates on same-WiFi networks
+        if (
+          this.activeRoom &&
+          this.roomRendezvous &&
+          this.directPeers.size === 0 &&
+          this.roomDialing.size === 0
+        ) {
+          this.announceRoomHello(true);
+        }
       }
 
       const res = this.wasm.call({

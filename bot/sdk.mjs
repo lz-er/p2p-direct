@@ -14,26 +14,38 @@ export const VOICE_SAMPLE_RATE = 16000;
 export const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16 kHz mono
 export const VOICE_FRAME_BYTES = VOICE_FRAME_SAMPLES * 2; // Int16LE
 
-function buildOpenRelayTurnServer() {
-  const expiry = Math.floor(Date.now() / 1000) + 12 * 3600;
-  const username = `${expiry}:p2pdbot`;
-  const credential = crypto
-    .createHmac("sha1", "openrelayprojectsecret")
-    .update(username)
-    .digest("base64");
-  return {
-    urls: "turn:staticauth.openrelay.metered.ca:443?transport=tcp",
-    username,
-    credential,
-  };
-}
-
 export const DEFAULT_ICE_SERVERS = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  buildOpenRelayTurnServer(),
 ];
+
+export async function fetchTurnIceServers(endpointUrl, timeoutMs = 2500) {
+  if (!endpointUrl || typeof fetch !== "function") return [];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(endpointUrl, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const raw = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.iceServers)
+        ? data.iceServers
+        : data?.iceServers
+          ? [data.iceServers]
+          : [];
+    return raw.filter((s) => s && (typeof s.urls === "string" || Array.isArray(s.urls)));
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function randomHex(byteLen) {
   return crypto.randomBytes(byteLen).toString("hex");
@@ -253,7 +265,9 @@ export class P2PBot extends EventEmitter {
     this.customRelay = options.relay || null;
     this.isBot = options.isBot !== false;
     this.wasmPath = options.wasmPath || path.resolve(__dirname, "..", "p2p_mesh.wasm");
-    this.iceServers = Array.isArray(options.iceServers) ? options.iceServers : DEFAULT_ICE_SERVERS;
+    this.customIceServers = Array.isArray(options.iceServers) ? options.iceServers : null;
+    this.turnEndpoint = options.turnEndpoint || process.env.P2P_TURN_ENDPOINT || null;
+    this.iceServers = this.customIceServers || DEFAULT_ICE_SERVERS.slice();
 
     this.wasm = null;
     this.status = null;
@@ -291,6 +305,19 @@ export class P2PBot extends EventEmitter {
 
     const wasmBytes = await readFile(this.wasmPath);
     this.wasm = await SafeRustWasmMesh.loadFromBytes(wasmBytes);
+
+    if (!this.customIceServers) {
+      let endpoint = this.turnEndpoint;
+      if (!endpoint && /https?:\/\/[^/]*dequ\.org/i.test(this.roomLink)) {
+        endpoint = "https://turn.dequ.org/";
+      }
+      if (endpoint) {
+        const fetched = await fetchTurnIceServers(endpoint);
+        if (fetched.length > 0) {
+          this.iceServers = [...DEFAULT_ICE_SERVERS, ...fetched];
+        }
+      }
+    }
 
     const { code, relayFromQuery } = parseRoomLink(this.roomLink);
     const decoded = this.wasm.call({
