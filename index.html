@@ -24,13 +24,23 @@
             window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
           const theme = saved === "dark" || saved === "light" ? saved : prefersDark ? "dark" : "light";
           const adv = sessionStorage.getItem("p2p-direct-advanced") === "true";
+          const rawPins = sessionStorage.getItem("p2p-direct-panel-pins");
+          let hasPinned = false;
+          try {
+            const parsedPins = rawPins ? JSON.parse(rawPins) : [];
+            hasPinned = Array.isArray(parsedPins) && parsedPins.length > 0;
+          } catch {
+            hasPinned = false;
+          }
           const hasRoomHash = /#room=/i.test(window.location.hash || "");
           document.documentElement.setAttribute("data-theme", theme);
           document.documentElement.setAttribute("data-advanced", adv ? "true" : "false");
+          document.documentElement.setAttribute("data-has-pinned", hasPinned ? "true" : "false");
           document.documentElement.setAttribute("data-in-room", hasRoomHash ? "true" : "false");
         } catch {
           document.documentElement.setAttribute("data-theme", "light");
           document.documentElement.setAttribute("data-advanced", "false");
+          document.documentElement.setAttribute("data-has-pinned", "false");
           document.documentElement.setAttribute("data-in-room", "false");
         }
       })();
@@ -600,15 +610,47 @@
           </section>
         </section>
 
-        <!-- Secondary Sidebar Rail (Advanced Only): Step-by-Step Connect, Peers & Network, Diagnostics -->
-        <aside class="rail advanced-only">
-          <section class="panel" aria-labelledby="connect-panel-title">
-            <div class="panel-header">
-              <h2 class="panel-title" id="connect-panel-title">Connect Peer</h2>
-              <button type="button" id="btn-wizard-reset" class="btn-link hidden">← Start Over</button>
-              <span class="panel-meta" id="connect-panel-meta">Step-by-Step</span>
+        <!-- Secondary Sidebar Rail: Collapsible & Pinnable Advanced Sections (Pinned panels stay visible even without Advanced) -->
+        <aside class="rail" id="advanced-rail" aria-label="Advanced tools">
+          <!-- Section 1: Connect Peer (default collapsed) -->
+          <section
+            class="panel adv-section"
+            id="adv-panel-connect"
+            data-adv-panel="connect"
+            data-collapsed="true"
+            data-pinned="false"
+            aria-labelledby="connect-panel-title"
+          >
+            <div class="panel-header adv-section-header">
+              <button
+                type="button"
+                class="adv-collapse-trigger"
+                data-toggle-panel="connect"
+                aria-expanded="false"
+                aria-controls="adv-body-connect"
+              >
+                <span class="adv-chevron" aria-hidden="true">▾</span>
+                <h2 class="panel-title" id="connect-panel-title">Connect Peer</h2>
+                <span class="panel-meta" id="connect-panel-meta">Step-by-Step</span>
+              </button>
+              <div class="adv-head-actions">
+                <button type="button" id="btn-wizard-reset" class="btn-link hidden">← Reset</button>
+                <button
+                  type="button"
+                  class="adv-pin-btn"
+                  data-pin-panel="connect"
+                  aria-pressed="false"
+                  title="Pin Connect Peer so it stays visible even when Advanced is off"
+                  aria-label="Pin Connect Peer"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true">
+                    <path d="M12 17v5" />
+                    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1V3H8v3h1z" />
+                  </svg>
+                </button>
+              </div>
             </div>
-            <div class="panel-body">
+            <div class="panel-body" id="adv-body-connect">
               <!-- 1-click local tab discovery banner -->
               <div id="local-mesh-banner" class="quick-banner hidden">
                 <div class="quick-banner-title">
@@ -893,26 +935,86 @@
             </div>
           </section>
 
-          <section class="panel" aria-labelledby="mesh-panel-title">
-            <div class="panel-header">
-              <h2 class="panel-title" id="mesh-panel-title">Peers &amp; Network</h2>
-              <button type="button" id="btn-sync-now" class="btn btn-sm">Sync Now</button>
+          <!-- Section 2: Peers & Network (Interactive Real-Time Topology Graph — default collapsed) -->
+          <section
+            class="panel adv-section"
+            id="adv-panel-network"
+            data-adv-panel="network"
+            data-collapsed="true"
+            data-pinned="false"
+            aria-labelledby="mesh-panel-title"
+          >
+            <div class="panel-header adv-section-header">
+              <button
+                type="button"
+                class="adv-collapse-trigger"
+                data-toggle-panel="network"
+                aria-expanded="false"
+                aria-controls="adv-body-network"
+              >
+                <span class="adv-chevron" aria-hidden="true">▾</span>
+                <h2 class="panel-title" id="mesh-panel-title">Peers &amp; Network</h2>
+                <span class="panel-meta" id="network-panel-meta">0 peers</span>
+              </button>
+              <div class="adv-head-actions">
+                <button
+                  type="button"
+                  class="adv-pin-btn"
+                  data-pin-panel="network"
+                  aria-pressed="false"
+                  title="Pin Peers & Network so it stays visible even when Advanced is off"
+                  aria-label="Pin Peers & Network"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true">
+                    <path d="M12 17v5" />
+                    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1V3H8v3h1z" />
+                  </svg>
+                </button>
+              </div>
             </div>
-            <div class="panel-body">
+            <div class="panel-body" id="adv-body-network">
               <div class="topology-wrap">
+                <div class="topology-toolbar">
+                  <span id="topology-summary" class="topology-summary">Waiting for peers…</span>
+                  <div class="topology-toolbar-actions">
+                    <button
+                      type="button"
+                      id="btn-topo-reset"
+                      class="btn btn-sm hidden"
+                      title="Reset dragged node positions"
+                    >
+                      Reset
+                    </button>
+                    <button type="button" id="btn-sync-now" class="btn btn-sm">Sync</button>
+                  </div>
+                </div>
                 <svg
                   id="topology-svg"
                   class="topology-svg"
-                  viewBox="0 0 340 160"
+                  viewBox="0 0 360 220"
                   role="img"
-                  aria-label="Peer-to-peer network topology graph"
+                  aria-label="Interactive real-time peer-to-peer network topology graph"
                 ></svg>
-                <div class="topology-legend">
-                  <div class="legend-items">
-                    <span><i class="legend-dot live-dot"></i>Connected</span>
-                    <span><i class="legend-dot warn-dot"></i>Connecting</span>
+                <div id="topology-inspector" class="topology-inspector">
+                  <div class="topo-insp-empty">
+                    Click any peer or link to inspect protocol, cipher &amp; live packets · Drag nodes to arrange
                   </div>
-                  <span id="profile-slot-label">in-memory session</span>
+                </div>
+                <div class="topology-legend">
+                  <div class="legend-row">
+                    <div class="legend-items">
+                      <span><i class="legend-dot direct-dot"></i>Direct P2P</span>
+                      <span><i class="legend-dot relay-dot"></i>E2EE Relay</span>
+                      <span><i class="legend-dot warn-dot"></i>Connecting</span>
+                    </div>
+                  </div>
+                  <div class="legend-row legend-row-packets">
+                    <div class="legend-items">
+                      <span><i class="legend-dot pkt-voice-dot"></i>Voice Pkt</span>
+                      <span><i class="legend-dot pkt-data-dot"></i>Data Pkt</span>
+                    </div>
+                    <span id="profile-slot-label">in-memory</span>
+                  </div>
                 </div>
               </div>
 
@@ -932,12 +1034,44 @@
             </div>
           </section>
 
-          <details id="bot-connect-details" class="panel bot-connect-panel">
-            <summary class="panel-header bot-setup-summary">
-              <h2 class="panel-title">Self-Host a Bot</h2>
-              <span class="panel-meta">SDK · WS Bridge ▾</span>
-            </summary>
-            <div class="panel-body bot-setup-body">
+          <!-- Section 3: Self-Host a Bot (Generic SDK / WS Bridge only — default collapsed) -->
+          <section
+            class="panel adv-section bot-connect-panel"
+            id="adv-panel-bot"
+            data-adv-panel="bot"
+            data-collapsed="true"
+            data-pinned="false"
+            aria-labelledby="bot-panel-title"
+          >
+            <div class="panel-header adv-section-header">
+              <button
+                type="button"
+                class="adv-collapse-trigger"
+                data-toggle-panel="bot"
+                aria-expanded="false"
+                aria-controls="adv-body-bot"
+              >
+                <span class="adv-chevron" aria-hidden="true">▾</span>
+                <h2 class="panel-title" id="bot-panel-title">Self-Host a Bot</h2>
+                <span class="panel-meta">SDK · WS Bridge</span>
+              </button>
+              <div class="adv-head-actions">
+                <button
+                  type="button"
+                  class="adv-pin-btn"
+                  data-pin-panel="bot"
+                  aria-pressed="false"
+                  title="Pin Self-Host a Bot so it stays visible even when Advanced is off"
+                  aria-label="Pin Self-Host a Bot"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true">
+                    <path d="M12 17v5" />
+                    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1V3H8v3h1z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div class="panel-body bot-setup-body" id="adv-body-bot">
               <p class="step-hint">
                 Bots join as normal encrypted peers using this room link (no roles or permissions needed).
               </p>
@@ -952,22 +1086,48 @@
                 <button type="button" id="btn-copy-bot-cmd" class="btn btn-sm btn-primary">
                   Copy Bridge Command
                 </button>
-                <button type="button" id="btn-copy-bot-wf" class="btn btn-sm">
-                  Warframe Bot
-                </button>
-                <button type="button" id="btn-copy-bot-music" class="btn btn-sm">
-                  Music Bot
+              </div>
+            </div>
+          </section>
+
+          <!-- Section 4: Activity & Stats (default collapsed) -->
+          <section
+            class="panel adv-section diagnostics-panel"
+            id="adv-panel-diagnostics"
+            data-adv-panel="diagnostics"
+            data-collapsed="true"
+            data-pinned="false"
+            aria-labelledby="telemetry-panel-title"
+          >
+            <div class="panel-header adv-section-header">
+              <button
+                type="button"
+                class="adv-collapse-trigger"
+                data-toggle-panel="diagnostics"
+                aria-expanded="false"
+                aria-controls="adv-body-diagnostics"
+              >
+                <span class="adv-chevron" aria-hidden="true">▾</span>
+                <h2 class="panel-title" id="telemetry-panel-title">Activity &amp; Stats</h2>
+                <span class="panel-meta">sync · voice · log</span>
+              </button>
+              <div class="adv-head-actions">
+                <button
+                  type="button"
+                  class="adv-pin-btn"
+                  data-pin-panel="diagnostics"
+                  aria-pressed="false"
+                  title="Pin Activity & Stats so it stays visible even when Advanced is off"
+                  aria-label="Pin Activity & Stats"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true">
+                    <path d="M12 17v5" />
+                    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1V3H8v3h1z" />
+                  </svg>
                 </button>
               </div>
             </div>
-          </details>
-
-          <details class="panel diagnostics-panel">
-            <summary class="panel-header diagnostics-summary">
-              <h2 class="panel-title" id="telemetry-panel-title">Activity &amp; Stats</h2>
-              <span class="panel-meta">sync · voice · log ▾</span>
-            </summary>
-            <div class="panel-body">
+            <div class="panel-body" id="adv-body-diagnostics">
               <div class="telemetry-stats">
                 <div class="metric-tile">
                   <span class="metric-label">Frames TX / RX</span>
@@ -996,7 +1156,7 @@
                 <div class="telemetry-entry">Initializing local engine…</div>
               </div>
             </div>
-          </details>
+          </section>
         </aside>
       </main>
     </div>

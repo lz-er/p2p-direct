@@ -903,6 +903,32 @@ class P2PDirectApp {
     this.telemetry = [];
     this.toastTimer = null;
 
+    // Collapsible & pinnable Advanced rail sections (default: ALL collapsed, NONE pinned)
+    this.advPanels = {
+      open: new Set(),
+      pinned: new Set(),
+    };
+
+    // Interactive real-time network topology graph & live packet animation engine
+    this.topo = {
+      selectedId: null,
+      positions: new Map(), // nodeId -> { x, y }
+      customPositions: new Map(), // user-dragged nodeId -> { x, y }
+      draggingId: null,
+      dragStartClient: null,
+      dragMoved: false,
+      particles: [], // { fromId, toId, kind: "voice"|"data", t, durationMs, color }
+      lastParticleAt: new Map(), // `${peerId}:${dir}:${kind}` -> ms
+      linkStats: new Map(), // peerId -> { txTotal, rxTotal, txBytes, rxBytes, txWin, rxWin, txBytesWin, rxBytesWin, txPps, rxPps, kbps, winStartMs, lastPacketAt }
+      peerTech: new Map(), // peerId -> { shortLabel, detailLabel, protocol, localType, remoteType, statsRttMs, brokerHost }
+      rafId: null,
+      lastFrameMs: 0,
+      lastInspectorTickMs: 0,
+      statsTimer: null,
+      svgInitialized: false,
+      particlePool: [],
+    };
+
     // Step-by-step Connect Wizard state
     this.wizard = {
       mode: "idle", // "idle" | "host" | "join"
@@ -1166,17 +1192,18 @@ class P2PDirectApp {
       "voice-join-hint",
       "voice-packet-stats",
       "voice-notice",
+      "network-panel-meta",
+      "topology-summary",
+      "btn-topo-reset",
       "btn-sync-now",
       "topology-svg",
+      "topology-inspector",
       "profile-slot-label",
       "auto-mesh-toggle",
       "auto-mesh-badge",
       "peer-list",
-      "bot-connect-details",
       "bot-cli-command",
       "btn-copy-bot-cmd",
-      "btn-copy-bot-wf",
-      "btn-copy-bot-music",
       "stat-e2ee",
       "stat-batches",
       "stat-voice",
@@ -1480,22 +1507,35 @@ class P2PDirectApp {
       });
     }
 
-    // Self-hosted Bot quick CLI copy buttons (Advanced sidebar)
+    // Self-hosted Bot quick CLI copy button (generic Bridge only)
     if (this.el["btn-copy-bot-cmd"]) {
       this.el["btn-copy-bot-cmd"].addEventListener("click", () => {
-        this.copyText(this.buildBotCliCommand("bridge"), "Copied bot bridge command");
+        this.copyText(this.buildBotCliCommand(), "Copied bot bridge command");
       });
     }
-    if (this.el["btn-copy-bot-wf"]) {
-      this.el["btn-copy-bot-wf"].addEventListener("click", () => {
-        this.copyText(this.buildBotCliCommand("warframe"), "Copied Warframe bot command");
+
+    // Collapsible & pinnable Advanced rail section headers
+    for (const btn of document.querySelectorAll("[data-toggle-panel]")) {
+      btn.addEventListener("click", () => {
+        this.toggleAdvPanel(btn.dataset.togglePanel);
       });
     }
-    if (this.el["btn-copy-bot-music"]) {
-      this.el["btn-copy-bot-music"].addEventListener("click", () => {
-        this.copyText(this.buildBotCliCommand("music"), "Copied Music bot command");
+    for (const btn of document.querySelectorAll("[data-pin-panel]")) {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this.toggleAdvPanelPin(btn.dataset.pinPanel);
       });
     }
+
+    // Interactive topology graph layout reset & pointer/click interactions
+    if (this.el["btn-topo-reset"]) {
+      this.el["btn-topo-reset"].addEventListener("click", () => {
+        this.topo.customPositions.clear();
+        this.el["btn-topo-reset"].classList.add("hidden");
+        this.renderTopology();
+      });
+    }
+    this.setupTopologyInteractions();
 
     // Identity & Mesh controls
     this.el["author-name-input"].addEventListener("input", () => {
@@ -1752,6 +1792,14 @@ class P2PDirectApp {
           // ignore
         }
       }
+      if (this.topo.rafId) {
+        cancelAnimationFrame(this.topo.rafId);
+        this.topo.rafId = null;
+      }
+      if (this.topo.statsTimer) {
+        clearInterval(this.topo.statsTimer);
+        this.topo.statsTimer = null;
+      }
       if (this.bc) {
         try {
           this.bc.close();
@@ -1767,6 +1815,7 @@ class P2PDirectApp {
   async init() {
     this.bindElements();
     this.initTheme();
+    this.initAdvPanels();
     this.initAdvancedMode();
     this.bindEvents();
     this.initPwa();
@@ -1964,7 +2013,162 @@ class P2PDirectApp {
     }
   }
 
-  /* ================= Simple vs Advanced Mode & Lobby ================= */
+  /* ================= Simple vs Advanced Mode, Collapsible & Pinnable Rail Panels ================= */
+
+  initAdvPanels() {
+    const valid = new Set(["connect", "network", "bot", "diagnostics"]);
+    this.advPanels.open.clear();
+    this.advPanels.pinned.clear();
+    try {
+      const savedOpen = JSON.parse(sessionStorage.getItem("p2p-direct-panel-open") || "[]");
+      if (Array.isArray(savedOpen)) {
+        for (const k of savedOpen) {
+          if (valid.has(k)) this.advPanels.open.add(k);
+        }
+      }
+      const savedPins = JSON.parse(sessionStorage.getItem("p2p-direct-panel-pins") || "[]");
+      if (Array.isArray(savedPins)) {
+        for (const k of savedPins) {
+          if (valid.has(k)) this.advPanels.pinned.add(k);
+        }
+      }
+    } catch {
+      // default: ALL collapsed, NONE pinned
+    }
+    this.syncAdvPanelsDom();
+  }
+
+  _persistAdvPanels() {
+    try {
+      sessionStorage.setItem("p2p-direct-panel-open", JSON.stringify(Array.from(this.advPanels.open)));
+      sessionStorage.setItem("p2p-direct-panel-pins", JSON.stringify(Array.from(this.advPanels.pinned)));
+    } catch {
+      // ignore storage restrictions
+    }
+  }
+
+  syncAdvPanelsDom() {
+    const panelTitles = {
+      connect: "Connect Peer",
+      network: "Peers & Network",
+      bot: "Self-Host a Bot",
+      diagnostics: "Activity & Stats",
+    };
+    for (const key of Object.keys(panelTitles)) {
+      const sec = document.getElementById(`adv-panel-${key}`);
+      if (!sec) continue;
+      const isOpen = this.advPanels.open.has(key);
+      const isPinned = this.advPanels.pinned.has(key);
+      sec.setAttribute("data-collapsed", isOpen ? "false" : "true");
+      sec.setAttribute("data-pinned", isPinned ? "true" : "false");
+      const toggleBtn = sec.querySelector(`[data-toggle-panel="${key}"]`);
+      if (toggleBtn) {
+        toggleBtn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+      }
+      const pinBtn = sec.querySelector(`[data-pin-panel="${key}"]`);
+      if (pinBtn) {
+        pinBtn.setAttribute("aria-pressed", isPinned ? "true" : "false");
+        pinBtn.title = isPinned
+          ? `Unpin ${panelTitles[key]} (hide when Advanced is off)`
+          : `Pin ${panelTitles[key]} so it stays visible even when Advanced is off`;
+      }
+    }
+    document.documentElement.setAttribute(
+      "data-has-pinned",
+      this.advPanels.pinned.size > 0 ? "true" : "false"
+    );
+    this._syncTopologyTimers();
+  }
+
+  setAdvPanelOpen(key, isOpen, persist = true) {
+    if (!key) return;
+    if (isOpen) {
+      this.advPanels.open.add(key);
+    } else {
+      this.advPanels.open.delete(key);
+    }
+    if (persist) this._persistAdvPanels();
+    this.syncAdvPanelsDom();
+    if (key === "network" && isOpen && this.status) {
+      this.pollPeerTransportStats();
+      this.renderTopology();
+      this.renderTopologyInspector();
+    }
+  }
+
+  toggleAdvPanel(key) {
+    this.setAdvPanelOpen(key, !this.advPanels.open.has(key), true);
+  }
+
+  setAdvPanelPinned(key, isPinned, persist = true) {
+    if (!key) return;
+    const names = {
+      connect: "Connect Peer",
+      network: "Peers & Network",
+      bot: "Self-Host a Bot",
+      diagnostics: "Activity & Stats",
+    };
+    if (isPinned) {
+      this.advPanels.pinned.add(key);
+    } else {
+      this.advPanels.pinned.delete(key);
+    }
+    if (persist) this._persistAdvPanels();
+    this.syncAdvPanelsDom();
+    if (this.status) {
+      this.syncLayoutAttributes();
+      if (key === "network" && isPinned && this.advPanels.open.has("network")) {
+        this.pollPeerTransportStats();
+        this.renderTopology();
+      }
+    }
+    if (persist && names[key]) {
+      this.showToast(
+        isPinned
+          ? `Pinned ${names[key]} — stays visible outside Advanced`
+          : `Unpinned ${names[key]}`
+      );
+    }
+  }
+
+  toggleAdvPanelPin(key) {
+    this.setAdvPanelPinned(key, !this.advPanels.pinned.has(key), true);
+  }
+
+  isTopologyVisible() {
+    if (!this.advPanels.open.has("network")) return false;
+    if (this.advancedMode) return true;
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    return inRoom && this.advPanels.pinned.has("network");
+  }
+
+  _syncTopologyTimers() {
+    const visible = this.isTopologyVisible();
+    if (visible) {
+      if (!this.topo.statsTimer) {
+        this.topo.statsTimer = setInterval(() => {
+          if (!this.isTopologyVisible()) {
+            this._syncTopologyTimers();
+            return;
+          }
+          this.pollPeerTransportStats();
+        }, 2400);
+      }
+      if (this.topo.particles.length > 0 && !this.topo.rafId) {
+        this.topo.lastFrameMs = performance.now();
+        this.topo.rafId = requestAnimationFrame((ts) => this._topologyTick(ts));
+      }
+    } else {
+      if (this.topo.statsTimer) {
+        clearInterval(this.topo.statsTimer);
+        this.topo.statsTimer = null;
+      }
+      if (this.topo.rafId) {
+        cancelAnimationFrame(this.topo.rafId);
+        this.topo.rafId = null;
+      }
+    }
+  }
 
   initAdvancedMode() {
     const initial = document.documentElement.getAttribute("data-advanced") === "true";
@@ -2007,6 +2211,8 @@ class P2PDirectApp {
       if (this.el["log-type-filter"]) this.el["log-type-filter"].value = "";
     }
 
+    this._syncTopologyTimers();
+
     if (this.status) {
       this.renderAll();
     } else {
@@ -2021,6 +2227,11 @@ class P2PDirectApp {
   syncLayoutAttributes() {
     const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
     document.documentElement.setAttribute("data-in-room", inRoom ? "true" : "false");
+    document.documentElement.setAttribute(
+      "data-has-pinned",
+      this.advPanels.pinned.size > 0 ? "true" : "false"
+    );
+    this._syncTopologyTimers();
   }
 
   createRoomFromLobby() {
@@ -2047,12 +2258,14 @@ class P2PDirectApp {
       if (decoded.signal.kind === "offer") {
         this.el["lobby-room-link-input"].value = "";
         this.setAdvancedMode(true);
+        this.setAdvPanelOpen("connect", true);
         await this.handleJoinOfferSubmit(raw);
         return;
       }
       if (decoded.signal.kind === "answer") {
         this.el["lobby-room-link-input"].value = "";
         this.setAdvancedMode(true);
+        this.setAdvPanelOpen("connect", true);
         await this.handleHostAnswerSubmit(raw);
         return;
       }
@@ -4529,12 +4742,14 @@ class P2PDirectApp {
         if (!this.advancedMode) {
           this.setAdvancedMode(true);
         }
+        this.setAdvPanelOpen("connect", true);
         this.openJoinWizard();
         await this.acceptManualOffer(frag.code);
       } else if (frag.kind === "answer") {
         if (!this.advancedMode) {
           this.setAdvancedMode(true);
         }
+        this.setAdvPanelOpen("connect", true);
         await this.handleIncomingAnswerUrlOrCode(frag.code, /* fromHash = */ true);
       }
     } catch (err) {
@@ -5857,6 +6072,7 @@ class P2PDirectApp {
       if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
         try {
           vdc.send(data);
+          this.recordTopologyPacket(peerId, "tx", "voice", data.byteLength);
         } catch {
           // drop frame cleanly under congestion
         }
@@ -6341,6 +6557,7 @@ class P2PDirectApp {
         if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
           try {
             vdc.send(data);
+            this.recordTopologyPacket(peerId, "tx", "voice", data.byteLength);
           } catch {
             // drop frame cleanly under congestion
           }
@@ -6378,6 +6595,7 @@ class P2PDirectApp {
         mixer.rms = headerRms;
         mixer.packetsReceived += 1;
         mixer.lastAudioAt = Date.now();
+        this.recordTopologyPacket(peerId, "rx", "voice", pktBytes.byteLength);
 
         if (this.voice.deafened || mixer.muted || !this.voice.audioCtx) {
           return;
@@ -6421,6 +6639,7 @@ class P2PDirectApp {
       mixer.rms = decoded.rms;
       mixer.packetsReceived += 1;
       mixer.lastAudioAt = Date.now();
+      this.recordTopologyPacket(peerId, "rx", "voice", pktBytes.byteLength);
 
       if (this.voice.deafened || mixer.muted || !this.voice.audioCtx) {
         return;
@@ -6855,6 +7074,7 @@ class P2PDirectApp {
                 const lt = local?.candidateType || "?";
                 const rt = remote?.candidateType || "?";
                 const proto = local?.protocol || "";
+                this._storeDirectPeerTech(peerId, local, remote, chosen);
                 const prefix = upgradingFromRelay
                   ? `Upgraded ${peerEntry.authorName} from E2EE Relay → Direct P2P`
                   : `WebRTC path to ${peerEntry.authorName}`;
@@ -6862,6 +7082,8 @@ class P2PDirectApp {
                   "room",
                   `${prefix}: ${lt} ↔ ${rt}${proto ? ` (${proto})` : ""}`
                 );
+                this.renderPeers();
+                this.renderTopology();
               }
             }
           })
@@ -6872,6 +7094,7 @@ class P2PDirectApp {
         // Keep existing WASM X25519 + ChaCha20-Poly1305 session and monotonic counters alive
         // for a zero-drop seamless upgrade from E2EE Relay to Direct WebRTC P2P.
         this.renderPeers();
+        this.renderTopology();
         this.renderStats();
         this.showToast(`Upgraded ${peerEntry.authorName} to Direct P2P`);
         return;
@@ -6932,6 +7155,7 @@ class P2PDirectApp {
           this.voiceChannels.delete(peerId);
         }
         this.disposePeerVoiceMixer(peerId);
+        this._cleanupPeerTopologyState(peerId);
         const res = this.wasm.call({ cmd: "peer_disconnected", peerId });
         this.status = res.status;
         this.executeActions(res.actions);
@@ -6988,6 +7212,7 @@ class P2PDirectApp {
     dc.onmessage = (ev) => {
       if (typeof ev.data !== "string" || peerEntry.superseded) return;
       peerEntry.lastActivityMs = Date.now();
+      this.recordTopologyPacket(peerId, "rx", "data", ev.data.length);
       try {
         const res = this.wasm.call({
           cmd: "wire_message",
@@ -7035,6 +7260,7 @@ class P2PDirectApp {
       }
     }
     this.disposePeerVoiceMixer(peerId);
+    this._cleanupPeerTopologyState(peerId);
     try {
       entry.dc.close();
       entry.pc.close();
@@ -7059,6 +7285,7 @@ class P2PDirectApp {
           if (peer && peer.dc && peer.dc.readyState === "open") {
             try {
               peer.dc.send(act.frame);
+              this.recordTopologyPacket(act.peerId, "tx", "data", act.frame.length);
             } catch (err) {
               this.addTelemetry("error", `Send failed to ${act.peerId}: ${err.message}`);
             }
@@ -7349,15 +7576,9 @@ class P2PDirectApp {
     this.renderLog();
   }
 
-  buildBotCliCommand(kind = "bridge") {
+  buildBotCliCommand() {
     const roomUrl = this.activeRoom?.url || "<paste-room-link>";
     const passFlag = this.activeRoom?.encrypted ? ' --passphrase "<room-passphrase>"' : "";
-    if (kind === "warframe") {
-      return `node bot/examples/warframe-bot.mjs --room "${roomUrl}"${passFlag}`;
-    }
-    if (kind === "music") {
-      return `node bot/examples/music-bot.mjs --room "${roomUrl}"${passFlag}`;
-    }
     return `node bot/bridge.mjs --room "${roomUrl}" --name "MyBot" --port 8765${passFlag}`;
   }
 
@@ -7368,7 +7589,7 @@ class P2PDirectApp {
     const relayCount = this.roomRelayStatus?.connectedCount || 0;
 
     if (this.el["bot-cli-command"]) {
-      this.el["bot-cli-command"].value = this.buildBotCliCommand("bridge");
+      this.el["bot-cli-command"].value = this.buildBotCliCommand();
     }
 
     let badgeText = "Connecting…";
@@ -7759,11 +7980,445 @@ class P2PDirectApp {
     this.el["stat-voice"].textContent = `${s.voicePacketsSent} / ${s.voicePacketsReceived}`;
   }
 
+  _storeDirectPeerTech(peerId, local, remote, pair) {
+    if (!peerId) return;
+    const lt = local?.candidateType || "";
+    const rt = remote?.candidateType || "";
+    const proto = (local?.protocol || remote?.protocol || "udp").toUpperCase();
+    let shortLabel = `P2P ${proto}`;
+    let detailLabel = `WebRTC DataChannel · ${proto}`;
+    if (lt === "host" && rt === "host") {
+      shortLabel = `LAN ${proto}`;
+      detailLabel = `WebRTC DataChannel · ${proto} (LAN host ↔ host)`;
+    } else if (lt === "srflx" || rt === "srflx") {
+      shortLabel = `STUN ${proto}`;
+      detailLabel = `WebRTC DataChannel · ${proto} (STUN ${lt || "?"} ↔ ${rt || "?"})`;
+    } else if (lt === "prflx" || rt === "prflx") {
+      shortLabel = `P2P ${proto}`;
+      detailLabel = `WebRTC DataChannel · ${proto} (Hole-punch ${lt || "?"} ↔ ${rt || "?"})`;
+    } else if (lt || rt) {
+      detailLabel = `WebRTC DataChannel · ${proto} (${lt || "?"} ↔ ${rt || "?"})`;
+    }
+    const statsRttMs =
+      typeof pair?.currentRoundTripTime === "number" && Number.isFinite(pair.currentRoundTripTime)
+        ? Math.max(1, Math.round(pair.currentRoundTripTime * 1000))
+        : null;
+    this.topo.peerTech.set(peerId, {
+      transport: "direct",
+      shortLabel,
+      detailLabel,
+      protocol: proto,
+      localType: lt || "?",
+      remoteType: rt || "?",
+      statsRttMs,
+      brokerHost: "",
+    });
+  }
+
+  _getPeerTechInfo(peerId) {
+    const liveConn = this.directPeers.get(peerId);
+    if (liveConn?.transport === "relay") {
+      let brokerHost = "WSS Multi-Relay";
+      const known = this.roomKnownPeers.get(peerId);
+      const relayUrl =
+        known?.relays?.[0] || this.roomRendezvous?.getStatus?.()?.connectedUrls?.[0] || "";
+      if (relayUrl) {
+        try {
+          brokerHost = new URL(relayUrl).host;
+        } catch {
+          brokerHost = relayUrl;
+        }
+      }
+      return {
+        transport: "relay",
+        shortLabel: "WSS RELAY",
+        detailLabel: `E2EE WSS Multi-Relay (DF/VB · Zero TURN · ${brokerHost})`,
+        protocol: "WSS/TLS",
+        localType: "wss",
+        remoteType: "wss",
+        statsRttMs: null,
+        brokerHost,
+      };
+    }
+    const cached = this.topo.peerTech.get(peerId);
+    if (cached && cached.transport === "direct") {
+      return cached;
+    }
+    return {
+      transport: "direct",
+      shortLabel: "WEBRTC P2P",
+      detailLabel: "WebRTC DataChannel · Direct ICE (Zero TURN)",
+      protocol: "UDP",
+      localType: "?",
+      remoteType: "?",
+      statsRttMs: null,
+      brokerHost: "",
+    };
+  }
+
+  _cleanupPeerTopologyState(peerId) {
+    this.topo.linkStats.delete(peerId);
+    this.topo.peerTech.delete(peerId);
+    this.topo.customPositions.delete(peerId);
+    this.topo.positions.delete(peerId);
+    if (this.topo.selectedId === peerId) {
+      this.topo.selectedId = null;
+    }
+    if (this.topo.customPositions.size === 0 && this.el["btn-topo-reset"]) {
+      this.el["btn-topo-reset"].classList.add("hidden");
+    }
+  }
+
+  async pollPeerTransportStats() {
+    if (!this.status) return;
+    let changed = false;
+    const jobs = [];
+    for (const [peerId, entry] of this.directPeers.entries()) {
+      if (entry.transport !== "direct" || !entry.pc || typeof entry.pc.getStats !== "function") {
+        continue;
+      }
+      jobs.push(
+        entry.pc
+          .getStats()
+          .then((stats) => {
+            let chosen = null;
+            const cands = new Map();
+            let transportSelectedId = null;
+            stats.forEach((r) => {
+              if (r.type === "transport" && r.selectedCandidatePairId) {
+                transportSelectedId = r.selectedCandidatePairId;
+              } else if (r.type === "local-candidate" || r.type === "remote-candidate") {
+                cands.set(r.id, r);
+              }
+            });
+            stats.forEach((r) => {
+              if (r.type !== "candidate-pair") return;
+              if (transportSelectedId && r.id === transportSelectedId) {
+                chosen = r;
+              } else if (!chosen && (r.selected || (r.nominated && r.state === "succeeded"))) {
+                chosen = r;
+              }
+            });
+            if (chosen) {
+              const local = cands.get(chosen.localCandidateId);
+              const remote = cands.get(chosen.remoteCandidateId);
+              const prev = this.topo.peerTech.get(peerId);
+              this._storeDirectPeerTech(peerId, local, remote, chosen);
+              const next = this.topo.peerTech.get(peerId);
+              if (
+                !prev ||
+                prev.shortLabel !== next.shortLabel ||
+                prev.statsRttMs !== next.statsRttMs
+              ) {
+                changed = true;
+              }
+            }
+          })
+          .catch(() => {})
+      );
+    }
+    if (jobs.length > 0) {
+      await Promise.all(jobs);
+    }
+    if (changed && this.isTopologyVisible()) {
+      this.renderPeers();
+      this.renderTopology();
+      this.renderTopologyInspector();
+    }
+  }
+
+  _rollLinkWindow(st, now) {
+    const elapsed = now - st.winStartMs;
+    if (elapsed >= 1000) {
+      const sec = Math.max(1, elapsed / 1000);
+      st.txPps = Math.round(st.txWin / sec);
+      st.rxPps = Math.round(st.rxWin / sec);
+      st.kbps = Number((((st.txBytesWin + st.rxBytesWin) * 8) / (sec * 1000)).toFixed(1));
+      st.txWin = 0;
+      st.rxWin = 0;
+      st.txBytesWin = 0;
+      st.rxBytesWin = 0;
+      st.winStartMs = now;
+    }
+  }
+
+  recordTopologyPacket(peerId, dir, kind, bytes = 0) {
+    if (!peerId || !this.status) return;
+    const now = performance.now();
+    let st = this.topo.linkStats.get(peerId);
+    if (!st) {
+      st = {
+        txTotal: 0,
+        rxTotal: 0,
+        txBytes: 0,
+        rxBytes: 0,
+        txWin: 0,
+        rxWin: 0,
+        txBytesWin: 0,
+        rxBytesWin: 0,
+        txPps: 0,
+        rxPps: 0,
+        kbps: 0,
+        winStartMs: now,
+        lastPacketAt: now,
+      };
+      this.topo.linkStats.set(peerId, st);
+    }
+    this._rollLinkWindow(st, now);
+    const sz = Math.max(0, Number(bytes) || 0);
+    if (dir === "tx") {
+      st.txTotal += 1;
+      st.txWin += 1;
+      st.txBytes += sz;
+      st.txBytesWin += sz;
+    } else {
+      st.rxTotal += 1;
+      st.rxWin += 1;
+      st.rxBytes += sz;
+      st.rxBytesWin += sz;
+    }
+    st.lastPacketAt = now;
+
+    if (!this.isTopologyVisible()) return;
+
+    // Coalesce rapid packet bursts cleanly so voice streams render as crisp rhythmic pulses
+    const minIntervalMs = kind === "voice" ? 115 : 55;
+    const throttleKey = `${peerId}:${dir}:${kind}`;
+    const lastSpawn = this.topo.lastParticleAt.get(throttleKey) || 0;
+    if (now - lastSpawn < minIntervalMs) return;
+    this.topo.lastParticleAt.set(throttleKey, now);
+
+    const selfId = this.status.peerId;
+    if (!this.topo.positions.has(selfId) || !this.topo.positions.has(peerId)) return;
+
+    const liveConn = this.directPeers.get(peerId);
+    const isRelayed = liveConn?.transport === "relay";
+    if (this.topo.particles.length >= 48) {
+      this.topo.particles.shift();
+    }
+    this.topo.particles.push({
+      fromId: dir === "tx" ? selfId : peerId,
+      toId: dir === "tx" ? peerId : selfId,
+      kind,
+      t: 0,
+      durationMs: isRelayed ? 620 : 390,
+      color: kind === "voice" ? "var(--acid)" : "var(--coral)",
+    });
+
+    if (!this.topo.rafId) {
+      this.topo.lastFrameMs = now;
+      this.topo.rafId = requestAnimationFrame((ts) => this._topologyTick(ts));
+    }
+  }
+
+  _ensureTopologySvgLayers(svg) {
+    if (this.topo.svgInitialized && svg.querySelector("#topo-particles")) {
+      return;
+    }
+    svg.innerHTML = `
+      <defs>
+        <pattern id="topo-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="var(--rule-soft)" stroke-width="1" />
+        </pattern>
+      </defs>
+      <rect id="topo-bg-hit" width="360" height="220" fill="url(#topo-grid)" />
+      <g id="topo-edge-lines"></g>
+      <g id="topo-particles"></g>
+      <g id="topo-edge-pills"></g>
+      <g id="topo-nodes"></g>
+    `;
+    const ns = "http://www.w3.org/2000/svg";
+    const particleLayer = svg.querySelector("#topo-particles");
+    this.topo.particlePool = [];
+    for (let i = 0; i < 48; i++) {
+      const rect = document.createElementNS(ns, "rect");
+      rect.setAttribute("visibility", "hidden");
+      rect.setAttribute("stroke", "#0e0f12");
+      rect.setAttribute("stroke-width", "1.2");
+      rect.style.pointerEvents = "none";
+      particleLayer.appendChild(rect);
+      this.topo.particlePool.push(rect);
+    }
+    this.topo.svgInitialized = true;
+  }
+
+  _topologyTick(ts) {
+    this.topo.rafId = null;
+    if (!this.isTopologyVisible()) {
+      for (const rect of this.topo.particlePool) {
+        rect.setAttribute("visibility", "hidden");
+      }
+      return;
+    }
+    const dt = Math.min(80, Math.max(0, ts - (this.topo.lastFrameMs || ts)));
+    this.topo.lastFrameMs = ts;
+
+    const alive = [];
+    for (const p of this.topo.particles) {
+      p.t += dt / p.durationMs;
+      if (p.t < 1) {
+        alive.push(p);
+      }
+    }
+    this.topo.particles = alive;
+
+    const pool = this.topo.particlePool;
+    for (let i = 0; i < pool.length; i++) {
+      const rect = pool[i];
+      if (i >= alive.length) {
+        if (rect.getAttribute("visibility") !== "hidden") {
+          rect.setAttribute("visibility", "hidden");
+        }
+        continue;
+      }
+      const p = alive[i];
+      const a = this.topo.positions.get(p.fromId);
+      const b = this.topo.positions.get(p.toId);
+      if (!a || !b) {
+        rect.setAttribute("visibility", "hidden");
+        continue;
+      }
+      const x = a.x + (b.x - a.x) * p.t;
+      const y = a.y + (b.y - a.y) * p.t;
+      const sz = p.kind === "voice" ? 6 : 7;
+      const half = sz / 2;
+      rect.setAttribute("x", (-half).toFixed(1));
+      rect.setAttribute("y", (-half).toFixed(1));
+      rect.setAttribute("width", String(sz));
+      rect.setAttribute("height", String(sz));
+      rect.setAttribute("fill", p.color);
+      rect.setAttribute(
+        "transform",
+        p.kind === "voice"
+          ? `translate(${x.toFixed(1)},${y.toFixed(1)}) rotate(45)`
+          : `translate(${x.toFixed(1)},${y.toFixed(1)})`
+      );
+      rect.setAttribute("visibility", "visible");
+    }
+
+    // Refresh live packet rate inside inspector at ~3 Hz while traffic is active
+    if (this.topo.selectedId && ts - this.topo.lastInspectorTickMs >= 350) {
+      this.topo.lastInspectorTickMs = ts;
+      this.renderTopologyInspector();
+    }
+
+    if (alive.length > 0) {
+      this.topo.rafId = requestAnimationFrame((nextTs) => this._topologyTick(nextTs));
+    }
+  }
+
+  _clientToSvgPoint(svg, clientX, clientY) {
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width || !rect.height) return { x: 180, y: 110 };
+    const x = ((clientX - rect.left) / rect.width) * 360;
+    const y = ((clientY - rect.top) / rect.height) * 220;
+    return {
+      x: Math.max(26, Math.min(334, x)),
+      y: Math.max(24, Math.min(194, y)),
+    };
+  }
+
+  setupTopologyInteractions() {
+    const svg = this.el["topology-svg"];
+    if (!svg) return;
+
+    svg.addEventListener("pointerdown", (ev) => {
+      const nodeEl = ev.target.closest?.("[data-topo-node]");
+      if (nodeEl) {
+        const nodeId = nodeEl.getAttribute("data-topo-node");
+        this.topo.draggingId = nodeId;
+        this.topo.dragStartClient = { x: ev.clientX, y: ev.clientY };
+        this.topo.dragMoved = false;
+        svg.classList.add("is-dragging");
+        try {
+          svg.setPointerCapture(ev.pointerId);
+        } catch {
+          // ignore
+        }
+        ev.preventDefault();
+        return;
+      }
+
+      const edgeEl = ev.target.closest?.("[data-topo-edge]");
+      if (edgeEl) {
+        const edgePeerId = edgeEl.getAttribute("data-topo-edge");
+        this.selectTopologyTarget(edgePeerId);
+        return;
+      }
+
+      if (ev.target === svg || ev.target.id === "topo-bg-hit") {
+        this.selectTopologyTarget(null);
+      }
+    });
+
+    svg.addEventListener("pointermove", (ev) => {
+      if (!this.topo.draggingId) return;
+      const start = this.topo.dragStartClient;
+      if (start && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) >= 4) {
+        this.topo.dragMoved = true;
+      }
+      if (!this.topo.dragMoved) return;
+      const pt = this._clientToSvgPoint(svg, ev.clientX, ev.clientY);
+      this.topo.customPositions.set(this.topo.draggingId, pt);
+      if (this.el["btn-topo-reset"]) {
+        this.el["btn-topo-reset"].classList.remove("hidden");
+      }
+      this.renderTopology();
+    });
+
+    const endDrag = (ev) => {
+      if (!this.topo.draggingId) return;
+      const nodeId = this.topo.draggingId;
+      const wasMoved = this.topo.dragMoved;
+      this.topo.draggingId = null;
+      this.topo.dragStartClient = null;
+      this.topo.dragMoved = false;
+      svg.classList.remove("is-dragging");
+      try {
+        svg.releasePointerCapture(ev.pointerId);
+      } catch {
+        // ignore
+      }
+      if (!wasMoved) {
+        this.selectTopologyTarget(this.topo.selectedId === nodeId ? null : nodeId);
+      }
+    };
+
+    svg.addEventListener("pointerup", endDrag);
+    svg.addEventListener("pointercancel", endDrag);
+  }
+
+  selectTopologyTarget(nodeId) {
+    this.topo.selectedId = nodeId || null;
+    this.renderTopology();
+    this.renderPeers();
+    this.renderTopologyInspector();
+  }
+
   renderPeers() {
     if (!this.status) return;
     const list = this.el["peer-list"];
     const direct = this.status.peers || [];
     const pending = this.status.pendingAutoMesh || [];
+
+    // Update collapsed-header live peer summary badge
+    if (this.el["network-panel-meta"]) {
+      let directCount = 0;
+      let relayCount = 0;
+      for (const p of direct) {
+        if (this.directPeers.get(p.peerId)?.transport === "relay") relayCount++;
+        else directCount++;
+      }
+      if (direct.length === 0) {
+        this.el["network-panel-meta"].textContent =
+          pending.length > 0 ? `${pending.length} connecting` : "0 peers";
+      } else {
+        const segs = [];
+        if (directCount > 0) segs.push(`${directCount} direct`);
+        if (relayCount > 0) segs.push(`${relayCount} relay`);
+        this.el["network-panel-meta"].textContent = segs.join(" · ");
+      }
+    }
 
     if (direct.length === 0 && pending.length === 0) {
       list.innerHTML =
@@ -7773,21 +8428,22 @@ class P2PDirectApp {
 
     const parts = [];
     for (const p of direct) {
-      const peerTheme = peerTileTheme(p.peerId, false);
       const botBadge = p.isBot ? '<span class="bot-tag">BOT</span>' : "";
       const liveConn = this.directPeers.get(p.peerId);
-      const originBadge =
-        liveConn?.transport === "relay"
-          ? '<span class="badge auto" title="E2EE Relay fallback (zero TURN; auto-upgrades to Direct P2P)">e2ee relay</span>'
-          : p.viaAutoMesh
-            ? `<span class="badge auto" title="Auto-connected via ${escapeHtml(p.introducedBy || "peer")}">auto</span>`
-            : '<span class="badge">direct</span>';
+      const isRelayed = liveConn?.transport === "relay";
+      const tech = this._getPeerTechInfo(p.peerId);
+      const transportCls = isRelayed ? "transport-relay" : "transport-direct";
+      const selectedCls = this.topo.selectedId === p.peerId ? " is-selected" : "";
+      const originBadge = isRelayed
+        ? `<span class="badge relay" title="${escapeHtml(tech.detailLabel)}">e2ee relay</span>`
+        : `<span class="badge direct" title="${escapeHtml(tech.detailLabel)}">${escapeHtml(tech.shortLabel.toLowerCase())}</span>`;
       const voiceBadge = p.inVoice
-        ? `<span class="badge auto">${p.voiceMuted ? "voice · muted" : "in voice"}</span>`
+        ? `<span class="badge voice-tag">${p.voiceMuted ? "voice · muted" : this.getPeerVoiceCodec(p.peerId) === "opus48" ? "opus 48k" : "adpcm 16k"}</span>`
         : "";
-      const rttLabel = typeof p.rttMs === "number" ? ` · ${p.rttMs}ms` : "";
+      const effRtt = typeof p.rttMs === "number" ? p.rttMs : tech.statsRttMs;
+      const rttLabel = typeof effRtt === "number" ? ` · ${effRtt}ms` : "";
       parts.push(`
-        <li class="peer-item ${peerTheme}" data-peer-id="${escapeHtml(p.peerId)}">
+        <li class="peer-item ${transportCls}${selectedCls}" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
             <div class="peer-name">${escapeHtml(p.authorName)} ${botBadge} ${originBadge} ${voiceBadge}</div>
             <div class="peer-id">${escapeHtml(p.peerId)} · code ${escapeHtml(p.safetyCode || "—")}${rttLabel}</div>
@@ -7809,141 +8465,444 @@ class P2PDirectApp {
     }
 
     list.innerHTML = parts.join("");
+    for (const row of list.querySelectorAll(".peer-item[data-peer-id]")) {
+      row.addEventListener("click", (ev) => {
+        if (ev.target.closest("[data-disconnect]")) return;
+        const pid = row.dataset.peerId;
+        this.selectTopologyTarget(this.topo.selectedId === pid ? null : pid);
+      });
+    }
     for (const btn of list.querySelectorAll("[data-disconnect]")) {
-      btn.addEventListener("click", () => this.disconnectPeer(btn.dataset.disconnect));
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this.disconnectPeer(btn.dataset.disconnect);
+      });
     }
   }
 
   renderTopology() {
     if (!this.status) return;
     const svg = this.el["topology-svg"];
-    const direct = this.status.peers || [];
-    const pending = this.status.pendingAutoMesh || [];
+    if (!svg) return;
+    this._ensureTopologySvgLayers(svg);
+
+    const connected = this.status.peers || [];
+    const pendingAuto = this.status.pendingAutoMesh || [];
 
     const nodes = [
       {
         id: this.status.peerId,
         label: `${this.status.authorName} (you)`,
         kind: "self",
+        transport: "self",
         inVoice: this.voice.inVoice,
+        speaking: Date.now() - this.voice.localSpeakingAt < 650,
+        isBot: false,
       },
     ];
     const nodeMap = new Map();
     nodeMap.set(this.status.peerId, nodes[0]);
 
-    for (const p of direct) {
+    let directCount = 0;
+    let relayCount = 0;
+    let pendingCount = 0;
+
+    for (const p of connected) {
+      const liveConn = this.directPeers.get(p.peerId);
+      const isRelayed = liveConn?.transport === "relay";
+      if (isRelayed) relayCount++;
+      else directCount++;
+      const mixer = this.voice.peerMixers.get(p.peerId);
       const n = {
         id: p.peerId,
         label: p.isBot ? `[BOT] ${p.authorName}` : p.authorName,
-        kind: p.viaAutoMesh ? "auto" : "direct",
+        kind: isRelayed ? "relay" : "direct",
+        transport: isRelayed ? "relay" : "direct",
         inVoice: Boolean(p.inVoice),
+        speaking: Boolean(mixer && Date.now() - mixer.lastAudioAt < 650 && mixer.rms > 180),
+        isBot: Boolean(p.isBot),
+        rttMs: typeof p.rttMs === "number" ? p.rttMs : this._getPeerTechInfo(p.peerId).statsRttMs,
       };
       nodes.push(n);
       nodeMap.set(p.peerId, n);
     }
-    for (const p of pending) {
+
+    for (const p of pendingAuto) {
       if (!nodeMap.has(p.peerId)) {
-        const n = { id: p.peerId, label: p.authorName, kind: "pending", inVoice: false };
+        pendingCount++;
+        const n = {
+          id: p.peerId,
+          label: p.authorName,
+          kind: "pending",
+          transport: "pending",
+          inVoice: false,
+          speaking: false,
+          isBot: false,
+        };
         nodes.push(n);
         nodeMap.set(p.peerId, n);
       }
     }
 
-    const cx = 170;
-    const cy = 80;
-    const rx = 112;
-    const ry = 50;
-    if (nodes.length === 1) {
-      nodes[0].x = cx;
-      nodes[0].y = cy;
-    } else {
-      for (let i = 0; i < nodes.length; i++) {
-        const angle = -Math.PI / 2 + (2 * Math.PI * i) / nodes.length;
-        nodes[i].x = cx + rx * Math.cos(angle);
-        nodes[i].y = cy + ry * Math.sin(angle);
+    // Also show actively dialing room peers (ICE handshake in progress) in Amber
+    for (const [pid, dial] of this.roomDialing.entries()) {
+      if (!nodeMap.has(pid) && !dial.isUpgradeProbe) {
+        pendingCount++;
+        const n = {
+          id: pid,
+          label: dial.targetName || pid,
+          kind: "pending",
+          transport: "pending",
+          inVoice: false,
+          speaking: false,
+          isBot: false,
+        };
+        nodes.push(n);
+        nodeMap.set(pid, n);
       }
     }
 
-    const themeColorVar = {
-      "tile-coral": "var(--coral)",
-      "tile-cobalt": "var(--cobalt)",
-      "tile-ochre": "var(--ochre)",
-      "tile-cyan": "var(--cyan)",
-      "tile-mint": "var(--mint)",
-    };
+    // Update live topology toolbar summary
+    if (this.el["topology-summary"]) {
+      const summaryParts = [];
+      if (directCount > 0) summaryParts.push(`${directCount} Direct P2P`);
+      if (relayCount > 0) summaryParts.push(`${relayCount} E2EE Relay`);
+      if (pendingCount > 0) summaryParts.push(`${pendingCount} Connecting`);
+      if (this.voice.inVoice) {
+        summaryParts.push(this.voice.opusSupported ? "Opus 48k" : "ADPCM 16k");
+      }
+      this.el["topology-summary"].textContent =
+        summaryParts.length > 0 ? summaryParts.join(" · ") : "Standalone · Waiting for peers";
+    }
 
-    const gridDefs = `
-      <defs>
-        <pattern id="topo-grid" width="20" height="20" patternUnits="userSpaceOnUse">
-          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="var(--rule-soft)" stroke-width="1" />
-        </pattern>
-      </defs>
-      <rect width="340" height="160" fill="url(#topo-grid)" />
-    `;
+    // Position nodes (centered YOU at top/center, peers evenly distributed, honoring dragged coordinates)
+    const cx = 180;
+    const cy = 110;
+    const rx = 122;
+    const ry = 68;
+    if (nodes.length === 1) {
+      const custom = this.topo.customPositions.get(nodes[0].id);
+      nodes[0].x = custom ? custom.x : cx;
+      nodes[0].y = custom ? custom.y : cy;
+    } else if (nodes.length === 2) {
+      const defaults = [
+        { x: 90, y: cy },
+        { x: 270, y: cy },
+      ];
+      for (let i = 0; i < 2; i++) {
+        const custom = this.topo.customPositions.get(nodes[i].id);
+        nodes[i].x = custom ? custom.x : defaults[i].x;
+        nodes[i].y = custom ? custom.y : defaults[i].y;
+      }
+    } else {
+      for (let i = 0; i < nodes.length; i++) {
+        const custom = this.topo.customPositions.get(nodes[i].id);
+        if (custom) {
+          nodes[i].x = custom.x;
+          nodes[i].y = custom.y;
+        } else {
+          const angle = -Math.PI / 2 + (2 * Math.PI * i) / nodes.length;
+          nodes[i].x = cx + rx * Math.cos(angle);
+          nodes[i].y = cy + ry * Math.sin(angle);
+        }
+      }
+    }
+
+    // Persist live coordinates so the 60fps packet animation tracks nodes smoothly
+    const liveIds = new Set();
+    for (const n of nodes) {
+      liveIds.add(n.id);
+      this.topo.positions.set(n.id, { x: n.x, y: n.y });
+    }
+    for (const id of Array.from(this.topo.positions.keys())) {
+      if (!liveIds.has(id)) this.topo.positions.delete(id);
+    }
 
     const edgeSet = new Set();
-    const lines = [];
-    const addEdge = (aId, bId, style) => {
+    const edgeLineParts = [];
+    const edgePillParts = [];
+    const addEdge = (aId, bId, style, peerIdForSelect = null, pillText = "") => {
       const a = nodeMap.get(aId);
       const b = nodeMap.get(bId);
       if (!a || !b || aId === bId) return;
       const key = aId < bId ? `${aId}|${bId}` : `${bId}|${aId}`;
       if (edgeSet.has(key)) return;
       edgeSet.add(key);
-      if (style === "pending") {
-        lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-warn)" stroke-width="2" stroke-dasharray="4 4" />`
-        );
+
+      const isSelected = Boolean(peerIdForSelect && this.topo.selectedId === peerIdForSelect);
+      let stroke = "var(--mint)";
+      let width = isSelected ? "3.4" : "2.6";
+      let dash = "";
+      let opacity = "1";
+      let pillStroke = "var(--mint)";
+
+      if (style === "relay") {
+        stroke = "var(--cyan)";
+        dash = ' stroke-dasharray="6 4"';
+        pillStroke = "var(--cyan)";
+      } else if (style === "pending") {
+        stroke = "var(--ochre)";
+        width = "2.2";
+        dash = ' stroke-dasharray="3 4"';
+        pillStroke = "var(--ochre)";
       } else if (style === "remote") {
-        lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-opacity="0.45" stroke-width="1.8" />`
-        );
-      } else {
-        lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-width="2.4" />`
-        );
+        stroke = "var(--ink-muted)";
+        width = "1.4";
+        dash = ' stroke-dasharray="3 3"';
+        opacity = "0.5";
+      }
+
+      const x1 = a.x.toFixed(1);
+      const y1 = a.y.toFixed(1);
+      const x2 = b.x.toFixed(1);
+      const y2 = b.y.toFixed(1);
+      const hitAttr = peerIdForSelect
+        ? ` class="topo-edge-hit" data-topo-edge="${escapeHtml(peerIdForSelect)}"`
+        : "";
+
+      edgeLineParts.push(`
+        <g${hitAttr}>
+          ${peerIdForSelect ? `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="transparent" stroke-width="14" />` : ""}
+          <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-opacity="${opacity}" stroke-width="${width}"${dash} />
+        </g>
+      `);
+
+      if (pillText && style !== "remote") {
+        const pw = Math.max(46, pillText.length * 5.3 + 10);
+        const ph = 14;
+        const mx = Math.max(pw / 2 + 4, Math.min(356 - pw / 2, (a.x + b.x) / 2));
+        const my = Math.max(ph / 2 + 4, Math.min(216 - ph / 2, (a.y + b.y) / 2));
+        edgePillParts.push(`
+          <g${hitAttr}>
+            <rect x="${(mx - pw / 2).toFixed(1)}" y="${(my - ph / 2).toFixed(1)}" width="${pw.toFixed(1)}" height="${ph}" fill="var(--bg-surface)" stroke="${isSelected ? "var(--cobalt)" : pillStroke}" stroke-width="${isSelected ? "2" : "1.4"}" />
+            <text x="${mx.toFixed(1)}" y="${(my + 3.2).toFixed(1)}" text-anchor="middle" font-family="var(--font-mono)" font-size="8" font-weight="700" letter-spacing="0.04em" fill="var(--ink-primary)">${escapeHtml(pillText)}</text>
+          </g>
+        `);
       }
     };
 
-    for (const p of direct) {
-      addEdge(this.status.peerId, p.peerId, "direct");
+    for (const p of connected) {
+      const tech = this._getPeerTechInfo(p.peerId);
+      const rtt = typeof p.rttMs === "number" ? p.rttMs : tech.statsRttMs;
+      const rttPart = typeof rtt === "number" ? ` · ${rtt}ms` : "";
+      const pill = `${tech.shortLabel}${rttPart}`;
+      addEdge(this.status.peerId, p.peerId, tech.transport, p.peerId, pill);
       for (const rp of p.remotePeers || []) {
         if (nodeMap.has(rp.peerId)) {
-          addEdge(p.peerId, rp.peerId, "remote");
+          addEdge(p.peerId, rp.peerId, "remote", null, "");
         }
       }
     }
-    for (const pend of pending) {
-      addEdge(this.status.peerId, pend.peerId, "pending");
-      addEdge(pend.viaPeerId, pend.peerId, "remote");
+    for (const pend of pendingAuto) {
+      addEdge(this.status.peerId, pend.peerId, "pending", pend.peerId, "DIALING…");
+      addEdge(pend.viaPeerId, pend.peerId, "remote", null, "");
+    }
+    for (const [pid, dial] of this.roomDialing.entries()) {
+      if (!this.directPeers.has(pid) && !dial.isUpgradeProbe) {
+        addEdge(this.status.peerId, pid, "pending", pid, "ICE STUN…");
+      }
     }
 
-    const blocks = nodes.map((n) => {
+    const nodeParts = nodes.map((n) => {
       const fill =
         n.kind === "self"
           ? "var(--ink-primary)"
-          : n.kind === "pending"
-            ? "var(--accent-warn)"
-            : themeColorVar[peerTileTheme(n.id, false)] || "var(--accent-live)";
-      const size = n.kind === "self" ? 16 : 14;
+          : n.kind === "relay"
+            ? "var(--cyan)"
+            : n.kind === "pending"
+              ? "var(--ochre)"
+              : "var(--mint)";
+      const size = n.kind === "self" ? 18 : n.kind === "pending" ? 14 : 16;
       const half = size / 2;
       const shortLabel = (n.label.length > 16 ? `${n.label.slice(0, 15)}…` : n.label).toUpperCase();
-      const labelY = n.y > cy ? n.y + 22 : n.y - 14;
-      const frameSize = size + 8;
-      const frameHalf = frameSize / 2;
+      const labelY = n.y > cy ? n.y + 23 : n.y - 15;
+      const isSelected = this.topo.selectedId === n.id;
+
+      const voiceStroke =
+        n.kind === "relay"
+          ? "var(--cyan)"
+          : n.kind === "self"
+            ? "var(--ink-primary)"
+            : "var(--mint)";
+      const voiceFrameSize = size + 8;
+      const voiceFrameHalf = voiceFrameSize / 2;
       const voiceFrame = n.inVoice
-        ? `<rect x="${(n.x - frameHalf).toFixed(1)}" y="${(n.y - frameHalf).toFixed(1)}" width="${frameSize}" height="${frameSize}" fill="none" stroke="var(--accent-live)" stroke-width="2" />`
+        ? `<rect x="${(n.x - voiceFrameHalf).toFixed(1)}" y="${(n.y - voiceFrameHalf).toFixed(1)}" width="${voiceFrameSize}" height="${voiceFrameSize}" fill="none" stroke="${voiceStroke}" stroke-width="${n.speaking ? "2.6" : "1.8"}" />`
         : "";
+
+      const selSize = size + 14;
+      const selHalf = selSize / 2;
+      const selFrame = isSelected
+        ? `<rect x="${(n.x - selHalf).toFixed(1)}" y="${(n.y - selHalf).toFixed(1)}" width="${selSize}" height="${selSize}" fill="none" stroke="var(--cobalt)" stroke-width="2" stroke-dasharray="4 2" />`
+        : "";
+
       return `
-        <g>
+        <g class="topo-node-group" data-topo-node="${escapeHtml(n.id)}">
+          ${selFrame}
           ${voiceFrame}
           <rect x="${(n.x - half).toFixed(1)}" y="${(n.y - half).toFixed(1)}" width="${size}" height="${size}" fill="${fill}" stroke="var(--bg-surface)" stroke-width="2" />
-          <text x="${n.x.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" font-weight="700" letter-spacing="0.06em" fill="var(--ink-primary)">${escapeHtml(shortLabel)}</text>
+          <text x="${n.x.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="var(--font-mono)" font-size="9" font-weight="700" letter-spacing="0.06em" fill="var(--ink-primary)">${escapeHtml(shortLabel)}</text>
         </g>
       `;
     });
 
-    svg.innerHTML = `${gridDefs}${lines.join("")}${blocks.join("")}`;
+    const edgeLinesLayer = svg.querySelector("#topo-edge-lines");
+    const edgePillsLayer = svg.querySelector("#topo-edge-pills");
+    const nodesLayer = svg.querySelector("#topo-nodes");
+    if (edgeLinesLayer) edgeLinesLayer.innerHTML = edgeLineParts.join("");
+    if (edgePillsLayer) edgePillsLayer.innerHTML = edgePillParts.join("");
+    if (nodesLayer) nodesLayer.innerHTML = nodeParts.join("");
+
+    this.renderTopologyInspector();
+  }
+
+  renderTopologyInspector() {
+    const box = this.el["topology-inspector"];
+    if (!box || !this.status) return;
+
+    const selId = this.topo.selectedId;
+    if (!selId) {
+      box.innerHTML =
+        '<div class="topo-insp-empty">Click any peer or link to inspect protocol, cipher &amp; live packets · Drag nodes to arrange</div>';
+      return;
+    }
+
+    // Local self node selected
+    if (selId === this.status.peerId) {
+      const relayStatus = this.roomRendezvous?.getStatus?.();
+      const relayInfo = relayStatus
+        ? `${relayStatus.connectedCount}/${relayStatus.totalCount} WSS brokers online`
+        : "No room relay active";
+      const localCodec = this.voice.opusSupported
+        ? `48 kHz Opus (${Math.round((this.voice.opusEncoderBitrate || this.computeDesiredOpusBitrate()) / 1000)} kbps)`
+        : "16 kHz ADPCM (fallback)";
+      box.innerHTML = `
+        <div class="topo-insp-head">
+          <div class="topo-insp-title">
+            <span>${escapeHtml(this.status.authorName)}</span>
+            <span class="badge">YOU</span>
+          </div>
+          <button type="button" class="btn-link" data-topo-close>✕</button>
+        </div>
+        <div class="topo-insp-grid">
+          <div class="topo-insp-cell">
+            <span class="topo-insp-k">Peer ID</span>
+            <span class="topo-insp-v">${escapeHtml(this.status.peerId)}</span>
+          </div>
+          <div class="topo-insp-cell">
+            <span class="topo-insp-k">Key Fingerprint</span>
+            <span class="topo-insp-v">${escapeHtml(this.status.e2ee?.keyFingerprint || "—")}</span>
+          </div>
+          <div class="topo-insp-cell">
+            <span class="topo-insp-k">Voice Engine</span>
+            <span class="topo-insp-v">${escapeHtml(localCodec)}</span>
+          </div>
+          <div class="topo-insp-cell">
+            <span class="topo-insp-k">Signaling Relays</span>
+            <span class="topo-insp-v">${escapeHtml(relayInfo)}</span>
+          </div>
+        </div>
+      `;
+      box.querySelector("[data-topo-close]")?.addEventListener("click", () => this.selectTopologyTarget(null));
+      return;
+    }
+
+    const peer = (this.status.peers || []).find((p) => p.peerId === selId);
+    if (!peer) {
+      // Pending / dialing peer
+      const dial = this.roomDialing.get(selId);
+      const pend = (this.status.pendingAutoMesh || []).find((p) => p.peerId === selId);
+      const label = dial?.targetName || pend?.authorName || selId;
+      const gathered = dial ? Array.from(dial.gatheredTypes || []).join(", ") || "gathering…" : "relayed offer";
+      box.innerHTML = `
+        <div class="topo-insp-head">
+          <div class="topo-insp-title">
+            <span>${escapeHtml(label)}</span>
+            <span class="badge pending">CONNECTING</span>
+          </div>
+          <button type="button" class="btn-link" data-topo-close>✕</button>
+        </div>
+        <div class="topo-insp-grid">
+          <div class="topo-insp-cell span-2">
+            <span class="topo-insp-k">Handshake Progress</span>
+            <span class="topo-insp-v">WebRTC ICE STUN (${escapeHtml(gathered)}) · auto-fallback to E2EE WSS Relay if blocked</span>
+          </div>
+        </div>
+      `;
+      box.querySelector("[data-topo-close]")?.addEventListener("click", () => this.selectTopologyTarget(null));
+      return;
+    }
+
+    const tech = this._getPeerTechInfo(selId);
+    const isRelayed = tech.transport === "relay";
+    const st = this.topo.linkStats.get(selId);
+    const now = performance.now();
+    if (st) this._rollLinkWindow(st, now);
+
+    const effRtt = typeof peer.rttMs === "number" ? peer.rttMs : tech.statsRttMs;
+    const rttText = typeof effRtt === "number" ? `${effRtt} ms` : "measuring…";
+    const peerCodec = this.getPeerVoiceCodec(selId);
+    const voiceText = peer.inVoice
+      ? peerCodec === "opus48"
+        ? isRelayed
+          ? "48 kHz Opus · 64 kbps (V2)"
+          : `48 kHz Opus · ${this.audioSettings.preset === "raw" ? 128 : 96} kbps (V2)`
+        : "16 kHz IMA-ADPCM (V1)"
+      : "Not in voice";
+    const flowText = st
+      ? `TX ${st.txPps}/s · RX ${st.rxPps}/s (${st.kbps} kbps)`
+      : "Idle (0 pkt/s)";
+    const totalText = st ? `TX ${st.txTotal} · RX ${st.rxTotal} pkts` : "0 / 0 pkts";
+
+    box.innerHTML = `
+      <div class="topo-insp-head">
+        <div class="topo-insp-title">
+          <span>${escapeHtml(peer.authorName)}</span>
+          ${peer.isBot ? '<span class="bot-tag">BOT</span>' : ""}
+          <span class="badge ${isRelayed ? "relay" : "direct"}">${escapeHtml(tech.shortLabel)}</span>
+        </div>
+        <button type="button" class="btn-link" data-topo-close>✕</button>
+      </div>
+      <div class="topo-insp-grid">
+        <div class="topo-insp-cell span-2">
+          <span class="topo-insp-k">Transport &amp; Technology</span>
+          <span class="topo-insp-v">${escapeHtml(tech.detailLabel)}</span>
+        </div>
+        <div class="topo-insp-cell">
+          <span class="topo-insp-k">Encryption</span>
+          <span class="topo-insp-v">X25519 + ChaCha20-Poly1305</span>
+        </div>
+        <div class="topo-insp-cell">
+          <span class="topo-insp-k">Latency / Safety Code</span>
+          <span class="topo-insp-v">${escapeHtml(rttText)} · ${escapeHtml(peer.safetyCode || "—")}</span>
+        </div>
+        <div class="topo-insp-cell">
+          <span class="topo-insp-k">Voice Stream</span>
+          <span class="topo-insp-v">${escapeHtml(voiceText)}</span>
+        </div>
+        <div class="topo-insp-cell">
+          <span class="topo-insp-k">Live Flow (${escapeHtml(totalText)})</span>
+          <span class="topo-insp-v">${escapeHtml(flowText)}</span>
+        </div>
+      </div>
+      <div class="topo-insp-actions">
+        ${isRelayed ? '<button type="button" class="btn btn-sm btn-primary" data-topo-upgrade>Try Direct P2P</button>' : ""}
+        <button type="button" class="btn btn-sm" data-topo-sync>Sync</button>
+        <button type="button" class="btn btn-sm btn-danger" data-topo-drop>Drop</button>
+      </div>
+    `;
+
+    box.querySelector("[data-topo-close]")?.addEventListener("click", () => this.selectTopologyTarget(null));
+    box.querySelector("[data-topo-upgrade]")?.addEventListener("click", () => {
+      this.tryBackgroundDirectUpgrades(Date.now(), true);
+      this.showToast(`Probing Direct WebRTC P2P upgrade to ${peer.authorName}…`);
+    });
+    box.querySelector("[data-topo-sync]")?.addEventListener("click", () => {
+      this.el["btn-sync-now"]?.click();
+    });
+    box.querySelector("[data-topo-drop]")?.addEventListener("click", () => {
+      this.disconnectPeer(selId);
+    });
   }
 
   renderTelemetry() {
