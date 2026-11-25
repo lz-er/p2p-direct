@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::crypto::{
+    KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, derive_invite_wrap_key,
+    derive_link_keys, derive_log_key, derive_mesh_key_from_passphrase, derive_relay_signal_key,
+    key_fingerprint, pair_safety_code, x25519_public_key,
+};
+use crate::deflate::base64url_encode;
 use crate::json::{JsonValue, write_json_string, write_json_value};
-use crate::log::{LogMessage, ReplicatedLog};
+use crate::log::{LogMessage, ReplicatedLog, SealedLogRecord};
 use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
-    DEFAULT_RELAY_TTL, PeerSummary, RelaySignalType, WireFrame, chunk_inv_ids,
-    chunk_sync_messages,
+    DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
+    WireFrame, chunk_inv_ids, chunk_sealed_records,
 };
 
 #[derive(Debug, Clone)]
@@ -40,6 +46,10 @@ impl Default for MeshConfig {
 pub struct MeshStats {
     pub frames_sent: u64,
     pub frames_received: u64,
+    pub e2ee_frames_encrypted: u64,
+    pub e2ee_frames_decrypted: u64,
+    pub e2ee_auth_failures: u64,
+    pub relay_signals_encrypted: u64,
     pub gossip_forwards: u64,
     pub gossip_duplicates_dropped: u64,
     pub sync_inv_sent: u64,
@@ -65,11 +75,13 @@ pub enum MeshAction {
     AutoMeshCreateOffer {
         target_peer_id: String,
         target_name: String,
+        target_pub_key: [u8; KEY_LEN],
         via_peer_id: String,
     },
     AutoMeshAcceptOffer {
         from_peer_id: String,
         from_name: String,
+        from_pub_key: [u8; KEY_LEN],
         via_peer_id: String,
         sdp: String,
     },
@@ -109,17 +121,23 @@ impl MeshAction {
                     }
                     write_json_string(out, id);
                 }
-                let _ = write!(out, "],\"totalCount\":{total_count},\"lamport\":{lamport}}}");
+                let _ = write!(
+                    out,
+                    "],\"totalCount\":{total_count},\"lamport\":{lamport}}}"
+                );
             }
             Self::AutoMeshCreateOffer {
                 target_peer_id,
                 target_name,
+                target_pub_key,
                 via_peer_id,
             } => {
                 out.push_str("{\"action\":\"auto_mesh_create_offer\",\"targetPeerId\":");
                 write_json_string(out, target_peer_id);
                 out.push_str(",\"targetName\":");
                 write_json_string(out, target_name);
+                out.push_str(",\"targetPubKey\":");
+                write_json_string(out, &base64url_encode(target_pub_key));
                 out.push_str(",\"viaPeerId\":");
                 write_json_string(out, via_peer_id);
                 out.push('}');
@@ -127,6 +145,7 @@ impl MeshAction {
             Self::AutoMeshAcceptOffer {
                 from_peer_id,
                 from_name,
+                from_pub_key,
                 via_peer_id,
                 sdp,
             } => {
@@ -134,6 +153,8 @@ impl MeshAction {
                 write_json_string(out, from_peer_id);
                 out.push_str(",\"fromName\":");
                 write_json_string(out, from_name);
+                out.push_str(",\"fromPubKey\":");
+                write_json_string(out, &base64url_encode(from_pub_key));
                 out.push_str(",\"viaPeerId\":");
                 write_json_string(out, via_peer_id);
                 out.push_str(",\"sdp\":");
@@ -169,7 +190,7 @@ impl MeshAction {
 }
 
 pub fn actions_to_json_array(actions: &[MeshAction]) -> String {
-    let mut out = String::with_capacity(actions.len().saturating_mul(128) + 8);
+    let mut out = String::with_capacity(actions.len().saturating_mul(160) + 8);
     out.push('[');
     for (i, act) in actions.iter().enumerate() {
         if i > 0 {
@@ -179,6 +200,72 @@ pub fn actions_to_json_array(actions: &[MeshAction]) -> String {
     }
     out.push(']');
     out
+}
+
+/// 64-slot sliding anti-replay window for authenticated per-link sequence numbers.
+#[derive(Debug, Clone, Default)]
+struct ReplayWindow {
+    max_seq: u64,
+    seen_mask: u64,
+}
+
+impl ReplayWindow {
+    fn would_accept(&self, seq: u64) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        if self.max_seq == 0 || seq > self.max_seq {
+            return true;
+        }
+        let diff = self.max_seq - seq;
+        if diff >= 64 {
+            return false;
+        }
+        (self.seen_mask & (1u64 << diff)) == 0
+    }
+
+    fn accept(&mut self, seq: u64) {
+        if self.max_seq == 0 {
+            self.max_seq = seq;
+            self.seen_mask = 1;
+            return;
+        }
+        if seq > self.max_seq {
+            let shift = seq - self.max_seq;
+            self.seen_mask = if shift >= 64 {
+                1
+            } else {
+                (self.seen_mask << shift) | 1
+            };
+            self.max_seq = seq;
+        } else {
+            let diff = self.max_seq - seq;
+            if diff < 64 {
+                self.seen_mask |= 1u64 << diff;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PeerCryptoState {
+    pub_key: [u8; KEY_LEN],
+    tx_key: [u8; KEY_LEN],
+    rx_key: [u8; KEY_LEN],
+    tx_nonce_prefix: [u8; 4],
+    tx_seq: u64,
+    replay_window: ReplayWindow,
+    safety_code: String,
+}
+
+impl PeerCryptoState {
+    fn next_tx_seq_and_nonce(&mut self) -> (u64, [u8; NONCE_LEN]) {
+        self.tx_seq = self.tx_seq.saturating_add(1);
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[0..4].copy_from_slice(&self.tx_nonce_prefix);
+        nonce[4..12].copy_from_slice(&self.tx_seq.to_le_bytes());
+        (self.tx_seq, nonce)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +283,7 @@ pub struct ConnectedPeer {
     pub via_auto_mesh: bool,
     pub introduced_by: Option<String>,
     pub remote_peers: Vec<PeerSummary>,
+    crypto: PeerCryptoState,
     known_ids: HashSet<String>,
     pending_inv: Option<PendingInventory>,
     we_sent_inv: bool,
@@ -205,6 +293,7 @@ pub struct ConnectedPeer {
 pub struct IndirectPeerRoute {
     pub peer_id: String,
     pub author_name: String,
+    pub pub_key: [u8; KEY_LEN],
     pub via_peer_id: String,
 }
 
@@ -212,6 +301,7 @@ pub struct IndirectPeerRoute {
 pub struct PendingAutoMesh {
     pub target_peer_id: String,
     pub target_name: String,
+    pub target_pub_key: [u8; KEY_LEN],
     pub via_peer_id: String,
     pub initiated_by_self: bool,
     pub started_at_ms: u64,
@@ -221,9 +311,17 @@ pub struct MeshNode {
     peer_id: String,
     author_name: String,
     room: String,
+    x25519_secret: [u8; KEY_LEN],
+    x25519_public: [u8; KEY_LEN],
+    mesh_key: [u8; KEY_LEN],
+    log_key: [u8; KEY_LEN],
+    key_fp: String,
+    passphrase_mode: bool,
+    csprng: SafeCsprng,
     config: MeshConfig,
     log: ReplicatedLog,
     peers: BTreeMap<String, ConnectedPeer>,
+    known_pub_keys: BTreeMap<String, [u8; KEY_LEN]>,
     indirect_routes: BTreeMap<String, IndirectPeerRoute>,
     auto_mesh_pending: BTreeMap<String, PendingAutoMesh>,
     stats: MeshStats,
@@ -231,14 +329,39 @@ pub struct MeshNode {
 }
 
 impl MeshNode {
-    pub fn new(peer_id: String, author_name: String, room: String, config: MeshConfig) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        peer_id: String,
+        author_name: String,
+        room: String,
+        x25519_secret: [u8; KEY_LEN],
+        mesh_key: [u8; KEY_LEN],
+        entropy_seed: &[u8],
+        config: MeshConfig,
+    ) -> Self {
+        let x25519_public = x25519_public_key(&x25519_secret);
+        let log_key = derive_log_key(&mesh_key);
+        let key_fp = key_fingerprint(&mesh_key);
+        let mut seed_buf = Vec::with_capacity(64 + entropy_seed.len());
+        seed_buf.extend_from_slice(&x25519_public);
+        seed_buf.extend_from_slice(&mesh_key);
+        seed_buf.extend_from_slice(entropy_seed);
+        let csprng = SafeCsprng::from_seed(&seed_buf);
         Self {
             peer_id,
             author_name,
             room,
+            x25519_secret,
+            x25519_public,
+            mesh_key,
+            log_key,
+            key_fp,
+            passphrase_mode: false,
+            csprng,
             config,
             log: ReplicatedLog::new(),
             peers: BTreeMap::new(),
+            known_pub_keys: BTreeMap::new(),
             indirect_routes: BTreeMap::new(),
             auto_mesh_pending: BTreeMap::new(),
             stats: MeshStats::default(),
@@ -258,6 +381,38 @@ impl MeshNode {
         &self.room
     }
 
+    pub fn public_key(&self) -> [u8; KEY_LEN] {
+        self.x25519_public
+    }
+
+    pub fn mesh_key(&self) -> [u8; KEY_LEN] {
+        self.mesh_key
+    }
+
+    pub fn key_fingerprint(&self) -> &str {
+        &self.key_fp
+    }
+
+    pub fn passphrase_mode(&self) -> bool {
+        self.passphrase_mode
+    }
+
+    pub fn invite_wrap_key(&self) -> Option<[u8; KEY_LEN]> {
+        if self.passphrase_mode {
+            Some(derive_invite_wrap_key(&self.mesh_key))
+        } else {
+            None
+        }
+    }
+
+    pub fn reseed_entropy(&mut self, entropy: &[u8]) {
+        self.csprng.reseed(entropy);
+    }
+
+    pub fn rng_mut(&mut self) -> &mut SafeCsprng {
+        &mut self.csprng
+    }
+
     pub fn set_author_name(&mut self, name: String) {
         if !name.trim().is_empty() {
             self.author_name = name;
@@ -272,6 +427,52 @@ impl MeshNode {
 
     pub fn set_auto_mesh_enabled(&mut self, enabled: bool) {
         self.config.auto_mesh_enabled = enabled;
+    }
+
+    /// Updates the 256-bit mesh key, re-sealing local log records and re-keying active links.
+    pub fn set_mesh_key(&mut self, new_mesh_key: [u8; KEY_LEN], passphrase_mode: bool) -> Result<(), String> {
+        self.mesh_key = new_mesh_key;
+        self.log_key = derive_log_key(&new_mesh_key);
+        self.key_fp = key_fingerprint(&new_mesh_key);
+        self.passphrase_mode = passphrase_mode;
+        self.log.reseal_all(&self.log_key, &mut self.csprng);
+
+        // Re-derive per-peer directional keys under the new mesh key
+        for (pid, peer) in self.peers.iter_mut() {
+            let (tx_key, rx_key) = derive_link_keys(
+                &self.x25519_secret,
+                &peer.crypto.pub_key,
+                &self.mesh_key,
+                &self.peer_id,
+                pid,
+            )?;
+            let prefix_block = self.csprng.next_bytes_32();
+            let mut prefix = [0u8; 4];
+            prefix.copy_from_slice(&prefix_block[..4]);
+            peer.crypto.tx_key = tx_key;
+            peer.crypto.rx_key = rx_key;
+            peer.crypto.tx_nonce_prefix = prefix;
+            peer.crypto.tx_seq = 0;
+            peer.crypto.replay_window = ReplayWindow::default();
+            peer.crypto.safety_code =
+                pair_safety_code(&self.x25519_public, &peer.crypto.pub_key, &self.mesh_key);
+        }
+        Ok(())
+    }
+
+    /// Derives the 256-bit mesh key from a shared passphrase using PBKDF2-HMAC-SHA256.
+    pub fn set_passphrase(&mut self, passphrase: &str) -> Result<(), String> {
+        if passphrase.is_empty() {
+            return Err("passphrase must not be empty".to_owned());
+        }
+        let derived = derive_mesh_key_from_passphrase(passphrase);
+        self.set_mesh_key(derived, true)
+    }
+
+    /// Disables passphrase-wrap mode while keeping or replacing the active random 256-bit mesh key.
+    pub fn clear_passphrase(&mut self, new_random_mesh_key: Option<[u8; KEY_LEN]>) -> Result<(), String> {
+        let key = new_random_mesh_key.unwrap_or(self.mesh_key);
+        self.set_mesh_key(key, false)
     }
 
     pub fn log(&self) -> &ReplicatedLog {
@@ -290,30 +491,61 @@ impl MeshNode {
         self.peers.contains_key(peer_id)
     }
 
+    pub fn peer_safety_code(&self, peer_id: &str) -> Option<&str> {
+        self.peers.get(peer_id).map(|p| p.crypto.safety_code.as_str())
+    }
+
     fn next_seq(&mut self) -> u64 {
         self.seq = self.seq.saturating_add(1);
         self.seq
     }
 
+    /// Encrypts `frame` with the peer's directional X25519+MeshKey ChaCha20-Poly1305 session key.
     fn emit_wire(&mut self, actions: &mut Vec<MeshAction>, peer_id: &str, frame: &WireFrame) {
+        let plaintext = frame.to_json_string();
+        let Some(peer) = self.peers.get_mut(peer_id) else {
+            return;
+        };
+        let (tx_seq, nonce) = peer.crypto.next_tx_seq_and_nonce();
+        let env = EncryptedWireEnvelope::seal(
+            &peer.crypto.tx_key,
+            tx_seq,
+            nonce,
+            &self.peer_id,
+            peer_id,
+            &plaintext,
+        );
         self.stats.frames_sent = self.stats.frames_sent.saturating_add(1);
+        self.stats.e2ee_frames_encrypted = self.stats.e2ee_frames_encrypted.saturating_add(1);
         actions.push(MeshAction::SendWire {
             peer_id: peer_id.to_owned(),
-            frame: frame.to_json_string(),
+            frame: env.to_json_string(),
         });
     }
 
-    /// Loads persisted replicated log state from a snapshot JSON value.
+    /// Imports an E2EE v2 snapshot (authenticating & decrypting every ChaCha20-Poly1305 record).
     pub fn import_persistence(&mut self, val: &JsonValue) -> Result<usize, String> {
-        self.log.import_snapshot_value(val)
+        if val.get("records").is_some() {
+            self.log.import_encrypted_snapshot_value(val, &self.log_key)
+        } else {
+            let added = self.log.import_snapshot_value(val)?;
+            self.log.reseal_all(&self.log_key, &mut self.csprng);
+            Ok(added)
+        }
     }
 
-    /// Exports persisted replicated log state as canonical JSON.
-    pub fn export_persistence(&self) -> String {
+    /// Exports an E2EE v2 snapshot containing ONLY ChaCha20-Poly1305 ciphertext records (zero plaintext).
+    pub fn export_persistence(&mut self) -> String {
+        self.log
+            .export_encrypted_snapshot_json(&self.log_key, &self.key_fp, &mut self.csprng)
+    }
+
+    /// Exports decrypted structured JSON messages (only when explicitly requested by user).
+    pub fn export_decrypted_json(&self) -> String {
         self.log.export_snapshot_json()
     }
 
-    /// Clears only this node's local replicated log so re-syncing pulls history from surviving peers.
+    /// Clears only this node's local replicated log so re-syncing pulls encrypted history from surviving peers.
     pub fn reset_local_log(&mut self) {
         self.log = ReplicatedLog::new();
         for peer in self.peers.values_mut() {
@@ -323,7 +555,7 @@ impl MeshNode {
         }
     }
 
-    /// Appends a new local structured JSON message and gossips it to all connected peers.
+    /// Appends a new local structured JSON message, AEAD-seals it, and gossips it encrypted to all peers.
     pub fn publish_local(
         &mut self,
         msg_type: String,
@@ -338,13 +570,15 @@ impl MeshNode {
             _ => format!("{}-{}-{}-{}", self.peer_id, next_lp, ts_ms, seq),
         };
 
-        let msg = self.log.append_local(
+        let (msg, sealed) = self.log.append_local_sealed(
             id,
             msg_type,
             ts_ms,
             self.peer_id.clone(),
             self.author_name.clone(),
             payload,
+            &self.log_key,
+            &mut self.csprng,
         )?;
 
         let mut actions = Vec::new();
@@ -358,7 +592,7 @@ impl MeshNode {
             origin: self.peer_id.clone(),
             ttl: self.config.gossip_ttl,
             path: vec![self.peer_id.clone()],
-            message: msg.clone(),
+            record: sealed,
         };
 
         let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
@@ -371,24 +605,44 @@ impl MeshNode {
 
         actions.push(MeshAction::Telemetry {
             event: "publish".to_owned(),
-            detail: format!("Published {} (L={}) to {} peers", msg.id, msg.lamport, self.peers.len()),
+            detail: format!(
+                "Sealed & gossiped {} (L={}) to {} peer(s)",
+                msg.id,
+                msg.lamport,
+                self.peers.len()
+            ),
         });
 
         Ok((msg, actions))
     }
 
-    /// Called when a direct WebRTC DataChannel opens with `peer_id`.
+    /// Called when a direct WebRTC DataChannel opens with `peer_id` and its verified X25519 `peer_pub_key`.
     pub fn on_peer_connected(
         &mut self,
         peer_id: String,
         author_name: String,
+        peer_pub_key: [u8; KEY_LEN],
         via_auto_mesh: bool,
         introduced_by: Option<String>,
-    ) -> Vec<MeshAction> {
+    ) -> Result<Vec<MeshAction>, String> {
         let mut actions = Vec::new();
         if peer_id.trim().is_empty() || peer_id == self.peer_id {
-            return actions;
+            return Ok(actions);
         }
+
+        let (tx_key, rx_key) = derive_link_keys(
+            &self.x25519_secret,
+            &peer_pub_key,
+            &self.mesh_key,
+            &self.peer_id,
+            &peer_id,
+        )?;
+        let safety_code = pair_safety_code(&self.x25519_public, &peer_pub_key, &self.mesh_key);
+        let prefix_block = self.csprng.next_bytes_32();
+        let mut tx_nonce_prefix = [0u8; 4];
+        tx_nonce_prefix.copy_from_slice(&prefix_block[..4]);
+
+        self.known_pub_keys.insert(peer_id.clone(), peer_pub_key);
 
         let resolved_intro = introduced_by.or_else(|| {
             self.auto_mesh_pending
@@ -398,7 +652,6 @@ impl MeshNode {
         self.auto_mesh_pending.remove(&peer_id);
         self.indirect_routes.remove(&peer_id);
 
-        // Snapshot other connected peers to advertise in Hello
         let other_peers: Vec<PeerSummary> = self
             .peers
             .values()
@@ -406,6 +659,7 @@ impl MeshNode {
             .map(|p| PeerSummary {
                 peer_id: p.peer_id.clone(),
                 author_name: p.author_name.clone(),
+                pub_key: p.crypto.pub_key,
             })
             .collect();
 
@@ -423,6 +677,15 @@ impl MeshNode {
                 via_auto_mesh,
                 introduced_by: resolved_intro,
                 remote_peers: Vec::new(),
+                crypto: PeerCryptoState {
+                    pub_key: peer_pub_key,
+                    tx_key,
+                    rx_key,
+                    tx_nonce_prefix,
+                    tx_seq: 0,
+                    replay_window: ReplayWindow::default(),
+                    safety_code: safety_code.clone(),
+                },
                 known_ids: HashSet::new(),
                 pending_inv: None,
                 we_sent_inv: true,
@@ -433,6 +696,7 @@ impl MeshNode {
             peer_id: self.peer_id.clone(),
             author_name: self.author_name.clone(),
             room: self.room.clone(),
+            pub_key: self.x25519_public,
             lamport: self.log.lamport(),
             log_count: self.log.len(),
             peers: other_peers,
@@ -444,14 +708,19 @@ impl MeshNode {
         actions.push(MeshAction::Telemetry {
             event: "peer_connected".to_owned(),
             detail: format!(
-                "Direct channel open with {} ({}){}",
+                "E2EE X25519 channel open with {} ({}) [safety {}]{}",
                 clean_name,
                 peer_id,
-                if via_auto_mesh { " [auto-mesh]" } else { " [manual]" }
+                safety_code,
+                if via_auto_mesh {
+                    " [auto-mesh]"
+                } else {
+                    " [manual]"
+                }
             ),
         });
 
-        actions
+        Ok(actions)
     }
 
     /// Called when a direct WebRTC DataChannel closes or errors.
@@ -460,11 +729,8 @@ impl MeshNode {
         let removed = self.peers.remove(peer_id);
         self.auto_mesh_pending.remove(peer_id);
 
-        // Remove indirect routes that depended on the departed peer
         self.indirect_routes
             .retain(|_, route| route.via_peer_id != peer_id);
-
-        // Cancel pending auto-mesh handshakes whose relay departed
         self.auto_mesh_pending
             .retain(|_, pending| pending.via_peer_id != peer_id);
 
@@ -472,7 +738,7 @@ impl MeshNode {
             actions.push(MeshAction::Telemetry {
                 event: "peer_disconnected".to_owned(),
                 detail: format!(
-                    "Disconnected from {} ({}); {} direct peers remaining, {} log entries retained",
+                    "Disconnected from {} ({}); {} direct peer(s) remaining, {} encrypted log entries retained",
                     peer.author_name,
                     peer.peer_id,
                     self.peers.len(),
@@ -483,7 +749,7 @@ impl MeshNode {
         actions
     }
 
-    /// Sends fresh anti-entropy `sync-inv` frames to all connected peers.
+    /// Sends fresh encrypted anti-entropy `sync-inv` frames to all connected peers.
     pub fn request_sync_all(&mut self) -> Vec<MeshAction> {
         let mut actions = Vec::new();
         let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
@@ -496,7 +762,7 @@ impl MeshNode {
         actions
     }
 
-    /// Periodic maintenance tick: expire timed-out auto-mesh negotiations and trigger anti-entropy.
+    /// Periodic maintenance tick: expire timed-out auto-mesh attempts and trigger anti-entropy.
     pub fn on_anti_entropy_tick(&mut self, now_ms: u64, run_sync: bool) -> Vec<MeshAction> {
         let mut actions = Vec::new();
         let timeout = self.config.auto_mesh_timeout_ms;
@@ -514,16 +780,22 @@ impl MeshNode {
             });
         }
 
-        // Re-evaluate known indirect peers in case a previous attempt timed out
         if self.config.auto_mesh_enabled {
-            let candidates: Vec<(String, String, String)> = self
+            let candidates: Vec<(String, String, [u8; KEY_LEN], String)> = self
                 .indirect_routes
                 .values()
-                .map(|r| (r.peer_id.clone(), r.author_name.clone(), r.via_peer_id.clone()))
+                .map(|r| {
+                    (
+                        r.peer_id.clone(),
+                        r.author_name.clone(),
+                        r.pub_key,
+                        r.via_peer_id.clone(),
+                    )
+                })
                 .collect();
-            for (pid, name, via) in candidates {
+            for (pid, name, pk, via) in candidates {
                 if self.peers.contains_key(&via) {
-                    self.consider_auto_mesh_peer(&pid, &name, &via, now_ms, &mut actions);
+                    self.consider_auto_mesh_peer(&pid, &name, pk, &via, now_ms, &mut actions);
                 }
             }
         }
@@ -536,7 +808,8 @@ impl MeshNode {
         actions
     }
 
-    /// Sends a local WebRTC SDP offer/answer or ICE candidate to a remote target via relayed mesh.
+    /// End-to-end encrypts a WebRTC SDP offer/answer or ICE candidate for `to_peer_id`
+    /// using `X25519(self_sk, target_pk) || mesh_key` so relay introducers cannot read it.
     pub fn send_relay_signal(
         &mut self,
         to_peer_id: String,
@@ -548,6 +821,32 @@ impl MeshNode {
         if to_peer_id.trim().is_empty() || to_peer_id == self.peer_id {
             return Err("invalid relay target peer id".to_owned());
         }
+
+        let target_pub_key = self
+            .known_pub_keys
+            .get(&to_peer_id)
+            .copied()
+            .or_else(|| self.auto_mesh_pending.get(&to_peer_id).map(|p| p.target_pub_key))
+            .or_else(|| self.indirect_routes.get(&to_peer_id).map(|r| r.pub_key))
+            .ok_or_else(|| format!("unknown X25519 public key for relay target {to_peer_id}"))?;
+
+        let relay_key = derive_relay_signal_key(
+            &self.x25519_secret,
+            &target_pub_key,
+            &self.mesh_key,
+            &self.peer_id,
+            &to_peer_id,
+        )?;
+        let body = RelaySignalBody {
+            signal_type,
+            sdp,
+            candidate,
+        };
+        let body_json = body.to_json_string();
+        let sealed_nonce = self.csprng.next_nonce();
+        let aad = format!("p2p-relay-v1|{}->{}", self.peer_id, to_peer_id);
+        let sealed_ciphertext = aead_seal(&relay_key, &sealed_nonce, aad.as_bytes(), body_json.as_bytes());
+        self.stats.relay_signals_encrypted = self.stats.relay_signals_encrypted.saturating_add(1);
 
         let mut actions = Vec::new();
         let mut next_hops: Vec<String> = Vec::new();
@@ -587,13 +886,13 @@ impl MeshNode {
             let frame = WireFrame::RelaySignal {
                 from: self.peer_id.clone(),
                 from_name: self.author_name.clone(),
+                from_pub_key: self.x25519_public,
                 to: to_peer_id.clone(),
                 via: hop.clone(),
                 hops: vec![self.peer_id.clone()],
                 ttl: self.config.relay_ttl,
-                signal_type,
-                sdp: sdp.clone(),
-                candidate: candidate.clone(),
+                sealed_nonce,
+                sealed_ciphertext: sealed_ciphertext.clone(),
             };
             self.emit_wire(&mut actions, &hop, &frame);
         }
@@ -601,15 +900,55 @@ impl MeshNode {
         Ok(actions)
     }
 
-    /// Processes an incoming wire JSON frame received over the direct DataChannel from `from_peer`.
+    /// Authenticates, anti-replay-checks, decrypts, and dispatches an incoming E2EE wire frame.
     pub fn on_wire_message(
         &mut self,
         from_peer: &str,
         raw_json: &str,
         now_ms: u64,
     ) -> Result<Vec<MeshAction>, String> {
-        let frame = WireFrame::parse_json(raw_json)?;
+        let env = match EncryptedWireEnvelope::parse_json(raw_json) {
+            Ok(e) => e,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+
+        let (rx_key, replay_ok) = match self.peers.get(from_peer) {
+            Some(peer) => (
+                peer.crypto.rx_key,
+                peer.crypto.replay_window.would_accept(env.seq),
+            ),
+            None => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(format!("received wire frame from unconnected peer '{from_peer}'"));
+            }
+        };
+
+        if !replay_ok {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(format!(
+                "rejected replayed or out-of-window wire sequence {} from {from_peer}",
+                env.seq
+            ));
+        }
+
+        let decrypted_json = match env.open(&rx_key, from_peer, &self.peer_id) {
+            Ok(plain) => plain,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+
+        if let Some(peer) = self.peers.get_mut(from_peer) {
+            peer.crypto.replay_window.accept(env.seq);
+        }
+
+        let frame = WireFrame::parse_json(&decrypted_json)?;
         self.stats.frames_received = self.stats.frames_received.saturating_add(1);
+        self.stats.e2ee_frames_decrypted = self.stats.e2ee_frames_decrypted.saturating_add(1);
 
         let mut actions = Vec::new();
         match frame {
@@ -617,19 +956,29 @@ impl MeshNode {
                 peer_id,
                 author_name,
                 room: _,
+                pub_key,
                 lamport,
                 log_count: _,
                 peers,
             } => {
-                self.handle_hello(from_peer, &peer_id, &author_name, lamport, peers, now_ms, &mut actions);
+                self.handle_hello(
+                    from_peer,
+                    &peer_id,
+                    &author_name,
+                    pub_key,
+                    lamport,
+                    peers,
+                    now_ms,
+                    &mut actions,
+                );
             }
             WireFrame::Msg {
                 origin,
                 ttl,
                 path,
-                message,
+                record,
             } => {
-                self.handle_gossip_msg(from_peer, origin, ttl, path, message, &mut actions)?;
+                self.handle_gossip_msg(from_peer, origin, ttl, path, record, &mut actions)?;
             }
             WireFrame::SyncInv {
                 from: _,
@@ -639,7 +988,15 @@ impl MeshNode {
                 lamport,
                 ids,
             } => {
-                self.handle_sync_inv(from_peer, inv_id, part, total_parts, lamport, ids, &mut actions);
+                self.handle_sync_inv(
+                    from_peer,
+                    inv_id,
+                    part,
+                    total_parts,
+                    lamport,
+                    ids,
+                    &mut actions,
+                );
             }
             WireFrame::SyncReq { from: _, ids } => {
                 self.handle_sync_req(from_peer, &ids, &mut actions);
@@ -649,14 +1006,14 @@ impl MeshNode {
                 batch_id,
                 chunk,
                 total_chunks,
-                messages,
+                records,
             } => {
                 self.handle_sync_batch(
                     from_peer,
                     &batch_id,
                     chunk,
                     total_chunks,
-                    messages,
+                    records,
                     &mut actions,
                 )?;
             }
@@ -664,33 +1021,41 @@ impl MeshNode {
                 via: _,
                 peer_id,
                 author_name,
+                pub_key,
             } => {
-                self.consider_auto_mesh_peer(&peer_id, &author_name, from_peer, now_ms, &mut actions);
+                self.consider_auto_mesh_peer(
+                    &peer_id,
+                    &author_name,
+                    pub_key,
+                    from_peer,
+                    now_ms,
+                    &mut actions,
+                );
             }
             WireFrame::RelaySignal {
                 from,
                 from_name,
+                from_pub_key,
                 to,
                 via: _,
                 hops,
                 ttl,
-                signal_type,
-                sdp,
-                candidate,
+                sealed_nonce,
+                sealed_ciphertext,
             } => {
                 self.handle_relay_signal(
                     from_peer,
                     from,
                     from_name,
+                    from_pub_key,
                     to,
                     hops,
                     ttl,
-                    signal_type,
-                    sdp,
-                    candidate,
+                    sealed_nonce,
+                    sealed_ciphertext,
                     now_ms,
                     &mut actions,
-                );
+                )?;
             }
         }
 
@@ -721,14 +1086,14 @@ impl MeshNode {
     fn send_sync_batches_to(
         &mut self,
         peer_id: &str,
-        messages: &[LogMessage],
+        records: &[SealedLogRecord],
         actions: &mut Vec<MeshAction>,
     ) {
-        if messages.is_empty() {
+        if records.is_empty() {
             return;
         }
-        let chunks = chunk_sync_messages(
-            messages,
+        let chunks = chunk_sealed_records(
+            records,
             self.config.batch_max_msgs,
             self.config.batch_max_bytes,
         );
@@ -736,10 +1101,10 @@ impl MeshNode {
         let batch_seq = self.next_seq();
         let batch_id = format!("batch-{}-{}", self.peer_id, batch_seq);
 
-        for (chunk_idx, batch_msgs) in chunks.into_iter().enumerate() {
+        for (chunk_idx, batch_recs) in chunks.into_iter().enumerate() {
             if let Some(peer) = self.peers.get_mut(peer_id) {
-                for m in &batch_msgs {
-                    peer.known_ids.insert(m.id.clone());
+                for r in &batch_recs {
+                    peer.known_ids.insert(r.id.clone());
                 }
             }
             let frame = WireFrame::SyncBatch {
@@ -747,7 +1112,7 @@ impl MeshNode {
                 batch_id: batch_id.clone(),
                 chunk: chunk_idx,
                 total_chunks,
-                messages: batch_msgs,
+                records: batch_recs,
             };
             self.stats.sync_batches_sent = self.stats.sync_batches_sent.saturating_add(1);
             self.emit_wire(actions, peer_id, &frame);
@@ -756,8 +1121,8 @@ impl MeshNode {
         actions.push(MeshAction::Telemetry {
             event: "sync_batch_sent".to_owned(),
             detail: format!(
-                "Backfilled {} messages in {} chunk(s) to {}",
-                messages.len(),
+                "Backfilled {} E2EE record(s) in {} chunk(s) to {}",
+                records.len(),
                 total_chunks,
                 peer_id
             ),
@@ -770,6 +1135,7 @@ impl MeshNode {
         from_peer: &str,
         announced_id: &str,
         author_name: &str,
+        peer_pub_key: [u8; KEY_LEN],
         remote_lamport: u64,
         remote_peers: Vec<PeerSummary>,
         now_ms: u64,
@@ -782,6 +1148,14 @@ impl MeshNode {
             announced_id.to_owned()
         };
 
+        let verified_pub_key = self
+            .peers
+            .get(&effective_peer)
+            .map(|p| p.crypto.pub_key)
+            .unwrap_or(peer_pub_key);
+        self.known_pub_keys
+            .insert(effective_peer.clone(), verified_pub_key);
+
         if let Some(peer) = self.peers.get_mut(&effective_peer) {
             if !author_name.trim().is_empty() {
                 peer.author_name = author_name.to_owned();
@@ -792,7 +1166,7 @@ impl MeshNode {
         actions.push(MeshAction::Telemetry {
             event: "hello".to_owned(),
             detail: format!(
-                "Handshake from {} ({}) with {} known neighbor(s)",
+                "Authenticated E2EE handshake from {} ({}) with {} neighbor(s)",
                 author_name,
                 effective_peer,
                 remote_peers.len()
@@ -803,19 +1177,19 @@ impl MeshNode {
             return;
         }
 
-        // Introduce the newly connected peer to all our other direct peers (and vice versa)
-        let other_peers: Vec<(String, String)> = self
+        let other_peers: Vec<(String, String, [u8; KEY_LEN])> = self
             .peers
             .values()
             .filter(|p| p.peer_id != effective_peer)
-            .map(|p| (p.peer_id.clone(), p.author_name.clone()))
+            .map(|p| (p.peer_id.clone(), p.author_name.clone(), p.crypto.pub_key))
             .collect();
 
-        for (other_id, other_name) in other_peers {
+        for (other_id, other_name, other_pk) in other_peers {
             let intro_to_other = WireFrame::MeshIntro {
                 via: self.peer_id.clone(),
                 peer_id: effective_peer.clone(),
                 author_name: author_name.to_owned(),
+                pub_key: verified_pub_key,
             };
             self.stats.auto_mesh_intros_sent = self.stats.auto_mesh_intros_sent.saturating_add(1);
             self.emit_wire(actions, &other_id, &intro_to_other);
@@ -824,16 +1198,17 @@ impl MeshNode {
                 via: self.peer_id.clone(),
                 peer_id: other_id,
                 author_name: other_name,
+                pub_key: other_pk,
             };
             self.stats.auto_mesh_intros_sent = self.stats.auto_mesh_intros_sent.saturating_add(1);
             self.emit_wire(actions, &effective_peer, &intro_to_new);
         }
 
-        // Also consider connecting to any peers that `effective_peer` advertised in Hello
         for summary in remote_peers {
             self.consider_auto_mesh_peer(
                 &summary.peer_id,
                 &summary.author_name,
+                summary.pub_key,
                 &effective_peer,
                 now_ms,
                 actions,
@@ -847,27 +1222,40 @@ impl MeshNode {
         origin: String,
         ttl: u32,
         path: Vec<String>,
-        message: LogMessage,
+        record: SealedLogRecord,
         actions: &mut Vec<MeshAction>,
     ) -> Result<(), String> {
+        let msg_id = record.id.clone();
         if let Some(peer) = self.peers.get_mut(from_peer) {
-            peer.known_ids.insert(message.id.clone());
+            peer.known_ids.insert(msg_id.clone());
         }
 
-        let inserted = self.log.insert(message.clone())?;
-        if !inserted {
+        if self.log.contains_id(&msg_id) {
             self.stats.gossip_duplicates_dropped =
                 self.stats.gossip_duplicates_dropped.saturating_add(1);
             return Ok(());
         }
 
+        let inserted = match self.log.insert_sealed(record.clone(), &self.log_key) {
+            Ok(opt) => opt,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+
+        let Some(_) = inserted else {
+            self.stats.gossip_duplicates_dropped =
+                self.stats.gossip_duplicates_dropped.saturating_add(1);
+            return Ok(());
+        };
+
         actions.push(MeshAction::LogUpdated {
-            added_ids: vec![message.id.clone()],
+            added_ids: vec![msg_id.clone()],
             total_count: self.log.len(),
             lamport: self.log.lamport(),
         });
 
-        // Strict loop-free multi-hop forwarding
         if ttl <= 1 || path.iter().any(|p| p == &self.peer_id) {
             return Ok(());
         }
@@ -883,7 +1271,7 @@ impl MeshNode {
             origin,
             ttl: next_ttl,
             path: next_path.clone(),
-            message: message.clone(),
+            record,
         };
 
         let targets: Vec<String> = self
@@ -892,14 +1280,14 @@ impl MeshNode {
             .filter(|(pid, peer)| {
                 pid.as_str() != from_peer
                     && !next_path.iter().any(|h| h == pid.as_str())
-                    && !peer.known_ids.contains(&message.id)
+                    && !peer.known_ids.contains(&msg_id)
             })
             .map(|(pid, _)| pid.clone())
             .collect();
 
         for target in targets {
             if let Some(peer) = self.peers.get_mut(&target) {
-                peer.known_ids.insert(message.id.clone());
+                peer.known_ids.insert(msg_id.clone());
             }
             self.stats.gossip_forwards = self.stats.gossip_forwards.saturating_add(1);
             self.emit_wire(actions, &target, &forward_frame);
@@ -957,13 +1345,13 @@ impl MeshNode {
         }
 
         if let Some(remote_ids) = completed_remote_ids {
-            // 1. Push all local messages (old & new) that `from_peer` is missing, in chunked sync-batch frames
-            let missing_for_remote = self.log.missing_for(&remote_ids);
+            let missing_for_remote =
+                self.log
+                    .missing_sealed_for(&remote_ids, &self.log_key, &mut self.csprng);
             if !missing_for_remote.is_empty() {
                 self.send_sync_batches_to(from_peer, &missing_for_remote, actions);
             }
 
-            // 2. If this was a one-sided anti-entropy inv (we did not concurrently send ours), request any IDs we lack
             if should_send_req {
                 let mut missing_locally: Vec<String> = remote_ids
                     .into_iter()
@@ -992,8 +1380,10 @@ impl MeshNode {
         if !self.peers.contains_key(from_peer) || requested_ids.is_empty() {
             return;
         }
-        let messages = self.log.select_by_ids(requested_ids);
-        self.send_sync_batches_to(from_peer, &messages, actions);
+        let records =
+            self.log
+                .select_sealed_by_ids(requested_ids, &self.log_key, &mut self.csprng);
+        self.send_sync_batches_to(from_peer, &records, actions);
     }
 
     fn handle_sync_batch(
@@ -1002,26 +1392,34 @@ impl MeshNode {
         batch_id: &str,
         chunk: usize,
         total_chunks: usize,
-        messages: Vec<LogMessage>,
+        records: Vec<SealedLogRecord>,
         actions: &mut Vec<MeshAction>,
     ) -> Result<(), String> {
         self.stats.sync_batches_received = self.stats.sync_batches_received.saturating_add(1);
 
-        let mut added: Vec<LogMessage> = Vec::new();
-        for msg in messages {
+        let mut added_records: Vec<(LogMessage, SealedLogRecord)> = Vec::new();
+        for rec in records {
             if let Some(peer) = self.peers.get_mut(from_peer) {
-                peer.known_ids.insert(msg.id.clone());
+                peer.known_ids.insert(rec.id.clone());
             }
-            if self.log.insert(msg.clone())? {
-                added.push(msg);
+            if self.log.contains_id(&rec.id) {
+                continue;
+            }
+            match self.log.insert_sealed(rec.clone(), &self.log_key) {
+                Ok(Some(msg)) => added_records.push((msg, rec)),
+                Ok(None) => {}
+                Err(err) => {
+                    self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                    return Err(err);
+                }
             }
         }
 
-        if added.is_empty() {
+        if added_records.is_empty() {
             return Ok(());
         }
 
-        let added_ids: Vec<String> = added.iter().map(|m| m.id.clone()).collect();
+        let added_ids: Vec<String> = added_records.iter().map(|(m, _)| m.id.clone()).collect();
         actions.push(MeshAction::LogUpdated {
             added_ids,
             total_count: self.log.len(),
@@ -1031,8 +1429,8 @@ impl MeshNode {
         actions.push(MeshAction::Telemetry {
             event: "sync_batch_received".to_owned(),
             detail: format!(
-                "Applied {} message(s) from {} ({} chunk {}/{})",
-                added.len(),
+                "Decrypted & applied {} record(s) from {} ({} chunk {}/{})",
+                added_records.len(),
                 from_peer,
                 batch_id,
                 chunk + 1,
@@ -1040,7 +1438,6 @@ impl MeshNode {
             ),
         });
 
-        // Loop-free multi-hop propagation of newly learned backfill messages to other connected peers
         let other_peers: Vec<String> = self
             .peers
             .keys()
@@ -1049,10 +1446,10 @@ impl MeshNode {
             .collect();
 
         for target in other_peers {
-            let to_forward: Vec<LogMessage> = match self.peers.get(&target) {
-                Some(peer) => added
+            let to_forward: Vec<(LogMessage, SealedLogRecord)> = match self.peers.get(&target) {
+                Some(peer) => added_records
                     .iter()
-                    .filter(|m| !peer.known_ids.contains(&m.id))
+                    .filter(|(m, _)| !peer.known_ids.contains(&m.id))
                     .cloned()
                     .collect(),
                 None => Vec::new(),
@@ -1061,21 +1458,23 @@ impl MeshNode {
                 continue;
             }
             if to_forward.len() <= 3 {
-                for m in to_forward {
+                for (m, rec) in to_forward {
                     if let Some(peer) = self.peers.get_mut(&target) {
                         peer.known_ids.insert(m.id.clone());
                     }
                     let gossip = WireFrame::Msg {
-                        origin: m.author.clone(),
+                        origin: m.author,
                         ttl: self.config.gossip_ttl.saturating_sub(1).max(1),
                         path: vec![from_peer.to_owned(), self.peer_id.clone()],
-                        message: m,
+                        record: rec,
                     };
                     self.stats.gossip_forwards = self.stats.gossip_forwards.saturating_add(1);
                     self.emit_wire(actions, &target, &gossip);
                 }
             } else {
-                self.send_sync_batches_to(&target, &to_forward, actions);
+                let sealed_only: Vec<SealedLogRecord> =
+                    to_forward.into_iter().map(|(_, r)| r).collect();
+                self.send_sync_batches_to(&target, &sealed_only, actions);
             }
         }
 
@@ -1086,6 +1485,7 @@ impl MeshNode {
         &mut self,
         target_peer_id: &str,
         target_name: &str,
+        target_pub_key: [u8; KEY_LEN],
         via_peer_id: &str,
         now_ms: u64,
         actions: &mut Vec<MeshAction>,
@@ -1098,6 +1498,9 @@ impl MeshNode {
             return;
         }
 
+        self.known_pub_keys
+            .insert(target_peer_id.to_owned(), target_pub_key);
+
         let clean_name = if target_name.trim().is_empty() {
             "Peer".to_owned()
         } else {
@@ -1109,6 +1512,7 @@ impl MeshNode {
             IndirectPeerRoute {
                 peer_id: target_peer_id.to_owned(),
                 author_name: clean_name.clone(),
+                pub_key: target_pub_key,
                 via_peer_id: via_peer_id.to_owned(),
             },
         );
@@ -1122,13 +1526,13 @@ impl MeshNode {
             return;
         }
 
-        // Glare-free deterministic initiator rule: lexicographically smaller peerId initiates
         if self.peer_id.as_str() < target_peer_id {
             self.auto_mesh_pending.insert(
                 target_peer_id.to_owned(),
                 PendingAutoMesh {
                     target_peer_id: target_peer_id.to_owned(),
                     target_name: clean_name.clone(),
+                    target_pub_key,
                     via_peer_id: via_peer_id.to_owned(),
                     initiated_by_self: true,
                     started_at_ms: now_ms,
@@ -1139,12 +1543,13 @@ impl MeshNode {
             actions.push(MeshAction::AutoMeshCreateOffer {
                 target_peer_id: target_peer_id.to_owned(),
                 target_name: clean_name.clone(),
+                target_pub_key,
                 via_peer_id: via_peer_id.to_owned(),
             });
             actions.push(MeshAction::Telemetry {
                 event: "auto_mesh_init".to_owned(),
                 detail: format!(
-                    "Auto-meshing directly with {} ({}) via {}",
+                    "Initiating E2EE relayed auto-mesh with {} ({}) via {}",
                     clean_name, target_peer_id, via_peer_id
                 ),
             });
@@ -1157,37 +1562,59 @@ impl MeshNode {
         from_link: &str,
         from: String,
         from_name: String,
+        from_pub_key: [u8; KEY_LEN],
         to: String,
         hops: Vec<String>,
         ttl: u32,
-        signal_type: RelaySignalType,
-        sdp: Option<String>,
-        candidate: Option<JsonValue>,
+        sealed_nonce: [u8; NONCE_LEN],
+        sealed_ciphertext: Vec<u8>,
         now_ms: u64,
         actions: &mut Vec<MeshAction>,
-    ) {
+    ) -> Result<(), String> {
         if to == self.peer_id {
-            // Delivered to us!
             if self.peers.contains_key(&from) {
-                // Already directly connected
-                return;
+                return Ok(());
             }
+            self.known_pub_keys.insert(from.clone(), from_pub_key);
             self.indirect_routes.insert(
                 from.clone(),
                 IndirectPeerRoute {
                     peer_id: from.clone(),
                     author_name: from_name.clone(),
+                    pub_key: from_pub_key,
                     via_peer_id: from_link.to_owned(),
                 },
             );
-            match signal_type {
+
+            // Decrypt the end-to-end sealed SDP/ICE body that was opaque to the relay node(s)
+            let relay_key = derive_relay_signal_key(
+                &self.x25519_secret,
+                &from_pub_key,
+                &self.mesh_key,
+                &from,
+                &self.peer_id,
+            )?;
+            let aad = format!("p2p-relay-v1|{from}->{}", self.peer_id);
+            let plain_bytes = match aead_open(&relay_key, &sealed_nonce, aad.as_bytes(), &sealed_ciphertext) {
+                Ok(b) => b,
+                Err(err) => {
+                    self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                    return Err(err);
+                }
+            };
+            let plain_str = std::str::from_utf8(&plain_bytes)
+                .map_err(|_| "decrypted relay signal is not valid UTF-8".to_owned())?;
+            let body = RelaySignalBody::parse_json(plain_str)?;
+
+            match body.signal_type {
                 RelaySignalType::Offer => {
-                    if let Some(offer_sdp) = sdp {
+                    if let Some(offer_sdp) = body.sdp {
                         self.auto_mesh_pending.insert(
                             from.clone(),
                             PendingAutoMesh {
                                 target_peer_id: from.clone(),
                                 target_name: from_name.clone(),
+                                target_pub_key: from_pub_key,
                                 via_peer_id: from_link.to_owned(),
                                 initiated_by_self: false,
                                 started_at_ms: now_ms,
@@ -1196,20 +1623,21 @@ impl MeshNode {
                         actions.push(MeshAction::AutoMeshAcceptOffer {
                             from_peer_id: from.clone(),
                             from_name: from_name.clone(),
+                            from_pub_key,
                             via_peer_id: from_link.to_owned(),
                             sdp: offer_sdp,
                         });
                         actions.push(MeshAction::Telemetry {
                             event: "auto_mesh_offer_recv".to_owned(),
                             detail: format!(
-                                "Received relayed auto-mesh offer from {} ({}) via {}",
+                                "Decrypted E2EE relayed offer from {} ({}) via {}",
                                 from_name, from, from_link
                             ),
                         });
                     }
                 }
                 RelaySignalType::Answer => {
-                    if let Some(answer_sdp) = sdp {
+                    if let Some(answer_sdp) = body.sdp {
                         actions.push(MeshAction::AutoMeshApplyAnswer {
                             from_peer_id: from.clone(),
                             sdp: answer_sdp,
@@ -1217,14 +1645,14 @@ impl MeshNode {
                         actions.push(MeshAction::Telemetry {
                             event: "auto_mesh_answer_recv".to_owned(),
                             detail: format!(
-                                "Received relayed auto-mesh answer from {} ({}) via {}",
+                                "Decrypted E2EE relayed answer from {} ({}) via {}",
                                 from_name, from, from_link
                             ),
                         });
                     }
                 }
                 RelaySignalType::Ice => {
-                    if let Some(cand) = candidate {
+                    if let Some(cand) = body.candidate {
                         actions.push(MeshAction::AutoMeshAddIce {
                             from_peer_id: from,
                             candidate: cand,
@@ -1232,12 +1660,12 @@ impl MeshNode {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
 
-        // Intermediate relay node: forward loop-free toward `to`
+        // Intermediate relay: forward opaque AEAD ciphertext without decrypting it!
         if ttl <= 1 || hops.iter().any(|h| h == &self.peer_id) {
-            return;
+            return Ok(());
         }
 
         let mut next_hops = hops;
@@ -1247,26 +1675,24 @@ impl MeshNode {
         next_hops.push(self.peer_id.clone());
 
         let forwarded = WireFrame::RelaySignal {
-            from: from.clone(),
+            from,
             from_name,
+            from_pub_key,
             to: to.clone(),
             via: self.peer_id.clone(),
             hops: next_hops.clone(),
             ttl: ttl - 1,
-            signal_type,
-            sdp,
-            candidate,
+            sealed_nonce,
+            sealed_ciphertext,
         };
 
-        // Prefer direct delivery if we are directly connected to `to`
         if self.peers.contains_key(&to) && to != from_link {
             self.stats.relay_signals_forwarded =
                 self.stats.relay_signals_forwarded.saturating_add(1);
             self.emit_wire(actions, &to, &forwarded);
-            return;
+            return Ok(());
         }
 
-        // Next prefer known indirect route to `to`
         if let Some(route) = self.indirect_routes.get(&to) {
             let next = route.via_peer_id.clone();
             if self.peers.contains_key(&next)
@@ -1276,11 +1702,10 @@ impl MeshNode {
                 self.stats.relay_signals_forwarded =
                     self.stats.relay_signals_forwarded.saturating_add(1);
                 self.emit_wire(actions, &next, &forwarded);
-                return;
+                return Ok(());
             }
         }
 
-        // Otherwise loop-free flood across remaining direct neighbors
         let targets: Vec<String> = self
             .peers
             .keys()
@@ -1295,20 +1720,27 @@ impl MeshNode {
                 self.stats.relay_signals_forwarded.saturating_add(1);
             self.emit_wire(actions, &target, &forwarded);
         }
+
+        Ok(())
     }
 
-    /// Serializes full node status, peers, topology, and counters for the UI.
+    /// Serializes full node status, E2EE metadata, peers, topology, and counters for the UI.
     pub fn status_json(&self) -> String {
-        let mut out = String::with_capacity(512);
+        let mut out = String::with_capacity(768);
         out.push_str("{\"peerId\":");
         write_json_string(&mut out, &self.peer_id);
         out.push_str(",\"authorName\":");
         write_json_string(&mut out, &self.author_name);
         out.push_str(",\"room\":");
         write_json_string(&mut out, &self.room);
+        out.push_str(",\"e2ee\":{\"cipher\":\"X25519 + ChaCha20-Poly1305\",\"keyFingerprint\":");
+        write_json_string(&mut out, &self.key_fp);
+        out.push_str(",\"publicKey\":");
+        write_json_string(&mut out, &base64url_encode(&self.x25519_public));
         let _ = write!(
             out,
-            ",\"lamport\":{},\"logCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
+            ",\"passphraseMode\":{}}},\"lamport\":{},\"logCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
+            self.passphrase_mode,
             self.log.lamport(),
             self.log.len(),
             self.config.auto_mesh_enabled
@@ -1321,12 +1753,24 @@ impl MeshNode {
             write_json_string(&mut out, &peer.peer_id);
             out.push_str(",\"authorName\":");
             write_json_string(&mut out, &peer.author_name);
-            let _ = write!(out, ",\"viaAutoMesh\":{},\"introducedBy\":", peer.via_auto_mesh);
+            out.push_str(",\"safetyCode\":");
+            write_json_string(&mut out, &peer.crypto.safety_code);
+            out.push_str(",\"publicKey\":");
+            write_json_string(&mut out, &base64url_encode(&peer.crypto.pub_key));
+            let _ = write!(
+                out,
+                ",\"viaAutoMesh\":{},\"introducedBy\":",
+                peer.via_auto_mesh
+            );
             match &peer.introduced_by {
                 Some(intro) => write_json_string(&mut out, intro),
                 None => out.push_str("null"),
             }
-            let _ = write!(out, ",\"knownCount\":{},\"remotePeers\":[", peer.known_ids.len());
+            let _ = write!(
+                out,
+                ",\"knownCount\":{},\"remotePeers\":[",
+                peer.known_ids.len()
+            );
             for (j, rp) in peer.remote_peers.iter().enumerate() {
                 if j > 0 {
                     out.push(',');
@@ -1367,9 +1811,13 @@ impl MeshNode {
         }
         let _ = write!(
             out,
-            "],\"stats\":{{\"framesSent\":{},\"framesReceived\":{},\"gossipForwards\":{},\"gossipDuplicatesDropped\":{},\"syncInvSent\":{},\"syncInvReceived\":{},\"syncBatchesSent\":{},\"syncBatchesReceived\":{},\"autoMeshIntrosSent\":{},\"autoMeshOffersCreated\":{},\"relaySignalsForwarded\":{}}}}}",
+            "],\"stats\":{{\"framesSent\":{},\"framesReceived\":{},\"e2eeFramesEncrypted\":{},\"e2eeFramesDecrypted\":{},\"e2eeAuthFailures\":{},\"relaySignalsEncrypted\":{},\"gossipForwards\":{},\"gossipDuplicatesDropped\":{},\"syncInvSent\":{},\"syncInvReceived\":{},\"syncBatchesSent\":{},\"syncBatchesReceived\":{},\"autoMeshIntrosSent\":{},\"autoMeshOffersCreated\":{},\"relaySignalsForwarded\":{}}}}}",
             self.stats.frames_sent,
             self.stats.frames_received,
+            self.stats.e2ee_frames_encrypted,
+            self.stats.e2ee_frames_decrypted,
+            self.stats.e2ee_auth_failures,
+            self.stats.relay_signals_encrypted,
             self.stats.gossip_forwards,
             self.stats.gossip_duplicates_dropped,
             self.stats.sync_inv_sent,
@@ -1387,21 +1835,6 @@ impl MeshNode {
     pub fn log_json(&self) -> String {
         let mut out = String::with_capacity(self.log.len().saturating_mul(160) + 8);
         self.log.write_messages_json_array(&mut out);
-        out
-    }
-
-    /// Serializes a subset of log messages by ID as a JSON array string.
-    pub fn messages_by_ids_json(&self, ids: &[String]) -> String {
-        let selected = self.log.select_by_ids(ids);
-        let mut out = String::with_capacity(selected.len().saturating_mul(160) + 8);
-        out.push('[');
-        for (i, m) in selected.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            m.write_json(&mut out);
-        }
-        out.push(']');
         out
     }
 }

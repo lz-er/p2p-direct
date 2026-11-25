@@ -4,6 +4,10 @@ use crate::codec::{
     PROTOCOL_VERSION, SignalCodeKind, SignalCodePayload, decode_signal_code, encode_fragment_url,
     encode_signal_code, extract_fragment_code,
 };
+use crate::crypto::{
+    derive_invite_wrap_key, derive_mesh_key_from_passphrase, parse_fixed_32,
+};
+use crate::deflate::{base64url_decode, base64url_encode};
 use crate::json::{JsonValue, parse_json, write_json_string};
 use crate::mesh::{MeshConfig, MeshNode, actions_to_json_array};
 use crate::protocol::RelaySignalType;
@@ -41,6 +45,29 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             let author_name = val.get_str("authorName").unwrap_or("Peer").to_owned();
             let room = val.get_str("room").unwrap_or("default").to_owned();
             let auto_mesh = val.get_bool("autoMeshEnabled").unwrap_or(true);
+
+            let secret_b64 = val
+                .get_str("x25519Secret")
+                .ok_or_else(|| "init missing base64url 'x25519Secret'".to_owned())?;
+            let x25519_secret =
+                parse_fixed_32(&base64url_decode(secret_b64)?, "x25519Secret")?;
+
+            let entropy = match val.get_str("entropy") {
+                Some(e) if !e.is_empty() => base64url_decode(e)?,
+                _ => Vec::new(),
+            };
+
+            let (mesh_key, passphrase_mode) = match val.get_str("passphrase") {
+                Some(pass) if !pass.is_empty() => (derive_mesh_key_from_passphrase(pass), true),
+                _ => {
+                    let mk_b64 = val
+                        .get_str("meshKey")
+                        .ok_or_else(|| "init missing base64url 'meshKey'".to_owned())?;
+                    let mk = parse_fixed_32(&base64url_decode(mk_b64)?, "meshKey")?;
+                    (mk, val.get_bool("passphraseMode").unwrap_or(false))
+                }
+            };
+
             let mut config = MeshConfig {
                 auto_mesh_enabled: auto_mesh,
                 ..MeshConfig::default()
@@ -48,7 +75,18 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             if let Some(max_p) = val.get_u64("maxDirectPeers") {
                 config.max_direct_peers = (max_p as usize).clamp(1, 64);
             }
-            let node = MeshNode::new(peer_id, author_name, room, config);
+            let mut node = MeshNode::new(
+                peer_id,
+                author_name,
+                room,
+                x25519_secret,
+                mesh_key,
+                &entropy,
+                config,
+            );
+            if passphrase_mode {
+                node.set_mesh_key(mesh_key, true)?;
+            }
             let status = node.status_json();
             *state = Some(node);
             Ok(format!("{{\"ok\":true,\"status\":{status}}}"))
@@ -67,6 +105,61 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             let status = node.status_json();
             Ok(format!("{{\"ok\":true,\"status\":{status}}}"))
         }
+        "set_passphrase" => {
+            let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
+            match val.get_str("passphrase") {
+                Some(pass) if !pass.is_empty() => {
+                    node.set_passphrase(pass)?;
+                }
+                _ => {
+                    let new_key = match val.get_str("meshKey") {
+                        Some(mk_b64) if !mk_b64.is_empty() => {
+                            Some(parse_fixed_32(&base64url_decode(mk_b64)?, "meshKey")?)
+                        }
+                        _ => None,
+                    };
+                    node.clear_passphrase(new_key)?;
+                }
+            }
+            let status = node.status_json();
+            let mk_b64 = base64url_encode(&node.mesh_key());
+            let mut out = String::with_capacity(status.len() + 96);
+            out.push_str("{\"ok\":true,\"meshKey\":");
+            write_json_string(&mut out, &mk_b64);
+            out.push_str(",\"status\":");
+            out.push_str(&status);
+            out.push('}');
+            Ok(out)
+        }
+        "set_mesh_key" => {
+            let node = require_node(state)?;
+            let mk_b64 = val
+                .get_str("meshKey")
+                .ok_or_else(|| "set_mesh_key missing 'meshKey'".to_owned())?;
+            let mk = parse_fixed_32(&base64url_decode(mk_b64)?, "meshKey")?;
+            let pass_mode = val.get_bool("passphraseMode").unwrap_or(false);
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
+            node.set_mesh_key(mk, pass_mode)?;
+            let status = node.status_json();
+            Ok(format!("{{\"ok\":true,\"status\":{status}}}"))
+        }
+        "reseed" => {
+            let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy") {
+                let bytes = base64url_decode(e)?;
+                node.reseed_entropy(&bytes);
+            }
+            Ok("{\"ok\":true}".to_owned())
+        }
         "import_snapshot" => {
             let node = require_node(state)?;
             let snap = val
@@ -84,6 +177,11 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             let snap = node.export_persistence();
             Ok(format!("{{\"ok\":true,\"snapshot\":{snap}}}"))
         }
+        "export_decrypted" => {
+            let node = require_node(state)?;
+            let snap = node.export_decrypted_json();
+            Ok(format!("{{\"ok\":true,\"snapshot\":{snap}}}"))
+        }
         "get_state" => {
             let node = require_node(state)?;
             let status = node.status_json();
@@ -96,12 +194,15 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             let node = require_node(state)?;
             node.reset_local_log();
             let status = node.status_json();
-            Ok(format!(
-                "{{\"ok\":true,\"status\":{status},\"log\":[]}}"
-            ))
+            Ok(format!("{{\"ok\":true,\"status\":{status},\"log\":[]}}"))
         }
         "publish" => {
             let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
             let msg_type = val
                 .get_str("type")
                 .ok_or_else(|| "publish missing string field 'type'".to_owned())?
@@ -129,10 +230,19 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 .ok_or_else(|| "peer_connected missing 'peerId'".to_owned())?
                 .to_owned();
             let author_name = val.get_str("authorName").unwrap_or("Peer").to_owned();
+            let pk_b64 = val
+                .get_str("peerPubKey")
+                .ok_or_else(|| "peer_connected missing X25519 'peerPubKey'".to_owned())?;
+            let peer_pub_key = parse_fixed_32(&base64url_decode(pk_b64)?, "peerPubKey")?;
             let via_auto_mesh = val.get_bool("viaAutoMesh").unwrap_or(false);
             let introduced_by = val.get_str("introducedBy").map(str::to_owned);
-            let actions =
-                node.on_peer_connected(peer_id, author_name, via_auto_mesh, introduced_by);
+            let actions = node.on_peer_connected(
+                peer_id,
+                author_name,
+                peer_pub_key,
+                via_auto_mesh,
+                introduced_by,
+            )?;
             let actions_json = actions_to_json_array(&actions);
             let status = node.status_json();
             Ok(format!(
@@ -214,6 +324,11 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
         }
         "encode_signal" => {
             let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
             let kind_str = val
                 .get_str("kind")
                 .ok_or_else(|| "encode_signal missing 'kind'".to_owned())?;
@@ -225,6 +340,8 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 .to_owned();
             let invite_id = val.get_str("inviteId").unwrap_or("").to_owned();
             let base_url = val.get_str("baseUrl").unwrap_or("");
+            let wrap_key = node.invite_wrap_key();
+            let include_mesh_key = kind == SignalCodeKind::Offer && wrap_key.is_none();
             let payload = SignalCodePayload {
                 version: PROTOCOL_VERSION,
                 kind,
@@ -232,29 +349,51 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 author_name: node.author_name().to_owned(),
                 room: node.room().to_owned(),
                 invite_id,
+                pub_key: node.public_key(),
+                mesh_key: if include_mesh_key {
+                    Some(node.mesh_key())
+                } else {
+                    None
+                },
                 sdp,
             };
-            let code = encode_signal_code(&payload)?;
+            let code = encode_signal_code(&payload, wrap_key.as_ref(), node.rng_mut())?;
             let url = if base_url.is_empty() {
                 format!("#{}={code}", kind.fragment_key())
             } else {
-                encode_fragment_url(base_url, &payload)?
+                encode_fragment_url(base_url, &payload, wrap_key.as_ref(), node.rng_mut())?
             };
-            let mut out = String::with_capacity(code.len() + url.len() + 64);
+            let mut out = String::with_capacity(code.len() + url.len() + 96);
             out.push_str("{\"ok\":true,\"code\":");
             write_json_string(&mut out, &code);
             out.push_str(",\"url\":");
             write_json_string(&mut out, &url);
-            let _ = write!(out, ",\"rawBytes\":{},\"codeChars\":{}}}", payload.sdp.len(), code.len());
+            let _ = write!(
+                out,
+                ",\"encrypted\":{},\"rawBytes\":{},\"codeChars\":{}}}",
+                wrap_key.is_some(),
+                payload.sdp.len(),
+                code.len()
+            );
             Ok(out)
         }
         "decode_signal" => {
             let input = val
                 .get_str("input")
                 .ok_or_else(|| "decode_signal missing 'input'".to_owned())?;
-            let sig = decode_signal_code(input)?;
-            let mut out = String::with_capacity(sig.sdp.len() + 192);
-            let _ = write!(out, "{{\"ok\":true,\"signal\":{{\"version\":{},\"kind\":", sig.version);
+            let wrap_key = match val.get_str("passphrase") {
+                Some(pass) if !pass.is_empty() => {
+                    Some(derive_invite_wrap_key(&derive_mesh_key_from_passphrase(pass)))
+                }
+                _ => state.as_ref().and_then(MeshNode::invite_wrap_key),
+            };
+            let (sig, was_encrypted) = decode_signal_code(input, wrap_key.as_ref())?;
+            let mut out = String::with_capacity(sig.sdp.len() + 288);
+            let _ = write!(
+                out,
+                "{{\"ok\":true,\"signal\":{{\"version\":{},\"kind\":",
+                sig.version
+            );
             write_json_string(&mut out, sig.kind.as_str());
             out.push_str(",\"peerId\":");
             write_json_string(&mut out, &sig.peer_id);
@@ -264,7 +403,14 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             write_json_string(&mut out, &sig.room);
             out.push_str(",\"inviteId\":");
             write_json_string(&mut out, &sig.invite_id);
-            out.push_str(",\"sdp\":");
+            out.push_str(",\"pubKey\":");
+            write_json_string(&mut out, &base64url_encode(&sig.pub_key));
+            out.push_str(",\"meshKey\":");
+            match &sig.mesh_key {
+                Some(mk) => write_json_string(&mut out, &base64url_encode(mk)),
+                None => out.push_str("null"),
+            }
+            let _ = write!(out, ",\"encrypted\":{was_encrypted},\"sdp\":");
             write_json_string(&mut out, &sig.sdp);
             out.push_str("}}");
             Ok(out)

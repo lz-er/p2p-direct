@@ -1,8 +1,13 @@
+use crate::crypto::{
+    KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, parse_fixed_12, parse_fixed_32,
+};
 use crate::deflate::{base64url_decode, base64url_encode, deflate_raw, inflate_auto};
 use crate::json::{parse_json, write_json_string};
 
 pub const CODE_PREFIX: &str = "P2P1:";
 pub const PROTOCOL_VERSION: u64 = 1;
+const E2E_INVITE_MAGIC: &[u8; 4] = b"E2E1";
+const E2E_INVITE_AAD: &[u8] = b"P2P1-E2E1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalCodeKind {
@@ -42,12 +47,14 @@ pub struct SignalCodePayload {
     pub author_name: String,
     pub room: String,
     pub invite_id: String,
+    pub pub_key: [u8; KEY_LEN],
+    pub mesh_key: Option<[u8; KEY_LEN]>,
     pub sdp: String,
 }
 
 impl SignalCodePayload {
     pub fn to_compact_json(&self) -> String {
-        let mut out = String::with_capacity(self.sdp.len() + 128);
+        let mut out = String::with_capacity(self.sdp.len() + 256);
         out.push_str("{\"v\":");
         out.push_str(&self.version.to_string());
         out.push_str(",\"k\":");
@@ -60,6 +67,12 @@ impl SignalCodePayload {
         write_json_string(&mut out, &self.room);
         out.push_str(",\"i\":");
         write_json_string(&mut out, &self.invite_id);
+        out.push_str(",\"x\":");
+        write_json_string(&mut out, &base64url_encode(&self.pub_key));
+        if let Some(mk) = &self.mesh_key {
+            out.push_str(",\"k2\":");
+            write_json_string(&mut out, &base64url_encode(mk));
+        }
         out.push_str(",\"s\":");
         write_json_string(&mut out, &self.sdp);
         out.push('}');
@@ -94,7 +107,12 @@ fn compact_sdp_for_wire(sdp: &str) -> String {
 }
 
 /// Encodes a WebRTC offer or answer payload into a deflate-compressed `P2P1:` code.
-pub fn encode_signal_code(payload: &SignalCodePayload) -> Result<String, String> {
+/// When `wrap_key` is `Some`, the compressed payload is additionally AEAD-encrypted with ChaCha20-Poly1305.
+pub fn encode_signal_code(
+    payload: &SignalCodePayload,
+    wrap_key: Option<&[u8; KEY_LEN]>,
+    rng: &mut SafeCsprng,
+) -> Result<String, String> {
     if payload.peer_id.trim().is_empty() {
         return Err("peer_id must not be empty".to_owned());
     }
@@ -108,17 +126,40 @@ pub fn encode_signal_code(payload: &SignalCodePayload) -> Result<String, String>
         author_name: payload.author_name.clone(),
         room: payload.room.clone(),
         invite_id: payload.invite_id.clone(),
+        pub_key: payload.pub_key,
+        mesh_key: if wrap_key.is_some() {
+            None
+        } else {
+            payload.mesh_key
+        },
         sdp: compact_sdp_for_wire(&payload.sdp),
     };
     let json = normalized.to_compact_json();
     let compressed = deflate_raw(json.as_bytes());
-    let encoded = base64url_encode(&compressed);
+    let wire_bytes = match wrap_key {
+        Some(key) => {
+            let nonce = rng.next_nonce();
+            let sealed = aead_seal(key, &nonce, E2E_INVITE_AAD, &compressed);
+            let mut framed = Vec::with_capacity(4 + NONCE_LEN + sealed.len());
+            framed.extend_from_slice(E2E_INVITE_MAGIC);
+            framed.extend_from_slice(&nonce);
+            framed.extend_from_slice(&sealed);
+            framed
+        }
+        None => compressed,
+    };
+    let encoded = base64url_encode(&wire_bytes);
     Ok(format!("{CODE_PREFIX}{encoded}"))
 }
 
 /// Builds a shareable URL with `#offer=P2P1:...` or `#answer=P2P1:...` fragment.
-pub fn encode_fragment_url(base_url: &str, payload: &SignalCodePayload) -> Result<String, String> {
-    let code = encode_signal_code(payload)?;
+pub fn encode_fragment_url(
+    base_url: &str,
+    payload: &SignalCodePayload,
+    wrap_key: Option<&[u8; KEY_LEN]>,
+    rng: &mut SafeCsprng,
+) -> Result<String, String> {
+    let code = encode_signal_code(payload, wrap_key, rng)?;
     let base = match base_url.split_once('#') {
         Some((prefix, _)) => prefix,
         None => base_url,
@@ -153,7 +194,11 @@ pub fn extract_fragment_code(input: &str) -> Option<(SignalCodeKind, String)> {
 }
 
 /// Decodes either a raw `P2P1:...` code or a full URL / `#offer=` / `#answer=` fragment.
-pub fn decode_signal_code(input: &str) -> Result<SignalCodePayload, String> {
+/// Returns `(payload, was_passphrase_encrypted)`.
+pub fn decode_signal_code(
+    input: &str,
+    wrap_key: Option<&[u8; KEY_LEN]>,
+) -> Result<(SignalCodePayload, bool), String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("empty invite/reply code".to_owned());
@@ -168,7 +213,28 @@ pub fn decode_signal_code(input: &str) -> Result<SignalCodePayload, String> {
         .strip_prefix(CODE_PREFIX)
         .ok_or_else(|| format!("signal code must start with '{CODE_PREFIX}'"))?;
 
-    let compressed = base64url_decode(body)?;
+    let wire_bytes = base64url_decode(body)?;
+    let (compressed, was_encrypted) = if wire_bytes.starts_with(E2E_INVITE_MAGIC) {
+        let key = wrap_key.ok_or_else(|| {
+            "this P2P1 code is passphrase-encrypted — enter the matching mesh passphrase to decrypt"
+                .to_owned()
+        })?;
+        let nonce_slice = wire_bytes
+            .get(4..4 + NONCE_LEN)
+            .ok_or_else(|| "truncated encrypted P2P1 nonce".to_owned())?;
+        let ct_slice = wire_bytes
+            .get(4 + NONCE_LEN..)
+            .ok_or_else(|| "truncated encrypted P2P1 ciphertext".to_owned())?;
+        let nonce = parse_fixed_12(nonce_slice, "P2P1 invite nonce")?;
+        let decrypted = aead_open(key, &nonce, E2E_INVITE_AAD, ct_slice).map_err(|_| {
+            "failed to decrypt passphrase-protected P2P1 code (wrong passphrase or corrupted code)"
+                .to_owned()
+        })?;
+        (decrypted, true)
+    } else {
+        (wire_bytes, false)
+    };
+
     let raw_bytes = inflate_auto(&compressed)?;
     let json_str = std::str::from_utf8(&raw_bytes)
         .map_err(|_| "decompressed P2P1 payload is not valid UTF-8".to_owned())?;
@@ -205,6 +271,18 @@ pub fn decode_signal_code(input: &str) -> Result<SignalCodePayload, String> {
         return Err("peer id 'p' must not be empty".to_owned());
     }
 
+    let pub_key_b64 = val
+        .get_str("x")
+        .ok_or_else(|| "missing X25519 public key field 'x'".to_owned())?;
+    let pub_key = parse_fixed_32(&base64url_decode(pub_key_b64)?, "X25519 public key")?;
+
+    let mesh_key = match val.get_str("k2") {
+        Some(k2_b64) if !k2_b64.is_empty() => {
+            Some(parse_fixed_32(&base64url_decode(k2_b64)?, "mesh key")?)
+        }
+        _ => None,
+    };
+
     let author_name = val.get_str("n").unwrap_or("Peer").to_owned();
     let room = val.get_str("r").unwrap_or("default").to_owned();
     let invite_id = val.get_str("i").unwrap_or("").to_owned();
@@ -216,15 +294,20 @@ pub fn decode_signal_code(input: &str) -> Result<SignalCodePayload, String> {
         return Err("SDP field 's' must not be empty".to_owned());
     }
 
-    Ok(SignalCodePayload {
-        version,
-        kind,
-        peer_id,
-        author_name,
-        room,
-        invite_id,
-        sdp: normalize_sdp(&sdp),
-    })
+    Ok((
+        SignalCodePayload {
+            version,
+            kind,
+            peer_id,
+            author_name,
+            room,
+            invite_id,
+            pub_key,
+            mesh_key,
+            sdp: normalize_sdp(&sdp),
+        },
+        was_encrypted,
+    ))
 }
 
 fn percent_decode(input: &str) -> String {

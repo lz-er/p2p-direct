@@ -3,11 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use p2p_direct::crypto::sha256;
 use p2p_direct::json::{JsonValue, parse_json};
 use p2p_direct::mesh::{MeshAction, MeshConfig, MeshNode};
 use p2p_direct::protocol::RelaySignalType;
 
 type TestResult = Result<(), String>;
+
+const SIM_MESH_KEY: [u8; 32] = [0x5Au8; 32];
 
 #[derive(Debug, Clone)]
 struct QueuedFrame {
@@ -28,6 +31,7 @@ struct SimNetwork {
     links: BTreeSet<(String, String)>,
     queue: VecDeque<QueuedFrame>,
     pending_webrtc: VecDeque<PendingDirectConn>,
+    captured_wire_frames: Vec<QueuedFrame>,
     now_ms: u64,
     total_frames_delivered: usize,
     max_frames_limit: usize,
@@ -40,6 +44,7 @@ impl SimNetwork {
             links: BTreeSet::new(),
             queue: VecDeque::new(),
             pending_webrtc: VecDeque::new(),
+            captured_wire_frames: Vec::new(),
             now_ms: 1_700_000_000_000,
             total_frames_delivered: 0,
             max_frames_limit,
@@ -55,9 +60,29 @@ impl SimNetwork {
     }
 
     fn add_node(&mut self, peer_id: &str, name: &str, config: MeshConfig) {
+        self.add_node_with_key(peer_id, name, SIM_MESH_KEY, config);
+    }
+
+    fn add_node_with_key(
+        &mut self,
+        peer_id: &str,
+        name: &str,
+        mesh_key: [u8; 32],
+        config: MeshConfig,
+    ) {
+        let sk = sha256(format!("sim-x25519-secret-{peer_id}").as_bytes());
+        let seed = sha256(format!("sim-entropy-{peer_id}").as_bytes());
         self.nodes.insert(
             peer_id.to_owned(),
-            MeshNode::new(peer_id.to_owned(), name.to_owned(), "sim-room".to_owned(), config),
+            MeshNode::new(
+                peer_id.to_owned(),
+                name.to_owned(),
+                "sim-room".to_owned(),
+                sk,
+                mesh_key,
+                &seed,
+                config,
+            ),
         );
     }
 
@@ -73,27 +98,37 @@ impl SimNetwork {
             .ok_or_else(|| format!("missing sim node {peer_id}"))
     }
 
-    fn connect(&mut self, a: &str, b: &str, via_auto_mesh: bool, introducer: Option<&str>) -> TestResult {
+    fn connect(
+        &mut self,
+        a: &str,
+        b: &str,
+        via_auto_mesh: bool,
+        introducer: Option<&str>,
+    ) -> TestResult {
         let edge = Self::canonical_edge(a, b);
         if self.links.contains(&edge) {
             return Ok(());
         }
         let name_a = self.node(a)?.author_name().to_owned();
         let name_b = self.node(b)?.author_name().to_owned();
+        let pk_a = self.node(a)?.public_key();
+        let pk_b = self.node(b)?.public_key();
         self.links.insert(edge);
 
         let acts_a = self.node_mut(a)?.on_peer_connected(
             b.to_owned(),
             name_b,
+            pk_b,
             via_auto_mesh,
             introducer.map(str::to_owned),
-        );
+        )?;
         let acts_b = self.node_mut(b)?.on_peer_connected(
             a.to_owned(),
             name_a,
+            pk_a,
             via_auto_mesh,
             introducer.map(str::to_owned),
-        );
+        )?;
         self.process_actions(a, acts_a)?;
         self.process_actions(b, acts_b)?;
         Ok(())
@@ -132,7 +167,13 @@ impl SimNetwork {
         Ok(())
     }
 
-    fn publish(&mut self, peer_id: &str, msg_type: &str, payload: JsonValue, ts_override: Option<u64>) -> Result<String, String> {
+    fn publish(
+        &mut self,
+        peer_id: &str,
+        msg_type: &str,
+        payload: JsonValue,
+        ts_override: Option<u64>,
+    ) -> Result<String, String> {
         let ts = match ts_override {
             Some(v) => v,
             None => {
@@ -156,13 +197,20 @@ impl SimNetwork {
         for act in actions {
             match act {
                 MeshAction::SendWire { peer_id, frame } => {
+                    // EVERY single frame crossing the wire MUST be an outer E2EE envelope!
+                    let parsed = parse_json(&frame)?;
+                    if parsed.get_str("kind") != Some("e2ee") {
+                        return Err(format!("non-E2EE frame leaked onto wire: {frame}"));
+                    }
                     let edge = Self::canonical_edge(actor, &peer_id);
                     if self.links.contains(&edge) {
-                        self.queue.push_back(QueuedFrame {
+                        let qf = QueuedFrame {
                             from: actor.to_owned(),
                             to: peer_id,
                             frame,
-                        });
+                        };
+                        self.captured_wire_frames.push(qf.clone());
+                        self.queue.push_back(qf);
                     }
                 }
                 MeshAction::AutoMeshCreateOffer {
@@ -170,8 +218,9 @@ impl SimNetwork {
                     via_peer_id,
                     ..
                 } => {
-                    // Simulate browser creating RTCPeerConnection offer and relaying it through `via_peer_id`
-                    let fake_sdp = format!("v=0\r\no=offer-{actor}-to-{target_peer_id}\r\n");
+                    let fake_sdp = format!(
+                        "v=0\r\no=CONFIDENTIAL-OFFER-SDP-{actor}-to-{target_peer_id}\r\n"
+                    );
                     let relay_acts = self.node_mut(actor)?.send_relay_signal(
                         target_peer_id.clone(),
                         RelaySignalType::Offer,
@@ -181,8 +230,9 @@ impl SimNetwork {
                     )?;
                     self.process_actions(actor, relay_acts)?;
 
-                    // Also trickle a simulated ICE candidate
-                    let ice_val = parse_json(r#"{"candidate":"candidate:1 1 udp 2122260223 127.0.0.1 50000 typ host","sdpMid":"0"}"#)?;
+                    let ice_val = parse_json(
+                        r#"{"candidate":"candidate:1 1 udp 2122260223 10.99.88.77 50000 typ host","sdpMid":"0"}"#,
+                    )?;
                     let ice_acts = self.node_mut(actor)?.send_relay_signal(
                         target_peer_id,
                         RelaySignalType::Ice,
@@ -197,7 +247,9 @@ impl SimNetwork {
                     via_peer_id,
                     ..
                 } => {
-                    let fake_ans = format!("v=0\r\no=answer-{actor}-to-{from_peer_id}\r\n");
+                    let fake_ans = format!(
+                        "v=0\r\no=CONFIDENTIAL-ANSWER-SDP-{actor}-to-{from_peer_id}\r\n"
+                    );
                     let relay_acts = self.node_mut(actor)?.send_relay_signal(
                         from_peer_id,
                         RelaySignalType::Answer,
@@ -208,7 +260,6 @@ impl SimNetwork {
                     self.process_actions(actor, relay_acts)?;
                 }
                 MeshAction::AutoMeshApplyAnswer { from_peer_id, .. } => {
-                    // WebRTC SDP handshake completed -> schedule direct DataChannel open!
                     self.pending_webrtc.push_back(PendingDirectConn {
                         a: actor.to_owned(),
                         b: from_peer_id,
@@ -234,10 +285,7 @@ impl SimNetwork {
                     ));
                 }
                 let edge = Self::canonical_edge(&qf.from, &qf.to);
-                if !self.links.contains(&edge) {
-                    continue;
-                }
-                if !self.nodes.contains_key(&qf.to) {
+                if !self.links.contains(&edge) || !self.nodes.contains_key(&qf.to) {
                     continue;
                 }
                 self.now_ms += 1;
@@ -271,7 +319,6 @@ impl SimNetwork {
             ));
         }
 
-        // Verify strict (lamport, ts, id) deterministic ascending order
         for pair in baseline.windows(2) {
             if let (Some(a), Some(b)) = (pair.first(), pair.get(1)) {
                 assert!(
@@ -298,7 +345,7 @@ impl SimNetwork {
 }
 
 #[test]
-fn sim_two_peer_bidirectional_backfill() -> TestResult {
+fn sim_two_peer_bidirectional_backfill_zero_plaintext_on_wire() -> TestResult {
     let mut sim = SimNetwork::new(2_000);
     sim.add_node("peer-a", "Alice", MeshConfig::default());
     sim.add_node("peer-b", "Bob", MeshConfig::default());
@@ -307,7 +354,7 @@ fn sim_two_peer_bidirectional_backfill() -> TestResult {
         sim.publish(
             "peer-a",
             "chat",
-            parse_json(&format!(r#"{{"text":"alice-{i}"}}"#))?,
+            parse_json(&format!(r#"{{"text":"TOPSECRET_ALICE_{i}"}}"#))?,
             None,
         )?;
     }
@@ -315,7 +362,7 @@ fn sim_two_peer_bidirectional_backfill() -> TestResult {
         sim.publish(
             "peer-b",
             "event",
-            parse_json(&format!(r#"{{"seq":{i},"from":"bob"}}"#))?,
+            parse_json(&format!(r#"{{"seq":{i},"secret":"TOPSECRET_BOB_{i}"}}"#))?,
             None,
         )?;
     }
@@ -323,8 +370,98 @@ fn sim_two_peer_bidirectional_backfill() -> TestResult {
     sim.connect("peer-a", "peer-b", false, None)?;
     sim.drain()?;
     sim.assert_all_converged(15)?;
-    assert!(sim.node("peer-a")?.stats().sync_batches_sent >= 1);
-    assert!(sim.node("peer-b")?.stats().sync_batches_sent >= 1);
+
+    // Safety numbers MUST match on both peers
+    assert_eq!(
+        sim.node("peer-a")?.peer_safety_code("peer-b"),
+        sim.node("peer-b")?.peer_safety_code("peer-a")
+    );
+
+    // Audit EVERY captured wire frame: ZERO plaintext keywords or secrets may appear!
+    assert!(!sim.captured_wire_frames.is_empty());
+    for qf in &sim.captured_wire_frames {
+        assert!(!qf.frame.contains("TOPSECRET_ALICE"));
+        assert!(!qf.frame.contains("TOPSECRET_BOB"));
+        assert!(!qf.frame.contains("\"sync-batch\""));
+        assert!(!qf.frame.contains("\"hello\""));
+    }
+
+    assert!(sim.node("peer-a")?.stats().e2ee_frames_encrypted >= 2);
+    assert!(sim.node("peer-b")?.stats().e2ee_frames_decrypted >= 2);
+    assert_eq!(sim.node("peer-a")?.stats().e2ee_auth_failures, 0);
+    Ok(())
+}
+
+#[test]
+fn sim_e2ee_rejects_plaintext_tampering_replay_and_wrong_key() -> TestResult {
+    let mut sim = SimNetwork::new(2_000);
+    sim.add_node("peer-a", "Alice", MeshConfig::default());
+    sim.add_node("peer-b", "Bob", MeshConfig::default());
+
+    sim.connect("peer-a", "peer-b", false, None)?;
+    sim.drain()?;
+
+    sim.publish(
+        "peer-a",
+        "chat",
+        parse_json(r#"{"text":"authentic-e2ee-msg"}"#)?,
+        None,
+    )?;
+    let last_frame = sim
+        .captured_wire_frames
+        .last()
+        .cloned()
+        .ok_or("no captured wire frame")?;
+    sim.drain()?;
+    sim.assert_all_converged(1)?;
+
+    // 1. Replaying an already-delivered authentic frame MUST be rejected!
+    assert!(
+        sim.node_mut("peer-b")?
+            .on_wire_message("peer-a", &last_frame.frame, 1_700_000_009_000)
+            .is_err()
+    );
+
+    // 2. Sending an unencrypted plaintext frame MUST be rejected!
+    assert!(
+        sim.node_mut("peer-b")?
+            .on_wire_message(
+                "peer-a",
+                r#"{"kind":"sync-inv","from":"peer-a","ids":[]}"#,
+                1_700_000_009_001
+            )
+            .is_err()
+    );
+
+    // 3. Tampering with ciphertext in transit MUST fail Poly1305 AEAD auth!
+    let mut tampered = last_frame.frame.clone();
+    if let Some(pos) = tampered.find("\"c\":\"") {
+        let idx = pos + 5;
+        let mut bytes = tampered.into_bytes();
+        if let Some(b) = bytes.get_mut(idx) {
+            *b = if *b == b'A' { b'B' } else { b'A' };
+        }
+        tampered = String::from_utf8(bytes).map_err(|_| "utf8 err")?;
+    }
+    assert!(
+        sim.node_mut("peer-b")?
+            .on_wire_message("peer-a", &tampered, 1_700_000_009_002)
+            .is_err()
+    );
+    assert!(sim.node("peer-b")?.stats().e2ee_auth_failures >= 3);
+
+    // 4. An unauthorized peer with a DIFFERENT mesh key cannot decrypt frames from Alice!
+    let wrong_key = [0x99u8; 32];
+    sim.add_node_with_key("peer-eve", "Eve", wrong_key, MeshConfig::default());
+    sim.connect("peer-a", "peer-eve", false, None)?;
+    // Delivering Alice's frame to Eve MUST fail AEAD authentication
+    let frame_to_eve = sim.queue.pop_front().ok_or("expected frame to eve")?;
+    assert!(
+        sim.node_mut(&frame_to_eve.to)?
+            .on_wire_message(&frame_to_eve.from, &frame_to_eve.frame, 1_700_000_010_000)
+            .is_err()
+    );
+    assert_eq!(sim.node("peer-eve")?.log().len(), 0);
     Ok(())
 }
 
@@ -333,14 +470,13 @@ fn sim_chunked_sync_inv_and_batch_backfill_old_and_new() -> TestResult {
     let small_chunks = MeshConfig {
         inv_chunk_ids: 15,
         batch_max_msgs: 7,
-        batch_max_bytes: 2_000,
+        batch_max_bytes: 3_000,
         ..MeshConfig::default()
     };
     let mut sim = SimNetwork::new(10_000);
     sim.add_node("peer-a", "Alice", small_chunks.clone());
     sim.add_node("peer-b", "Bob", small_chunks);
 
-    // 65 historical messages on Alice before Bob ever joins
     for i in 0..65 {
         sim.publish(
             "peer-a",
@@ -350,20 +486,12 @@ fn sim_chunked_sync_inv_and_batch_backfill_old_and_new() -> TestResult {
         )?;
     }
 
-    // Bob joins late with 0 messages -> multi-part sync-inv + multi-chunk sync-batch backfill
     sim.connect("peer-a", "peer-b", false, None)?;
     sim.drain()?;
     sim.assert_all_converged(65)?;
-    assert!(
-        sim.node("peer-a")?.stats().sync_inv_sent >= 5,
-        "expected >=5 sync-inv parts for 65 messages at 15/chunk"
-    );
-    assert!(
-        sim.node("peer-a")?.stats().sync_batches_sent >= 10,
-        "expected >=10 sync-batch chunks for 65 messages at 7/chunk"
-    );
+    assert!(sim.node("peer-a")?.stats().sync_inv_sent >= 5);
+    assert!(sim.node("peer-a")?.stats().sync_batches_sent >= 10);
 
-    // Disconnect Bob, both produce new offline messages
     sim.disconnect("peer-a", "peer-b")?;
     for i in 0..10 {
         sim.publish(
@@ -382,7 +510,6 @@ fn sim_chunked_sync_inv_and_batch_backfill_old_and_new() -> TestResult {
         )?;
     }
 
-    // Reconnect Bob -> both old and new missing messages reconcile
     sim.connect("peer-a", "peer-b", false, None)?;
     sim.drain()?;
     sim.assert_all_converged(83)?;
@@ -402,7 +529,6 @@ fn sim_loop_free_multi_hop_gossip_in_cyclic_topology() -> TestResult {
         sim.add_node(id, id, gossip_only.clone());
     }
 
-    // Ring with cross chords (multiple overlapping cycles!)
     let edges = [
         ("n1", "n2"),
         ("n2", "n3"),
@@ -418,7 +544,6 @@ fn sim_loop_free_multi_hop_gossip_in_cyclic_topology() -> TestResult {
     }
     sim.drain()?;
 
-    // Every node publishes 3 messages
     for (idx, id) in ids.iter().enumerate() {
         for j in 0..3 {
             sim.publish(
@@ -442,11 +567,8 @@ fn sim_loop_free_multi_hop_gossip_in_cyclic_topology() -> TestResult {
         .filter_map(|id| sim.node(id).ok())
         .map(|n| n.stats().gossip_duplicates_dropped)
         .sum();
-    assert!(total_forwards > 0, "expected multi-hop gossip forwards");
-    assert!(
-        total_drops > 0,
-        "expected cyclic duplicate suppression drops"
-    );
+    assert!(total_forwards > 0);
+    assert!(total_drops > 0);
     Ok(())
 }
 
@@ -461,41 +583,45 @@ fn sim_partition_divergent_edits_with_tie_collisions_and_heal() -> TestResult {
         sim.add_node(id, id, gossip_only.clone());
     }
 
-    // Two disconnected clusters: (p1-p2-p3) and (p4-p5-p6)
     sim.connect("p1", "p2", false, None)?;
     sim.connect("p2", "p3", false, None)?;
     sim.connect("p4", "p5", false, None)?;
     sim.connect("p5", "p6", false, None)?;
     sim.drain()?;
 
-    // Publish concurrent messages with identical timestamps & colliding lamport values!
     let shared_ts = Some(1_700_000_555_000);
     for i in 0..4 {
-        sim.publish("p1", "chat", parse_json(&format!(r#"{{"c":1,"i":{i}}}"#))?, shared_ts)?;
-        sim.publish("p6", "chat", parse_json(&format!(r#"{{"c":2,"i":{i}}}"#))?, shared_ts)?;
+        sim.publish(
+            "p1",
+            "chat",
+            parse_json(&format!(r#"{{"c":1,"i":{i}}}"#))?,
+            shared_ts,
+        )?;
+        sim.publish(
+            "p6",
+            "chat",
+            parse_json(&format!(r#"{{"c":2,"i":{i}}}"#))?,
+            shared_ts,
+        )?;
         sim.drain()?;
     }
     sim.publish("p3", "state", parse_json(r#"{"cluster":"left"}"#)?, shared_ts)?;
     sim.publish("p4", "state", parse_json(r#"{"cluster":"right"}"#)?, shared_ts)?;
     sim.drain()?;
 
-    // Heal partition via a single bridge link p3 -- p4
     sim.connect("p3", "p4", false, None)?;
     sim.drain()?;
-
-    // All 6 nodes across both formerly partitioned clusters must converge to identical order!
     sim.assert_all_converged(10)?;
     Ok(())
 }
 
 #[test]
-fn sim_relayed_auto_mesh_introduction_and_log_survival_through_churn() -> TestResult {
+fn sim_relayed_auto_mesh_e2ee_and_log_survival_through_churn() -> TestResult {
     let mut sim = SimNetwork::new(5_000);
     sim.add_node("p-alice", "Alice", MeshConfig::default());
     sim.add_node("p-bob", "Bob", MeshConfig::default());
     sim.add_node("p-carol", "Carol", MeshConfig::default());
 
-    // Alice publishes historical messages before anyone else joins
     for i in 0..5 {
         sim.publish(
             "p-alice",
@@ -505,48 +631,46 @@ fn sim_relayed_auto_mesh_introduction_and_log_survival_through_churn() -> TestRe
         )?;
     }
 
-    // Alice -- Bob manual connect
     sim.connect("p-alice", "p-bob", false, None)?;
     sim.drain()?;
     assert_eq!(sim.node("p-bob")?.log().len(), 5);
 
-    // Carol joins Bob manually -> Bob introduces Alice & Carol -> direct WebRTC link Alice <-> Carol forms!
     sim.connect("p-bob", "p-carol", false, None)?;
     sim.drain()?;
 
-    assert!(
-        sim.node("p-alice")?.is_connected_to("p-carol"),
-        "expected relayed auto-mesh direct connection from Alice to Carol"
-    );
-    assert!(
-        sim.node("p-carol")?.is_connected_to("p-alice"),
-        "expected relayed auto-mesh direct connection from Carol to Alice"
-    );
-    assert!(sim.node("p-bob")?.stats().auto_mesh_intros_sent >= 2);
+    assert!(sim.node("p-alice")?.is_connected_to("p-carol"));
+    assert!(sim.node("p-carol")?.is_connected_to("p-alice"));
+    assert!(sim.node("p-alice")?.stats().relay_signals_encrypted >= 1);
     assert!(sim.node("p-bob")?.stats().relay_signals_forwarded >= 2);
+    // Verify Alice & Carol derived matching X25519 safety codes on their auto-meshed link
+    assert_eq!(
+        sim.node("p-alice")?.peer_safety_code("p-carol"),
+        sim.node("p-carol")?.peer_safety_code("p-alice")
+    );
+    // Verify no confidential SDP/ICE leaked onto any wire frame
+    for qf in &sim.captured_wire_frames {
+        assert!(!qf.frame.contains("CONFIDENTIAL-OFFER-SDP"));
+        assert!(!qf.frame.contains("CONFIDENTIAL-ANSWER-SDP"));
+        assert!(!qf.frame.contains("10.99.88.77"));
+    }
     sim.assert_all_converged(5)?;
 
-    // Now Bob (the introducer!) leaves completely
+    // Bob (introducer) departs completely
     sim.remove_node("p-bob")?;
 
-    // Alice and Carol continue communicating directly without Bob
-    sim.publish("p-alice", "chat", parse_json(r#"{"text":"still direct!"}"#)?, None)?;
+    sim.publish("p-alice", "chat", parse_json(r#"{"text":"still direct & E2EE!"}"#)?, None)?;
     sim.publish("p-carol", "chat", parse_json(r#"{"text":"bob is gone, mesh alive"}"#)?, None)?;
     sim.drain()?;
     assert_eq!(sim.node("p-alice")?.log().len(), 7);
     assert_eq!(sim.node("p-carol")?.log().len(), 7);
 
-    // Now Alice (original creator!) leaves too; only Carol remains!
+    // Alice (original creator) leaves too; Dave joins Carol and recovers all 7 encrypted records
     sim.remove_node("p-alice")?;
-    assert_eq!(sim.node("p-carol")?.log().len(), 7);
-
-    // New peer Dave joins Carol (the sole survivor) -> receives all 7 messages including Alice's genesis history!
     sim.add_node("p-dave", "Dave", MeshConfig::default());
     sim.connect("p-carol", "p-dave", false, None)?;
     sim.drain()?;
     sim.assert_all_converged(7)?;
 
-    // Verify Alice's original genesis messages survived on Dave after both Alice & Bob left!
     let genesis_count = sim
         .node("p-dave")?
         .log()
@@ -558,14 +682,13 @@ fn sim_relayed_auto_mesh_introduction_and_log_survival_through_churn() -> TestRe
 }
 
 #[test]
-fn sim_four_node_chain_auto_meshes_into_full_clique() -> TestResult {
+fn sim_four_node_chain_auto_meshes_into_full_e2ee_clique() -> TestResult {
     let mut sim = SimNetwork::new(10_000);
     let ids = ["peer-1", "peer-2", "peer-3", "peer-4"];
     for id in ids {
         sim.add_node(id, id, MeshConfig::default());
     }
 
-    // Initial chain: peer-1 -- peer-2 -- peer-3 -- peer-4
     sim.connect("peer-1", "peer-2", false, None)?;
     sim.drain()?;
     sim.connect("peer-2", "peer-3", false, None)?;
@@ -573,18 +696,12 @@ fn sim_four_node_chain_auto_meshes_into_full_clique() -> TestResult {
     sim.connect("peer-3", "peer-4", false, None)?;
     sim.drain()?;
 
-    // Every node should end up directly connected to all 3 other nodes (full K4 mesh!)
     for id in ids {
         let peers = sim.node(id)?.connected_peer_ids();
-        assert_eq!(
-            peers.len(),
-            3,
-            "expected full mesh (3 direct peers) on {id}, got {:?}",
-            peers
-        );
+        assert_eq!(peers.len(), 3, "expected 3 direct E2EE peers on {id}");
+        assert_eq!(sim.node(id)?.stats().e2ee_auth_failures, 0);
     }
 
-    // Publish from each node and confirm convergence
     for id in ids {
         sim.publish(id, "clique", parse_json(&format!(r#"{{"by":"{id}"}}"#))?, None)?;
     }
@@ -608,7 +725,6 @@ fn sim_local_wipe_and_one_sided_sync_recovery() -> TestResult {
     sim.drain()?;
     sim.assert_all_converged(12)?;
 
-    // Bob wipes local log and requests one-sided anti-entropy sync -> Alice backfills everything!
     sim.node_mut("peer-b")?.reset_local_log();
     assert_eq!(sim.node("peer-b")?.log().len(), 0);
     sim.request_sync("peer-b")?;

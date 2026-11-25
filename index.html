@@ -32,7 +32,7 @@
           <div class="brand-titles">
             <h1>p2p-direct</h1>
             <div class="brand-subtitle">
-              Serverless WebRTC Mesh · Safe Rust WASM (0 unsafe, 0 unwrap)
+              E2EE WebRTC Mesh · Safe Rust WASM (X25519 + ChaCha20-Poly1305)
             </div>
           </div>
         </div>
@@ -41,6 +41,9 @@
           <div class="name-field">
             <label for="author-name-input">Name</label>
             <input id="author-name-input" type="text" maxlength="32" autocomplete="off" />
+          </div>
+          <div class="stat-chip live" id="e2ee-fp-chip" title="End-to-End Encryption Key Fingerprint (X25519 + ChaCha20-Poly1305)">
+            E2EE <strong id="key-fp-display">…</strong>
           </div>
           <div class="stat-chip" title="Local Peer ID">
             ID <strong id="peer-id-display">loading…</strong>
@@ -64,9 +67,35 @@
           <section class="panel" aria-labelledby="connect-panel-title">
             <div class="panel-header">
               <h2 class="panel-title" id="connect-panel-title">Out-of-Band WebRTC Handshake</h2>
-              <span class="panel-meta">P2P1 · deflate</span>
+              <span class="panel-meta">P2P1 · E2EE</span>
             </div>
             <div class="panel-body">
+              <div class="e2ee-bar">
+                <div class="e2ee-bar-head">
+                  <span>E2EE Key</span>
+                  <span id="e2ee-mode-label">Auto 256-bit Key</span>
+                </div>
+                <div class="e2ee-bar-row">
+                  <input
+                    id="e2ee-passphrase-input"
+                    class="text-input"
+                    type="password"
+                    placeholder="Optional shared passphrase (encrypts P2P1 codes too)…"
+                    autocomplete="off"
+                  />
+                  <button type="button" id="btn-apply-passphrase" class="btn btn-sm btn-primary">
+                    Set
+                  </button>
+                  <button type="button" id="btn-clear-passphrase" class="btn btn-sm">
+                    Auto
+                  </button>
+                </div>
+                <p class="e2ee-bar-hint" id="e2ee-bar-hint">
+                  Every wire frame, relayed SDP/ICE signal, and IndexedDB log record is sealed with
+                  X25519 + ChaCha20-Poly1305 AEAD.
+                </p>
+              </div>
+
               <div class="tabs" role="tablist">
                 <button
                   type="button"
@@ -194,7 +223,7 @@
                 ></svg>
                 <div class="topology-legend">
                   <div class="legend-items">
-                    <span><i class="legend-dot" style="background: #0f766e"></i>Direct</span>
+                    <span><i class="legend-dot" style="background: #0f766e"></i>Direct E2EE</span>
                     <span><i class="legend-dot" style="background: #b45309"></i>Auto-meshing</span>
                   </div>
                   <span id="profile-slot-label">profile: default</span>
@@ -221,10 +250,14 @@
           <section class="panel" aria-labelledby="telemetry-panel-title">
             <div class="panel-header">
               <h2 class="panel-title" id="telemetry-panel-title">Protocol Telemetry</h2>
-              <span class="panel-meta">sync-inv · gossip</span>
+              <span class="panel-meta">e2ee · sync · gossip</span>
             </div>
             <div class="panel-body">
               <div class="telemetry-stats">
+                <div class="metric-tile">
+                  <span class="metric-label">E2EE Enc / Dec</span>
+                  <span class="metric-value" id="stat-e2ee">0 / 0</span>
+                </div>
                 <div class="metric-tile">
                   <span class="metric-label">Sync Batches</span>
                   <span class="metric-value" id="stat-batches">0 / 0</span>
@@ -233,13 +266,9 @@
                   <span class="metric-label">Gossip Fwd/Drop</span>
                   <span class="metric-value" id="stat-gossip">0 / 0</span>
                 </div>
-                <div class="metric-tile">
-                  <span class="metric-label">Auto-Mesh Intros</span>
-                  <span class="metric-value" id="stat-intros">0</span>
-                </div>
               </div>
               <div id="telemetry-log" class="telemetry-log">
-                <div class="telemetry-entry">Initializing safe Rust WebAssembly core…</div>
+                <div class="telemetry-entry">Initializing safe Rust WebAssembly E2EE core…</div>
               </div>
             </div>
           </section>
@@ -255,6 +284,7 @@
               </h2>
               <div class="btn-row" style="margin-top: 0">
                 <button type="button" id="btn-toggle-raw" class="btn btn-sm">Raw JSON</button>
+                <button type="button" id="btn-export-encrypted" class="btn btn-sm">Encrypted Backup</button>
                 <button type="button" id="btn-export-log" class="btn btn-sm">Export JSON</button>
                 <button
                   type="button"

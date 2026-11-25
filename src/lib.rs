@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::panic))]
 
 pub mod codec;
+pub mod crypto;
 pub mod deflate;
 pub mod json;
 pub mod log;

@@ -1,5 +1,10 @@
 import { SafeRustWasmMesh } from "./wasm_client.js";
-import { acquireProfileSlot, loadProfileState, saveProfileState } from "./storage.js";
+import {
+  acquireProfileSlot,
+  loadProfileState,
+  randomBase64Url,
+  saveProfileState,
+} from "./storage.js";
 
 const ICE_CONFIG = {
   iceServers: [
@@ -15,15 +20,15 @@ const STRUCTURED_PRESETS = {
   },
   task: {
     type: "task",
-    payload: { id: "task-1", title: "Verify P2P backfill", status: "open", priority: 2 },
+    payload: { id: "task-1", title: "Verify E2EE P2P backfill", status: "open", priority: 2 },
   },
   metric: {
     type: "metric",
-    payload: { name: "mesh_latency_ms", value: 14.2, unit: "ms", tags: ["webrtc", "wasm"] },
+    payload: { name: "mesh_latency_ms", value: 14.2, unit: "ms", tags: ["webrtc", "e2ee", "wasm"] },
   },
   state: {
     type: "state",
-    payload: { key: "config.mode", value: "active", updatedBy: "peer" },
+    payload: { key: "config.mode", value: "encrypted", updatedBy: "peer" },
   },
 };
 
@@ -51,7 +56,12 @@ function escapeHtml(str) {
 function formatTime(tsMs) {
   try {
     const d = new Date(tsMs);
-    return d.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    return d.toLocaleTimeString([], {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
   } catch {
     return String(tsMs);
   }
@@ -86,7 +96,6 @@ function waitForIceGathering(pc, maxWaitMs = 2000) {
       if (!ev.candidate) {
         finish();
       } else if (!candidateTimer) {
-        // Once local host candidate is ready, wait briefly for srflx before completing
         candidateTimer = setTimeout(finish, 900);
       }
     };
@@ -108,15 +117,15 @@ class P2PDirectApp {
     this.toastTimer = null;
 
     // Out-of-band manual signaling state
-    this.pendingOffers = new Map(); // inviteId -> { inviteId, pc, dc, code, url }
-    this.pendingAnswers = new Map(); // remotePeerId -> { pc, dc, code, url }
+    this.pendingOffers = new Map();
+    this.pendingAnswers = new Map();
     this.latestOffer = null;
     this.latestAnswer = null;
 
     // Live WebRTC transport maps
-    this.directPeers = new Map(); // peerId -> { peerId, authorName, pc, dc, viaAutoMesh, introducedBy }
-    this.relayPeers = new Map(); // peerId -> { peerId, authorName, viaPeerId, pc, dc, remoteDescSet, sdpSent, localIceQueue, pendingIce }
-    this.earlyRelayIce = new Map(); // peerId -> Array<RTCIceCandidateInit>
+    this.directPeers = new Map();
+    this.relayPeers = new Map();
+    this.earlyRelayIce = new Map();
 
     this.el = {};
   }
@@ -124,12 +133,18 @@ class P2PDirectApp {
   bindElements() {
     const ids = [
       "author-name-input",
+      "key-fp-display",
       "peer-id-display",
       "lamport-display",
       "mesh-status-chip",
       "mesh-status-dot",
       "peer-count-display",
       "log-count-display",
+      "e2ee-mode-label",
+      "e2ee-passphrase-input",
+      "btn-apply-passphrase",
+      "btn-clear-passphrase",
+      "e2ee-bar-hint",
       "tab-btn-invite",
       "tab-btn-join",
       "tab-pane-invite",
@@ -155,11 +170,12 @@ class P2PDirectApp {
       "auto-mesh-toggle",
       "auto-mesh-badge",
       "peer-list",
+      "stat-e2ee",
       "stat-batches",
       "stat-gossip",
-      "stat-intros",
       "telemetry-log",
       "btn-toggle-raw",
+      "btn-export-encrypted",
       "btn-export-log",
       "btn-clear-local-log",
       "log-search-input",
@@ -184,6 +200,15 @@ class P2PDirectApp {
   bindEvents() {
     this.el["tab-btn-invite"].addEventListener("click", () => this.switchConnectTab("invite"));
     this.el["tab-btn-join"].addEventListener("click", () => this.switchConnectTab("join"));
+
+    this.el["btn-apply-passphrase"].addEventListener("click", () => this.applyPassphrase());
+    this.el["btn-clear-passphrase"].addEventListener("click", () => this.clearPassphrase());
+    this.el["e2ee-passphrase-input"].addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        this.applyPassphrase();
+      }
+    });
 
     this.el["btn-create-invite"].addEventListener("click", () => this.createManualInvite());
     this.el["btn-copy-offer-code"].addEventListener("click", () => {
@@ -235,7 +260,7 @@ class P2PDirectApp {
       const res = this.wasm.call({ cmd: "request_sync" });
       this.status = res.status;
       this.executeActions(res.actions);
-      this.addTelemetry("sync_inv", `Triggered anti-entropy sync-inv across ${this.directPeers.size} peer(s)`);
+      this.addTelemetry("sync_inv", `Triggered E2EE anti-entropy sync across ${this.directPeers.size} peer(s)`);
       this.renderAll();
     });
 
@@ -286,7 +311,8 @@ class P2PDirectApp {
       this.renderLog();
     });
 
-    this.el["btn-export-log"].addEventListener("click", () => this.exportLogFile());
+    this.el["btn-export-encrypted"].addEventListener("click", () => this.exportEncryptedBackup());
+    this.el["btn-export-log"].addEventListener("click", () => this.exportDecryptedLog());
     this.el["btn-clear-local-log"].addEventListener("click", () => this.wipeLocalLog());
 
     this.el["log-search-input"].addEventListener("input", () => this.renderLog());
@@ -317,7 +343,7 @@ class P2PDirectApp {
     this.profile = await loadProfileState(slot);
 
     this.wasm = await SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm");
-    this.addTelemetry("wasm", "Loaded safe Rust WebAssembly engine (0 unsafe, 0 unwrap)");
+    this.addTelemetry("wasm", "Loaded safe Rust WASM E2EE engine (X25519 + ChaCha20-Poly1305)");
 
     const initRes = this.wasm.call({
       cmd: "init",
@@ -325,14 +351,27 @@ class P2PDirectApp {
       authorName: this.profile.authorName,
       room: this.profile.room || "mesh-main",
       autoMeshEnabled: this.profile.autoMeshEnabled !== false,
+      x25519Secret: this.profile.x25519Secret,
+      meshKey: this.profile.meshKey,
+      passphraseMode: Boolean(this.profile.passphraseMode),
+      entropy: randomBase64Url(32),
     });
     this.status = initRes.status;
 
-    if (this.profile.snapshot && Array.isArray(this.profile.snapshot.messages) && this.profile.snapshot.messages.length > 0) {
-      const imp = this.wasm.call({ cmd: "import_snapshot", snapshot: this.profile.snapshot });
-      this.status = imp.status;
-      this.logMessages = imp.log;
-      this.addTelemetry("storage", `Restored ${imp.added} persisted log entry(ies) from IndexedDB`);
+    const snap = this.profile.snapshot;
+    const hasRecords = snap && ((Array.isArray(snap.records) && snap.records.length > 0) || (Array.isArray(snap.messages) && snap.messages.length > 0));
+    if (hasRecords) {
+      try {
+        const imp = this.wasm.call({ cmd: "import_snapshot", snapshot: snap });
+        this.status = imp.status;
+        this.logMessages = imp.log;
+        this.addTelemetry("e2ee", `Authenticated & decrypted ${imp.added} persisted log record(s)`);
+      } catch (err) {
+        this.addTelemetry("error", `Stored snapshot could not be decrypted: ${err.message}`);
+        const state = this.wasm.call({ cmd: "get_state" });
+        this.status = state.status;
+        this.logMessages = state.log;
+      }
     } else {
       const state = this.wasm.call({ cmd: "get_state" });
       this.status = state.status;
@@ -345,10 +384,8 @@ class P2PDirectApp {
 
     this.renderAll();
 
-    // Handle any #offer= or #answer= fragment present in the initial URL
     await this.handleUrlHashFragment();
 
-    // Periodic anti-entropy + stale auto-mesh cleanup heartbeat
     setInterval(() => {
       if (!this.wasm) return;
       const runSync = this.directPeers.size > 0;
@@ -359,6 +396,54 @@ class P2PDirectApp {
     }, 15_000);
 
     window.__p2pDirect = this;
+  }
+
+  applyPassphrase() {
+    const pass = this.el["e2ee-passphrase-input"].value;
+    if (!pass) {
+      this.showToast("Enter a passphrase first, or click Auto for an automatic 256-bit key.");
+      return;
+    }
+    try {
+      const res = this.wasm.call({
+        cmd: "set_passphrase",
+        passphrase: pass,
+        entropy: randomBase64Url(32),
+      });
+      this.status = res.status;
+      this.profile.meshKey = res.meshKey;
+      this.profile.passphraseMode = true;
+      this.flushPersist();
+      this.renderAll();
+      this.addTelemetry(
+        "e2ee",
+        `Derived 256-bit key via PBKDF2-HMAC-SHA256 (${this.status.e2ee.keyFingerprint}); P2P1 codes are now passphrase-encrypted`
+      );
+      this.showToast(`Passphrase E2EE active · FP ${this.status.e2ee.keyFingerprint}`);
+    } catch (err) {
+      this.addTelemetry("error", `Passphrase error: ${err.message}`);
+    }
+  }
+
+  clearPassphrase() {
+    const freshKey = randomBase64Url(32);
+    const res = this.wasm.call({
+      cmd: "set_passphrase",
+      passphrase: "",
+      meshKey: freshKey,
+      entropy: randomBase64Url(32),
+    });
+    this.el["e2ee-passphrase-input"].value = "";
+    this.status = res.status;
+    this.profile.meshKey = res.meshKey;
+    this.profile.passphraseMode = false;
+    this.flushPersist();
+    this.renderAll();
+    this.addTelemetry(
+      "e2ee",
+      `Switched to automatic 256-bit mesh key (${this.status.e2ee.keyFingerprint})`
+    );
+    this.showToast(`Auto 256-bit E2EE active · FP ${this.status.e2ee.keyFingerprint}`);
   }
 
   switchConnectTab(tab) {
@@ -441,6 +526,7 @@ class P2PDirectApp {
       this.profile.snapshot = exp.snapshot;
       this.profile.authorName = this.status.authorName;
       this.profile.autoMeshEnabled = this.status.autoMeshEnabled;
+      this.profile.passphraseMode = Boolean(this.status.e2ee?.passphraseMode);
       saveProfileState(this.profile);
     } catch {
       // ignore persistence error
@@ -454,6 +540,7 @@ class P2PDirectApp {
         type: msgType,
         payload,
         ts: Date.now(),
+        entropy: randomBase64Url(16),
       });
       this.status = res.status;
       this.executeActions(res.actions);
@@ -476,13 +563,25 @@ class P2PDirectApp {
     this.status = res.status;
     this.logMessages = res.log;
     this.flushPersist();
-    this.addTelemetry("storage", "Cleared local log; click Sync Now or reconnect to backfill from peers");
+    this.addTelemetry("storage", "Cleared local encrypted log; click Sync Now to backfill from peers");
     this.renderAll();
-    this.showToast("Local log cleared (surviving peers still hold history)");
+    this.showToast("Local log cleared (surviving peers still hold encrypted history)");
   }
 
-  exportLogFile() {
+  exportEncryptedBackup() {
     const exp = this.wasm.call({ cmd: "export_snapshot" });
+    const blob = new Blob([JSON.stringify(exp.snapshot, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `p2p-direct-e2ee-backup-${this.status.peerId}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    this.showToast(`Exported ${exp.snapshot.records.length} ChaCha20-Poly1305 encrypted record(s)`);
+  }
+
+  exportDecryptedLog() {
+    const exp = this.wasm.call({ cmd: "export_decrypted" });
     const blob = new Blob([JSON.stringify(exp.snapshot, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -490,7 +589,7 @@ class P2PDirectApp {
     a.download = `p2p-direct-log-${this.status.peerId}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    this.showToast(`Exported ${this.logMessages.length} log entries`);
+    this.showToast(`Exported ${this.logMessages.length} decrypted log entries`);
   }
 
   async handleUrlHashFragment() {
@@ -521,7 +620,7 @@ class P2PDirectApp {
     }
   }
 
-  /* ================= Manual Out-of-Band P2P1 Handshake ================= */
+  /* ================= Manual Out-of-Band E2EE P2P1 Handshake ================= */
 
   async createManualInvite() {
     this.el["btn-create-invite"].disabled = true;
@@ -534,8 +633,6 @@ class P2PDirectApp {
         inviteId,
         pc,
         dc,
-        remotePeerId: null,
-        remoteName: "Peer",
         code: "",
         url: "",
       };
@@ -551,6 +648,7 @@ class P2PDirectApp {
         inviteId,
         sdp: pc.localDescription.sdp,
         baseUrl: basePageUrl(),
+        entropy: randomBase64Url(16),
       });
 
       pending.code = encoded.code;
@@ -558,15 +656,20 @@ class P2PDirectApp {
       this.latestOffer = pending;
 
       this.el["offer-code-output"].value = encoded.code;
-      this.el["offer-size-meta"].textContent = `${encoded.rawBytes}B SDP → ${encoded.codeChars} chars`;
+      this.el["offer-size-meta"].textContent = `${encoded.rawBytes}B SDP → ${encoded.codeChars} chars${encoded.encrypted ? " · AEAD" : ""}`;
       this.el["btn-copy-offer-code"].disabled = false;
       this.el["btn-copy-offer-url"].disabled = false;
       this.showNotice(
         "invite-notice",
         "success",
-        `Invite ready (${inviteId}). Share the P2P1: code or #offer= link, then paste the peer's reply below.`
+        encoded.encrypted
+          ? `Passphrase-encrypted invite ready (${inviteId}). Peer must enter the same passphrase to decrypt.`
+          : `E2EE invite ready (${inviteId}, FP ${this.status.e2ee.keyFingerprint}). Share the P2P1: code or #offer= link.`
       );
-      this.addTelemetry("signal", `Generated P2P1 offer ${inviteId} (${encoded.codeChars} chars)`);
+      this.addTelemetry(
+        "signal",
+        `Generated ${encoded.encrypted ? "passphrase-encrypted " : ""}P2P1 offer ${inviteId} (${encoded.codeChars} chars)`
+      );
     } catch (err) {
       this.showNotice("invite-notice", "error", `Failed to create invite: ${err.message}`);
     } finally {
@@ -583,7 +686,12 @@ class P2PDirectApp {
     this.el["btn-create-answer"].disabled = true;
     this.showNotice("join-notice", "info", "Decoding P2P1 offer and gathering ICE candidates…");
     try {
-      const decoded = this.wasm.call({ cmd: "decode_signal", input: trimmed });
+      const passInput = this.el["e2ee-passphrase-input"].value;
+      const decoded = this.wasm.call({
+        cmd: "decode_signal",
+        input: trimmed,
+        passphrase: passInput || undefined,
+      });
       const sig = decoded.signal;
       if (sig.kind !== "offer") {
         throw new Error(`Expected an offer code, got '${sig.kind}'`);
@@ -592,9 +700,39 @@ class P2PDirectApp {
         throw new Error("Cannot connect a node to itself (open a second tab or device).");
       }
 
+      // Adopt inviter's 256-bit mesh key automatically if embedded in out-of-band #offer= fragment
+      if (sig.meshKey && !sig.encrypted) {
+        const keyRes = this.wasm.call({
+          cmd: "set_mesh_key",
+          meshKey: sig.meshKey,
+          passphraseMode: false,
+          entropy: randomBase64Url(16),
+        });
+        this.status = keyRes.status;
+        this.profile.meshKey = sig.meshKey;
+        this.profile.passphraseMode = false;
+        this.schedulePersist();
+        this.renderHeader();
+        this.addTelemetry(
+          "e2ee",
+          `Adopted inviter E2EE mesh key (FP ${this.status.e2ee.keyFingerprint})`
+        );
+      } else if (sig.encrypted && passInput && !this.status.e2ee.passphraseMode) {
+        const passRes = this.wasm.call({
+          cmd: "set_passphrase",
+          passphrase: passInput,
+          entropy: randomBase64Url(16),
+        });
+        this.status = passRes.status;
+        this.profile.meshKey = passRes.meshKey;
+        this.profile.passphraseMode = true;
+        this.schedulePersist();
+        this.renderHeader();
+      }
+
       const pc = new RTCPeerConnection(ICE_CONFIG);
       pc.ondatachannel = (ev) => {
-        this.attachDataChannel(pc, ev.channel, sig.peerId, sig.authorName, false, null);
+        this.attachDataChannel(pc, ev.channel, sig.peerId, sig.authorName, sig.pubKey, false, null);
       };
 
       await pc.setRemoteDescription({ type: "offer", sdp: sig.sdp });
@@ -608,21 +746,22 @@ class P2PDirectApp {
         inviteId: sig.inviteId || "",
         sdp: pc.localDescription.sdp,
         baseUrl: basePageUrl(),
+        entropy: randomBase64Url(16),
       });
 
       this.pendingAnswers.set(sig.peerId, { pc, code: encoded.code, url: encoded.url });
       this.latestAnswer = { code: encoded.code, url: encoded.url, peerId: sig.peerId };
 
       this.el["answer-code-output"].value = encoded.code;
-      this.el["answer-size-meta"].textContent = `${encoded.rawBytes}B SDP → ${encoded.codeChars} chars`;
+      this.el["answer-size-meta"].textContent = `${encoded.rawBytes}B SDP → ${encoded.codeChars} chars${encoded.encrypted ? " · AEAD" : ""}`;
       this.el["btn-copy-answer-code"].disabled = false;
       this.el["btn-copy-answer-url"].disabled = false;
       this.showNotice(
         "join-notice",
         "success",
-        `Reply ready for ${sig.authorName} (${sig.peerId}). Send the P2P1: reply code or #answer= link back to connect.`
+        `E2EE reply ready for ${sig.authorName} (${sig.peerId}, FP ${this.status.e2ee.keyFingerprint}). Send reply back to connect.`
       );
-      this.addTelemetry("signal", `Created P2P1 reply for ${sig.authorName} (${sig.peerId})`);
+      this.addTelemetry("signal", `Created E2EE P2P1 reply for ${sig.authorName} (${sig.peerId})`);
     } catch (err) {
       this.showNotice("join-notice", "error", `Could not accept invite: ${err.message}`);
     } finally {
@@ -638,7 +777,12 @@ class P2PDirectApp {
     }
     this.el["btn-accept-answer"].disabled = true;
     try {
-      const decoded = this.wasm.call({ cmd: "decode_signal", input: trimmed });
+      const passInput = this.el["e2ee-passphrase-input"].value;
+      const decoded = this.wasm.call({
+        cmd: "decode_signal",
+        input: trimmed,
+        passphrase: passInput || undefined,
+      });
       const sig = decoded.signal;
       if (sig.kind !== "answer") {
         throw new Error(`Expected an answer code, got '${sig.kind}'`);
@@ -656,14 +800,14 @@ class P2PDirectApp {
       }
 
       this.pendingOffers.delete(pending.inviteId);
-      this.attachDataChannel(pending.pc, pending.dc, sig.peerId, sig.authorName, false, null);
+      this.attachDataChannel(pending.pc, pending.dc, sig.peerId, sig.authorName, sig.pubKey, false, null);
       await pending.pc.setRemoteDescription({ type: "answer", sdp: sig.sdp });
 
       this.el["answer-code-input"].value = "";
       this.showNotice(
         "invite-notice",
         "info",
-        `Applying reply from ${sig.authorName} (${sig.peerId}) — opening direct WebRTC DataChannel…`
+        `Applying X25519 reply from ${sig.authorName} (${sig.peerId}) — opening E2EE DataChannel…`
       );
       this.addTelemetry("signal", `Applied P2P1 answer from ${sig.authorName} (${sig.peerId})`);
     } catch (err) {
@@ -673,16 +817,15 @@ class P2PDirectApp {
     }
   }
 
-  /* ================= Direct DataChannel & Relayed Auto-Mesh ================= */
+  /* ================= Direct E2EE DataChannel & Relayed Auto-Mesh ================= */
 
-  attachDataChannel(pc, dc, peerId, authorName, viaAutoMesh, introducedBy) {
+  attachDataChannel(pc, dc, peerId, authorName, peerPubKey, viaAutoMesh, introducedBy) {
     let closed = false;
 
     const handleOpen = () => {
       if (closed) return;
       const existing = this.directPeers.get(peerId);
       if (existing && existing.dc && existing.dc.readyState === "open" && existing.dc !== dc) {
-        // Already have an active direct channel to this peer
         try {
           dc.close();
           pc.close();
@@ -693,10 +836,12 @@ class P2PDirectApp {
       }
 
       this.relayPeers.delete(peerId);
+      this.earlyRelayIce.delete(peerId);
       this.pendingAnswers.delete(peerId);
       this.directPeers.set(peerId, {
         peerId,
         authorName: authorName || "Peer",
+        peerPubKey,
         pc,
         dc,
         viaAutoMesh,
@@ -707,6 +852,7 @@ class P2PDirectApp {
         cmd: "peer_connected",
         peerId,
         authorName: authorName || "Peer",
+        peerPubKey,
         viaAutoMesh,
         introducedBy,
       });
@@ -718,13 +864,13 @@ class P2PDirectApp {
         this.showNotice(
           "invite-notice",
           "success",
-          `Direct WebRTC DataChannel open with ${authorName} (${peerId}).`
+          `Direct E2EE WebRTC channel open with ${authorName} (${peerId}).`
         );
       }
       this.showToast(
         viaAutoMesh
-          ? `Auto-meshed directly with ${authorName || peerId}`
-          : `Connected directly to ${authorName || peerId}`
+          ? `Auto-meshed directly (E2EE) with ${authorName || peerId}`
+          : `Connected (E2EE) to ${authorName || peerId}`
       );
     };
 
@@ -795,7 +941,8 @@ class P2PDirectApp {
         this.executeActions(res.actions);
         this.renderAll();
       } catch (err) {
-        this.addTelemetry("error", `Wire frame error from ${peerId}: ${err.message}`);
+        this.addTelemetry("error", `E2EE wire rejection from ${peerId}: ${err.message}`);
+        this.renderStats();
       }
     };
 
@@ -850,11 +997,11 @@ class P2PDirectApp {
           break;
         }
         case "auto_mesh_create_offer": {
-          this.startRelayedOffer(act.targetPeerId, act.targetName, act.viaPeerId);
+          this.startRelayedOffer(act.targetPeerId, act.targetName, act.targetPubKey, act.viaPeerId);
           break;
         }
         case "auto_mesh_accept_offer": {
-          this.acceptRelayedOffer(act.fromPeerId, act.fromName, act.viaPeerId, act.sdp);
+          this.acceptRelayedOffer(act.fromPeerId, act.fromName, act.fromPubKey, act.viaPeerId, act.sdp);
           break;
         }
         case "auto_mesh_apply_answer": {
@@ -896,7 +1043,7 @@ class P2PDirectApp {
     }
   }
 
-  async startRelayedOffer(targetPeerId, targetName, viaPeerId) {
+  async startRelayedOffer(targetPeerId, targetName, targetPubKey, viaPeerId) {
     if (this.directPeers.has(targetPeerId) || this.relayPeers.has(targetPeerId)) {
       return;
     }
@@ -908,6 +1055,7 @@ class P2PDirectApp {
       const entry = {
         peerId: targetPeerId,
         authorName: targetName || "Peer",
+        peerPubKey: targetPubKey,
         viaPeerId,
         pc,
         dc,
@@ -917,7 +1065,7 @@ class P2PDirectApp {
         pendingIce: early,
       };
       this.relayPeers.set(targetPeerId, entry);
-      this.attachDataChannel(pc, dc, targetPeerId, targetName, true, viaPeerId);
+      this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, true, viaPeerId);
 
       pc.onicecandidate = (ev) => {
         if (!ev.candidate) return;
@@ -953,7 +1101,7 @@ class P2PDirectApp {
     }
   }
 
-  async acceptRelayedOffer(fromPeerId, fromName, viaPeerId, sdp) {
+  async acceptRelayedOffer(fromPeerId, fromName, fromPubKey, viaPeerId, sdp) {
     if (this.directPeers.has(fromPeerId)) return;
     const prev = this.relayPeers.get(fromPeerId);
     if (prev) {
@@ -972,6 +1120,7 @@ class P2PDirectApp {
       const entry = {
         peerId: fromPeerId,
         authorName: fromName || "Peer",
+        peerPubKey: fromPubKey,
         viaPeerId,
         pc,
         dc: null,
@@ -984,7 +1133,7 @@ class P2PDirectApp {
 
       pc.ondatachannel = (ev) => {
         entry.dc = ev.channel;
-        this.attachDataChannel(pc, ev.channel, fromPeerId, fromName, true, viaPeerId);
+        this.attachDataChannel(pc, ev.channel, fromPeerId, fromName, fromPubKey, true, viaPeerId);
       };
 
       pc.onicecandidate = (ev) => {
@@ -1097,6 +1246,15 @@ class P2PDirectApp {
     this.el["log-count-display"].textContent = String(this.status.logCount);
     this.el["next-lamport-preview"].textContent = `next lamport: ${this.status.lamport + 1}`;
 
+    if (this.status.e2ee) {
+      this.el["key-fp-display"].textContent = this.status.e2ee.keyFingerprint.slice(0, 9);
+      this.el["key-fp-display"].parentElement.title =
+        `E2EE ${this.status.e2ee.cipher} · Full Key Fingerprint: ${this.status.e2ee.keyFingerprint}`;
+      this.el["e2ee-mode-label"].textContent = this.status.e2ee.passphraseMode
+        ? `Passphrase-Locked · ${this.status.e2ee.keyFingerprint.slice(0, 9)}`
+        : `Auto 256-bit Key · ${this.status.e2ee.keyFingerprint.slice(0, 9)}`;
+    }
+
     const isOnline = this.status.peers.length > 0;
     this.el["mesh-status-chip"].classList.toggle("live", isOnline);
     this.el["mesh-status-dot"].classList.toggle("online", isOnline);
@@ -1105,9 +1263,9 @@ class P2PDirectApp {
   renderStats() {
     if (!this.status?.stats) return;
     const s = this.status.stats;
+    this.el["stat-e2ee"].textContent = `${s.e2eeFramesEncrypted} / ${s.e2eeFramesDecrypted}`;
     this.el["stat-batches"].textContent = `${s.syncBatchesSent} / ${s.syncBatchesReceived}`;
     this.el["stat-gossip"].textContent = `${s.gossipForwards} / ${s.gossipDuplicatesDropped}`;
-    this.el["stat-intros"].textContent = String(s.autoMeshIntrosSent + s.relaySignalsForwarded);
   }
 
   renderPeers() {
@@ -1131,7 +1289,7 @@ class P2PDirectApp {
         <li class="peer-item" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
             <div class="peer-name">${escapeHtml(p.authorName)} ${originBadge}</div>
-            <div class="peer-id">${escapeHtml(p.peerId)} · synced ${p.knownCount}</div>
+            <div class="peer-id">${escapeHtml(p.peerId)} · safety ${escapeHtml(p.safetyCode || "—")} · synced ${p.knownCount}</div>
           </div>
           <button type="button" class="btn btn-sm btn-danger" data-disconnect="${escapeHtml(p.peerId)}">Drop</button>
         </li>
@@ -1142,7 +1300,7 @@ class P2PDirectApp {
       parts.push(`
         <li class="peer-item">
           <div class="peer-main">
-            <div class="peer-name">${escapeHtml(pend.authorName)} <span class="badge pending">connecting via ${escapeHtml(pend.viaPeerId)}</span></div>
+            <div class="peer-name">${escapeHtml(pend.authorName)} <span class="badge pending">E2EE relay via ${escapeHtml(pend.viaPeerId)}</span></div>
             <div class="peer-id">${escapeHtml(pend.peerId)}</div>
           </div>
         </li>
@@ -1184,7 +1342,6 @@ class P2PDirectApp {
       }
     }
 
-    // Place nodes around a clean ring (or center + orbit)
     const cx = 170;
     const cy = 85;
     const rx = 112;
@@ -1260,7 +1417,7 @@ class P2PDirectApp {
     box.innerHTML = this.telemetry
       .map((item) => {
         let cls = "telemetry-entry";
-        if (item.event.startsWith("auto_mesh") || item.event === "peer_connected") {
+        if (item.event.startsWith("auto_mesh") || item.event === "peer_connected" || item.event === "e2ee") {
           cls += " event-auto";
         } else if (item.event.startsWith("sync") || item.event === "hello") {
           cls += " event-sync";
@@ -1300,7 +1457,7 @@ class P2PDirectApp {
     if (filtered.length === 0) {
       feed.innerHTML =
         this.logMessages.length === 0
-          ? '<div class="empty-state">Replicated log is empty. Publish a message below — it persists locally in IndexedDB and automatically backfills to any joining or reconnecting peer as long as at least one peer remains in the network.</div>'
+          ? '<div class="empty-state">Replicated log is empty. Publish a message below — every entry is AEAD-encrypted with ChaCha20-Poly1305 in IndexedDB and on the wire, staying alive as long as at least one peer remains in the network.</div>'
           : '<div class="empty-state">No log entries match your current filter.</div>';
       return;
     }

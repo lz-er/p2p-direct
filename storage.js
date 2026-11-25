@@ -1,7 +1,7 @@
-const DB_NAME = "p2p_direct_mesh_v1";
+const DB_NAME = "p2p_direct_mesh_v2";
 const STORE_NAME = "profiles";
 const DB_VERSION = 1;
-const LS_PREFIX = "p2p_direct_profile_v1:";
+const LS_PREFIX = "p2p_direct_profile_v2:";
 
 const DEFAULT_NAMES = [
   "Alpha",
@@ -14,8 +14,8 @@ const DEFAULT_NAMES = [
   "Hotel",
 ];
 
-function randomHex(bytesLen) {
-  const arr = new Uint8Array(bytesLen);
+function randomBytes(len) {
+  const arr = new Uint8Array(len);
   if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
     crypto.getRandomValues(arr);
   } else {
@@ -23,13 +23,26 @@ function randomHex(bytesLen) {
       arr[i] = Math.floor(Math.random() * 256);
     }
   }
-  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+  return arr;
+}
+
+function randomHex(bytesLen) {
+  return Array.from(randomBytes(bytesLen), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function randomBase64Url(bytesLen = 32) {
+  const bytes = randomBytes(bytesLen);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
 /**
  * Acquires a stable profile slot for this browser tab:
  * - Honors `?profile=<slot>` query param if explicitly provided.
- * - Reuses `sessionStorage` slot on page reloads so the same tab keeps its identity & log.
+ * - Reuses `sessionStorage` slot on page reloads so the same tab keeps its identity & encrypted log.
  * - Uses Web Locks (`navigator.locks`) so a single tab reopens `"default"` across browser restarts,
  *   while multiple simultaneously open tabs automatically get distinct slots (`peer-2`, `peer-3`, ...).
  */
@@ -96,7 +109,6 @@ function tryAcquireLock(slot) {
             return;
           }
           resolve(true);
-          // Keep lock held for the lifetime of this tab
           return new Promise(() => {});
         })
         .catch(() => resolve(false));
@@ -158,13 +170,28 @@ export function createDefaultProfile(slot) {
     authorName: baseName,
     room: "mesh-main",
     autoMeshEnabled: true,
-    snapshot: { version: 1, lamport: 0, messages: [] },
+    x25519Secret: randomBase64Url(32),
+    meshKey: randomBase64Url(32),
+    passphraseMode: false,
+    snapshot: { version: 2, e2ee: "chacha20-poly1305", lamport: 0, records: [] },
     updatedAt: Date.now(),
   };
 }
 
+function ensureCryptoFields(record) {
+  if (!record.x25519Secret) {
+    record.x25519Secret = randomBase64Url(32);
+  }
+  if (!record.meshKey) {
+    record.meshKey = randomBase64Url(32);
+  }
+  if (typeof record.passphraseMode !== "boolean") {
+    record.passphraseMode = false;
+  }
+  return record;
+}
+
 export async function loadProfileState(slot) {
-  // Prefer IndexedDB for large replicated logs; fallback to localStorage
   try {
     const db = await openDb();
     const record = await new Promise((resolve, reject) => {
@@ -176,7 +203,7 @@ export async function loadProfileState(slot) {
     });
     db.close();
     if (record && record.peerId) {
-      return record;
+      return ensureCryptoFields(record);
     }
   } catch {
     // Fallback to localStorage below
@@ -187,7 +214,7 @@ export async function loadProfileState(slot) {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && parsed.peerId) {
-        return parsed;
+        return ensureCryptoFields(parsed);
       }
     }
   } catch {
@@ -224,6 +251,6 @@ export async function saveProfileState(profile) {
       localStorage.setItem(`${LS_PREFIX}${record.slot}`, serialized);
     }
   } catch {
-    // Ignore localStorage quota exceeded when IndexedDB holds the full log
+    // Ignore localStorage quota exceeded when IndexedDB holds the full encrypted log
   }
 }

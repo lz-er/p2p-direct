@@ -1,18 +1,117 @@
 use std::fmt::Write as _;
 
+use crate::crypto::{
+    KEY_LEN, NONCE_LEN, aead_open, aead_seal, parse_fixed_12, parse_fixed_32,
+};
+use crate::deflate::{base64url_decode, base64url_encode};
 use crate::json::{JsonValue, parse_json, write_json_string, write_json_value};
-use crate::log::LogMessage;
+use crate::log::SealedLogRecord;
 
 pub const DEFAULT_GOSSIP_TTL: u32 = 16;
 pub const DEFAULT_RELAY_TTL: u32 = 8;
 pub const DEFAULT_INV_CHUNK_IDS: usize = 200;
-pub const DEFAULT_BATCH_MAX_MSGS: usize = 20;
-pub const DEFAULT_BATCH_MAX_BYTES: usize = 12_000;
+pub const DEFAULT_BATCH_MAX_MSGS: usize = 16;
+pub const DEFAULT_BATCH_MAX_BYTES: usize = 11_000;
+
+/// Outer ChaCha20-Poly1305 AEAD envelope wrapping EVERY frame sent over WebRTC DataChannels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedWireEnvelope {
+    pub version: u64,
+    pub seq: u64,
+    pub nonce: [u8; NONCE_LEN],
+    pub ciphertext: Vec<u8>,
+}
+
+impl EncryptedWireEnvelope {
+    fn aad_bytes(sender_id: &str, receiver_id: &str, seq: u64) -> Vec<u8> {
+        format!("p2p-wire-v1|{sender_id}->{receiver_id}|{seq}").into_bytes()
+    }
+
+    pub fn seal(
+        tx_key: &[u8; KEY_LEN],
+        seq: u64,
+        nonce: [u8; NONCE_LEN],
+        sender_id: &str,
+        receiver_id: &str,
+        plaintext_frame: &str,
+    ) -> Self {
+        let aad = Self::aad_bytes(sender_id, receiver_id, seq);
+        let ciphertext = aead_seal(tx_key, &nonce, &aad, plaintext_frame.as_bytes());
+        Self {
+            version: 1,
+            seq,
+            nonce,
+            ciphertext,
+        }
+    }
+
+    pub fn open(
+        &self,
+        rx_key: &[u8; KEY_LEN],
+        sender_id: &str,
+        receiver_id: &str,
+    ) -> Result<String, String> {
+        if self.version != 1 {
+            return Err(format!("unsupported e2ee envelope version {}", self.version));
+        }
+        let aad = Self::aad_bytes(sender_id, receiver_id, self.seq);
+        let plain = aead_open(rx_key, &self.nonce, &aad, &self.ciphertext)?;
+        String::from_utf8(plain)
+            .map_err(|_| "decrypted wire frame is not valid UTF-8".to_owned())
+    }
+
+    pub fn to_json_string(&self) -> String {
+        let mut out = String::with_capacity(self.ciphertext.len() * 2 + 64);
+        let _ = write!(
+            out,
+            "{{\"kind\":\"e2ee\",\"v\":{},\"s\":{},\"n\":",
+            self.version, self.seq
+        );
+        write_json_string(&mut out, &base64url_encode(&self.nonce));
+        out.push_str(",\"c\":");
+        write_json_string(&mut out, &base64url_encode(&self.ciphertext));
+        out.push('}');
+        out
+    }
+
+    pub fn parse_json(raw: &str) -> Result<Self, String> {
+        let val = parse_json(raw)?;
+        let kind = val
+            .get_str("kind")
+            .ok_or_else(|| "wire message missing 'kind' (only encrypted 'e2ee' frames allowed)".to_owned())?;
+        if kind != "e2ee" {
+            return Err(format!(
+                "rejected unencrypted wire frame kind '{kind}' (E2EE required)"
+            ));
+        }
+        let version = val
+            .get_u64("v")
+            .ok_or_else(|| "e2ee envelope missing version 'v'".to_owned())?;
+        let seq = val
+            .get_u64("s")
+            .ok_or_else(|| "e2ee envelope missing sequence 's'".to_owned())?;
+        let nonce_b64 = val
+            .get_str("n")
+            .ok_or_else(|| "e2ee envelope missing nonce 'n'".to_owned())?;
+        let ct_b64 = val
+            .get_str("c")
+            .ok_or_else(|| "e2ee envelope missing ciphertext 'c'".to_owned())?;
+        let nonce = parse_fixed_12(&base64url_decode(nonce_b64)?, "wire nonce")?;
+        let ciphertext = base64url_decode(ct_b64)?;
+        Ok(Self {
+            version,
+            seq,
+            nonce,
+            ciphertext,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSummary {
     pub peer_id: String,
     pub author_name: String,
+    pub pub_key: [u8; KEY_LEN],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,12 +140,59 @@ impl RelaySignalType {
     }
 }
 
+/// Inner payload of a `RelaySignal`, AEAD-encrypted end-to-end between `from` and `to`
+/// so intermediate relay peers cannot read WebRTC SDP or ICE candidates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelaySignalBody {
+    pub signal_type: RelaySignalType,
+    pub sdp: Option<String>,
+    pub candidate: Option<JsonValue>,
+}
+
+impl RelaySignalBody {
+    pub fn to_json_string(&self) -> String {
+        let mut out = String::with_capacity(256);
+        out.push_str("{\"signalType\":");
+        write_json_string(&mut out, self.signal_type.as_str());
+        out.push_str(",\"sdp\":");
+        match &self.sdp {
+            Some(s) => write_json_string(&mut out, s),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"candidate\":");
+        match &self.candidate {
+            Some(c) => write_json_value(&mut out, c),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        out
+    }
+
+    pub fn parse_json(raw: &str) -> Result<Self, String> {
+        let val = parse_json(raw)?;
+        let sig_str = req_str(&val, "signalType")?;
+        let signal_type = RelaySignalType::from_str_kind(&sig_str)
+            .ok_or_else(|| format!("unknown relay signalType '{sig_str}'"))?;
+        let sdp = val.get_str("sdp").map(str::to_owned);
+        let candidate = match val.get("candidate") {
+            Some(JsonValue::Null) | None => None,
+            Some(other) => Some(other.clone()),
+        };
+        Ok(Self {
+            signal_type,
+            sdp,
+            candidate,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireFrame {
     Hello {
         peer_id: String,
         author_name: String,
         room: String,
+        pub_key: [u8; KEY_LEN],
         lamport: u64,
         log_count: usize,
         peers: Vec<PeerSummary>,
@@ -55,7 +201,7 @@ pub enum WireFrame {
         origin: String,
         ttl: u32,
         path: Vec<String>,
-        message: LogMessage,
+        record: SealedLogRecord,
     },
     SyncInv {
         from: String,
@@ -74,23 +220,24 @@ pub enum WireFrame {
         batch_id: String,
         chunk: usize,
         total_chunks: usize,
-        messages: Vec<LogMessage>,
+        records: Vec<SealedLogRecord>,
     },
     MeshIntro {
         via: String,
         peer_id: String,
         author_name: String,
+        pub_key: [u8; KEY_LEN],
     },
     RelaySignal {
         from: String,
         from_name: String,
+        from_pub_key: [u8; KEY_LEN],
         to: String,
         via: String,
         hops: Vec<String>,
         ttl: u32,
-        signal_type: RelaySignalType,
-        sdp: Option<String>,
-        candidate: Option<JsonValue>,
+        sealed_nonce: [u8; NONCE_LEN],
+        sealed_ciphertext: Vec<u8>,
     },
 }
 
@@ -102,6 +249,7 @@ impl WireFrame {
                 peer_id,
                 author_name,
                 room,
+                pub_key,
                 lamport,
                 log_count,
                 peers,
@@ -112,7 +260,12 @@ impl WireFrame {
                 write_json_string(&mut out, author_name);
                 out.push_str(",\"room\":");
                 write_json_string(&mut out, room);
-                let _ = write!(out, ",\"lamport\":{lamport},\"logCount\":{log_count},\"peers\":[");
+                out.push_str(",\"pubKey\":");
+                write_json_string(&mut out, &base64url_encode(pub_key));
+                let _ = write!(
+                    out,
+                    ",\"lamport\":{lamport},\"logCount\":{log_count},\"peers\":["
+                );
                 for (i, p) in peers.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
@@ -121,6 +274,8 @@ impl WireFrame {
                     write_json_string(&mut out, &p.peer_id);
                     out.push_str(",\"authorName\":");
                     write_json_string(&mut out, &p.author_name);
+                    out.push_str(",\"pubKey\":");
+                    write_json_string(&mut out, &base64url_encode(&p.pub_key));
                     out.push('}');
                 }
                 out.push_str("]}");
@@ -129,14 +284,14 @@ impl WireFrame {
                 origin,
                 ttl,
                 path,
-                message,
+                record,
             } => {
                 out.push_str("{\"kind\":\"msg\",\"origin\":");
                 write_json_string(&mut out, origin);
                 let _ = write!(out, ",\"ttl\":{ttl},\"path\":");
                 write_string_array(&mut out, path);
-                out.push_str(",\"message\":");
-                message.write_json(&mut out);
+                out.push_str(",\"record\":");
+                record.write_json(&mut out);
                 out.push('}');
             }
             Self::SyncInv {
@@ -170,7 +325,7 @@ impl WireFrame {
                 batch_id,
                 chunk,
                 total_chunks,
-                messages,
+                records,
             } => {
                 out.push_str("{\"kind\":\"sync-batch\",\"from\":");
                 write_json_string(&mut out, from);
@@ -178,13 +333,13 @@ impl WireFrame {
                 write_json_string(&mut out, batch_id);
                 let _ = write!(
                     out,
-                    ",\"chunk\":{chunk},\"totalChunks\":{total_chunks},\"messages\":["
+                    ",\"chunk\":{chunk},\"totalChunks\":{total_chunks},\"records\":["
                 );
-                for (i, msg) in messages.iter().enumerate() {
+                for (i, rec) in records.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
-                    msg.write_json(&mut out);
+                    rec.write_json(&mut out);
                 }
                 out.push_str("]}");
             }
@@ -192,6 +347,7 @@ impl WireFrame {
                 via,
                 peer_id,
                 author_name,
+                pub_key,
             } => {
                 out.push_str("{\"kind\":\"mesh-intro\",\"via\":");
                 write_json_string(&mut out, via);
@@ -199,41 +355,37 @@ impl WireFrame {
                 write_json_string(&mut out, peer_id);
                 out.push_str(",\"authorName\":");
                 write_json_string(&mut out, author_name);
+                out.push_str(",\"pubKey\":");
+                write_json_string(&mut out, &base64url_encode(pub_key));
                 out.push('}');
             }
             Self::RelaySignal {
                 from,
                 from_name,
+                from_pub_key,
                 to,
                 via,
                 hops,
                 ttl,
-                signal_type,
-                sdp,
-                candidate,
+                sealed_nonce,
+                sealed_ciphertext,
             } => {
                 out.push_str("{\"kind\":\"relay-signal\",\"from\":");
                 write_json_string(&mut out, from);
                 out.push_str(",\"fromName\":");
                 write_json_string(&mut out, from_name);
+                out.push_str(",\"fromPubKey\":");
+                write_json_string(&mut out, &base64url_encode(from_pub_key));
                 out.push_str(",\"to\":");
                 write_json_string(&mut out, to);
                 out.push_str(",\"via\":");
                 write_json_string(&mut out, via);
                 out.push_str(",\"hops\":");
                 write_string_array(&mut out, hops);
-                let _ = write!(out, ",\"ttl\":{ttl},\"signalType\":");
-                write_json_string(&mut out, signal_type.as_str());
-                out.push_str(",\"sdp\":");
-                match sdp {
-                    Some(s) => write_json_string(&mut out, s),
-                    None => out.push_str("null"),
-                }
-                out.push_str(",\"candidate\":");
-                match candidate {
-                    Some(c) => write_json_value(&mut out, c),
-                    None => out.push_str("null"),
-                }
+                let _ = write!(out, ",\"ttl\":{ttl},\"sn\":");
+                write_json_string(&mut out, &base64url_encode(sealed_nonce));
+                out.push_str(",\"sc\":");
+                write_json_string(&mut out, &base64url_encode(sealed_ciphertext));
                 out.push('}');
             }
         }
@@ -250,6 +402,8 @@ impl WireFrame {
                 let peer_id = req_str(&val, "peerId")?;
                 let author_name = val.get_str("authorName").unwrap_or("Peer").to_owned();
                 let room = val.get_str("room").unwrap_or("default").to_owned();
+                let pk_b64 = req_str(&val, "pubKey")?;
+                let pub_key = parse_fixed_32(&base64url_decode(&pk_b64)?, "hello pubKey")?;
                 let lamport = val.get_u64("lamport").unwrap_or(0);
                 let log_count = val.get_u64("logCount").unwrap_or(0) as usize;
                 let mut peers = Vec::new();
@@ -257,6 +411,9 @@ impl WireFrame {
                     for item in arr {
                         if let Some(pid) = item.get_str("peerId")
                             && !pid.trim().is_empty()
+                            && let Some(p_pk_b64) = item.get_str("pubKey")
+                            && let Ok(pk_bytes) = base64url_decode(p_pk_b64)
+                            && let Ok(p_pk) = parse_fixed_32(&pk_bytes, "peer summary pubKey")
                         {
                             peers.push(PeerSummary {
                                 peer_id: pid.to_owned(),
@@ -264,6 +421,7 @@ impl WireFrame {
                                     .get_str("authorName")
                                     .unwrap_or("Peer")
                                     .to_owned(),
+                                pub_key: p_pk,
                             });
                         }
                     }
@@ -272,6 +430,7 @@ impl WireFrame {
                     peer_id,
                     author_name,
                     room,
+                    pub_key,
                     lamport,
                     log_count,
                     peers,
@@ -284,15 +443,15 @@ impl WireFrame {
                     .unwrap_or(u64::from(DEFAULT_GOSSIP_TTL))
                     .min(u64::from(u32::MAX)) as u32;
                 let path = parse_string_array(val.get("path"));
-                let msg_val = val
-                    .get("message")
-                    .ok_or_else(|| "msg frame missing 'message' object".to_owned())?;
-                let message = LogMessage::from_json_value(msg_val)?;
+                let rec_val = val
+                    .get("record")
+                    .ok_or_else(|| "msg frame missing 'record' object".to_owned())?;
+                let record = SealedLogRecord::from_json_value(rec_val)?;
                 Ok(Self::Msg {
                     origin,
                     ttl,
                     path,
-                    message,
+                    record,
                 })
             }
             "sync-inv" => {
@@ -322,34 +481,40 @@ impl WireFrame {
                 let chunk = val.get_u64("chunk").unwrap_or(0) as usize;
                 let total_chunks = (val.get_u64("totalChunks").unwrap_or(1) as usize).max(1);
                 let arr = val
-                    .get("messages")
+                    .get("records")
                     .and_then(JsonValue::as_array)
-                    .ok_or_else(|| "sync-batch missing 'messages' array".to_owned())?;
-                let mut messages = Vec::with_capacity(arr.len());
+                    .ok_or_else(|| "sync-batch missing 'records' array".to_owned())?;
+                let mut records = Vec::with_capacity(arr.len());
                 for item in arr {
-                    messages.push(LogMessage::from_json_value(item)?);
+                    records.push(SealedLogRecord::from_json_value(item)?);
                 }
                 Ok(Self::SyncBatch {
                     from,
                     batch_id,
                     chunk,
                     total_chunks,
-                    messages,
+                    records,
                 })
             }
             "mesh-intro" => {
                 let via = req_str(&val, "via")?;
                 let peer_id = req_str(&val, "peerId")?;
                 let author_name = val.get_str("authorName").unwrap_or("Peer").to_owned();
+                let pk_b64 = req_str(&val, "pubKey")?;
+                let pub_key = parse_fixed_32(&base64url_decode(&pk_b64)?, "mesh-intro pubKey")?;
                 Ok(Self::MeshIntro {
                     via,
                     peer_id,
                     author_name,
+                    pub_key,
                 })
             }
             "relay-signal" => {
                 let from = req_str(&val, "from")?;
                 let from_name = val.get_str("fromName").unwrap_or("Peer").to_owned();
+                let pk_b64 = req_str(&val, "fromPubKey")?;
+                let from_pub_key =
+                    parse_fixed_32(&base64url_decode(&pk_b64)?, "relay-signal fromPubKey")?;
                 let to = req_str(&val, "to")?;
                 let via = val.get_str("via").unwrap_or("").to_owned();
                 let hops = parse_string_array(val.get("hops"));
@@ -357,24 +522,21 @@ impl WireFrame {
                     .get_u64("ttl")
                     .unwrap_or(u64::from(DEFAULT_RELAY_TTL))
                     .min(u64::from(u32::MAX)) as u32;
-                let sig_str = req_str(&val, "signalType")?;
-                let signal_type = RelaySignalType::from_str_kind(&sig_str)
-                    .ok_or_else(|| format!("unknown relay signalType '{sig_str}'"))?;
-                let sdp = val.get_str("sdp").map(str::to_owned);
-                let candidate = match val.get("candidate") {
-                    Some(JsonValue::Null) | None => None,
-                    Some(other) => Some(other.clone()),
-                };
+                let sn_b64 = req_str(&val, "sn")?;
+                let sc_b64 = req_str(&val, "sc")?;
+                let sealed_nonce =
+                    parse_fixed_12(&base64url_decode(&sn_b64)?, "relay-signal nonce")?;
+                let sealed_ciphertext = base64url_decode(&sc_b64)?;
                 Ok(Self::RelaySignal {
                     from,
                     from_name,
+                    from_pub_key,
                     to,
                     via,
                     hops,
                     ttl,
-                    signal_type,
-                    sdp,
-                    candidate,
+                    sealed_nonce,
+                    sealed_ciphertext,
                 })
             }
             other => Err(format!("unknown wire frame kind '{other}'")),
@@ -394,31 +556,32 @@ pub fn chunk_inv_ids(ids: &[String], max_ids_per_chunk: usize) -> Vec<Vec<String
     chunks
 }
 
-pub fn chunk_sync_messages(
-    messages: &[LogMessage],
+pub fn chunk_sealed_records(
+    records: &[SealedLogRecord],
     max_msgs_per_chunk: usize,
     max_bytes_per_chunk: usize,
-) -> Vec<Vec<LogMessage>> {
-    if messages.is_empty() {
+) -> Vec<Vec<SealedLogRecord>> {
+    if records.is_empty() {
         return Vec::new();
     }
     let msg_limit = max_msgs_per_chunk.max(1);
     let byte_limit = max_bytes_per_chunk.max(512);
 
-    let mut chunks: Vec<Vec<LogMessage>> = Vec::new();
-    let mut current: Vec<LogMessage> = Vec::new();
-    let mut current_bytes: usize = 128; // JSON envelope overhead
+    let mut chunks: Vec<Vec<SealedLogRecord>> = Vec::new();
+    let mut current: Vec<SealedLogRecord> = Vec::new();
+    let mut current_bytes: usize = 160;
 
-    for msg in messages {
-        let est_size = msg.to_json_string().len() + 2;
+    for rec in records {
+        let est_size = rec.to_json_string().len() + 2;
         let would_overflow_count = current.len() >= msg_limit;
-        let would_overflow_bytes = !current.is_empty() && current_bytes.saturating_add(est_size) > byte_limit;
+        let would_overflow_bytes =
+            !current.is_empty() && current_bytes.saturating_add(est_size) > byte_limit;
         if would_overflow_count || would_overflow_bytes {
             chunks.push(current);
             current = Vec::new();
-            current_bytes = 128;
+            current_bytes = 160;
         }
-        current.push(msg.clone());
+        current.push(rec.clone());
         current_bytes = current_bytes.saturating_add(est_size);
     }
     if !current.is_empty() {
