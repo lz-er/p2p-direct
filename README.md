@@ -18,15 +18,16 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
   - **Opaque Relayed Auto-Mesh Signaling**: Relayed SDP offers, answers, and ICE candidates between peers `A` and `C` are AEAD-encrypted end-to-end with `X25519(A_sk, C_pk) || meshKey` so intermediate relay peer `B` forwards only opaque ciphertext.
   - **Opaque Encrypted Long-Lived Room Rendezvous**: Long-lived `#room=P2P1:...` invite links derive an opaque 32-hex-char rendezvous topic via `HKDF(meshKey, "room-rendezvous-topic")` and ChaCha20-Poly1305 AEAD-encrypt every presence beacon, SDP offer/answer, and ICE candidate (`R1:` envelopes) under `HKDF(meshKey, "room-rendezvous-aead")` inside safe Rust WASM. Stateless public MQTT-over-WSS relays see only random topic hashes and opaque ciphertext, while all chat, images, replicated logs, and voice audio flow strictly peer-to-peer over direct WebRTC DataChannels.
   - **Optional Passphrase-Protected `P2P1:` Invites**: Enter a shared passphrase to derive the 256-bit mesh key via PBKDF2-HMAC-SHA256 and AEAD-encrypt `#room=` / `#offer=` / `#answer=` codes themselves (omitting the mesh key from invite URLs). Or use automatic 256-bit keys carried strictly inside the client-only URL `#fragment` (never sent to HTTP servers) with verifiable key fingerprints and per-peer X25519 safety codes.
-- **Simple Room Mode (Default) & Advanced Toggle**:
-  - Clean default landing screen showing only **Create Room** and **Join Room**. Inside a room, shows only the room bar (**Copy Invite Link** / **Leave Room**), **Voice Channel**, and **Chat** (with image paste/attach and clickable links, no JSON UI clutter).
+- **Flat / Metro Signal Blocks UI — Simple Room Mode (Default) & Advanced Toggle**:
+  - Brandless topbar anchored by a prominent display-name field, sharp `0px`-radius architectural layout with zero drop shadows, self-hosted `Sora` + `Kode Mono` WOFF2 fonts (`fonts/` — zero external CDNs), and Light & Dark themes.
+  - Expanding split-door lobby showing only **Create Room** and **Join Room**. Inside a room, displays only the isolated room ribbon (**Copy Link** / **Leave Room**), **Voice Channel**, and **Chat** with an Inline Badges composer (`URL ↗` + `+ IMG · CTRL+V`, zero JSON clutter).
   - Toggle **Advanced** in the top bar anytime to reveal the full peer-to-peer workbench: 1-to-1 offline manual connect wizard, passphrase key settings, live network topology graph, peer safety codes, structured JSON composer, raw JSON view, search/type filter, backup/export, and diagnostics.
 - **Long-Lived Reusable Room Links (`#room=P2P1:...`)**:
   - Create one reusable room link and share it anywhere. Whoever opens the link first creates/hosts the room, and every future person who opens that same link joins automatically with zero extra steps.
   - Survives creator departure: any remaining peer keeps the room alive in memory and automatically backfills the entire encrypted history to new joiners. Once all users leave, zero data remains on any client and reopening the link starts fresh.
 - **Ephemeral In-Memory Replicated Log, Pasted Images & Clickable Links**:
   - Machine-readable JSON messages with exact fields `(id, type, lamport, ts, author, authorName, payload)`, deterministically ordered by `(lamport, ts, id)`.
-  - Support for pasting (`Ctrl+V` / `Cmd+V`), dragging, or attaching compressed images (with lightbox preview) and auto-detected clickable links with link preview chips, plus Light & Dark Mode.
+  - Support for pasting (`Ctrl+V` / `Cmd+V`), dragging, or attaching compressed images (with lightbox preview) and auto-detected clickable links with link preview slabs, plus Light & Dark Mode.
   - **Zero permanent client storage**: zero `IndexedDB` databases and zero `localStorage` writes (legacy client storage from older versions is automatically purged on load). History stays alive across active peers in memory as long as at least one peer remains, and disappears completely once everyone leaves.
 - **Anti-Entropy Backfill & Loop-Free Multi-Hop Gossip**:
   - Multi-part `sync-inv`, `sync-req`, and count/byte-bounded chunked `sync-batch` backfill deliver all missing historical and new records to joining or reconnecting peers.
@@ -35,7 +36,8 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
   - Offline / relay-free 3-step guided Connect flow: **Invite a Peer** (Step 1 Copy Invite Link → Step 2 Paste Peer's Reply → Step 3 Connected) or **Join with Invite** (Step 1 Paste Invite → Step 2 Copy Reply Link → Step 3 Connected), with automatic step progression on `#offer=` / `#answer=` URL fragments and cross-tab `#answer=` delivery via `BroadcastChannel`.
   - An inline Blob Web Worker sends encrypted `Ping`/`Pong` keepalive frames every 4s (unthrottled in hidden tabs) paired with liveness-aware disconnect timers and foreground resume sync so background tabs stay connected.
 - **Real-Time Multi-Peer E2EE Voice Channel**:
-  - Unified always-visible **Voice Channel** stage that shows active voice participants immediately with avatar cards, live status indicators, and animated audio waveforms — clicking **Join Voice** (or **Listen Only**) simply adds you directly to the participant list with real-time 9-bar reactive waveforms, speaking rings, per-peer mute/volume sliders, and deafen controls.
+  - Full-color flat Metro participant mosaic with oversized monograms, spinning speaker starbursts, and 10-column Bauhaus floor equalizers. Active voice participants appear immediately beside an in-grid **+ Join Voice** (or **Listen Only**) tile that morphs into your own tile upon joining.
+  - Icon-only **Mute** & **Deafen** toggles and a separated **Leave Voice** button live directly inside your own card, with per-hue color muting (**Mute** softens your card's hue; **Deafen** softens everyone else's card hues) plus per-peer mute & volume sliders.
   - Captured via an inline Blob `AudioWorkletProcessor` (with `ScriptProcessorNode` fallback) into 16 kHz mono 20 ms (`320`-sample) PCM frames, encoded inside safe Rust WASM with a stateless **IMA ADPCM** wideband codec (`src/audio.rs`), and sealed per peer into binary `V1` ChaCha20-Poly1305 AEAD packets under domain-separated directional `X25519 + meshKey` voice keys with a 64-slot anti-replay window.
   - Sent over a dedicated unordered, zero-retransmit WebRTC DataChannel (`p2p-voice`, `{ ordered: false, maxRetransmits: 0 }`) with zero SDP renegotiation and mixed simultaneously across all active remote speakers via independent Web Audio `GainNode` playout jitter buffers.
 
@@ -55,7 +57,8 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
 | `src/main.rs` | Safe Rust WASM shared-memory bridge + zero-JSON binary fast-path voice opcodes (`#![forbid(unsafe_code)]`, zero `unsafe`) |
 | `p2p_mesh.wasm` | Compiled release WebAssembly binary for zero-build static hosting |
 | `mqtt_relay.js` | Zero-dependency MQTT 3.1.1 over WebSocket multi-broker client for opaque encrypted room rendezvous (supports custom `?relay=ws(s)://...` override) |
-| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport (`p2p-mesh` + `p2p-voice`), Web Audio multi-speaker voice channel, ephemeral in-memory session lifecycle, Long-Lived Room Links, step-by-step Connect Wizard, Dark/Light mode, image/link chat, topology SVG, and UI |
+| `fonts/` | Self-hosted OFL WOFF2 fonts (`Sora` + `Kode Mono`) for zero-CDN static delivery |
+| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport (`p2p-mesh` + `p2p-voice`), Web Audio multi-speaker voice channel, ephemeral in-memory session lifecycle, Long-Lived Room Links, step-by-step Connect Wizard, Dark/Light mode, image/link chat, topology SVG, and Signal Blocks UI |
 
 ## Running Locally
 

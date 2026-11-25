@@ -84,27 +84,33 @@ const STRUCTURED_PRESETS = {
   },
 };
 
-const AVATAR_PALETTE = [
-  "#0f766e",
-  "#2563eb",
-  "#b45309",
-  "#4f46e5",
-  "#be123c",
-  "#047857",
+const METRO_TILE_THEMES = [
+  "tile-coral",
+  "tile-cobalt",
+  "tile-ochre",
+  "tile-cyan",
 ];
 
-const VOICE_EQ_WEIGHTS = [0.28, 0.52, 0.78, 0.94, 1.0, 0.94, 0.78, 0.52, 0.28];
+const VOICE_EQ_WEIGHTS = [0.32, 0.54, 0.76, 0.92, 1.0, 1.0, 0.92, 0.76, 0.54, 0.32];
 const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 const URL_REGEX = /https?:\/\/[^\s<>"']+/gi;
 const MAX_IMAGES_PER_MESSAGE = 3;
 const MAX_TOTAL_IMAGE_DATA_CHARS = 60000;
 
+const SPEAK_STAR_SVG =
+  '<svg class="speak-star" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="12,1 14.8,8.2 22,5 16.8,12 22,19 14.8,15.8 12,23 9.2,15.8 2,19 7.2,12 2,5 9.2,8.2"/></svg>';
 const MIC_ON_SVG =
-  '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>';
+  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>';
 const MIC_OFF_SVG =
-  '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2"/></svg>';
+  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><line x1="2" y1="2" x2="22" y2="22"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V5a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>';
+const HEAD_ON_SVG =
+  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19v-5h-3v7h1a2 2 0 0 0 2-2zM3 19a2 2 0 0 0 2 2h1v-7H3z"/></svg>';
+const HEAD_OFF_SVG =
+  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><line x1="2" y1="2" x2="22" y2="22"/><path d="M3 18v-6a9 9 0 0 1 14.5-7.1"/><path d="M21 12v6"/><path d="M21 19v-5h-3v4"/><path d="M3 19a2 2 0 0 0 2 2h1v-7H3z"/></svg>';
+const EXIT_VOICE_SVG =
+  '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="square" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
 const LINK_ARROW_SVG =
-  '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
+  '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><path d="M18 13v6H5V6h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
 
 function randomId(prefix) {
   const bytes = new Uint8Array(4);
@@ -139,13 +145,14 @@ function avatarInitials(name) {
   return single.slice(0, 2).toUpperCase();
 }
 
-function avatarColor(seed) {
-  const str = String(seed || "self");
+function peerTileTheme(seed, isSelf = false) {
+  if (isSelf) return "tile-mint";
+  const str = String(seed || "peer");
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
   }
-  return AVATAR_PALETTE[Math.abs(hash) % AVATAR_PALETTE.length];
+  return METRO_TILE_THEMES[Math.abs(hash) % METRO_TILE_THEMES.length];
 }
 
 function formatByteSize(bytes) {
@@ -468,6 +475,7 @@ class P2PDirectApp {
       "lobby-notice",
       "simple-room-bar",
       "simple-room-name",
+      "simple-room-status-wrap",
       "simple-room-badge",
       "btn-simple-copy-link",
       "btn-simple-leave-room",
@@ -549,14 +557,10 @@ class P2PDirectApp {
       "e2ee-bar-hint",
       "voice-panel",
       "voice-status-badge",
-      "voice-idle-controls",
-      "voice-active-controls",
+      "voice-join-card",
       "voice-empty-state",
       "btn-voice-join",
       "btn-voice-listen",
-      "btn-voice-mute",
-      "btn-voice-deafen",
-      "btn-voice-leave",
       "voice-participant-list",
       "voice-footer",
       "voice-codec-meta",
@@ -776,12 +780,9 @@ class P2PDirectApp {
     });
     this.el["btn-join-done"].addEventListener("click", () => this.resetWizard());
 
-    // Real-time Multi-Peer Voice Channel controls
+    // Real-time Multi-Peer Voice Channel controls (mute/deafen/leave bind dynamically inside your voice tile)
     this.el["btn-voice-join"].addEventListener("click", () => this.joinVoiceChat({ listenOnly: false }));
     this.el["btn-voice-listen"].addEventListener("click", () => this.joinVoiceChat({ listenOnly: true }));
-    this.el["btn-voice-mute"].addEventListener("click", () => this.toggleVoiceMute());
-    this.el["btn-voice-deafen"].addEventListener("click", () => this.toggleVoiceDeafen());
-    this.el["btn-voice-leave"].addEventListener("click", () => this.leaveVoiceChat());
 
     // Identity & Mesh controls
     this.el["author-name-input"].addEventListener("change", () => {
@@ -3412,7 +3413,7 @@ class P2PDirectApp {
 
       this.renderAll();
       this.showToast(
-        effectiveListenOnly ? "Joined voice chat (listen-only)" : "Joined voice chat"
+        effectiveListenOnly ? "Joined voice channel (listen-only)" : "Joined voice channel"
       );
     } catch (err) {
       this.cleanupVoiceAudioResources();
@@ -3580,7 +3581,7 @@ class P2PDirectApp {
   toggleVoiceMute() {
     if (!this.voice.inVoice) return;
     if (this.voice.listenOnly) {
-      this.showToast("Joined in Listen-Only mode — leave and click Join Voice Chat to enable microphone");
+      this.showToast("Joined in Listen-Only mode — leave and click Join Voice to enable microphone");
       return;
     }
     this.voice.muted = !this.voice.muted;
@@ -3591,6 +3592,7 @@ class P2PDirectApp {
     }
     if (this.voice.muted) {
       this.voice.localRms = 0;
+      this.voice.localSmoothLevel = 0;
     }
     const res = this.wasm.call({
       cmd: "set_voice_state",
@@ -3601,6 +3603,7 @@ class P2PDirectApp {
     this.executeActions(res.actions);
     this.renderVoicePanel(true);
     this.renderHeader();
+    this.updateVoiceMeters();
   }
 
   toggleVoiceDeafen() {
@@ -3610,6 +3613,7 @@ class P2PDirectApp {
       this.voice.masterGain.gain.value = this.voice.deafened ? 0 : 1;
     }
     this.renderVoicePanel(true);
+    this.updateVoiceMeters();
   }
 
   setPeerVoiceVolume(peerId, vol) {
@@ -3625,6 +3629,7 @@ class P2PDirectApp {
     mixer.muted = !mixer.muted;
     mixer.gainNode.gain.value = mixer.muted ? 0 : mixer.volume;
     this.renderVoicePanel(true);
+    this.updateVoiceMeters();
   }
 
   cleanupVoiceAudioResources() {
@@ -3724,7 +3729,7 @@ class P2PDirectApp {
     if (!silent) {
       this.el["voice-notice"].classList.add("hidden");
       this.renderAll();
-      this.showToast("Left voice chat");
+      this.showToast("Left voice channel");
     }
   }
 
@@ -3749,7 +3754,7 @@ class P2PDirectApp {
       } else {
         const w = VOICE_EQ_WEIGHTS[i] || 0.5;
         const wobble = 0.72 + 0.28 * Math.sin(tickPhase * 0.9 + i * 1.15);
-        const h = Math.max(4, Math.min(22, Math.round(4 + level * 18 * w * wobble)));
+        const h = Math.max(4, Math.min(30, Math.round(4 + level * 26 * w * wobble)));
         bars[i].style.height = `${h}px`;
       }
     }
@@ -3762,41 +3767,44 @@ class P2PDirectApp {
     const phase = this.voice.meterTicks;
 
     // Local speaker smoothing (fast attack, smooth release)
-    const localFresh = !this.voice.muted && now - this.voice.localSpeakingAt < 320;
+    const selfSilenced = this.voice.muted || this.voice.listenOnly;
+    const localFresh = !selfSilenced && now - this.voice.localSpeakingAt < 320;
     const localTarget = localFresh ? rmsToLevel(this.voice.localRms) : 0;
-    this.voice.localSmoothLevel =
-      localTarget > this.voice.localSmoothLevel
+    this.voice.localSmoothLevel = selfSilenced
+      ? 0
+      : localTarget > this.voice.localSmoothLevel
         ? this.voice.localSmoothLevel * 0.4 + localTarget * 0.6
         : this.voice.localSmoothLevel * 0.72 + localTarget * 0.28;
     if (this.voice.localSmoothLevel < 0.015) this.voice.localSmoothLevel = 0;
 
     const selfDefault = this.voice.listenOnly
-      ? "Listen-only"
+      ? "Listen-Only"
       : this.voice.muted
         ? "Muted"
-        : this.voice.deafened
-          ? "Deafened"
-          : "Live";
+        : "Live";
     this._applySpeakerVisualizer("self", this.voice.localSmoothLevel, selfDefault, phase);
 
     // Remote speaker smoothing & live visualizer update
     const peersInVoice = (this.status?.peers || []).filter((p) => p.inVoice);
     for (const p of peersInVoice) {
       const mixer = this.voice.peerMixers.get(p.peerId);
-      const fresh = mixer && now - mixer.lastAudioAt < 340;
+      const localMuted = Boolean(mixer && mixer.muted);
+      const peerSilenced = this.voice.deafened || localMuted || Boolean(p.voiceMuted);
+      const fresh = !peerSilenced && mixer && now - mixer.lastAudioAt < 340;
       const target = fresh ? rmsToLevel(mixer.rms) : 0;
       if (mixer) {
-        mixer.smoothLevel =
-          target > (mixer.smoothLevel || 0)
+        mixer.smoothLevel = peerSilenced
+          ? 0
+          : target > (mixer.smoothLevel || 0)
             ? (mixer.smoothLevel || 0) * 0.4 + target * 0.6
             : (mixer.smoothLevel || 0) * 0.72 + target * 0.28;
         if (mixer.smoothLevel < 0.015) mixer.smoothLevel = 0;
       }
-      const level = mixer ? mixer.smoothLevel : 0;
-      const defaultState = p.voiceMuted
-        ? "Muted"
-        : mixer && mixer.muted
-          ? "Muted for you"
+      const level = peerSilenced ? 0 : mixer ? mixer.smoothLevel : 0;
+      const defaultState = this.voice.deafened
+        ? "Deafened"
+        : p.voiceMuted || localMuted
+          ? "Muted"
           : "Live";
       this._applySpeakerVisualizer(p.peerId, level, defaultState, phase + p.peerId.charCodeAt(2));
     }
@@ -4374,15 +4382,18 @@ class P2PDirectApp {
 
     let badgeText = "Connecting…";
     let badgeClass = "badge pending";
+    let isLive = false;
     if (peerCount > 0) {
       badgeText = `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
       badgeClass = "badge auto";
+      isLive = true;
     } else if (isActive && relayState === "live" && relayCount > 0) {
       badgeText = "Listening";
       badgeClass = "badge auto";
+      isLive = true;
     }
 
-    // Update Simple Mode compact room header bar
+    // Update Simple Mode architectural room ribbon
     if (this.el["simple-room-bar"]) {
       const displayName = isActive
         ? this.activeRoom.name || "Shared Room"
@@ -4392,6 +4403,9 @@ class P2PDirectApp {
       this.el["simple-room-name"].textContent = displayName;
       this.el["simple-room-badge"].textContent = badgeText;
       this.el["simple-room-badge"].className = badgeClass;
+      if (this.el["simple-room-status-wrap"]) {
+        this.el["simple-room-status-wrap"].classList.toggle("is-live", isLive);
+      }
       this.el["btn-simple-copy-link"].classList.toggle("hidden", !isActive);
     }
 
@@ -4430,7 +4444,7 @@ class P2PDirectApp {
     this.el["log-count-display"].textContent = String(this.status.logCount);
     this.el["next-lamport-preview"].textContent =
       this.composerMode === "chat"
-        ? "Paste images or links"
+        ? "URLs & images supported"
         : `next lamport: ${this.status.lamport + 1}`;
 
     if (this.status.e2ee) {
@@ -4510,25 +4524,11 @@ class P2PDirectApp {
       badge.className = "badge auto";
     }
 
-    this.el["voice-idle-controls"].classList.toggle("hidden", this.voice.inVoice);
-    this.el["voice-active-controls"].classList.toggle("hidden", !this.voice.inVoice);
+    this.el["voice-join-card"].classList.toggle("hidden", this.voice.inVoice);
     this.el["voice-empty-state"].classList.toggle("hidden", totalInVoice > 0);
     this.el["voice-participant-list"].classList.toggle("hidden", totalInVoice === 0);
-    this.el["voice-footer"].classList.toggle("hidden", totalInVoice === 0);
 
     if (this.voice.inVoice) {
-      const muteBtn = this.el["btn-voice-mute"];
-      muteBtn.textContent = this.voice.listenOnly
-        ? "Listen Only"
-        : this.voice.muted
-          ? "Unmute Mic"
-          : "Mute Mic";
-      muteBtn.classList.toggle("is-toggled", this.voice.muted);
-
-      const deafBtn = this.el["btn-voice-deafen"];
-      deafBtn.textContent = this.voice.deafened ? "Undeafen" : "Deafen";
-      deafBtn.classList.toggle("is-toggled", this.voice.deafened);
-
       if (this.el["voice-join-hint"]) {
         this.el["voice-join-hint"].classList.add("hidden");
       }
@@ -4588,38 +4588,62 @@ class P2PDirectApp {
       const enteringClass = prevRendered.has(key) ? "" : " is-entering";
 
       if (key === "self") {
-        const selfBg = avatarColor(this.status.peerId);
+        const selfTheme = peerTileTheme(this.status.peerId, true);
         const selfInitials = escapeHtml(avatarInitials(this.status.authorName));
         const selfMuted = this.voice.muted || this.voice.listenOnly;
         const selfStateText = this.voice.listenOnly
-          ? "Listen-only"
+          ? "Listen-Only"
           : this.voice.muted
             ? "Muted"
-            : this.voice.deafened
-              ? "Deafened"
-              : "Live";
+            : "Live";
+        const muteLabel = this.voice.listenOnly
+          ? "Listen-only mode"
+          : this.voice.muted
+            ? "Unmute microphone"
+            : "Mute microphone";
+        const deafenLabel = this.voice.deafened ? "Undeafen audio" : "Deafen audio";
 
         items.push(`
-          <li class="voice-card is-self${enteringClass}" data-voice-row="self">
-            <div class="voice-avatar-wrap">
-              <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
-              <span class="voice-ring" aria-hidden="true"></span>
-              <div class="voice-avatar" style="background: ${selfBg}">${selfInitials}</div>
-              <span class="voice-avatar-badge${selfMuted ? " muted" : ""}" aria-hidden="true">
-                ${selfMuted ? MIC_OFF_SVG : MIC_ON_SVG}
-              </span>
+          <li class="voice-card is-self ${selfTheme}${selfMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="self">
+            <div class="voice-tile-top">
+              <span class="tile-mono">${selfInitials}</span>
+              <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="self">${selfStateText}</span></span>
             </div>
-            <div class="voice-card-identity">
-              <div class="voice-card-name-row">
+            <div class="tile-lower">
+              <div class="voice-tile-mid">
                 <span class="voice-card-name">${escapeHtml(this.status.authorName)}</span>
                 <span class="voice-you-pill">You</span>
               </div>
-              <div class="voice-card-state-row">
-                <span class="voice-live-dot${selfMuted ? " is-muted" : ""}" aria-hidden="true"></span>
-                <span class="voice-card-state" data-voice-state="self">${selfStateText}</span>
+              <div class="tile-control-slot">
+                <div class="self-card-controls">
+                  <div class="self-audio-group">
+                    <button
+                      type="button"
+                      id="btn-voice-mute"
+                      class="self-ctrl-icon${selfMuted ? " is-toggled" : ""}"
+                      aria-pressed="${selfMuted ? "true" : "false"}"
+                      aria-label="${muteLabel}"
+                      title="${muteLabel}"
+                    >${selfMuted ? MIC_OFF_SVG : MIC_ON_SVG}</button>
+                    <button
+                      type="button"
+                      id="btn-voice-deafen"
+                      class="self-ctrl-icon${this.voice.deafened ? " is-toggled" : ""}"
+                      aria-pressed="${this.voice.deafened ? "true" : "false"}"
+                      aria-label="${deafenLabel}"
+                      title="${deafenLabel}"
+                    >${this.voice.deafened ? HEAD_OFF_SVG : HEAD_ON_SVG}</button>
+                  </div>
+                  <button
+                    type="button"
+                    id="btn-voice-leave"
+                    class="self-ctrl-leave"
+                    title="Leave voice channel (stays in room)"
+                  >${EXIT_VOICE_SVG}<span>Leave Voice</span></button>
+                </div>
               </div>
+              <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
             </div>
-            <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
           </li>
         `);
         continue;
@@ -4627,74 +4651,69 @@ class P2PDirectApp {
 
       const p = peerMap.get(key);
       if (!p) continue;
-      const bg = avatarColor(p.peerId);
+      const peerTheme = peerTileTheme(p.peerId, false);
       const initials = escapeHtml(avatarInitials(p.authorName));
 
       if (this.voice.inVoice) {
         const mixer = this.voice.peerMixers.get(p.peerId);
-        const localMuted = mixer ? mixer.muted : false;
+        const localMuted = Boolean(mixer && mixer.muted);
         const volPct = mixer ? Math.round(mixer.volume * 100) : 100;
-        const isMutedDot = p.voiceMuted || localMuted;
-        const peerStateText = p.voiceMuted ? "Muted" : localMuted ? "Muted for you" : "Live";
+        const peerColorMuted = this.voice.deafened || localMuted || Boolean(p.voiceMuted);
+        const peerStateText = this.voice.deafened
+          ? "Deafened"
+          : p.voiceMuted || localMuted
+            ? "Muted"
+            : "Live";
 
         items.push(`
-          <li class="voice-card${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
-            <div class="voice-avatar-wrap">
-              <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
-              <span class="voice-ring" aria-hidden="true"></span>
-              <div class="voice-avatar" style="background: ${bg}">${initials}</div>
-              <span class="voice-avatar-badge${p.voiceMuted ? " muted" : ""}" aria-hidden="true">
-                ${p.voiceMuted ? MIC_OFF_SVG : MIC_ON_SVG}
-              </span>
+          <li class="voice-card ${peerTheme}${peerColorMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
+            <div class="voice-tile-top">
+              <span class="tile-mono">${initials}</span>
+              <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span></span>
             </div>
-            <div class="voice-card-identity">
-              <div class="voice-card-name-row">
+            <div class="tile-lower">
+              <div class="voice-tile-mid">
                 <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
               </div>
-              <div class="voice-card-state-row">
-                <span class="voice-live-dot${isMutedDot ? " is-muted" : ""}" aria-hidden="true"></span>
-                <span class="voice-card-state" data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span>
+              <div class="tile-control-slot">
+                <div class="voice-peer-mixer">
+                  <button
+                    type="button"
+                    class="tile-mute-btn${localMuted ? " is-muted" : ""}"
+                    data-peer-voice-mute="${escapeHtml(p.peerId)}"
+                  >${localMuted ? "Unmute" : "Mute"}</button>
+                  <input
+                    type="range"
+                    class="voice-volume-slider"
+                    min="0"
+                    max="150"
+                    value="${volPct}"
+                    data-peer-voice-vol="${escapeHtml(p.peerId)}"
+                    aria-label="Volume for ${escapeHtml(p.authorName)}"
+                  />
+                </div>
               </div>
-            </div>
-            <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
-            <div class="voice-peer-mixer">
-              <button type="button" class="btn btn-sm" data-peer-voice-mute="${escapeHtml(p.peerId)}">
-                ${localMuted ? "Unmute" : "Mute"}
-              </button>
-              <input
-                type="range"
-                class="voice-volume-slider"
-                min="0"
-                max="150"
-                value="${volPct}"
-                data-peer-voice-vol="${escapeHtml(p.peerId)}"
-                aria-label="Volume for ${escapeHtml(p.authorName)}"
-              />
+              <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
             </div>
           </li>
         `);
       } else {
-        const previewStateText = p.voiceMuted ? "Muted" : "In voice";
+        const previewStateText = p.voiceMuted ? "Muted" : "In Voice";
         items.push(`
-          <li class="voice-card is-channel-preview${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
-            <div class="voice-avatar-wrap">
-              <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
-              <span class="voice-ring" aria-hidden="true"></span>
-              <div class="voice-avatar" style="background: ${bg}">${initials}</div>
-              <span class="voice-avatar-badge${p.voiceMuted ? " muted" : ""}" aria-hidden="true">
-                ${p.voiceMuted ? MIC_OFF_SVG : MIC_ON_SVG}
-              </span>
+          <li class="voice-card is-channel-preview ${peerTheme}${p.voiceMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
+            <div class="voice-tile-top">
+              <span class="tile-mono">${initials}</span>
+              <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${previewStateText}</span></span>
             </div>
-            <div class="voice-card-identity">
-              <div class="voice-card-name-row">
+            <div class="tile-lower">
+              <div class="voice-tile-mid">
                 <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
               </div>
-              <div class="voice-card-state-row">
-                <span class="voice-live-dot${p.voiceMuted ? " is-muted" : ""}" aria-hidden="true"></span>
-                <span class="voice-card-state" data-voice-state="${escapeHtml(p.peerId)}">${previewStateText}</span>
+              <div class="tile-control-slot">
+                <span class="tile-prejoin-hint">Active in voice channel</span>
               </div>
+              <div class="voice-eq${p.voiceMuted ? "" : " is-preview"}" aria-hidden="true">${eqBarsHtml}</div>
             </div>
-            <div class="voice-eq${p.voiceMuted ? "" : " is-preview"}" aria-hidden="true">${eqBarsHtml}</div>
           </li>
         `);
       }
@@ -4705,6 +4724,18 @@ class P2PDirectApp {
     listEl.innerHTML = items.join("");
 
     if (this.voice.inVoice) {
+      const selfMuteBtn = listEl.querySelector("#btn-voice-mute");
+      if (selfMuteBtn) {
+        selfMuteBtn.addEventListener("click", () => this.toggleVoiceMute());
+      }
+      const selfDeafBtn = listEl.querySelector("#btn-voice-deafen");
+      if (selfDeafBtn) {
+        selfDeafBtn.addEventListener("click", () => this.toggleVoiceDeafen());
+      }
+      const selfLeaveBtn = listEl.querySelector("#btn-voice-leave");
+      if (selfLeaveBtn) {
+        selfLeaveBtn.addEventListener("click", () => this.leaveVoiceChat());
+      }
       for (const btn of listEl.querySelectorAll("[data-peer-voice-mute]")) {
         btn.addEventListener("click", () => this.togglePeerVoiceMute(btn.dataset.peerVoiceMute));
       }
@@ -4995,8 +5026,8 @@ class P2PDirectApp {
 
     if (filtered.length === 0) {
       const emptyPrompt = this.advancedMode
-        ? "No messages yet. Type a message, paste an image or link, or share structured JSON below."
-        : "No messages yet. Type a message, paste an image, or share a link below.";
+        ? "No messages yet. Write a message, drop a link, press Ctrl+V to share an image, or send structured JSON."
+        : "No messages yet. Write a message, drop a link, or press Ctrl+V to share an image.";
       feed.innerHTML =
         this.logMessages.length === 0
           ? `<div class="empty-state">${emptyPrompt}</div>`
@@ -5014,6 +5045,7 @@ class P2PDirectApp {
     feed.innerHTML = filtered
       .map((m) => {
         const isSelf = m.author === myId;
+        const stripeTheme = peerTileTheme(m.author, isSelf);
         const isChat =
           m.type === "chat" &&
           m.payload &&
@@ -5026,16 +5058,19 @@ class P2PDirectApp {
           : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
         return `
           <article class="log-entry${isSelf ? " is-self" : ""}" data-msg-id="${escapeHtml(m.id)}">
-            <div class="log-entry-head">
-              <div class="log-author-group">
-                <span class="log-author">${escapeHtml(m.authorName)}</span>
-                ${typeTag}
+            <div class="msg-stripe ${stripeTheme}" aria-hidden="true"></div>
+            <div class="log-entry-main">
+              <div class="log-entry-head">
+                <div class="log-author-group">
+                  <span class="log-author">${escapeHtml(m.authorName)}</span>
+                  ${typeTag}
+                </div>
+                <span class="log-order-tuple" title="Order (lamport ${m.lamport}) · ${escapeHtml(m.id)}">
+                  ${escapeHtml(formatTime(m.ts))}
+                </span>
               </div>
-              <span class="log-order-tuple" title="Order (lamport ${m.lamport}) · ${escapeHtml(m.id)}">
-                ${escapeHtml(formatTime(m.ts))}
-              </span>
+              ${bodyHtml}
             </div>
-            ${bodyHtml}
           </article>
         `;
       })

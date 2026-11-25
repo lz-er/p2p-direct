@@ -3,15 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>p2p-direct — Direct Voice &amp; Chat</title>
+    <title>Direct Voice &amp; Chat</title>
     <meta
       name="description"
-      content="Direct browser-to-browser voice chat and encrypted messaging with zero servers."
+      content="Direct browser-to-browser encrypted voice and chat rooms with zero servers and zero permanent storage."
     />
     <link
       rel="icon"
       type="image/svg+xml"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2317191c'/%3E%3Cg stroke='%23ffffff' stroke-width='2.4' fill='none' stroke-linecap='round'%3E%3Cline x1='8.5' y1='10' x2='23.5' y2='10'/%3E%3Cline x1='8.5' y1='10' x2='16' y2='23'/%3E%3Cline x1='23.5' y1='10' x2='16' y2='23'/%3E%3Ccircle cx='8.5' cy='10' r='2.6' fill='%230f766e'/%3E%3Ccircle cx='23.5' cy='10' r='2.6' fill='%230f766e'/%3E%3Ccircle cx='16' cy='23' r='2.6' fill='%23ffffff'/%3E%3C/g%3E%3C/svg%3E"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230e0f12'/%3E%3Crect x='4' y='4' width='11' height='11' fill='%230057ff'/%3E%3Crect x='17' y='4' width='11' height='11' fill='%23ffb800'/%3E%3Crect x='4' y='17' width='11' height='11' fill='%2300e082'/%3E%3Crect x='17' y='17' width='11' height='11' fill='%23ff3b30'/%3E%3C/svg%3E"
     />
     <script>
       (() => {
@@ -36,32 +36,30 @@
   </head>
   <body>
     <div class="app-shell">
+      <!-- Brandless Utility Topbar: Big Prominent Name Field Left, Controls Right -->
       <header class="topbar">
-        <div class="brand-group">
-          <div class="brand-mark" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="5" cy="6" r="2.5" />
-              <circle cx="19" cy="6" r="2.5" />
-              <circle cx="12" cy="18" r="2.5" />
-              <line x1="7.3" y1="6.8" x2="16.7" y2="6.8" />
-              <line x1="6.4" y1="8.1" x2="10.8" y2="15.9" />
-              <line x1="17.6" y1="8.1" x2="13.2" y2="15.9" />
+        <div class="name-hero-wrap">
+          <label class="name-hero-tag" for="author-name-input">Name</label>
+          <input
+            id="author-name-input"
+            class="name-hero-input"
+            type="text"
+            maxlength="32"
+            autocomplete="off"
+            aria-label="Your display name"
+          />
+          <span class="name-edit-hint" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
             </svg>
-          </div>
-          <div class="brand-titles">
-            <h1>p2p-direct</h1>
-            <div class="brand-subtitle">Direct Voice &amp; Encrypted Chat</div>
-          </div>
+          </span>
         </div>
 
         <div class="identity-bar">
-          <div class="name-field">
-            <label for="author-name-input">Name</label>
-            <input id="author-name-input" type="text" maxlength="32" autocomplete="off" />
-          </div>
           <div class="stat-chip live advanced-only" id="e2ee-fp-chip" title="End-to-End Encrypted Room Key Fingerprint">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true">
+              <rect x="3" y="11" width="18" height="11" />
               <path d="M7 11V7a5 5 0 0 1 10 0v4" />
             </svg>
             <strong id="key-fp-display">…</strong>
@@ -84,34 +82,23 @@
           <button
             type="button"
             id="btn-advanced-toggle"
-            class="btn btn-sm btn-advanced"
+            class="top-bar-btn btn-advanced"
             aria-pressed="false"
             title="Show advanced networking, manual connect, and JSON tools"
           >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <line x1="4" y1="21" x2="4" y2="14" />
-              <line x1="4" y1="10" x2="4" y2="3" />
-              <line x1="12" y1="21" x2="12" y2="12" />
-              <line x1="12" y1="8" x2="12" y2="3" />
-              <line x1="20" y1="21" x2="20" y2="16" />
-              <line x1="20" y1="12" x2="20" y2="3" />
-              <line x1="1" y1="14" x2="7" y2="14" />
-              <line x1="9" y1="8" x2="15" y2="8" />
-              <line x1="17" y1="16" x2="23" y2="16" />
-            </svg>
             <span>Advanced</span>
           </button>
           <button
             type="button"
             id="btn-theme-toggle"
-            class="btn btn-icon"
+            class="top-bar-btn top-bar-icon"
             title="Toggle dark mode"
             aria-label="Toggle dark mode"
           >
-            <svg id="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+            <svg id="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square">
               <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
             </svg>
-            <svg id="icon-sun" class="hidden" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+            <svg id="icon-sun" class="hidden" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square">
               <circle cx="12" cy="12" r="5" />
               <line x1="12" y1="1" x2="12" y2="3" />
               <line x1="12" y1="21" x2="12" y2="23" />
@@ -126,180 +113,180 @@
         </div>
       </header>
 
-      <!-- Default Simple Lobby: Create Room or Join Room -->
+      <!-- Default Simple Lobby: Two Monumental Expanding Flat Color Doors -->
       <section id="room-lobby" class="room-lobby" aria-label="Create or join a room">
-        <div class="lobby-container">
-          <div class="lobby-header">
-            <h2>Start or Join a Room</h2>
-            <p>End-to-end encrypted voice and chat directly between browsers. Nothing is stored once everyone leaves.</p>
+        <!-- Inline passphrase unlock banner if opening a passphrase-protected room link -->
+        <div id="lobby-passphrase-box" class="lobby-passphrase-bar hidden">
+          <div class="lobby-passphrase-head">
+            <strong>Passphrase Required</strong>
+            <span>This room link is protected with a shared passphrase.</span>
           </div>
+          <form id="lobby-passphrase-form" class="lobby-passphrase-row">
+            <input
+              id="lobby-passphrase-input"
+              class="text-input"
+              type="password"
+              placeholder="Enter room passphrase…"
+              autocomplete="off"
+            />
+            <button type="submit" id="btn-lobby-unlock-room" class="btn btn-primary chev-trigger">
+              <span>Unlock &amp; Join</span>
+              <span class="chevrons" aria-hidden="true"><span>&gt;</span><span>&gt;</span><span>&gt;</span></span>
+            </button>
+          </form>
+        </div>
 
-          <div class="lobby-grid">
-            <div class="panel lobby-card">
-              <div class="lobby-card-head">
-                <span class="lobby-icon lobby-icon-create" aria-hidden="true">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="12" y1="5" x2="12" y2="19" />
-                    <line x1="5" y1="12" x2="19" y2="12" />
-                  </svg>
-                </span>
-                <h3>Create Room</h3>
-              </div>
-              <p class="lobby-card-desc">
-                Create a private room and get an invite link anyone can use to join automatically.
+        <div id="lobby-notice" class="lobby-notice inline-notice hidden"></div>
+
+        <div class="lobby-doors">
+          <div class="lobby-door door-create">
+            <div class="door-top">
+              <span class="door-num">01 / NEW</span>
+              <span class="door-arrow" aria-hidden="true">→</span>
+            </div>
+            <div class="door-body">
+              <h1 class="door-title"><span class="t-thin">Start a</span>New Room</h1>
+              <p class="door-copy">
+                Launch an encrypted browser-to-browser voice and chat room with one reusable invite link.
               </p>
-              <form id="lobby-create-form" class="lobby-form">
+              <form id="lobby-create-form" class="door-form">
                 <input
                   id="lobby-room-name-input"
-                  class="text-input"
+                  class="slab-input"
                   type="text"
                   maxlength="32"
                   placeholder="Room name (optional)…"
                   autocomplete="off"
                 />
-                <button type="submit" id="btn-lobby-create-room" class="btn btn-live lobby-submit">
-                  Create Room
+                <button type="submit" id="btn-lobby-create-room" class="slab-cta chev-trigger">
+                  <span>Create Room</span>
+                  <span class="chevrons" aria-hidden="true"><span>&gt;</span><span>&gt;</span><span>&gt;</span></span>
                 </button>
               </form>
             </div>
+            <div class="door-foot">
+              <span>Zero Servers</span>
+              <span>Cleared When All Leave</span>
+            </div>
+          </div>
 
-            <div class="panel lobby-card">
-              <div class="lobby-card-head">
-                <span class="lobby-icon lobby-icon-join" aria-hidden="true">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
-                    <polyline points="10 17 15 12 10 7" />
-                    <line x1="15" y1="12" x2="3" y2="12" />
-                  </svg>
-                </span>
-                <h3>Join Room</h3>
-              </div>
-              <p class="lobby-card-desc">
-                Paste a room invite link below to connect right away with everyone in the room.
+          <div class="lobby-door door-join">
+            <div class="door-top">
+              <span class="door-num">02 / ENTER</span>
+              <span class="door-arrow" aria-hidden="true">→</span>
+            </div>
+            <div class="door-body">
+              <h2 class="door-title"><span class="t-thin">Enter an</span>Active Room</h2>
+              <p class="door-copy">
+                Paste an invite link to step right into an active voice channel and encrypted live chat.
               </p>
-              <form id="lobby-join-form" class="lobby-form">
+              <form id="lobby-join-form" class="door-form">
                 <input
                   id="lobby-room-link-input"
-                  class="text-input"
+                  class="slab-input"
                   type="text"
                   placeholder="Paste room invite link…"
                   autocomplete="off"
                 />
-                <button type="submit" id="btn-lobby-join-room" class="btn btn-primary lobby-submit">
-                  Join Room
+                <button type="submit" id="btn-lobby-join-room" class="slab-cta chev-trigger">
+                  <span>Join Room</span>
+                  <span class="chevrons" aria-hidden="true"><span>&gt;</span><span>&gt;</span><span>&gt;</span></span>
                 </button>
               </form>
             </div>
-          </div>
-
-          <!-- Inline passphrase prompt if a passphrase-protected room link is opened in Simple Mode -->
-          <div id="lobby-passphrase-box" class="panel lobby-passphrase-box hidden">
-            <div class="lobby-passphrase-head">
-              <strong>Passphrase Required</strong>
-              <span>This room link is protected with a shared passphrase.</span>
+            <div class="door-foot">
+              <span>End-to-End Encrypted</span>
+              <span>In-Memory Only</span>
             </div>
-            <form id="lobby-passphrase-form" class="lobby-passphrase-row">
-              <input
-                id="lobby-passphrase-input"
-                class="text-input"
-                type="password"
-                placeholder="Enter room passphrase…"
-                autocomplete="off"
-              />
-              <button type="submit" id="btn-lobby-unlock-room" class="btn btn-live btn-sm">
-                Unlock &amp; Join
-              </button>
-            </form>
           </div>
-
-          <div id="lobby-notice" class="inline-notice hidden"></div>
         </div>
       </section>
 
       <main class="workbench">
-        <!-- Main Focus Column: Simple Room Bar + Voice Stage + Rich Live Chat -->
+        <!-- Main Focus Column: Simple Room Ribbon + Metro Voice Wall + Flat Chat Stream -->
         <section class="main-column">
-          <!-- Compact Room Header Bar (shown in default Simple Mode when inside a room) -->
-          <section class="panel simple-room-bar simple-only" id="simple-room-bar" aria-label="Current room">
+          <!-- Full-Bleed Architectural Room Ribbon (Simple Mode — Leave Room sits completely isolated here) -->
+          <section class="simple-room-bar simple-only" id="simple-room-bar" aria-label="Current room">
             <div class="simple-room-info">
               <h2 class="simple-room-title" id="simple-room-name">Shared Room</h2>
-              <span class="badge pending" id="simple-room-badge">Connecting…</span>
+              <div class="simple-room-status-wrap" id="simple-room-status-wrap">
+                <span class="live-sq" aria-hidden="true"></span>
+                <span class="badge pending" id="simple-room-badge">Connecting…</span>
+              </div>
             </div>
             <div class="simple-room-actions">
-              <button type="button" id="btn-simple-copy-link" class="btn btn-sm btn-live">
-                Copy Invite Link
+              <button type="button" id="btn-simple-copy-link" class="ribbon-btn ribbon-btn-copy">
+                Copy Link
               </button>
-              <button type="button" id="btn-simple-leave-room" class="btn btn-sm btn-danger">
-                Leave Room
+              <button type="button" id="btn-simple-leave-room" class="ribbon-btn ribbon-btn-leave">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="square" aria-hidden="true">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                  <polyline points="16 17 21 12 16 7" />
+                  <line x1="21" y1="12" x2="9" y2="12" />
+                </svg>
+                <span>Leave Room</span>
               </button>
             </div>
           </section>
 
-          <!-- Prominent Unified Real-Time Voice Channel -->
+          <!-- Metro Live Voice Wall (Zero Header Buttons — All Call Controls Live Directly Inside Your Card) -->
           <section class="panel voice-stage-panel" id="voice-panel" aria-labelledby="voice-panel-title">
             <div class="panel-header voice-stage-header">
               <div class="voice-title-group">
-                <span class="voice-stage-icon" aria-hidden="true">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                    <line x1="12" y1="19" x2="12" y2="23" />
-                    <line x1="8" y1="23" x2="16" y2="23" />
-                  </svg>
-                </span>
                 <h2 class="panel-title" id="voice-panel-title">
                   Voice Channel
                   <span class="badge" id="voice-status-badge">Empty</span>
                 </h2>
               </div>
 
-              <!-- Join actions (shown when not in voice) -->
-              <div id="voice-idle-controls" class="voice-header-actions">
-                <button type="button" id="btn-voice-join" class="btn btn-live">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                  </svg>
-                  Join Voice
-                </button>
-                <button type="button" id="btn-voice-listen" class="btn btn-sm" title="Join without a microphone to hear everyone in the channel">
-                  Listen Only
-                </button>
-              </div>
-
-              <!-- Active Call Controls (shown when joined) -->
-              <div id="voice-active-controls" class="voice-header-actions hidden">
-                <button type="button" id="btn-voice-mute" class="btn btn-sm">
-                  Mute Mic
-                </button>
-                <button type="button" id="btn-voice-deafen" class="btn btn-sm">
-                  Deafen
-                </button>
-                <button type="button" id="btn-voice-leave" class="btn btn-sm btn-danger">
-                  Leave Voice
-                </button>
+              <div id="voice-footer" class="voice-header-meta">
+                <span id="voice-codec-meta">End-to-end encrypted · 16 kHz</span>
+                <span id="voice-join-hint" class="hidden">Click + Join Voice</span>
+                <span id="voice-packet-stats" class="advanced-only"></span>
               </div>
             </div>
 
-            <div class="panel-body voice-stage-body">
-              <!-- Shown only when 0 participants are currently in the voice channel -->
-              <div id="voice-empty-state" class="voice-empty-stage">
-                <div class="voice-idle-bars" aria-hidden="true">
-                  <span></span><span></span><span></span><span></span><span></span>
+            <div class="voice-stage-body">
+              <div class="voice-mosaic">
+                <!-- Active voice participant tiles render directly inside this mosaic grid -->
+                <ul id="voice-participant-list" class="voice-stage-grid hidden"></ul>
+
+                <!-- In-grid "+ Join Voice" card (with integrated Listen Only strip); morphs into YOUR card on join -->
+                <div id="voice-join-card" class="join-voice-card">
+                  <button type="button" id="btn-voice-join" class="join-voice-main chev-trigger">
+                    <div class="join-top-row">
+                      <span class="join-plus" aria-hidden="true">+</span>
+                      <span class="chevrons" aria-hidden="true"><span>&gt;</span><span>&gt;</span><span>&gt;</span></span>
+                    </div>
+                    <div>
+                      <span class="join-tile-label">Join Voice</span>
+                      <span class="join-tile-sub">Step into the live channel</span>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    id="btn-voice-listen"
+                    class="join-listen-strip"
+                    title="Join without a microphone to hear everyone in the channel"
+                  >
+                    <span>Listen Only (No Mic)</span>
+                    <span aria-hidden="true">→</span>
+                  </button>
                 </div>
-                <span class="voice-empty-label">Voice channel is empty — join to talk in real time</span>
+
+                <!-- Shown beside "+ Join Voice" only when 0 participants are in the channel -->
+                <div id="voice-empty-state" class="voice-empty-stage">
+                  <div class="voice-idle-bars" aria-hidden="true">
+                    <span></span><span></span><span></span><span></span><span></span><span></span>
+                  </div>
+                  <div class="voice-empty-text">
+                    <strong>Channel Empty</strong>
+                    <span>Join voice to talk in real time</span>
+                  </div>
+                </div>
               </div>
 
-              <!-- Always shows active voice channel participants; joining adds you right to the list -->
-              <ul id="voice-participant-list" class="voice-stage-grid hidden"></ul>
-
-              <div id="voice-footer" class="voice-footer hidden">
-                <span id="voice-codec-meta">End-to-end encrypted · 16 kHz</span>
-                <span id="voice-join-hint" class="hidden">Click Join Voice to talk together</span>
-                <span id="voice-packet-stats" class="advanced-only"></span>
-              </div>
-
-              <div id="voice-notice" class="inline-notice hidden"></div>
+              <div id="voice-notice" class="inline-notice voice-inline-notice hidden"></div>
             </div>
           </section>
 
@@ -339,7 +326,7 @@
 
             <div id="log-feed" class="log-feed" aria-live="polite">
               <div class="empty-state">
-                No messages yet. Type a message, paste an image, or share a link below.
+                No messages yet. Write a message, drop a link, or press Ctrl+V to share an image.
               </div>
             </div>
 
@@ -365,13 +352,13 @@
                     Structured JSON
                   </button>
                 </div>
-                <span class="panel-meta" id="next-lamport-preview">Paste images or links</span>
+                <span class="panel-meta" id="next-lamport-preview">URLs &amp; images supported</span>
               </div>
 
               <!-- Staged Pasted / Attached Images Preview Tray -->
               <div id="chat-image-tray" class="chat-image-tray hidden"></div>
 
-              <!-- Quick Chat Mode with Image Paste / Attach & Link Auto-Detection -->
+              <!-- Quick Chat Mode: Inline Badges Flat Composer -->
               <form id="chat-composer-form" class="composer-row">
                 <input
                   id="chat-image-input"
@@ -380,27 +367,31 @@
                   multiple
                   class="hidden"
                 />
-                <button
-                  type="button"
-                  id="btn-attach-image"
-                  class="btn btn-icon"
-                  title="Attach image (or press Ctrl+V / Cmd+V to paste)"
-                  aria-label="Attach image"
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                    <circle cx="8.5" cy="8.5" r="1.5" />
-                    <polyline points="21 15 16 10 5 21" />
-                  </svg>
+                <div class="composer-input-wrap">
+                  <input
+                    id="chat-text-input"
+                    class="composer-text-input"
+                    type="text"
+                    placeholder="Write a message…"
+                    autocomplete="off"
+                  />
+                  <div class="comp-inline-badges">
+                    <span class="inline-chip" title="Links become clickable cards automatically">URL ↗</span>
+                    <button
+                      type="button"
+                      id="btn-attach-image"
+                      class="inline-chip inline-chip-btn"
+                      title="Attach image (or press Ctrl+V / Cmd+V to paste)"
+                      aria-label="Attach image"
+                    >
+                      + IMG · CTRL+V
+                    </button>
+                  </div>
+                </div>
+                <button type="submit" id="btn-send-chat" class="composer-send-btn chev-trigger">
+                  <span>Send</span>
+                  <span class="chevrons" aria-hidden="true"><span>&gt;</span><span>&gt;</span><span>&gt;</span></span>
                 </button>
-                <input
-                  id="chat-text-input"
-                  class="text-input"
-                  type="text"
-                  placeholder="Message, paste a link, or paste an image (Ctrl+V)…"
-                  autocomplete="off"
-                />
-                <button type="submit" id="btn-send-chat" class="btn btn-primary">Send</button>
               </form>
 
               <!-- Structured JSON Mode (Advanced Only) -->
@@ -438,7 +429,7 @@
           </section>
         </section>
 
-        <!-- Secondary Sidebar Rail (Advanced Only): Step-by-Step Connect, Peers & Network, Collapsible Diagnostics -->
+        <!-- Secondary Sidebar Rail (Advanced Only): Step-by-Step Connect, Peers & Network, Diagnostics -->
         <aside class="rail advanced-only">
           <section class="panel" aria-labelledby="connect-panel-title">
             <div class="panel-header">
