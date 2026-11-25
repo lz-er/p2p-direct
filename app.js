@@ -1429,13 +1429,19 @@ class P2PDirectApp {
       "voice-status-badge",
       "btn-voice-settings",
       "voice-settings-drawer",
+      "audio-custom-badge",
       "btn-audio-monitor",
       "btn-audio-reset",
+      "btn-audio-close",
       "audio-input-select",
+      "audio-output-field",
+      "audio-output-select",
+      "audio-monitor-hint",
       "audio-mic-meter-status",
       "audio-mic-gain",
       "audio-mic-gain-val",
       "audio-mic-meter-fill",
+      "audio-gate-zone",
       "audio-gate-marker",
       "audio-output-gain",
       "audio-output-gain-val",
@@ -1699,6 +1705,9 @@ class P2PDirectApp {
     if (this.el["btn-voice-settings"]) {
       this.el["btn-voice-settings"].addEventListener("click", () => this.toggleAudioSettingsDrawer());
     }
+    if (this.el["btn-audio-close"]) {
+      this.el["btn-audio-close"].addEventListener("click", () => this.toggleAudioSettingsDrawer(false));
+    }
     for (const btn of document.querySelectorAll("[data-audio-preset]")) {
       btn.addEventListener("click", () => this.applyAudioPreset(btn.dataset.audioPreset));
     }
@@ -1716,10 +1725,28 @@ class P2PDirectApp {
         })
       );
     }
+    if (this.el["audio-output-select"]) {
+      this.el["audio-output-select"].addEventListener("change", () =>
+        this.updateAudioSetting("outputDeviceId", this.el["audio-output-select"].value, {
+          applyOutputDevice: true,
+          keepPreset: true,
+        })
+      );
+    }
+    const bindSliderDblClickReset = (elId, key, defaultVal, toastLabel, opts = {}) => {
+      const input = this.el[elId];
+      if (!input) return;
+      input.addEventListener("dblclick", () => {
+        if (this.audioSettings[key] === defaultVal) return;
+        this.updateAudioSetting(key, defaultVal, opts);
+        this.showToast(toastLabel);
+      });
+    };
     if (this.el["audio-mic-gain"]) {
       this.el["audio-mic-gain"].addEventListener("input", () =>
         this.updateAudioSetting("micGain", Number(this.el["audio-mic-gain"].value))
       );
+      bindSliderDblClickReset("audio-mic-gain", "micGain", 100, "My Mic Volume reset to 100%");
     }
     if (this.el["audio-output-gain"]) {
       this.el["audio-output-gain"].addEventListener("input", () =>
@@ -1727,11 +1754,15 @@ class P2PDirectApp {
           keepPreset: true,
         })
       );
+      bindSliderDblClickReset("audio-output-gain", "outputGain", 100, "Call Volume reset to 100%", {
+        keepPreset: true,
+      });
     }
     if (this.el["audio-noise-gate"]) {
       this.el["audio-noise-gate"].addEventListener("input", () =>
         this.updateAudioSetting("noiseGate", Number(this.el["audio-noise-gate"].value))
       );
+      bindSliderDblClickReset("audio-noise-gate", "noiseGate", 2, "Voice Cutoff reset to 2%");
     }
     if (this.el["audio-highpass"]) {
       this.el["audio-highpass"].addEventListener("change", () =>
@@ -1742,6 +1773,7 @@ class P2PDirectApp {
       this.el["audio-presence"].addEventListener("input", () =>
         this.updateAudioSetting("presenceDb", Number(this.el["audio-presence"].value))
       );
+      bindSliderDblClickReset("audio-presence", "presenceDb", 0, "Voice Clarity reset to 0 dB");
     }
     if (this.el["audio-compressor"]) {
       this.el["audio-compressor"].addEventListener("change", () =>
@@ -5924,10 +5956,31 @@ class P2PDirectApp {
     }
     if (next) {
       this.syncAudioSettingsUI();
+      if (!this.voice.inVoice && !this.voice.preCallMonitor) {
+        this.updateAudioMeterUi(0, false, "Idle");
+      }
       this.refreshAudioInputDevices();
     } else if (!this.voice.inVoice && this.voice.monitorActive) {
       this.stopPreCallMicMonitor();
     }
+  }
+
+  detectMatchingAudioPreset(settings) {
+    for (const [name, p] of Object.entries(AUDIO_PRESETS)) {
+      if (
+        settings.micGain === p.micGain &&
+        settings.noiseGate === p.noiseGate &&
+        settings.highPassHz === p.highPassHz &&
+        settings.presenceDb === p.presenceDb &&
+        Boolean(settings.compressor) === Boolean(p.compressor) &&
+        Boolean(settings.echoCancellation) === Boolean(p.echoCancellation) &&
+        Boolean(settings.noiseSuppression) === Boolean(p.noiseSuppression) &&
+        Boolean(settings.autoGainControl) === Boolean(p.autoGainControl)
+      ) {
+        return name;
+      }
+    }
+    return "custom";
   }
 
   syncAudioSettingsUI() {
@@ -5950,10 +6003,15 @@ class P2PDirectApp {
     if (this.el["audio-noise-gate-val"]) {
       this.el["audio-noise-gate-val"].textContent = s.noiseGate === 0 ? "Off" : `${s.noiseGate}%`;
     }
+    // Exact 1:1 alignment with Rust VoiceCaptureDsp48k gate threshold and updateAudioMeterUi (0..4900 RMS)
+    const markerPct = Math.min(100, Math.round((s.noiseGate / 35) * 100));
     if (this.el["audio-gate-marker"]) {
-      const markerPct = Math.min(98, Math.round((s.noiseGate / 35) * 65));
       this.el["audio-gate-marker"].style.left = `${markerPct}%`;
       this.el["audio-gate-marker"].classList.toggle("hidden", s.noiseGate === 0);
+    }
+    if (this.el["audio-gate-zone"]) {
+      this.el["audio-gate-zone"].style.width = `${markerPct}%`;
+      this.el["audio-gate-zone"].classList.toggle("hidden", s.noiseGate === 0);
     }
     if (this.el["audio-highpass"]) {
       this.el["audio-highpass"].value = String(s.highPassHz);
@@ -5983,13 +6041,26 @@ class P2PDirectApp {
     for (const btn of document.querySelectorAll("[data-audio-preset]")) {
       btn.classList.toggle("active", btn.dataset.audioPreset === s.preset);
     }
+    if (this.el["audio-custom-badge"]) {
+      this.el["audio-custom-badge"].classList.toggle("hidden", s.preset !== "custom");
+    }
+    if (this.el["audio-monitor-hint"]) {
+      this.el["audio-monitor-hint"].classList.toggle("hidden", !this.voice.monitorActive);
+    }
     if (this.el["btn-audio-monitor"]) {
       this.el["btn-audio-monitor"].classList.toggle("is-active", this.voice.monitorActive);
       this.el["btn-audio-monitor"].setAttribute(
         "aria-pressed",
         this.voice.monitorActive ? "true" : "false"
       );
-      this.el["btn-audio-monitor"].textContent = this.voice.monitorActive ? "Stop Test" : "Test Mic";
+      this.el["btn-audio-monitor"].textContent = this.voice.monitorActive ? "Stop Mic Test" : "Test Mic";
+    }
+    if (this.el["audio-output-select"]) {
+      const targetOut = s.outputDeviceId || "";
+      const hasOpt = Array.from(this.el["audio-output-select"].options).some(
+        (opt) => opt.value === targetOut
+      );
+      this.el["audio-output-select"].value = hasOpt ? targetOut : "";
     }
   }
 
@@ -6016,8 +6087,54 @@ class P2PDirectApp {
       } else {
         select.value = "";
       }
+
+      // Optional Speaker / Headphones selector (shown when browser supports AudioContext.setSinkId)
+      const outSelect = this.el["audio-output-select"];
+      const outField = this.el["audio-output-field"];
+      const supportsSinkId =
+        typeof AudioContext !== "undefined" && typeof AudioContext.prototype.setSinkId === "function";
+      if (outSelect && outField) {
+        const outputs = supportsSinkId
+          ? devices.filter((d) => d.kind === "audiooutput" && d.deviceId && d.deviceId !== "default")
+          : [];
+        if (outputs.length > 0) {
+          const currentOut = this.audioSettings.outputDeviceId || "";
+          const outOpts = ['<option value="">Default Output</option>'];
+          outputs.forEach((d, idx) => {
+            const label = d.label && d.label.trim() ? d.label.trim() : `Speaker / Output ${idx + 1}`;
+            outOpts.push(`<option value="${escapeHtml(d.deviceId)}">${escapeHtml(label)}</option>`);
+          });
+          outSelect.innerHTML = outOpts.join("");
+          outSelect.value =
+            currentOut && outputs.some((d) => d.deviceId === currentOut) ? currentOut : "";
+          outField.classList.remove("hidden");
+        } else {
+          outField.classList.add("hidden");
+        }
+      }
     } catch {
       // ignore permission/device enumeration errors
+    }
+  }
+
+  async applyOutputAudioDevice(targetCtx = null, announce = false) {
+    const sinkId = this.audioSettings.outputDeviceId || "";
+    const contexts = targetCtx
+      ? [targetCtx]
+      : [this.voice.audioCtx, this.voice.preCallMonitor?.ctx].filter(Boolean);
+    let applied = false;
+    for (const ctx of contexts) {
+      if (typeof ctx.setSinkId === "function") {
+        try {
+          await ctx.setSinkId(sinkId);
+          applied = true;
+        } catch {
+          // ignore disconnected or unsupported sinkId
+        }
+      }
+    }
+    if (announce && (applied || contexts.length === 0)) {
+      this.showToast(sinkId ? "Switched speaker / headphones output" : "Using default audio output");
     }
   }
 
@@ -6033,7 +6150,7 @@ class P2PDirectApp {
     this.applyMicTrackConstraints();
     this.updateVoiceCodecMeta();
     this.showToast(
-      `Audio preset: ${presetName === "raw" ? "Raw / Music" : presetName[0].toUpperCase() + presetName.slice(1)}`
+      `Audio profile: ${presetName === "raw" ? "Raw / Music" : presetName[0].toUpperCase() + presetName.slice(1)}`
     );
   }
 
@@ -6041,6 +6158,7 @@ class P2PDirectApp {
     this.audioSettings = saveSessionAudioSettings({
       ...DEFAULT_AUDIO_SETTINGS,
       deviceId: this.audioSettings.deviceId || "",
+      outputDeviceId: this.audioSettings.outputDeviceId || "",
     });
     this.syncAudioSettingsUI();
     this.applyLiveAudioDspParams(true);
@@ -6052,23 +6170,36 @@ class P2PDirectApp {
   updateAudioSetting(
     key,
     value,
-    { reconnectMic = false, rewireGraph = false, applyTrackConstraints = false, keepPreset = false } = {}
+    {
+      reconnectMic = false,
+      applyOutputDevice = false,
+      rewireGraph = false,
+      applyTrackConstraints = false,
+      keepPreset = false,
+    } = {}
   ) {
+    const prevPreset = this.audioSettings.preset;
     const next = {
       ...this.audioSettings,
       [key]: value,
     };
     if (!keepPreset) {
-      next.preset = "custom";
+      next.preset = this.detectMatchingAudioPreset(next);
     }
     this.audioSettings = saveSessionAudioSettings(next);
     this.syncAudioSettingsUI();
     this.applyLiveAudioDspParams(rewireGraph);
+    if (prevPreset !== this.audioSettings.preset && (prevPreset === "raw" || this.audioSettings.preset === "raw")) {
+      this.updateVoiceCodecMeta();
+    }
     if (applyTrackConstraints) {
       this.applyMicTrackConstraints();
     }
     if (reconnectMic) {
       this.switchActiveMicrophone();
+    }
+    if (applyOutputDevice) {
+      this.applyOutputAudioDevice(null, true);
     }
   }
 
@@ -6302,6 +6433,7 @@ class P2PDirectApp {
       if (ctx.state === "suspended") {
         await ctx.resume();
       }
+      await this.applyOutputAudioDevice(ctx, false);
       const source = ctx.createMediaStreamSource(stream);
       const nodes = this.createMicDspNodes(ctx, source);
       const analyser = ctx.createAnalyser();
@@ -6378,24 +6510,30 @@ class P2PDirectApp {
     const fill = this.el["audio-mic-meter-fill"];
     const status = this.el["audio-mic-meter-status"];
     if (!fill && !status) return;
-    const pct = Math.min(100, Math.round((rmsInt16 / 7500) * 100));
+    // Exact 1:1 alignment with Rust VoiceCaptureDsp48k gate open_threshold:
+    // noiseGate max 35% -> 0.35 * 14000 = 4900 RMS Int16 -> 100% bar width.
+    const pct = Math.min(100, Math.round((rmsInt16 / 4900) * 100));
+    const isHot = !gated && pct > 85;
     if (fill) {
       fill.style.width = `${pct}%`;
       fill.classList.toggle("is-gated", Boolean(gated));
-      fill.classList.toggle("is-hot", !gated && pct > 82);
+      fill.classList.toggle("is-hot", isHot);
     }
     if (status) {
       if (!this.voice.inVoice && !this.voice.preCallMonitor) {
-        status.textContent = "Idle";
+        status.textContent = "Idle — click Test Mic";
         status.className = "audio-meter-status";
       } else if (this.voice.inVoice && (this.voice.muted || this.voice.listenOnly)) {
         status.textContent = this.voice.listenOnly ? "Listen-Only" : "Muted";
         status.className = "audio-meter-status";
       } else if (gated) {
-        status.textContent = "Gated";
+        status.textContent = "Blocked (too quiet)";
         status.className = "audio-meter-status is-gated";
+      } else if (isHot) {
+        status.textContent = "Too loud!";
+        status.className = "audio-meter-status is-hot";
       } else {
-        status.textContent = activeLabel;
+        status.textContent = activeLabel === "Testing" ? "Hearing you" : "Transmitting";
         status.className = "audio-meter-status is-live";
       }
     }
@@ -6606,6 +6744,9 @@ class P2PDirectApp {
       this.voice.masterLimiter = masterLimiter;
       this.voice.workletsLoaded = false;
       this.voice.workletsLoadingPromise = null;
+      if (this.audioSettings.outputDeviceId) {
+        this.applyOutputAudioDevice(ctx, false);
+      }
     }
     if (this.voice.audioCtx.state === "suspended") {
       this.voice.audioCtx.resume().catch(() => {});

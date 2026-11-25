@@ -299,145 +299,246 @@
               </div>
             </div>
 
-            <!-- Personal Audio Settings Drawer (Flat Metro DSP & Filter Deck) -->
+            <!-- Personal Audio Settings Drawer (Intuitive Profile Cards + Live Sensitivity Bar + Plain-English Controls) -->
             <div id="voice-settings-drawer" class="audio-settings-drawer hidden" role="region" aria-label="My audio settings">
-              <div class="audio-settings-bar">
-                <div class="audio-presets-group" role="group" aria-label="Audio filter presets">
-                  <span class="audio-bar-label">Preset</span>
-                  <button type="button" class="audio-preset-btn active" data-audio-preset="voice">Voice</button>
-                  <button type="button" class="audio-preset-btn" data-audio-preset="broadcast">Broadcast</button>
-                  <button type="button" class="audio-preset-btn" data-audio-preset="raw">Raw / Music</button>
+              <!-- Top Bar: Profile Cards + Custom Indicator + Reset / Close -->
+              <div class="audio-settings-top">
+                <div class="audio-top-head">
+                  <div class="audio-top-title-group">
+                    <span class="audio-section-kicker">Sound Profile</span>
+                    <span id="audio-custom-badge" class="audio-custom-badge hidden">Custom</span>
+                  </div>
+                  <div class="audio-bar-actions">
+                    <button type="button" id="btn-audio-reset" class="audio-action-btn" title="Restore recommended defaults">Reset Defaults</button>
+                    <button type="button" id="btn-audio-close" class="audio-action-btn" aria-label="Close audio settings">Done</button>
+                  </div>
                 </div>
-                <div class="audio-bar-actions">
-                  <button
-                    type="button"
-                    id="btn-audio-monitor"
-                    class="audio-action-btn"
-                    aria-pressed="false"
-                    title="Route your processed microphone back to your headphones to test loudness and filters"
-                  >
-                    Test Mic
+
+                <div class="audio-profile-grid" role="group" aria-label="Audio filter presets">
+                  <button type="button" class="audio-preset-btn audio-profile-card active" data-audio-preset="voice">
+                    <span class="audio-profile-head">
+                      <span class="audio-profile-name">Voice</span>
+                      <span class="audio-profile-tag">96 kbps</span>
+                    </span>
+                    <span class="audio-profile-desc">Everyday chat · blocks echo &amp; room noise</span>
                   </button>
-                  <button type="button" id="btn-audio-reset" class="audio-action-btn">Reset</button>
+                  <button type="button" class="audio-preset-btn audio-profile-card" data-audio-preset="broadcast">
+                    <span class="audio-profile-head">
+                      <span class="audio-profile-name">Broadcast</span>
+                      <span class="audio-profile-tag">Rich</span>
+                    </span>
+                    <span class="audio-profile-desc">Louder, crisper voice · smooths volume spikes</span>
+                  </button>
+                  <button type="button" class="audio-preset-btn audio-profile-card" data-audio-preset="raw">
+                    <span class="audio-profile-head">
+                      <span class="audio-profile-name">Raw / Music</span>
+                      <span class="audio-profile-tag">128 kbps</span>
+                    </span>
+                    <span class="audio-profile-desc">All filters off · pure studio audio for instruments</span>
+                  </button>
                 </div>
               </div>
 
-              <div class="audio-settings-grid">
-                <!-- Column 1: Device + Loudness + Live Mic Meter -->
-                <div class="audio-settings-col">
-                  <div class="audio-field">
+              <!-- Hero Card: Devices + Live Mic Test + Unified Voice Cutoff (Sensitivity) Bar -->
+              <div class="audio-card audio-mic-hero">
+                <div class="audio-devices-row">
+                  <div class="audio-field audio-device-field">
                     <div class="audio-field-head">
-                      <label for="audio-input-select">Microphone Input</label>
-                      <span class="audio-meter-status" id="audio-mic-meter-status">Idle</span>
+                      <label for="audio-input-select">Microphone</label>
                     </div>
                     <select id="audio-input-select" class="select-input audio-select">
                       <option value="">Default Microphone</option>
                     </select>
                   </div>
 
-                  <div class="audio-field">
+                  <div class="audio-field audio-device-field hidden" id="audio-output-field">
                     <div class="audio-field-head">
-                      <label for="audio-mic-gain">Mic Loudness</label>
-                      <span class="audio-readout" id="audio-mic-gain-val">100%</span>
+                      <label for="audio-output-select">Speakers / Headphones</label>
                     </div>
-                    <input
-                      id="audio-mic-gain"
-                      class="audio-range"
-                      type="range"
-                      min="0"
-                      max="250"
-                      step="5"
-                      value="100"
-                    />
-                    <div class="audio-meter-track" title="Live post-filter microphone level (vertical notch marks noise gate threshold)">
-                      <div id="audio-mic-meter-fill" class="audio-meter-fill"></div>
-                      <div id="audio-gate-marker" class="audio-gate-marker"></div>
-                    </div>
-                  </div>
-
-                  <div class="audio-field">
-                    <div class="audio-field-head">
-                      <label for="audio-output-gain">Master Output Loudness</label>
-                      <span class="audio-readout" id="audio-output-gain-val">100%</span>
-                    </div>
-                    <input
-                      id="audio-output-gain"
-                      class="audio-range"
-                      type="range"
-                      min="0"
-                      max="200"
-                      step="5"
-                      value="100"
-                    />
-                  </div>
-                </div>
-
-                <!-- Column 2: Noise Gate + Tone/EQ Filters -->
-                <div class="audio-settings-col">
-                  <div class="audio-field">
-                    <div class="audio-field-head">
-                      <label for="audio-noise-gate">Noise Gate</label>
-                      <span class="audio-readout" id="audio-noise-gate-val">2%</span>
-                    </div>
-                    <input
-                      id="audio-noise-gate"
-                      class="audio-range"
-                      type="range"
-                      min="0"
-                      max="35"
-                      step="1"
-                      value="2"
-                    />
-                  </div>
-
-                  <div class="audio-field">
-                    <div class="audio-field-head">
-                      <label for="audio-highpass">Low-Cut (High-Pass Filter)</label>
-                      <span class="audio-readout" id="audio-highpass-val">80 Hz</span>
-                    </div>
-                    <select id="audio-highpass" class="select-input audio-select">
-                      <option value="0">Off (Full Range)</option>
-                      <option value="80" selected>80 Hz — Rumble Cut</option>
-                      <option value="120">120 Hz — Desk / AC Cut</option>
-                      <option value="200">200 Hz — Tight Voice Cut</option>
+                    <select id="audio-output-select" class="select-input audio-select">
+                      <option value="">Default Output</option>
                     </select>
                   </div>
 
-                  <div class="audio-field">
-                    <div class="audio-field-head">
-                      <label for="audio-presence">Voice Clarity (2.8 kHz)</label>
-                      <span class="audio-readout" id="audio-presence-val">+2 dB</span>
-                    </div>
-                    <input
-                      id="audio-presence"
-                      class="audio-range"
-                      type="range"
-                      min="-6"
-                      max="6"
-                      step="1"
-                      value="2"
-                    />
+                  <div class="audio-monitor-wrap">
+                    <button
+                      type="button"
+                      id="btn-audio-monitor"
+                      class="audio-action-btn audio-test-btn"
+                      aria-pressed="false"
+                      title="Hear your own processed microphone in your headphones"
+                    >
+                      Test Mic
+                    </button>
                   </div>
                 </div>
 
-                <!-- Column 3: Live Processing Switches -->
-                <div class="audio-settings-col audio-switches-col">
-                  <label class="audio-switch-row" for="audio-compressor">
-                    <input id="audio-compressor" class="metro-switch" type="checkbox" checked />
-                    <span>Compressor / Limiter</span>
-                  </label>
-                  <label class="audio-switch-row" for="audio-ec">
-                    <input id="audio-ec" class="metro-switch" type="checkbox" checked />
-                    <span>Echo Cancellation</span>
-                  </label>
-                  <label class="audio-switch-row" for="audio-ns">
-                    <input id="audio-ns" class="metro-switch" type="checkbox" checked />
-                    <span>Noise Suppression</span>
-                  </label>
-                  <label class="audio-switch-row" for="audio-agc">
-                    <input id="audio-agc" class="metro-switch" type="checkbox" checked />
-                    <span>Auto Gain Control</span>
-                  </label>
+                <p id="audio-monitor-hint" class="audio-monitor-hint hidden">
+                  Listening to your processed mic — use headphones so your speakers don't echo.
+                </p>
+
+                <!-- Unified Live Mic Level + Noise Gate Cutoff Bar -->
+                <div class="audio-gate-box">
+                  <div class="audio-field-head">
+                    <div class="audio-gate-label-group">
+                      <label for="audio-noise-gate">Voice Cutoff (Noise Gate)</label>
+                      <span class="audio-meter-status" id="audio-mic-meter-status">Idle — click Test Mic</span>
+                    </div>
+                    <span class="audio-readout" id="audio-noise-gate-val">2%</span>
+                  </div>
+
+                  <div
+                    class="audio-meter-track audio-meter-track-lg"
+                    title="Live microphone level — red line marks where your mic opens"
+                  >
+                    <div id="audio-gate-zone" class="audio-gate-zone"></div>
+                    <div id="audio-mic-meter-fill" class="audio-meter-fill"></div>
+                    <div id="audio-gate-marker" class="audio-gate-marker"></div>
+                  </div>
+
+                  <input
+                    id="audio-noise-gate"
+                    class="audio-range audio-gate-range"
+                    type="range"
+                    min="0"
+                    max="35"
+                    step="1"
+                    value="2"
+                    title="Double-click to reset to 2%"
+                  />
+
+                  <div class="audio-gate-legend">
+                    <span>Muted zone (left of red line) · Speaks live (green)</span>
+                    <span>Set 0% to always transmit</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Lower 2-Column Structured Controls: Volumes & Tone + Smart Cleanup -->
+              <div class="audio-settings-columns">
+                <!-- Left Card: Volumes & Voice Tone -->
+                <div class="audio-card">
+                  <div class="audio-card-head">
+                    <span class="audio-section-kicker">Volumes &amp; Voice Tone</span>
+                    <span class="audio-card-tip">Double-click any slider to reset</span>
+                  </div>
+
+                  <div class="audio-tone-grid">
+                    <div class="audio-field">
+                      <div class="audio-field-head">
+                        <label for="audio-mic-gain">My Mic Volume</label>
+                        <span class="audio-readout" id="audio-mic-gain-val">100%</span>
+                      </div>
+                      <div class="audio-range-wrap">
+                        <span class="audio-range-tick" style="left: 40%" title="100% normal"></span>
+                        <input
+                          id="audio-mic-gain"
+                          class="audio-range"
+                          type="range"
+                          min="0"
+                          max="250"
+                          step="5"
+                          value="100"
+                          title="Double-click to reset to 100%"
+                        />
+                      </div>
+                      <span class="audio-field-hint">How loud others hear you</span>
+                    </div>
+
+                    <div class="audio-field">
+                      <div class="audio-field-head">
+                        <label for="audio-output-gain">Call Volume (Others)</label>
+                        <span class="audio-readout" id="audio-output-gain-val">100%</span>
+                      </div>
+                      <div class="audio-range-wrap">
+                        <span class="audio-range-tick" style="left: 50%" title="100% normal"></span>
+                        <input
+                          id="audio-output-gain"
+                          class="audio-range"
+                          type="range"
+                          min="0"
+                          max="200"
+                          step="5"
+                          value="100"
+                          title="Double-click to reset to 100%"
+                        />
+                      </div>
+                      <span class="audio-field-hint">Master volume for everyone</span>
+                    </div>
+
+                    <div class="audio-field">
+                      <div class="audio-field-head">
+                        <label for="audio-presence">Voice Clarity</label>
+                        <span class="audio-readout" id="audio-presence-val">+2 dB</span>
+                      </div>
+                      <div class="audio-range-wrap">
+                        <span class="audio-range-tick" style="left: 50%" title="0 dB natural"></span>
+                        <input
+                          id="audio-presence"
+                          class="audio-range"
+                          type="range"
+                          min="-6"
+                          max="6"
+                          step="1"
+                          value="2"
+                          title="Double-click to reset to 0 dB"
+                        />
+                      </div>
+                      <div class="audio-scale-labels">
+                        <span>Warm</span>
+                        <span>Natural</span>
+                        <span>Crisp</span>
+                      </div>
+                    </div>
+
+                    <div class="audio-field">
+                      <div class="audio-field-head">
+                        <label for="audio-highpass">Low Rumble Cut</label>
+                        <span class="audio-readout" id="audio-highpass-val">80 Hz</span>
+                      </div>
+                      <select id="audio-highpass" class="select-input audio-select">
+                        <option value="0">Off — Full bass (music)</option>
+                        <option value="80" selected>80 Hz — Light (mic hum)</option>
+                        <option value="120">120 Hz — Medium (desk/AC)</option>
+                        <option value="200">200 Hz — Strong (voice only)</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Right Card: Smart Audio Cleanup Switches -->
+                <div class="audio-card">
+                  <span class="audio-section-kicker">Smart Audio Cleanup</span>
+                  <div class="audio-switches-list">
+                    <label class="audio-switch-row" for="audio-compressor">
+                      <input id="audio-compressor" class="metro-switch" type="checkbox" checked />
+                      <span class="audio-switch-copy">
+                        <span class="audio-switch-title">Volume Leveler</span>
+                        <span class="audio-switch-desc">Boosts quiet speech &amp; tames spikes</span>
+                      </span>
+                    </label>
+                    <label class="audio-switch-row" for="audio-ec">
+                      <input id="audio-ec" class="metro-switch" type="checkbox" checked />
+                      <span class="audio-switch-copy">
+                        <span class="audio-switch-title">Echo Cancellation</span>
+                        <span class="audio-switch-desc">Stops speaker audio looping back</span>
+                      </span>
+                    </label>
+                    <label class="audio-switch-row" for="audio-ns">
+                      <input id="audio-ns" class="metro-switch" type="checkbox" checked />
+                      <span class="audio-switch-copy">
+                        <span class="audio-switch-title">Noise Suppression</span>
+                        <span class="audio-switch-desc">Filters fans, keyboards &amp; static</span>
+                      </span>
+                    </label>
+                    <label class="audio-switch-row" for="audio-agc">
+                      <input id="audio-agc" class="metro-switch" type="checkbox" checked />
+                      <span class="audio-switch-copy">
+                        <span class="audio-switch-title">Auto Mic Volume</span>
+                        <span class="audio-switch-desc">Auto-levels quiet or loud mics</span>
+                      </span>
+                    </label>
+                  </div>
                 </div>
               </div>
             </div>

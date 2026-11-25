@@ -14,6 +14,7 @@ const SESSION_AUDIO_KEY = "p2p-direct-audio-settings";
 export const DEFAULT_AUDIO_SETTINGS = Object.freeze({
   preset: "voice",
   deviceId: "",
+  outputDeviceId: "",
   micGain: 100, // 0..250 (%)
   outputGain: 100, // 0..200 (%)
   noiseGate: 2, // 0..35 (% of full scale RMS)
@@ -41,6 +42,7 @@ export function sanitizeAudioSettings(raw) {
   return {
     preset,
     deviceId: typeof src.deviceId === "string" ? src.deviceId.slice(0, 128) : "",
+    outputDeviceId: typeof src.outputDeviceId === "string" ? src.outputDeviceId.slice(0, 128) : "",
     micGain: Math.round(clampNum(src.micGain, 0, 250, DEFAULT_AUDIO_SETTINGS.micGain)),
     outputGain: Math.round(clampNum(src.outputGain, 0, 200, DEFAULT_AUDIO_SETTINGS.outputGain)),
     noiseGate: Math.round(clampNum(src.noiseGate, 0, 35, DEFAULT_AUDIO_SETTINGS.noiseGate)),
