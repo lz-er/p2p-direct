@@ -359,6 +359,7 @@ class P2PDirectApp {
     this.profile = null;
     this.status = null;
     this.logMessages = [];
+    this.advancedMode = false;
     this.rawJsonMode = false;
     this.composerMode = "chat";
     this.pendingImages = [];
@@ -449,9 +450,27 @@ class P2PDirectApp {
       "voice-header-chip",
       "voice-header-count",
       "log-count-display",
+      "btn-advanced-toggle",
       "btn-theme-toggle",
       "icon-moon",
       "icon-sun",
+      "room-lobby",
+      "lobby-create-form",
+      "lobby-room-name-input",
+      "btn-lobby-create-room",
+      "lobby-join-form",
+      "lobby-room-link-input",
+      "btn-lobby-join-room",
+      "lobby-passphrase-box",
+      "lobby-passphrase-form",
+      "lobby-passphrase-input",
+      "btn-lobby-unlock-room",
+      "lobby-notice",
+      "simple-room-bar",
+      "simple-room-name",
+      "simple-room-badge",
+      "btn-simple-copy-link",
+      "btn-simple-leave-room",
       "connect-panel-title",
       "btn-wizard-reset",
       "connect-panel-meta",
@@ -541,6 +560,7 @@ class P2PDirectApp {
       "voice-participant-list",
       "voice-footer",
       "voice-codec-meta",
+      "voice-join-hint",
       "voice-packet-stats",
       "voice-notice",
       "btn-sync-now",
@@ -585,6 +605,29 @@ class P2PDirectApp {
   }
 
   bindEvents() {
+    // Simple vs Advanced mode toggle & Lobby / Simple Room Bar controls
+    this.el["btn-advanced-toggle"].addEventListener("click", () => this.toggleAdvancedMode());
+    this.el["lobby-create-form"].addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      this.createRoomFromLobby();
+    });
+    this.el["lobby-join-form"].addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      this.joinRoomFromLobby();
+    });
+    this.el["lobby-passphrase-form"].addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      this.unlockRoomFromLobby();
+    });
+    this.el["btn-simple-copy-link"].addEventListener("click", () => {
+      if (!this.activeRoom) return;
+      this.copyText(
+        this.activeRoom.url,
+        "Copied room link — anyone who opens it joins automatically"
+      );
+    });
+    this.el["btn-simple-leave-room"].addEventListener("click", () => this.leaveLongLivedRoom());
+
     // Passphrase controls
     this.el["btn-apply-passphrase"].addEventListener("click", () => this.applyPassphrase());
     this.el["btn-clear-passphrase"].addEventListener("click", () => this.clearPassphrase());
@@ -1000,6 +1043,7 @@ class P2PDirectApp {
   async init() {
     this.bindElements();
     this.initTheme();
+    this.initAdvancedMode();
     this.bindEvents();
 
     // Ensure nothing is persisted permanently on the client
@@ -1030,15 +1074,124 @@ class P2PDirectApp {
 
     this.setupBroadcastChannel();
     this.startKeepaliveWorker();
-    this.renderAll();
 
-    // Handle any #room=, #offer=, or #answer= fragment present in the initial URL
+    // Handle any #room=, #offer=, or #answer= fragment before first render to avoid lobby flash
     await this.handleUrlHashFragment();
+    this.renderAll();
 
     // Discover any other live tabs open in this browser
     this.broadcastMeshBeacon(true);
 
     window.__p2pDirect = this;
+  }
+
+  /* ================= Simple vs Advanced Mode & Lobby ================= */
+
+  initAdvancedMode() {
+    const initial = document.documentElement.getAttribute("data-advanced") === "true";
+    this.setAdvancedMode(initial, /* persist = */ false);
+  }
+
+  setAdvancedMode(enabled, persist = true) {
+    this.advancedMode = Boolean(enabled);
+    document.documentElement.setAttribute("data-advanced", this.advancedMode ? "true" : "false");
+
+    const btn = this.el["btn-advanced-toggle"];
+    if (btn) {
+      btn.classList.toggle("is-active", this.advancedMode);
+      btn.setAttribute("aria-pressed", String(this.advancedMode));
+      btn.title = this.advancedMode
+        ? "Return to simple room view"
+        : "Show advanced networking, manual connect, and JSON tools";
+    }
+
+    if (persist) {
+      try {
+        sessionStorage.setItem("p2p-direct-advanced", this.advancedMode ? "true" : "false");
+      } catch {
+        // ignore storage restrictions
+      }
+    }
+
+    if (!this.advancedMode) {
+      if (this.rawJsonMode) {
+        this.rawJsonMode = false;
+        if (this.el["btn-toggle-raw"]) {
+          this.el["btn-toggle-raw"].textContent = "Raw JSON";
+        }
+      }
+      if (this.composerMode !== "chat") {
+        this.switchComposerMode("chat");
+      }
+      if (this.el["log-search-input"]) this.el["log-search-input"].value = "";
+      if (this.el["log-type-filter"]) this.el["log-type-filter"].value = "";
+    }
+
+    if (this.status) {
+      this.renderAll();
+    } else {
+      this.syncLayoutAttributes();
+    }
+  }
+
+  toggleAdvancedMode() {
+    this.setAdvancedMode(!this.advancedMode, true);
+  }
+
+  syncLayoutAttributes() {
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    document.documentElement.setAttribute("data-in-room", inRoom ? "true" : "false");
+  }
+
+  createRoomFromLobby() {
+    const typedName = (this.el["lobby-room-name-input"]?.value || "").trim();
+    this.createLongLivedRoom({ freshKey: false, roomNameOverride: typedName });
+  }
+
+  async joinRoomFromLobby() {
+    const raw = (this.el["lobby-room-link-input"]?.value || "").trim();
+    if (!raw) {
+      this.showNotice("lobby-notice", "warn", "Paste a room invite link first.");
+      return;
+    }
+    this.el["lobby-notice"]?.classList.add("hidden");
+    this.el["lobby-passphrase-box"]?.classList.add("hidden");
+
+    try {
+      const passInput = this.el["e2ee-passphrase-input"].value;
+      const decoded = this.wasm.call({
+        cmd: "decode_signal",
+        input: raw,
+        passphrase: passInput || undefined,
+      });
+      if (decoded.signal.kind === "offer") {
+        this.el["lobby-room-link-input"].value = "";
+        this.setAdvancedMode(true);
+        await this.handleJoinOfferSubmit(raw);
+        return;
+      }
+      if (decoded.signal.kind === "answer") {
+        this.el["lobby-room-link-input"].value = "";
+        this.setAdvancedMode(true);
+        await this.handleHostAnswerSubmit(raw);
+        return;
+      }
+    } catch {
+      // Fall through to joinLongLivedRoomLink so passphrase prompt / clean error notice displays
+    }
+
+    await this.joinLongLivedRoomLink(raw);
+  }
+
+  async unlockRoomFromLobby() {
+    const pass = this.el["lobby-passphrase-input"]?.value || "";
+    if (!pass) {
+      this.showNotice("lobby-notice", "warn", "Enter the shared room passphrase.");
+      return;
+    }
+    this.el["e2ee-passphrase-input"].value = pass;
+    this.el["lobby-passphrase-input"].value = "";
+    await this.applyPassphrase();
   }
 
   /* ================= Theme & Chat Media Helpers ================= */
@@ -2174,8 +2327,11 @@ class P2PDirectApp {
     return true;
   }
 
-  createLongLivedRoom({ freshKey = false } = {}) {
-    const typedName = (this.el["room-name-input"]?.value || "").trim();
+  createLongLivedRoom({ freshKey = false, roomNameOverride = null } = {}) {
+    const typedName =
+      roomNameOverride !== null
+        ? String(roomNameOverride).trim()
+        : (this.el["room-name-input"]?.value || "").trim();
     const params = new URLSearchParams(window.location.search);
     const queryRelay = (params.get("relay") || "").trim() || null;
 
@@ -2196,7 +2352,12 @@ class P2PDirectApp {
     if (this.el["room-name-input"]) {
       this.el["room-name-input"].value = "";
     }
+    if (this.el["lobby-room-name-input"]) {
+      this.el["lobby-room-name-input"].value = "";
+    }
     this.el["connect-notice"].classList.add("hidden");
+    this.el["lobby-notice"]?.classList.add("hidden");
+    this.el["lobby-passphrase-box"]?.classList.add("hidden");
     this.activateCurrentMeshAsRoom({
       roomName,
       relay: queryRelay,
@@ -2250,6 +2411,11 @@ class P2PDirectApp {
       const effectiveRelay = (params.get("relay") || "").trim() || sig.relay || null;
 
       this.el["connect-notice"].classList.add("hidden");
+      this.el["lobby-notice"]?.classList.add("hidden");
+      this.el["lobby-passphrase-box"]?.classList.add("hidden");
+      if (this.el["lobby-room-link-input"]) {
+        this.el["lobby-room-link-input"].value = "";
+      }
       this.activateCurrentMeshAsRoom({
         roomName,
         relay: effectiveRelay,
@@ -2264,9 +2430,18 @@ class P2PDirectApp {
       if (msg.toLowerCase().includes("passphrase")) {
         this.pendingRoomCode = trimmed;
         this.el["e2ee-key-details"].open = true;
-        this.el["e2ee-passphrase-input"].focus();
+        if (this.advancedMode) {
+          this.el["e2ee-passphrase-input"].focus();
+        } else if (this.el["lobby-passphrase-box"]) {
+          this.el["lobby-passphrase-box"].classList.remove("hidden");
+          this.el["lobby-passphrase-input"]?.focus();
+        }
       }
       this.showNotice("connect-notice", "error", msg);
+      if (this.el["lobby-notice"]) {
+        this.showNotice("lobby-notice", "error", msg);
+      }
+      this.syncLayoutAttributes();
       return false;
     }
   }
@@ -2327,7 +2502,10 @@ class P2PDirectApp {
       this.roomRendezvous = null;
     }
     this.activeRoom = null;
+    this.pendingRoomCode = null;
     this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0 };
+    this.el["lobby-notice"]?.classList.add("hidden");
+    this.el["lobby-passphrase-box"]?.classList.add("hidden");
     // Disconnect from the room and wipe in-memory messages so leaving leaves zero trace
     this.switchToMeshKey(randomBase64Url(32), false, "mesh-main");
     try {
@@ -2695,9 +2873,15 @@ class P2PDirectApp {
       }
 
       if (frag.kind === "offer") {
+        if (!this.advancedMode) {
+          this.setAdvancedMode(true);
+        }
         this.openJoinWizard();
         await this.acceptManualOffer(frag.code);
       } else if (frag.kind === "answer") {
+        if (!this.advancedMode) {
+          this.setAdvancedMode(true);
+        }
         await this.handleIncomingAnswerUrlOrCode(frag.code, /* fromHash = */ true);
       }
     } catch (err) {
@@ -4169,6 +4353,7 @@ class P2PDirectApp {
   /* ================= Rendering ================= */
 
   renderAll() {
+    this.syncLayoutAttributes();
     this.renderHeader();
     this.renderRoomCard();
     this.renderWizard();
@@ -4182,33 +4367,48 @@ class P2PDirectApp {
   }
 
   renderRoomCard() {
-    if (!this.el["room-link-card"]) return;
     const isActive = Boolean(this.activeRoom);
+    const peerCount = this.status?.peers?.length || 0;
+    const relayState = this.roomRelayStatus?.state || "connecting";
+    const relayCount = this.roomRelayStatus?.connectedCount || 0;
+
+    let badgeText = "Connecting…";
+    let badgeClass = "badge pending";
+    if (peerCount > 0) {
+      badgeText = `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
+      badgeClass = "badge auto";
+    } else if (isActive && relayState === "live" && relayCount > 0) {
+      badgeText = "Listening";
+      badgeClass = "badge auto";
+    }
+
+    // Update Simple Mode compact room header bar
+    if (this.el["simple-room-bar"]) {
+      const displayName = isActive
+        ? this.activeRoom.name || "Shared Room"
+        : this.status?.room && this.status.room !== "mesh-main" && this.status.room !== "default"
+          ? this.status.room
+          : "Direct Room";
+      this.el["simple-room-name"].textContent = displayName;
+      this.el["simple-room-badge"].textContent = badgeText;
+      this.el["simple-room-badge"].className = badgeClass;
+      this.el["btn-simple-copy-link"].classList.toggle("hidden", !isActive);
+    }
+
+    if (!this.el["room-link-card"]) return;
     this.el["room-link-card"].classList.toggle("is-active", isActive);
     this.el["room-link-setup"].classList.toggle("hidden", isActive);
     this.el["room-link-active"].classList.toggle("hidden", !isActive);
 
     if (!isActive) return;
 
-    const peerCount = this.status?.peers?.length || 0;
-    const relayState = this.roomRelayStatus?.state || "connecting";
-    const relayCount = this.roomRelayStatus?.connectedCount || 0;
-
     this.el["room-active-name"].textContent = this.activeRoom.name || "Shared Room";
     this.el["room-link-output"].value = this.activeRoom.url;
     this.el["btn-room-share"].classList.toggle("hidden", typeof navigator.share !== "function");
 
     const badge = this.el["room-relay-badge"];
-    if (peerCount > 0) {
-      badge.textContent = `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
-      badge.className = "badge auto";
-    } else if (relayState === "live" && relayCount > 0) {
-      badge.textContent = "Listening";
-      badge.className = "badge auto";
-    } else {
-      badge.textContent = "Connecting…";
-      badge.className = "badge pending";
-    }
+    badge.textContent = badgeText;
+    badge.className = badgeClass;
 
     if (peerCount > 0) {
       this.el["room-active-hint"].textContent =
@@ -4329,12 +4529,23 @@ class P2PDirectApp {
       deafBtn.textContent = this.voice.deafened ? "Undeafen" : "Deafen";
       deafBtn.classList.toggle("is-toggled", this.voice.deafened);
 
+      if (this.el["voice-join-hint"]) {
+        this.el["voice-join-hint"].classList.add("hidden");
+      }
       if (this.status.stats) {
         this.el["voice-packet-stats"].textContent =
           `TX ${this.status.stats.voicePacketsSent} / RX ${this.status.stats.voicePacketsReceived}`;
       }
     } else if (totalInVoice > 0) {
-      this.el["voice-packet-stats"].textContent = "Click Join Voice to talk together";
+      if (this.el["voice-join-hint"]) {
+        this.el["voice-join-hint"].classList.remove("hidden");
+      }
+      this.el["voice-packet-stats"].textContent = "";
+    } else {
+      if (this.el["voice-join-hint"]) {
+        this.el["voice-join-hint"].classList.add("hidden");
+      }
+      this.el["voice-packet-stats"].textContent = "";
     }
 
     if (totalInVoice === 0) {
@@ -4759,8 +4970,8 @@ class P2PDirectApp {
 
   renderLog() {
     const feed = this.el["log-feed"];
-    const query = this.el["log-search-input"].value.trim().toLowerCase();
-    const typeFilter = this.el["log-type-filter"].value;
+    const query = this.advancedMode ? this.el["log-search-input"].value.trim().toLowerCase() : "";
+    const typeFilter = this.advancedMode ? this.el["log-type-filter"].value : "";
 
     const filtered = this.logMessages.filter((m) => {
       if (typeFilter && m.type !== typeFilter) return false;
@@ -4783,14 +4994,17 @@ class P2PDirectApp {
     });
 
     if (filtered.length === 0) {
+      const emptyPrompt = this.advancedMode
+        ? "No messages yet. Type a message, paste an image or link, or share structured JSON below."
+        : "No messages yet. Type a message, paste an image, or share a link below.";
       feed.innerHTML =
         this.logMessages.length === 0
-          ? '<div class="empty-state">No messages yet. Type a message, paste an image or link, or share structured JSON below.</div>'
+          ? `<div class="empty-state">${emptyPrompt}</div>`
           : '<div class="empty-state">No messages match your current filter.</div>';
       return;
     }
 
-    if (this.rawJsonMode) {
+    if (this.advancedMode && this.rawJsonMode) {
       const jsonl = filtered.map((m) => JSON.stringify(m)).join("\n");
       feed.innerHTML = `<pre class="raw-jsonl-view">${escapeHtml(jsonl)}</pre>`;
       return;

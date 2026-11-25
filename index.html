@@ -20,9 +20,15 @@
           const prefersDark =
             window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
           const theme = saved === "dark" || saved === "light" ? saved : prefersDark ? "dark" : "light";
+          const adv = sessionStorage.getItem("p2p-direct-advanced") === "true";
+          const hasRoomHash = /#room=/i.test(window.location.hash || "");
           document.documentElement.setAttribute("data-theme", theme);
+          document.documentElement.setAttribute("data-advanced", adv ? "true" : "false");
+          document.documentElement.setAttribute("data-in-room", hasRoomHash ? "true" : "false");
         } catch {
           document.documentElement.setAttribute("data-theme", "light");
+          document.documentElement.setAttribute("data-advanced", "false");
+          document.documentElement.setAttribute("data-in-room", "false");
         }
       })();
     </script>
@@ -53,28 +59,48 @@
             <label for="author-name-input">Name</label>
             <input id="author-name-input" type="text" maxlength="32" autocomplete="off" />
           </div>
-          <div class="stat-chip live" id="e2ee-fp-chip" title="End-to-End Encrypted Room Key Fingerprint">
+          <div class="stat-chip live advanced-only" id="e2ee-fp-chip" title="End-to-End Encrypted Room Key Fingerprint">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
               <path d="M7 11V7a5 5 0 0 1 10 0v4" />
             </svg>
             <strong id="key-fp-display">…</strong>
           </div>
-          <div class="stat-chip" id="mesh-status-chip" title="Connected Peers">
+          <div class="stat-chip room-only" id="mesh-status-chip" title="Connected Peers">
             <span class="status-dot" id="mesh-status-dot"></span>
             Peers <strong id="peer-count-display">0</strong>
           </div>
-          <div class="stat-chip hidden" id="voice-header-chip" title="Active Voice Participants">
+          <div class="stat-chip room-only hidden" id="voice-header-chip" title="Active Voice Participants">
             <span class="status-dot online"></span>
             Voice <strong id="voice-header-count">0</strong>
           </div>
-          <div class="stat-chip chip-secondary" title="Local Peer ID">
+          <div class="stat-chip chip-secondary advanced-only" title="Local Peer ID">
             ID <strong id="peer-id-display">loading…</strong>
           </div>
-          <div class="stat-chip chip-secondary" title="Messages">
+          <div class="stat-chip chip-secondary advanced-only" title="Messages">
             Msgs <strong id="log-count-display">0</strong>
           </div>
           <span class="hidden" id="lamport-display">0</span>
+          <button
+            type="button"
+            id="btn-advanced-toggle"
+            class="btn btn-sm btn-advanced"
+            aria-pressed="false"
+            title="Show advanced networking, manual connect, and JSON tools"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="4" y1="21" x2="4" y2="14" />
+              <line x1="4" y1="10" x2="4" y2="3" />
+              <line x1="12" y1="21" x2="12" y2="12" />
+              <line x1="12" y1="8" x2="12" y2="3" />
+              <line x1="20" y1="21" x2="20" y2="16" />
+              <line x1="20" y1="12" x2="20" y2="3" />
+              <line x1="1" y1="14" x2="7" y2="14" />
+              <line x1="9" y1="8" x2="15" y2="8" />
+              <line x1="17" y1="16" x2="23" y2="16" />
+            </svg>
+            <span>Advanced</span>
+          </button>
           <button
             type="button"
             id="btn-theme-toggle"
@@ -100,9 +126,115 @@
         </div>
       </header>
 
+      <!-- Default Simple Lobby: Create Room or Join Room -->
+      <section id="room-lobby" class="room-lobby" aria-label="Create or join a room">
+        <div class="lobby-container">
+          <div class="lobby-header">
+            <h2>Start or Join a Room</h2>
+            <p>End-to-end encrypted voice and chat directly between browsers. Nothing is stored once everyone leaves.</p>
+          </div>
+
+          <div class="lobby-grid">
+            <div class="panel lobby-card">
+              <div class="lobby-card-head">
+                <span class="lobby-icon lobby-icon-create" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                </span>
+                <h3>Create Room</h3>
+              </div>
+              <p class="lobby-card-desc">
+                Create a private room and get an invite link anyone can use to join automatically.
+              </p>
+              <form id="lobby-create-form" class="lobby-form">
+                <input
+                  id="lobby-room-name-input"
+                  class="text-input"
+                  type="text"
+                  maxlength="32"
+                  placeholder="Room name (optional)…"
+                  autocomplete="off"
+                />
+                <button type="submit" id="btn-lobby-create-room" class="btn btn-live lobby-submit">
+                  Create Room
+                </button>
+              </form>
+            </div>
+
+            <div class="panel lobby-card">
+              <div class="lobby-card-head">
+                <span class="lobby-icon lobby-icon-join" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
+                    <polyline points="10 17 15 12 10 7" />
+                    <line x1="15" y1="12" x2="3" y2="12" />
+                  </svg>
+                </span>
+                <h3>Join Room</h3>
+              </div>
+              <p class="lobby-card-desc">
+                Paste a room invite link below to connect right away with everyone in the room.
+              </p>
+              <form id="lobby-join-form" class="lobby-form">
+                <input
+                  id="lobby-room-link-input"
+                  class="text-input"
+                  type="text"
+                  placeholder="Paste room invite link…"
+                  autocomplete="off"
+                />
+                <button type="submit" id="btn-lobby-join-room" class="btn btn-primary lobby-submit">
+                  Join Room
+                </button>
+              </form>
+            </div>
+          </div>
+
+          <!-- Inline passphrase prompt if a passphrase-protected room link is opened in Simple Mode -->
+          <div id="lobby-passphrase-box" class="panel lobby-passphrase-box hidden">
+            <div class="lobby-passphrase-head">
+              <strong>Passphrase Required</strong>
+              <span>This room link is protected with a shared passphrase.</span>
+            </div>
+            <form id="lobby-passphrase-form" class="lobby-passphrase-row">
+              <input
+                id="lobby-passphrase-input"
+                class="text-input"
+                type="password"
+                placeholder="Enter room passphrase…"
+                autocomplete="off"
+              />
+              <button type="submit" id="btn-lobby-unlock-room" class="btn btn-live btn-sm">
+                Unlock &amp; Join
+              </button>
+            </form>
+          </div>
+
+          <div id="lobby-notice" class="inline-notice hidden"></div>
+        </div>
+      </section>
+
       <main class="workbench">
-        <!-- Main Focus Column: Prominent Voice Stage + Rich Live Chat -->
+        <!-- Main Focus Column: Simple Room Bar + Voice Stage + Rich Live Chat -->
         <section class="main-column">
+          <!-- Compact Room Header Bar (shown in default Simple Mode when inside a room) -->
+          <section class="panel simple-room-bar simple-only" id="simple-room-bar" aria-label="Current room">
+            <div class="simple-room-info">
+              <h2 class="simple-room-title" id="simple-room-name">Shared Room</h2>
+              <span class="badge pending" id="simple-room-badge">Connecting…</span>
+            </div>
+            <div class="simple-room-actions">
+              <button type="button" id="btn-simple-copy-link" class="btn btn-sm btn-live">
+                Copy Invite Link
+              </button>
+              <button type="button" id="btn-simple-leave-room" class="btn btn-sm btn-danger">
+                Leave Room
+              </button>
+            </div>
+          </section>
+
           <!-- Prominent Unified Real-Time Voice Channel -->
           <section class="panel voice-stage-panel" id="voice-panel" aria-labelledby="voice-panel-title">
             <div class="panel-header voice-stage-header">
@@ -163,7 +295,8 @@
 
               <div id="voice-footer" class="voice-footer hidden">
                 <span id="voice-codec-meta">End-to-end encrypted · 16 kHz</span>
-                <span id="voice-packet-stats"></span>
+                <span id="voice-join-hint" class="hidden">Click Join Voice to talk together</span>
+                <span id="voice-packet-stats" class="advanced-only"></span>
               </div>
 
               <div id="voice-notice" class="inline-notice hidden"></div>
@@ -177,7 +310,7 @@
                 <h2 class="panel-title" id="log-panel-title">Chat</h2>
                 <span class="panel-meta" id="chat-sync-meta">In-memory · Encrypted</span>
               </div>
-              <div class="btn-row" style="margin-top: 0">
+              <div class="btn-row advanced-only" style="margin-top: 0">
                 <button type="button" id="btn-toggle-raw" class="btn btn-sm">Raw JSON</button>
                 <button type="button" id="btn-export-encrypted" class="btn btn-sm">Backup</button>
                 <button type="button" id="btn-export-log" class="btn btn-sm">Export</button>
@@ -192,7 +325,7 @@
               </div>
             </div>
 
-            <div class="log-toolbar">
+            <div class="log-toolbar advanced-only">
               <input
                 id="log-search-input"
                 class="search-input"
@@ -206,12 +339,12 @@
 
             <div id="log-feed" class="log-feed" aria-live="polite">
               <div class="empty-state">
-                No messages yet. Type a message, paste an image or link, or share structured JSON below.
+                No messages yet. Type a message, paste an image, or share a link below.
               </div>
             </div>
 
             <div class="composer" id="chat-composer-dropzone">
-              <div class="composer-head">
+              <div class="composer-head advanced-only">
                 <div class="composer-modes" role="tablist">
                   <button
                     type="button"
@@ -270,8 +403,8 @@
                 <button type="submit" id="btn-send-chat" class="btn btn-primary">Send</button>
               </form>
 
-              <!-- Structured JSON Mode -->
-              <form id="json-composer-form" class="composer-structured hidden">
+              <!-- Structured JSON Mode (Advanced Only) -->
+              <form id="json-composer-form" class="composer-structured advanced-only hidden">
                 <div class="structured-meta-row">
                   <input
                     id="json-type-input"
@@ -305,8 +438,8 @@
           </section>
         </section>
 
-        <!-- Secondary Sidebar Rail: Step-by-Step Connect, Peers & Network, Collapsible Diagnostics -->
-        <aside class="rail">
+        <!-- Secondary Sidebar Rail (Advanced Only): Step-by-Step Connect, Peers & Network, Collapsible Diagnostics -->
+        <aside class="rail advanced-only">
           <section class="panel" aria-labelledby="connect-panel-title">
             <div class="panel-header">
               <h2 class="panel-title" id="connect-panel-title">Connect Peer</h2>
