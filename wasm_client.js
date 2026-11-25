@@ -8,6 +8,8 @@ const OP_CALL = 1;
 const OP_STREAM_APPEND = 2;
 const OP_STREAM_EXEC = 3;
 const OP_READ_OUT_CHUNK = 4;
+const OP_VOICE_ENCODE_SEAL = 5;
+const OP_VOICE_OPEN_DECODE = 6;
 
 const STATUS_OK = 1;
 const EXPECTED_BUF_CAP = 262144;
@@ -153,6 +155,88 @@ export class SafeRustWasmMesh {
       throw new Error(parsed.error || "Unknown WASM RPC error");
     }
     return parsed;
+  }
+
+  /**
+   * Pure binary fast-path: encodes 16 kHz mono Int16Array PCM with IMA ADPCM and seals
+   * per-peer V1 ChaCha20-Poly1305 packets for every peer currently in voice chat.
+   */
+  sealVoicePcm(int16Array) {
+    if (!int16Array || int16Array.length === 0) {
+      return { rms: 0, packets: [] };
+    }
+    const rawView = new Uint8Array(
+      int16Array.buffer,
+      int16Array.byteOffset,
+      int16Array.byteLength
+    );
+    const byteLen = Math.min(rawView.byteLength, this.bufCap);
+    new Uint8Array(this.memory.buffer, this.inPtr, byteLen).set(rawView.subarray(0, byteLen));
+
+    const hdr = this._invoke(OP_VOICE_ENCODE_SEAL, byteLen);
+    const outLen = hdr[7];
+    if (hdr[8] !== STATUS_OK || outLen < 4) {
+      return { rms: 0, packets: [] };
+    }
+
+    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
+    const outBytes = new Uint8Array(this.memory.buffer, this.outPtr, outLen);
+    const rms = dv.getUint16(0, true);
+    const peerCount = dv.getUint16(2, true);
+    const packets = [];
+    let offset = 4;
+
+    for (let i = 0; i < peerCount; i++) {
+      if (offset + 2 > outLen) break;
+      const pidLen = dv.getUint16(offset, true);
+      offset += 2;
+      if (offset + pidLen + 2 > outLen) break;
+      const peerId = textDecoder.decode(outBytes.subarray(offset, offset + pidLen));
+      offset += pidLen;
+      const pktLen = dv.getUint16(offset, true);
+      offset += 2;
+      if (offset + pktLen > outLen) break;
+      const data = outBytes.slice(offset, offset + pktLen);
+      offset += pktLen;
+      packets.push({ peerId, data });
+    }
+    return { rms, packets };
+  }
+
+  /**
+   * Pure binary fast-path: authenticates, anti-replay checks, decrypts, and IMA-ADPCM-decodes
+   * an incoming V1 binary voice packet from `peerId`.
+   */
+  openVoicePacket(peerId, packetUint8) {
+    if (!peerId || !packetUint8 || packetUint8.byteLength === 0) {
+      return null;
+    }
+    const pidBytes = textEncoder.encode(peerId);
+    const totalIn = 2 + pidBytes.length + packetUint8.byteLength;
+    if (totalIn > this.bufCap || pidBytes.length > 65535) {
+      return null;
+    }
+    const inBuf = new Uint8Array(this.memory.buffer, this.inPtr, totalIn);
+    inBuf[0] = pidBytes.length & 0xff;
+    inBuf[1] = (pidBytes.length >> 8) & 0xff;
+    inBuf.set(pidBytes, 2);
+    inBuf.set(packetUint8, 2 + pidBytes.length);
+
+    const hdr = this._invoke(OP_VOICE_OPEN_DECODE, totalIn);
+    const outLen = hdr[7];
+    if (hdr[8] !== STATUS_OK || outLen < 4) {
+      return null;
+    }
+
+    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
+    const rms = dv.getUint16(0, true);
+    const sampleCount = dv.getUint16(2, true);
+    const byteCount = sampleCount * 2;
+    if (sampleCount === 0 || 4 + byteCount > outLen) {
+      return { rms, pcm: new Int16Array(0) };
+    }
+    const pcmBytes = new Uint8Array(this.memory.buffer, this.outPtr + 4, byteCount).slice();
+    return { rms, pcm: new Int16Array(pcmBytes.buffer) };
   }
 
   rehandshake() {

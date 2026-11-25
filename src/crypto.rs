@@ -950,6 +950,28 @@ pub fn derive_link_keys(
     Ok((tx_key, rx_key))
 }
 
+/// Derives directional (tx, rx) ChaCha20-Poly1305 voice keys from X25519 ECDH + mesh key.
+pub fn derive_voice_link_keys(
+    my_secret: &[u8; KEY_LEN],
+    peer_public: &[u8; KEY_LEN],
+    mesh_key: &[u8; KEY_LEN],
+    my_peer_id: &str,
+    other_peer_id: &str,
+) -> Result<([u8; KEY_LEN], [u8; KEY_LEN]), String> {
+    let ecdh = x25519_shared_secret(my_secret, peer_public)?;
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(&ecdh);
+    ikm[32..64].copy_from_slice(mesh_key);
+
+    let prk = hkdf_extract(b"p2p-direct-voice-v1", &ikm);
+
+    let tx_info = format!("voice|{my_peer_id}->{other_peer_id}");
+    let rx_info = format!("voice|{other_peer_id}->{my_peer_id}");
+    let tx_key = hkdf_expand_32(&prk, tx_info.as_bytes());
+    let rx_key = hkdf_expand_32(&prk, rx_info.as_bytes());
+    Ok((tx_key, rx_key))
+}
+
 /// Derives an end-to-end key for relayed SDP/ICE signaling opaque to intermediate relay peers.
 pub fn derive_relay_signal_key(
     my_secret: &[u8; KEY_LEN],

@@ -186,6 +186,71 @@ impl RelaySignalBody {
     }
 }
 
+pub const VOICE_PACKET_MAGIC: [u8; 2] = *b"V1";
+pub const VOICE_PACKET_HEADER_LEN: usize = 2 + 8 + NONCE_LEN;
+
+fn voice_aad_bytes(sender_id: &str, receiver_id: &str, seq: u64) -> Vec<u8> {
+    format!("p2p-voice-v1|{sender_id}->{receiver_id}|{seq}").into_bytes()
+}
+
+/// Seals a raw IMA ADPCM voice frame into a compact binary ChaCha20-Poly1305 packet:
+/// `[b'V', b'1', seq_u64_le (8B), nonce (12B), ciphertext + 16B Poly1305 tag]`.
+pub fn seal_voice_packet(
+    tx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: [u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    adpcm_payload: &[u8],
+) -> Vec<u8> {
+    let aad = voice_aad_bytes(sender_id, receiver_id, seq);
+    let ciphertext = aead_seal(tx_key, &nonce, &aad, adpcm_payload);
+    let mut out = Vec::with_capacity(VOICE_PACKET_HEADER_LEN + ciphertext.len());
+    out.extend_from_slice(&VOICE_PACKET_MAGIC);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    out
+}
+
+/// Parses a binary `V1` E2EE voice packet header into `(seq, nonce, ciphertext_with_tag)`.
+pub fn parse_voice_packet_header(packet: &[u8]) -> Result<(u64, [u8; NONCE_LEN], &[u8]), String> {
+    if packet.len() < VOICE_PACKET_HEADER_LEN + 16 {
+        return Err("voice packet shorter than V1 E2EE minimum length".to_owned());
+    }
+    if packet.get(0..2) != Some(&VOICE_PACKET_MAGIC[..]) {
+        return Err("rejected voice packet without V1 E2EE magic header".to_owned());
+    }
+    let seq_slice = packet
+        .get(2..10)
+        .ok_or_else(|| "voice packet missing sequence".to_owned())?;
+    let mut seq_arr = [0u8; 8];
+    seq_arr.copy_from_slice(seq_slice);
+    let seq = u64::from_le_bytes(seq_arr);
+
+    let nonce_slice = packet
+        .get(10..VOICE_PACKET_HEADER_LEN)
+        .ok_or_else(|| "voice packet missing nonce".to_owned())?;
+    let nonce = parse_fixed_12(nonce_slice, "voice nonce")?;
+    let ct = packet
+        .get(VOICE_PACKET_HEADER_LEN..)
+        .ok_or_else(|| "voice packet missing ciphertext".to_owned())?;
+    Ok((seq, nonce, ct))
+}
+
+/// Authenticates and decrypts the ADPCM payload of a parsed `V1` E2EE voice packet.
+pub fn open_voice_packet_ciphertext(
+    rx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: &[u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let aad = voice_aad_bytes(sender_id, receiver_id, seq);
+    aead_open(rx_key, nonce, &aad, ciphertext)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireFrame {
     Hello {
@@ -195,6 +260,8 @@ pub enum WireFrame {
         pub_key: [u8; KEY_LEN],
         lamport: u64,
         log_count: usize,
+        in_voice: bool,
+        voice_muted: bool,
         peers: Vec<PeerSummary>,
     },
     Msg {
@@ -245,6 +312,10 @@ pub enum WireFrame {
     Pong {
         ts: u64,
     },
+    VoiceState {
+        in_voice: bool,
+        muted: bool,
+    },
 }
 
 impl WireFrame {
@@ -258,6 +329,8 @@ impl WireFrame {
                 pub_key,
                 lamport,
                 log_count,
+                in_voice,
+                voice_muted,
                 peers,
             } => {
                 out.push_str("{\"kind\":\"hello\",\"peerId\":");
@@ -270,7 +343,7 @@ impl WireFrame {
                 write_json_string(&mut out, &base64url_encode(pub_key));
                 let _ = write!(
                     out,
-                    ",\"lamport\":{lamport},\"logCount\":{log_count},\"peers\":["
+                    ",\"lamport\":{lamport},\"logCount\":{log_count},\"inVoice\":{in_voice},\"voiceMuted\":{voice_muted},\"peers\":["
                 );
                 for (i, p) in peers.iter().enumerate() {
                     if i > 0 {
@@ -400,6 +473,12 @@ impl WireFrame {
             Self::Pong { ts } => {
                 let _ = write!(out, "{{\"kind\":\"pong\",\"t\":{ts}}}");
             }
+            Self::VoiceState { in_voice, muted } => {
+                let _ = write!(
+                    out,
+                    "{{\"kind\":\"voice-state\",\"inVoice\":{in_voice},\"muted\":{muted}}}"
+                );
+            }
         }
         out
     }
@@ -418,6 +497,8 @@ impl WireFrame {
                 let pub_key = parse_fixed_32(&base64url_decode(&pk_b64)?, "hello pubKey")?;
                 let lamport = val.get_u64("lamport").unwrap_or(0);
                 let log_count = val.get_u64("logCount").unwrap_or(0) as usize;
+                let in_voice = val.get_bool("inVoice").unwrap_or(false);
+                let voice_muted = val.get_bool("voiceMuted").unwrap_or(false);
                 let mut peers = Vec::new();
                 if let Some(arr) = val.get("peers").and_then(JsonValue::as_array) {
                     for item in arr {
@@ -445,6 +526,8 @@ impl WireFrame {
                     pub_key,
                     lamport,
                     log_count,
+                    in_voice,
+                    voice_muted,
                     peers,
                 })
             }
@@ -556,6 +639,10 @@ impl WireFrame {
             }),
             "pong" => Ok(Self::Pong {
                 ts: val.get_u64("t").unwrap_or(0),
+            }),
+            "voice-state" => Ok(Self::VoiceState {
+                in_voice: val.get_bool("inVoice").unwrap_or(false),
+                muted: val.get_bool("muted").unwrap_or(false),
             }),
             other => Err(format!("unknown wire frame kind '{other}'")),
         }

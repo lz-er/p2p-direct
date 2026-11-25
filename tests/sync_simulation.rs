@@ -819,3 +819,119 @@ fn sim_keepalive_ping_pong_and_rapid_rejoin_same_peer_id() -> TestResult {
     assert_eq!(sim.node("peer-b")?.stats().e2ee_auth_failures, 0);
     Ok(())
 }
+
+#[test]
+fn sim_multi_peer_realtime_e2ee_voice_chat() -> TestResult {
+    let mut sim = SimNetwork::new(2_000);
+    sim.add_node("peer-a", "Alice", MeshConfig::default());
+    sim.add_node("peer-b", "Bob", MeshConfig::default());
+    sim.add_node("peer-c", "Carol", MeshConfig::default());
+    sim.add_node("peer-d", "Dave", MeshConfig::default());
+
+    // Build mesh: A-B, A-C, A-D -> auto-mesh turns it into a full mesh!
+    sim.connect("peer-a", "peer-b", false, None)?;
+    sim.connect("peer-a", "peer-c", false, None)?;
+    sim.connect("peer-a", "peer-d", false, None)?;
+    sim.drain()?;
+
+    // Alice, Bob, and Carol join voice chat simultaneously; Dave stays out of voice
+    for pid in ["peer-a", "peer-b", "peer-c"] {
+        let acts = sim.node_mut(pid)?.set_voice_state(true, false);
+        sim.process_actions(pid, acts)?;
+    }
+    sim.drain()?;
+
+    // Generate distinct 20ms (320-sample) 16 kHz sine waves for Alice (440 Hz), Bob (660 Hz), Carol (880 Hz)
+    let make_tone = |freq_hz: f64| -> Vec<i16> {
+        (0..320)
+            .map(|i| {
+                let t = (i as f64) / 16_000.0;
+                (12_000.0 * (2.0 * std::f64::consts::PI * freq_hz * t).sin()) as i16
+            })
+            .collect()
+    };
+    let tone_a = make_tone(440.0);
+    let tone_b = make_tone(660.0);
+    let tone_c = make_tone(880.0);
+
+    // Every speaker talks simultaneously: each seals for the other 2 voice peers (and NOT for Dave!)
+    let speakers = [("peer-a", &tone_a), ("peer-b", &tone_b), ("peer-c", &tone_c)];
+    let mut captured_for_tamper: Option<(String, String, Vec<u8>)> = None;
+
+    for (sender, pcm) in speakers {
+        let (local_rms, pkts) = sim.node_mut(sender)?.seal_voice_pcm(pcm);
+        assert!(local_rms > 6_000, "sender {sender} should have strong RMS");
+        assert_eq!(pkts.len(), 2, "sender {sender} must send only to the 2 other voice peers");
+        for (target, pkt) in pkts {
+            assert_ne!(target, "peer-d", "Dave is not in voice and must not receive voice packets");
+            assert_eq!(pkt.get(0..2), Some(&b"V1"[..]));
+            if captured_for_tamper.is_none() {
+                captured_for_tamper = Some((sender.to_owned(), target.clone(), pkt.clone()));
+            }
+            let (rx_rms, decoded_pcm) = sim.node_mut(&target)?.open_voice_packet(sender, &pkt)?;
+            assert_eq!(decoded_pcm.len(), 320);
+            assert!(
+                rx_rms > 5_000,
+                "receiver {target} must decode audible E2EE voice from {sender}"
+            );
+        }
+    }
+
+    // Verify stats on all 3 voice participants
+    for pid in ["peer-a", "peer-b", "peer-c"] {
+        let st = sim.node(pid)?.stats();
+        assert_eq!(st.voice_packets_sent, 2);
+        assert_eq!(st.voice_packets_received, 2);
+        assert_eq!(st.e2ee_auth_failures, 0);
+    }
+    assert_eq!(sim.node("peer-d")?.stats().voice_packets_received, 0);
+
+    // Replay & Tamper resistance on E2EE voice packets
+    let (sender, target, orig_pkt) = captured_for_tamper.ok_or("missing captured voice pkt")?;
+    // 1. Replaying the same voice packet MUST fail anti-replay check
+    assert!(
+        sim.node_mut(&target)?
+            .open_voice_packet(&sender, &orig_pkt)
+            .is_err()
+    );
+    // 2. Flipping a bit in ciphertext of a fresh packet MUST fail Poly1305 AEAD check
+    let (_, fresh_pkts) = sim.node_mut(&sender)?.seal_voice_pcm(&tone_a);
+    let (_, mut tampered) = fresh_pkts
+        .into_iter()
+        .find(|(p, _)| p == &target)
+        .ok_or("missing fresh packet for target")?;
+    if let Some(last) = tampered.last_mut() {
+        *last ^= 0xFF;
+    }
+    assert!(
+        sim.node_mut(&target)?
+            .open_voice_packet(&sender, &tampered)
+            .is_err()
+    );
+    assert!(sim.node(&target)?.stats().e2ee_auth_failures >= 2);
+
+    // Muting Alice stops outbound voice packets immediately while keeping local RMS meter working
+    let mute_acts = sim.node_mut("peer-a")?.set_voice_state(true, true);
+    sim.process_actions("peer-a", mute_acts)?;
+    sim.drain()?;
+    let (muted_rms, muted_pkts) = sim.node_mut("peer-a")?.seal_voice_pcm(&tone_a);
+    assert!(muted_rms > 6_000);
+    assert!(muted_pkts.is_empty());
+
+    // A brand-new peer joining the mesh while Bob & Carol are in voice learns their voice state via Hello!
+    sim.add_node("peer-e", "EveJoiner", MeshConfig::default());
+    sim.connect("peer-e", "peer-b", false, None)?;
+    sim.drain()?;
+    let status_e = parse_json(&sim.node("peer-e")?.status_json())?;
+    let peers_e = status_e
+        .get("peers")
+        .and_then(JsonValue::as_array)
+        .ok_or("missing peers in peer-e status")?;
+    let bob_entry = peers_e
+        .iter()
+        .find(|p| p.get_str("peerId") == Some("peer-b"))
+        .ok_or("missing peer-b in peer-e status")?;
+    assert_eq!(bob_entry.get_bool("inVoice"), Some(true));
+    assert_eq!(bob_entry.get_bool("voiceMuted"), Some(false));
+    Ok(())
+}

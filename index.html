@@ -55,6 +55,10 @@
             <span class="status-dot" id="mesh-status-dot"></span>
             Peers <strong id="peer-count-display">0</strong>
           </div>
+          <div class="stat-chip hidden" id="voice-header-chip" title="Active E2EE Voice Chat Participants">
+            <span class="status-dot online"></span>
+            Voice <strong id="voice-header-count">0</strong>
+          </div>
           <div class="stat-chip" title="Replicated Log Entries">
             Log <strong id="log-count-display">0</strong>
           </div>
@@ -62,39 +66,15 @@
       </header>
 
       <main class="workbench">
-        <!-- Left Rail: Signaling, Topology, Telemetry -->
+        <!-- Left Rail: Step-by-Step Connect, Real-Time Voice Chat, Topology, Telemetry -->
         <aside class="rail">
           <section class="panel" aria-labelledby="connect-panel-title">
             <div class="panel-header">
-              <h2 class="panel-title" id="connect-panel-title">Connect &amp; Join Mesh</h2>
-              <span class="panel-meta">P2P1 · E2EE</span>
+              <h2 class="panel-title" id="connect-panel-title">Connect Peer</h2>
+              <button type="button" id="btn-wizard-reset" class="btn-link hidden">← Start Over</button>
+              <span class="panel-meta" id="connect-panel-meta">Step-by-Step · E2EE</span>
             </div>
             <div class="panel-body">
-              <div class="e2ee-bar">
-                <div class="e2ee-bar-head">
-                  <span>E2EE Key</span>
-                  <span id="e2ee-mode-label">Auto 256-bit Key</span>
-                </div>
-                <div class="e2ee-bar-row">
-                  <input
-                    id="e2ee-passphrase-input"
-                    class="text-input"
-                    type="password"
-                    placeholder="Optional shared passphrase (encrypts P2P1 codes)…"
-                    autocomplete="off"
-                  />
-                  <button type="button" id="btn-apply-passphrase" class="btn btn-sm btn-primary">
-                    Set
-                  </button>
-                  <button type="button" id="btn-clear-passphrase" class="btn btn-sm">
-                    Auto
-                  </button>
-                </div>
-                <p class="e2ee-bar-hint" id="e2ee-bar-hint">
-                  X25519 + ChaCha20-Poly1305 AEAD on every wire frame, relay signal, and IndexedDB record.
-                </p>
-              </div>
-
               <!-- 1-click local tab discovery banner -->
               <div id="local-mesh-banner" class="quick-banner hidden">
                 <div class="quick-banner-title">
@@ -118,7 +98,7 @@
                 <p class="quick-banner-sub" id="rejoin-desc"></p>
                 <div class="btn-row" style="margin-top: 0">
                   <button type="button" id="btn-create-rejoin" class="btn btn-sm btn-primary">
-                    Create Rejoin Link
+                    Create Rejoin Invite
                   </button>
                   <button type="button" id="btn-dismiss-rejoin" class="btn btn-sm">
                     Dismiss
@@ -126,61 +106,258 @@
                 </div>
               </div>
 
-              <!-- Primary 1-click invite button -->
-              <div class="connect-hero-row">
-                <button type="button" id="btn-create-invite" class="btn btn-primary">
-                  Invite Peer (Create #offer Link)
-                </button>
-              </div>
-
-              <!-- Active outgoing offer or reply card (auto-opens when needed, auto-closes when connected) -->
-              <div id="handshake-card" class="handshake-card hidden">
-                <div class="handshake-card-head">
-                  <span class="handshake-step-pill" id="handshake-step-pill">Step 1 · Share Invite</span>
-                  <span class="panel-meta" id="handshake-size-meta"></span>
-                </div>
-                <p class="step-hint" id="handshake-instruction" style="margin-bottom: 8px"></p>
-                <div class="btn-row" style="margin-top: 0; margin-bottom: 8px">
-                  <button type="button" id="btn-copy-handshake-url" class="btn btn-primary btn-sm">
-                    Copy Link
+              <!-- Mode 0: Clear Role Picker -->
+              <div id="wizard-role-picker" class="role-picker">
+                <p class="step-hint" style="margin-bottom: 10px">
+                  Choose your role to connect directly browser-to-browser (no server required).
+                </p>
+                <div class="role-grid">
+                  <button type="button" id="btn-wizard-start-host" class="role-card primary">
+                    <span class="role-card-title">Invite a Peer</span>
+                    <span class="role-card-desc">Create an invite link to send to someone else</span>
                   </button>
-                  <button type="button" id="btn-copy-handshake-code" class="btn btn-sm">
-                    Copy Code
-                  </button>
-                  <button type="button" id="btn-share-handshake" class="btn btn-sm hidden">
-                    Share…
+                  <button type="button" id="btn-wizard-start-join" class="role-card">
+                    <span class="role-card-title">Join with Invite</span>
+                    <span class="role-card-desc">Paste an invite link or <code>P2P1:</code> code you received</span>
                   </button>
                 </div>
-                <textarea
-                  id="handshake-code-output"
-                  class="code-box"
-                  rows="2"
-                  readonly
-                ></textarea>
               </div>
 
-              <!-- Unified Smart Auto-Detect Paste Input -->
-              <div class="smart-paste-wrap">
-                <label class="step-label" for="smart-signal-input">
-                  <span>Paste Invite or Reply (auto-detects <code>#offer=</code> / <code>#answer=</code> / <code>P2P1:</code>)</span>
-                </label>
-                <textarea
-                  id="smart-signal-input"
-                  class="code-box"
-                  rows="2"
-                  placeholder="Paste any P2P1: code or #offer= / #answer= link — connects automatically…"
-                ></textarea>
-                <div class="smart-paste-actions">
-                  <button type="button" id="btn-paste-clipboard" class="btn btn-sm">
-                    Paste Clipboard
-                  </button>
-                  <button type="button" id="btn-smart-connect" class="btn btn-accent btn-sm">
-                    Connect / Apply
-                  </button>
+              <!-- Mode 1: Host Step-by-Step Flow (Invite -> Receive Reply -> Connected) -->
+              <div id="wizard-host-flow" class="wizard-flow hidden">
+                <div class="wizard-step active" id="wizard-host-step-1">
+                  <div class="wizard-step-head">
+                    <span class="step-num" id="host-step-1-badge">1</span>
+                    <span class="wizard-step-title">Send your invite link</span>
+                    <span class="panel-meta" id="host-offer-meta"></span>
+                  </div>
+                  <div class="wizard-step-body" id="host-step-1-body">
+                    <p class="step-hint" id="host-step-1-hint">
+                      Copy and send this link to your peer via any chat app.
+                    </p>
+                    <div class="btn-row" style="margin-top: 0; margin-bottom: 8px">
+                      <button type="button" id="btn-host-copy-url" class="btn btn-primary btn-sm">
+                        Copy Invite Link
+                      </button>
+                      <button type="button" id="btn-host-copy-code" class="btn btn-sm">
+                        Copy Code
+                      </button>
+                      <button type="button" id="btn-host-share" class="btn btn-sm hidden">
+                        Share…
+                      </button>
+                    </div>
+                    <textarea
+                      id="host-offer-code"
+                      class="code-box"
+                      rows="2"
+                      readonly
+                      aria-label="Generated invite code"
+                    ></textarea>
+                  </div>
+                </div>
+
+                <div class="wizard-step" id="wizard-host-step-2">
+                  <div class="wizard-step-head">
+                    <span class="step-num" id="host-step-2-badge">2</span>
+                    <span class="wizard-step-title">Paste your peer's reply</span>
+                  </div>
+                  <div class="wizard-step-body" id="host-step-2-body">
+                    <p class="step-hint">
+                      When your peer sends back their <code>#answer=</code> link or <code>P2P1:</code> reply, paste it below (or simply click their link).
+                    </p>
+                    <textarea
+                      id="host-answer-input"
+                      class="code-box"
+                      rows="2"
+                      placeholder="Paste peer's #answer= link or P2P1: reply code…"
+                    ></textarea>
+                    <div class="btn-row">
+                      <button type="button" id="btn-host-paste-answer" class="btn btn-sm">
+                        Paste Clipboard
+                      </button>
+                      <button type="button" id="btn-host-apply-answer" class="btn btn-accent btn-sm">
+                        Finish &amp; Connect
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="wizard-step" id="wizard-host-step-3">
+                  <div class="wizard-step-head">
+                    <span class="step-num" id="host-step-3-badge">3</span>
+                    <span class="wizard-step-title" id="host-step-3-title">Connected (E2EE)</span>
+                  </div>
+                  <div class="wizard-step-body hidden" id="host-step-3-body">
+                    <p class="step-hint" id="host-step-3-detail" style="margin-bottom: 8px"></p>
+                    <div class="btn-row" style="margin-top: 0">
+                      <button type="button" id="btn-host-invite-another" class="btn btn-primary btn-sm">
+                        Invite Another Peer
+                      </button>
+                      <button type="button" id="btn-host-done" class="btn btn-sm">
+                        Done
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Mode 2: Joiner Step-by-Step Flow (Paste Invite -> Send Reply -> Connected) -->
+              <div id="wizard-join-flow" class="wizard-flow hidden">
+                <div class="wizard-step active" id="wizard-join-step-1">
+                  <div class="wizard-step-head">
+                    <span class="step-num" id="join-step-1-badge">1</span>
+                    <span class="wizard-step-title" id="join-step-1-title">Paste the invite you received</span>
+                  </div>
+                  <div class="wizard-step-body" id="join-step-1-body">
+                    <p class="step-hint">
+                      Paste the <code>#offer=</code> link or <code>P2P1:</code> invite code from your peer.
+                    </p>
+                    <textarea
+                      id="join-offer-input"
+                      class="code-box"
+                      rows="2"
+                      placeholder="Paste #offer= link or P2P1: invite code…"
+                    ></textarea>
+                    <div class="btn-row">
+                      <button type="button" id="btn-join-paste-offer" class="btn btn-sm">
+                        Paste Clipboard
+                      </button>
+                      <button type="button" id="btn-join-create-reply" class="btn btn-primary btn-sm">
+                        Create My Reply
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="wizard-step" id="wizard-join-step-2">
+                  <div class="wizard-step-head">
+                    <span class="step-num" id="join-step-2-badge">2</span>
+                    <span class="wizard-step-title">Send your reply link back</span>
+                    <span class="panel-meta" id="join-answer-meta"></span>
+                  </div>
+                  <div class="wizard-step-body hidden" id="join-step-2-body">
+                    <p class="step-hint" id="join-step-2-hint">
+                      Send this reply back to your peer so they can complete the link.
+                    </p>
+                    <div class="btn-row" style="margin-top: 0; margin-bottom: 8px">
+                      <button type="button" id="btn-join-copy-url" class="btn btn-primary btn-sm">
+                        Copy Reply Link
+                      </button>
+                      <button type="button" id="btn-join-copy-code" class="btn btn-sm">
+                        Copy Code
+                      </button>
+                      <button type="button" id="btn-join-share" class="btn btn-sm hidden">
+                        Share…
+                      </button>
+                    </div>
+                    <textarea
+                      id="join-answer-code"
+                      class="code-box"
+                      rows="2"
+                      readonly
+                      aria-label="Generated reply code"
+                    ></textarea>
+                  </div>
+                </div>
+
+                <div class="wizard-step" id="wizard-join-step-3">
+                  <div class="wizard-step-head">
+                    <span class="step-num" id="join-step-3-badge">3</span>
+                    <span class="wizard-step-title" id="join-step-3-title">Waiting for peer to connect</span>
+                  </div>
+                  <div class="wizard-step-body hidden" id="join-step-3-body">
+                    <p class="step-hint" id="join-step-3-detail" style="margin-bottom: 8px"></p>
+                    <div class="btn-row" style="margin-top: 0">
+                      <button type="button" id="btn-join-done" class="btn btn-primary btn-sm">
+                        Done
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
 
               <div id="connect-notice" class="inline-notice hidden"></div>
+
+              <!-- Compact Collapsible E2EE Key / Optional Passphrase Bar -->
+              <details id="e2ee-key-details" class="e2ee-bar">
+                <summary class="e2ee-bar-summary">
+                  <span>E2EE Key</span>
+                  <span class="e2ee-summary-right">
+                    <span id="e2ee-mode-label">Auto 256-bit Key</span>
+                    <span class="e2ee-toggle-hint">Passphrase ▾</span>
+                  </span>
+                </summary>
+                <div class="e2ee-bar-content">
+                  <div class="e2ee-bar-row">
+                    <input
+                      id="e2ee-passphrase-input"
+                      class="text-input"
+                      type="password"
+                      placeholder="Optional shared passphrase (encrypts P2P1 codes)…"
+                      autocomplete="off"
+                    />
+                    <button type="button" id="btn-apply-passphrase" class="btn btn-sm btn-primary">
+                      Set
+                    </button>
+                    <button type="button" id="btn-clear-passphrase" class="btn btn-sm">
+                      Auto
+                    </button>
+                  </div>
+                  <p class="e2ee-bar-hint" id="e2ee-bar-hint">
+                    X25519 + ChaCha20-Poly1305 AEAD on every wire frame, voice packet, relay signal, and IndexedDB record.
+                  </p>
+                </div>
+              </details>
+            </div>
+          </section>
+
+          <!-- Real-Time Multi-Peer E2EE Voice Chat Panel -->
+          <section class="panel" id="voice-panel" aria-labelledby="voice-panel-title">
+            <div class="panel-header">
+              <h2 class="panel-title" id="voice-panel-title">
+                Voice Chat
+                <span class="badge" id="voice-status-badge">Off</span>
+              </h2>
+              <span class="panel-meta">16 kHz · E2EE</span>
+            </div>
+            <div class="panel-body">
+              <div id="voice-idle-view">
+                <p class="step-hint" id="voice-idle-desc" style="margin-bottom: 10px">
+                  Join real-time group voice chat with everyone in the mesh simultaneously. All audio is IMA ADPCM encoded and ChaCha20-Poly1305 encrypted inside safe Rust WASM.
+                </p>
+                <div id="voice-waiting-peers" class="voice-waiting-banner hidden"></div>
+                <div class="btn-row" style="margin-top: 0">
+                  <button type="button" id="btn-voice-join" class="btn btn-primary" style="flex: 1">
+                    Join Voice Chat
+                  </button>
+                  <button type="button" id="btn-voice-listen" class="btn btn-sm" title="Join without a microphone to hear everyone in the call">
+                    Listen Only
+                  </button>
+                </div>
+              </div>
+
+              <div id="voice-active-view" class="hidden">
+                <div class="voice-controls-row">
+                  <button type="button" id="btn-voice-mute" class="btn btn-sm">
+                    Mute Mic
+                  </button>
+                  <button type="button" id="btn-voice-deafen" class="btn btn-sm">
+                    Deafen
+                  </button>
+                  <button type="button" id="btn-voice-leave" class="btn btn-sm btn-danger">
+                    Leave Voice
+                  </button>
+                </div>
+
+                <ul id="voice-participant-list" class="voice-list"></ul>
+
+                <div class="voice-footer">
+                  <span id="voice-codec-meta">Safe Rust WASM · V1 AEAD</span>
+                  <span id="voice-packet-stats">TX 0 / RX 0</span>
+                </div>
+              </div>
+
+              <div id="voice-notice" class="inline-notice hidden"></div>
             </div>
           </section>
 
@@ -217,8 +394,7 @@
 
               <ul id="peer-list" class="peer-list">
                 <li class="empty-state">
-                  No direct peers yet. Create an invite or open an <code>#offer=</code> link to join
-                  a mesh.
+                  No direct peers yet. Use the step-by-step Connect Peer panel above to invite or join a mesh.
                 </li>
               </ul>
             </div>
@@ -227,7 +403,7 @@
           <section class="panel" aria-labelledby="telemetry-panel-title">
             <div class="panel-header">
               <h2 class="panel-title" id="telemetry-panel-title">Protocol Telemetry</h2>
-              <span class="panel-meta">e2ee · sync · gossip</span>
+              <span class="panel-meta">e2ee · sync · voice</span>
             </div>
             <div class="panel-body">
               <div class="telemetry-stats">
@@ -240,8 +416,8 @@
                   <span class="metric-value" id="stat-batches">0 / 0</span>
                 </div>
                 <div class="metric-tile">
-                  <span class="metric-label">Gossip Fwd/Drop</span>
-                  <span class="metric-value" id="stat-gossip">0 / 0</span>
+                  <span class="metric-label">Voice TX / RX</span>
+                  <span class="metric-value" id="stat-voice">0 / 0</span>
                 </div>
               </div>
               <div id="telemetry-log" class="telemetry-log">

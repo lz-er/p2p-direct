@@ -307,6 +307,17 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
             ))
         }
+        "set_voice_state" => {
+            let node = require_node(state)?;
+            let in_voice = val.get_bool("inVoice").unwrap_or(false);
+            let muted = val.get_bool("muted").unwrap_or(false);
+            let actions = node.set_voice_state(in_voice, muted);
+            let actions_json = actions_to_json_array(&actions);
+            let status = node.status_json();
+            Ok(format!(
+                "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
+            ))
+        }
         "send_relay_signal" => {
             let node = require_node(state)?;
             let to_peer_id = val

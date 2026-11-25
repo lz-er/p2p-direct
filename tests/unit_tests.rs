@@ -3,14 +3,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use p2p_direct::audio::{compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm};
 use p2p_direct::codec::{
     PROTOCOL_VERSION, SignalCodeKind, SignalCodePayload, decode_signal_code, encode_fragment_url,
     encode_signal_code, extract_fragment_code,
 };
 use p2p_direct::crypto::{
     SafeCsprng, aead_open, aead_seal, derive_invite_wrap_key, derive_log_key,
-    derive_mesh_key_from_passphrase, hkdf_extract, key_fingerprint, pair_safety_code, sha256,
-    x25519, x25519_public_key, x25519_shared_secret,
+    derive_mesh_key_from_passphrase, derive_voice_link_keys, hkdf_extract, key_fingerprint,
+    pair_safety_code, sha256, x25519, x25519_public_key, x25519_shared_secret,
 };
 use p2p_direct::deflate::{
     base64url_decode, base64url_encode, deflate_raw, inflate_auto, inflate_raw,
@@ -19,7 +20,8 @@ use p2p_direct::json::{JsonValue, parse_json};
 use p2p_direct::log::{LogMessage, ReplicatedLog, SealedLogRecord};
 use p2p_direct::protocol::{
     EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType, WireFrame, chunk_inv_ids,
-    chunk_sealed_records,
+    chunk_sealed_records, open_voice_packet_ciphertext, parse_voice_packet_header,
+    seal_voice_packet,
 };
 use p2p_direct::rpc::dispatch_rpc;
 
@@ -494,6 +496,8 @@ fn wire_frames_e2ee_envelope_and_chunking_roundtrip() -> TestResult {
             pub_key: pk1,
             lamport: 7,
             log_count: 1,
+            in_voice: true,
+            voice_muted: false,
             peers: vec![PeerSummary {
                 peer_id: "p-2".to_owned(),
                 author_name: "Node2".to_owned(),
@@ -541,6 +545,10 @@ fn wire_frames_e2ee_envelope_and_chunking_roundtrip() -> TestResult {
             ttl: 6,
             sealed_nonce: [0x99u8; 12],
             sealed_ciphertext: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+        },
+        WireFrame::VoiceState {
+            in_voice: true,
+            muted: true,
         },
     ];
 
@@ -674,5 +682,91 @@ fn rpc_dispatcher_e2ee_end_to_end() -> TestResult {
         dec_resp.get("signal").and_then(|s| s.get_bool("encrypted")),
         Some(true)
     );
+
+    let voice_resp = parse_json(&dispatch_rpc(
+        &mut state,
+        r#"{"cmd":"set_voice_state","inVoice":true,"muted":false}"#,
+    ))?;
+    assert_eq!(voice_resp.get_bool("ok"), Some(true));
+    assert_eq!(
+        voice_resp
+            .get("status")
+            .and_then(|s| s.get("voice"))
+            .and_then(|v| v.get_bool("inVoice")),
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
+fn ima_adpcm_and_e2ee_voice_packet_roundtrip() -> TestResult {
+    // 20ms (320 samples) @ 16 kHz wideband speech-like two-tone signal
+    let pcm: Vec<i16> = (0..320)
+        .map(|i| {
+            let t = (i as f64) / 16_000.0;
+            let s = 10_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+                + 4_000.0 * (2.0 * std::f64::consts::PI * 1120.0 * t).sin();
+            s as i16
+        })
+        .collect();
+
+    let encoded = encode_ima_adpcm(&pcm);
+    // 5-byte header + ceil(319 / 2) = 165 bytes (~4x compression from 640 PCM bytes)
+    assert_eq!(encoded.len(), 165);
+
+    let decoded = decode_ima_adpcm(&encoded)?;
+    assert_eq!(decoded.len(), pcm.len());
+
+    let orig_rms = compute_rms_i16(&pcm);
+    let dec_rms = compute_rms_i16(&decoded);
+    assert!(orig_rms > 6_000);
+    assert!(
+        orig_rms.abs_diff(dec_rms) < 900,
+        "decoded RMS {dec_rms} diverged too far from original {orig_rms}"
+    );
+
+    // Compute SNR-like correlation: average sample error must stay small relative to signal amplitude
+    let mean_abs_err: f64 = pcm
+        .iter()
+        .zip(decoded.iter())
+        .map(|(&a, &b)| (i32::from(a) - i32::from(b)).abs() as f64)
+        .sum::<f64>()
+        / (pcm.len() as f64);
+    assert!(
+        mean_abs_err < 1_200.0,
+        "IMA ADPCM mean absolute error too high: {mean_abs_err}"
+    );
+
+    // Malformed / truncated / out-of-range ADPCM inputs must fail cleanly without panicking
+    assert!(decode_ima_adpcm(&[]).is_err());
+    assert!(decode_ima_adpcm(&[0, 0, 99, 10, 0, 0, 0, 0, 0, 0]).is_err());
+    assert!(decode_ima_adpcm(&[0, 0, 0, 0xFF, 0xFF]).is_err());
+    assert!(decode_ima_adpcm(&[0, 0, 0, 100, 0, 1, 2]).is_err());
+
+    // Empty frame roundtrip
+    let empty_enc = encode_ima_adpcm(&[]);
+    assert_eq!(decode_ima_adpcm(&empty_enc)?, Vec::<i16>::new());
+
+    // Directional X25519 + MeshKey voice key derivation + V1 binary AEAD packet roundtrip
+    let sk_a = [0x11u8; 32];
+    let sk_b = [0x22u8; 32];
+    let pk_a = x25519_public_key(&sk_a);
+    let pk_b = x25519_public_key(&sk_b);
+    let mesh_key = [0x55u8; 32];
+    let (a_tx, a_rx) = derive_voice_link_keys(&sk_a, &pk_b, &mesh_key, "peer-a", "peer-b")?;
+    let (b_tx, b_rx) = derive_voice_link_keys(&sk_b, &pk_a, &mesh_key, "peer-b", "peer-a")?;
+    assert_eq!(a_tx, b_rx);
+    assert_eq!(b_tx, a_rx);
+    assert_ne!(a_tx, a_rx);
+
+    let pkt = seal_voice_packet(&a_tx, 42, [0x77u8; 12], "peer-a", "peer-b", &encoded);
+    assert_eq!(pkt.len(), 2 + 8 + 12 + encoded.len() + 16);
+    let (seq, nonce, ct) = parse_voice_packet_header(&pkt)?;
+    assert_eq!(seq, 42);
+    assert_eq!(nonce, [0x77u8; 12]);
+    // Wrong direction AAD must fail
+    assert!(open_voice_packet_ciphertext(&b_rx, seq, &nonce, "peer-b", "peer-a", ct).is_err());
+    let opened = open_voice_packet_ciphertext(&b_rx, seq, &nonce, "peer-a", "peer-b", ct)?;
+    assert_eq!(opened, encoded);
     Ok(())
 }

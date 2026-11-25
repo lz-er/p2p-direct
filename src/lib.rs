@@ -2,6 +2,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(not(test), deny(clippy::panic))]
 
+pub mod audio;
 pub mod codec;
 pub mod crypto;
 pub mod deflate;

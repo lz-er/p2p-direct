@@ -23,26 +23,31 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
 - **Anti-Entropy Backfill & Loop-Free Multi-Hop Gossip**:
   - Multi-part `sync-inv`, `sync-req`, and count/byte-bounded chunked `sync-batch` backfill deliver all missing historical and new records to joining or reconnecting peers.
   - Loop-free multi-hop gossip and transitive backfill propagation guarded by seen-ID deduplication, path tracking, and TTL bounds.
-- **Frictionless Joining, Tab-Reopen Rejoining & Background Keepalive**:
-  - Unified **Connect & Join** box auto-detects pasted `P2P1:`, `#offer=`, and `#answer=` links (with 1-click clipboard paste and Web Share support); opening an `#answer=` link in a new tab automatically delivers the reply to the original inviter tab via `BroadcastChannel`.
-  - Reopening a closed or reloaded tab restores the saved `peerId`, X25519 identity, mesh key, encrypted log, and `knownPeers` — auto-rejoining open tabs on the same browser with zero clicks, or offering a 1-click **Create Rejoin Link** for peers on other devices (cleanly superseding stale sockets).
+- **Step-by-Step Connect Wizard, Tab-Reopen Rejoining & Background Keepalive**:
+  - Clear 3-step guided Connect flow: choose **Invite a Peer** (Step 1 Copy Invite Link → Step 2 Paste Peer's Reply → Step 3 Connected) or **Join with Invite** (Step 1 Paste Invite → Step 2 Copy Reply Link → Step 3 Connected), with automatic step progression on `#offer=` / `#answer=` URL fragments and cross-tab `#answer=` delivery via `BroadcastChannel`.
+  - Reopening a closed or reloaded tab restores the saved `peerId`, X25519 identity, mesh key, encrypted log, and `knownPeers` — auto-rejoining open tabs on the same browser with zero clicks, or offering a 1-click **Create Rejoin Invite** for peers on other devices (cleanly superseding stale sockets).
   - An inline Blob Web Worker sends encrypted `Ping`/`Pong` keepalive frames every 4s (unthrottled in hidden tabs) paired with liveness-aware disconnect timers and foreground resume sync so background tabs stay connected.
+- **Real-Time Multi-Peer E2EE Voice Chat**:
+  - Everyone in the mesh who joins **Voice Chat** can talk and hear each other simultaneously in full duplex, with per-peer mute/volume controls, deafen, listen-only mode, and real-time speaking level meters.
+  - Captured via an inline Blob `AudioWorkletProcessor` (with `ScriptProcessorNode` fallback) into 16 kHz mono 20 ms (`320`-sample) PCM frames, encoded inside safe Rust WASM with a stateless **IMA ADPCM** wideband codec (`src/audio.rs`), and sealed per peer into binary `V1` ChaCha20-Poly1305 AEAD packets under domain-separated directional `X25519 + meshKey` voice keys with a 64-slot anti-replay window.
+  - Sent over a dedicated unordered, zero-retransmit WebRTC DataChannel (`p2p-voice`, `{ ordered: false, maxRetransmits: 0 }`) with zero SDP renegotiation and mixed simultaneously across all active remote speakers via independent Web Audio `GainNode` playout jitter buffers.
 
 ## Architecture
 
 | File | Role |
 | --- | --- |
-| `src/crypto.rs` | Pure safe Rust SHA-256, HMAC, HKDF, PBKDF2, RFC 8439 ChaCha20-Poly1305 AEAD, RFC 7748 X25519, CSPRNG |
+| `src/crypto.rs` | Pure safe Rust SHA-256, HMAC, HKDF, PBKDF2, RFC 8439 ChaCha20-Poly1305 AEAD, RFC 7748 X25519, directional wire & voice key derivation, CSPRNG |
+| `src/audio.rs` | Pure safe Rust 16 kHz mono stateless IMA ADPCM wideband voice codec & RMS amplitude meter |
 | `src/json.rs` | Pure safe Rust RFC 8259 JSON parser & canonical serializer |
 | `src/deflate.rs` | Pure safe Rust RFC 1951 DEFLATE/INFLATE + Base64URL codec |
 | `src/codec.rs` | `P2P1:` deflate + optional AEAD-encrypted invite/reply code and `#offer=` / `#answer=` URL fragment codec |
 | `src/log.rs` | Deterministic `(lamport, ts, id)` `ReplicatedLog` & ChaCha20-Poly1305 `SealedLogRecord` encrypted snapshots |
-| `src/protocol.rs` | Outer `EncryptedWireEnvelope`, E2EE wire frames, opaque `RelaySignal`, and chunkers |
-| `src/mesh.rs` | Pure deterministic E2EE `MeshNode` state machine with anti-replay windows |
+| `src/protocol.rs` | Outer `EncryptedWireEnvelope`, E2EE wire frames (`VoiceState`, `Hello`, etc.), binary `V1` E2EE voice packet framing, opaque `RelaySignal`, and chunkers |
+| `src/mesh.rs` | Pure deterministic E2EE `MeshNode` state machine with wire & voice anti-replay windows |
 | `src/rpc.rs` | JSON RPC command dispatcher |
-| `src/main.rs` | Safe Rust WASM shared-memory bridge (`#![forbid(unsafe_code)]`, zero `unsafe`) |
+| `src/main.rs` | Safe Rust WASM shared-memory bridge + zero-JSON binary fast-path voice opcodes (`#![forbid(unsafe_code)]`, zero `unsafe`) |
 | `p2p_mesh.wasm` | Compiled release WebAssembly binary for zero-build static hosting |
-| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport, encrypted IndexedDB persistence, topology SVG, and UI |
+| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport (`p2p-mesh` + `p2p-voice`), Web Audio multi-speaker voice mixer, encrypted IndexedDB persistence, step-by-step Connect Wizard, topology SVG, and UI |
 
 ## Running Locally
 

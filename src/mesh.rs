@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::audio::{compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm};
 use crate::crypto::{
     KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, derive_invite_wrap_key,
     derive_link_keys, derive_log_key, derive_mesh_key_from_passphrase, derive_relay_signal_key,
-    key_fingerprint, pair_safety_code, x25519_public_key,
+    derive_voice_link_keys, key_fingerprint, pair_safety_code, x25519_public_key,
 };
 use crate::deflate::base64url_encode;
 use crate::json::{JsonValue, write_json_string, write_json_value};
@@ -12,7 +13,8 @@ use crate::log::{LogMessage, ReplicatedLog, SealedLogRecord};
 use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
     DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
-    WireFrame, chunk_inv_ids, chunk_sealed_records,
+    WireFrame, chunk_inv_ids, chunk_sealed_records, open_voice_packet_ciphertext,
+    parse_voice_packet_header, seal_voice_packet,
 };
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,8 @@ pub struct MeshStats {
     pub auto_mesh_intros_sent: u64,
     pub auto_mesh_offers_created: u64,
     pub relay_signals_forwarded: u64,
+    pub voice_packets_sent: u64,
+    pub voice_packets_received: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -255,6 +259,11 @@ struct PeerCryptoState {
     tx_nonce_prefix: [u8; 4],
     tx_seq: u64,
     replay_window: ReplayWindow,
+    voice_tx_key: [u8; KEY_LEN],
+    voice_rx_key: [u8; KEY_LEN],
+    voice_tx_nonce_prefix: [u8; 4],
+    voice_tx_seq: u64,
+    voice_replay_window: ReplayWindow,
     safety_code: String,
 }
 
@@ -265,6 +274,14 @@ impl PeerCryptoState {
         nonce[0..4].copy_from_slice(&self.tx_nonce_prefix);
         nonce[4..12].copy_from_slice(&self.tx_seq.to_le_bytes());
         (self.tx_seq, nonce)
+    }
+
+    fn next_voice_tx_seq_and_nonce(&mut self) -> (u64, [u8; NONCE_LEN]) {
+        self.voice_tx_seq = self.voice_tx_seq.saturating_add(1);
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[0..4].copy_from_slice(&self.voice_tx_nonce_prefix);
+        nonce[4..12].copy_from_slice(&self.voice_tx_seq.to_le_bytes());
+        (self.voice_tx_seq, nonce)
     }
 }
 
@@ -285,6 +302,8 @@ pub struct ConnectedPeer {
     pub remote_peers: Vec<PeerSummary>,
     pub last_pong_ms: u64,
     pub rtt_ms: Option<u64>,
+    pub in_voice: bool,
+    pub voice_muted: bool,
     crypto: PeerCryptoState,
     known_ids: HashSet<String>,
     pending_inv: Option<PendingInventory>,
@@ -319,6 +338,8 @@ pub struct MeshNode {
     log_key: [u8; KEY_LEN],
     key_fp: String,
     passphrase_mode: bool,
+    in_voice: bool,
+    voice_muted: bool,
     csprng: SafeCsprng,
     config: MeshConfig,
     log: ReplicatedLog,
@@ -359,6 +380,8 @@ impl MeshNode {
             log_key,
             key_fp,
             passphrase_mode: false,
+            in_voice: false,
+            voice_muted: false,
             csprng,
             config,
             log: ReplicatedLog::new(),
@@ -397,6 +420,14 @@ impl MeshNode {
 
     pub fn passphrase_mode(&self) -> bool {
         self.passphrase_mode
+    }
+
+    pub fn in_voice(&self) -> bool {
+        self.in_voice
+    }
+
+    pub fn voice_muted(&self) -> bool {
+        self.voice_muted
     }
 
     pub fn invite_wrap_key(&self) -> Option<[u8; KEY_LEN]> {
@@ -443,9 +474,16 @@ impl MeshNode {
         self.passphrase_mode = passphrase_mode;
         self.log.reseal_all(&self.log_key, &mut self.csprng);
 
-        // Re-derive per-peer directional keys under the new mesh key
+        // Re-derive per-peer directional wire and voice keys under the new mesh key
         for (pid, peer) in self.peers.iter_mut() {
             let (tx_key, rx_key) = derive_link_keys(
+                &self.x25519_secret,
+                &peer.crypto.pub_key,
+                &self.mesh_key,
+                &self.peer_id,
+                pid,
+            )?;
+            let (voice_tx_key, voice_rx_key) = derive_voice_link_keys(
                 &self.x25519_secret,
                 &peer.crypto.pub_key,
                 &self.mesh_key,
@@ -455,11 +493,18 @@ impl MeshNode {
             let prefix_block = self.csprng.next_bytes_32();
             let mut prefix = [0u8; 4];
             prefix.copy_from_slice(&prefix_block[..4]);
+            let mut voice_prefix = [0u8; 4];
+            voice_prefix.copy_from_slice(&prefix_block[4..8]);
             peer.crypto.tx_key = tx_key;
             peer.crypto.rx_key = rx_key;
             peer.crypto.tx_nonce_prefix = prefix;
             peer.crypto.tx_seq = 0;
             peer.crypto.replay_window = ReplayWindow::default();
+            peer.crypto.voice_tx_key = voice_tx_key;
+            peer.crypto.voice_rx_key = voice_rx_key;
+            peer.crypto.voice_tx_nonce_prefix = voice_prefix;
+            peer.crypto.voice_tx_seq = 0;
+            peer.crypto.voice_replay_window = ReplayWindow::default();
             peer.crypto.safety_code =
                 pair_safety_code(&self.x25519_public, &peer.crypto.pub_key, &self.mesh_key);
         }
@@ -643,10 +688,19 @@ impl MeshNode {
             &self.peer_id,
             &peer_id,
         )?;
+        let (voice_tx_key, voice_rx_key) = derive_voice_link_keys(
+            &self.x25519_secret,
+            &peer_pub_key,
+            &self.mesh_key,
+            &self.peer_id,
+            &peer_id,
+        )?;
         let safety_code = pair_safety_code(&self.x25519_public, &peer_pub_key, &self.mesh_key);
         let prefix_block = self.csprng.next_bytes_32();
         let mut tx_nonce_prefix = [0u8; 4];
         tx_nonce_prefix.copy_from_slice(&prefix_block[..4]);
+        let mut voice_tx_nonce_prefix = [0u8; 4];
+        voice_tx_nonce_prefix.copy_from_slice(&prefix_block[4..8]);
 
         self.known_pub_keys.insert(peer_id.clone(), peer_pub_key);
 
@@ -685,6 +739,8 @@ impl MeshNode {
                 remote_peers: Vec::new(),
                 last_pong_ms: 0,
                 rtt_ms: None,
+                in_voice: false,
+                voice_muted: false,
                 crypto: PeerCryptoState {
                     pub_key: peer_pub_key,
                     tx_key,
@@ -692,6 +748,11 @@ impl MeshNode {
                     tx_nonce_prefix,
                     tx_seq: 0,
                     replay_window: ReplayWindow::default(),
+                    voice_tx_key,
+                    voice_rx_key,
+                    voice_tx_nonce_prefix,
+                    voice_tx_seq: 0,
+                    voice_replay_window: ReplayWindow::default(),
                     safety_code: safety_code.clone(),
                 },
                 known_ids: HashSet::new(),
@@ -707,6 +768,8 @@ impl MeshNode {
             pub_key: self.x25519_public,
             lamport: self.log.lamport(),
             log_count: self.log.len(),
+            in_voice: self.in_voice,
+            voice_muted: self.voice_muted,
             peers: other_peers,
         };
         self.emit_wire(&mut actions, &peer_id, &hello);
@@ -729,6 +792,134 @@ impl MeshNode {
         });
 
         Ok(actions)
+    }
+
+    /// Updates local voice-call membership/mute state and broadcasts an encrypted `VoiceState` frame to all direct peers.
+    pub fn set_voice_state(&mut self, in_voice: bool, muted: bool) -> Vec<MeshAction> {
+        let effective_muted = if in_voice { muted } else { false };
+        self.in_voice = in_voice;
+        self.voice_muted = effective_muted;
+
+        let mut actions = Vec::new();
+        let frame = WireFrame::VoiceState {
+            in_voice: self.in_voice,
+            muted: self.voice_muted,
+        };
+        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+        for pid in peer_ids {
+            self.emit_wire(&mut actions, &pid, &frame);
+        }
+
+        let detail = if !self.in_voice {
+            "Left E2EE voice chat".to_owned()
+        } else if self.voice_muted {
+            "In E2EE voice chat (mic muted)".to_owned()
+        } else {
+            "Joined E2EE voice chat (mic live)".to_owned()
+        };
+        actions.push(MeshAction::Telemetry {
+            event: "voice_state".to_owned(),
+            detail,
+        });
+        actions
+    }
+
+    /// Encodes a 16 kHz mono signed 16-bit PCM frame with IMA ADPCM once and seals a binary `V1`
+    /// ChaCha20-Poly1305 packet for each connected peer currently participating in voice chat.
+    /// Returns `(local_rms, vec_of_(peer_id, sealed_v1_packet))`.
+    pub fn seal_voice_pcm(&mut self, pcm: &[i16]) -> (u16, Vec<(String, Vec<u8>)>) {
+        let rms = compute_rms_i16(pcm);
+        if !self.in_voice || self.voice_muted || pcm.is_empty() {
+            return (rms, Vec::new());
+        }
+        let voice_peer_count = self.peers.values().filter(|p| p.in_voice).count();
+        if voice_peer_count == 0 {
+            return (rms, Vec::new());
+        }
+
+        let adpcm = encode_ima_adpcm(pcm);
+        let mut packets = Vec::with_capacity(voice_peer_count);
+        for (pid, peer) in self.peers.iter_mut() {
+            if !peer.in_voice {
+                continue;
+            }
+            let (seq, nonce) = peer.crypto.next_voice_tx_seq_and_nonce();
+            let pkt = seal_voice_packet(
+                &peer.crypto.voice_tx_key,
+                seq,
+                nonce,
+                &self.peer_id,
+                pid,
+                &adpcm,
+            );
+            self.stats.voice_packets_sent = self.stats.voice_packets_sent.saturating_add(1);
+            packets.push((pid.clone(), pkt));
+        }
+        (rms, packets)
+    }
+
+    /// Authenticates, anti-replay-checks, decrypts, and IMA-ADPCM-decodes an incoming binary `V1` voice packet.
+    /// Returns `Ok((rms, pcm_samples))`. If local node is not currently in voice chat, silently returns empty PCM.
+    pub fn open_voice_packet(
+        &mut self,
+        from_peer: &str,
+        packet: &[u8],
+    ) -> Result<(u16, Vec<i16>), String> {
+        if !self.in_voice {
+            return Ok((0, Vec::new()));
+        }
+
+        let (seq, nonce, ct) = match parse_voice_packet_header(packet) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+
+        let (voice_rx_key, replay_ok) = match self.peers.get(from_peer) {
+            Some(peer) => (
+                peer.crypto.voice_rx_key,
+                peer.crypto.voice_replay_window.would_accept(seq),
+            ),
+            None => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(format!(
+                    "received voice packet from unconnected peer '{from_peer}'"
+                ));
+            }
+        };
+
+        if !replay_ok {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(format!(
+                "rejected replayed or out-of-window voice sequence {seq} from {from_peer}"
+            ));
+        }
+
+        let adpcm = match open_voice_packet_ciphertext(
+            &voice_rx_key,
+            seq,
+            &nonce,
+            from_peer,
+            &self.peer_id,
+            ct,
+        ) {
+            Ok(plain) => plain,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+
+        if let Some(peer) = self.peers.get_mut(from_peer) {
+            peer.crypto.voice_replay_window.accept(seq);
+        }
+
+        let pcm = decode_ima_adpcm(&adpcm)?;
+        let rms = compute_rms_i16(&pcm);
+        self.stats.voice_packets_received = self.stats.voice_packets_received.saturating_add(1);
+        Ok((rms, pcm))
     }
 
     /// Called when a direct WebRTC DataChannel closes or errors.
@@ -978,6 +1169,8 @@ impl MeshNode {
                 pub_key,
                 lamport,
                 log_count: _,
+                in_voice,
+                voice_muted,
                 peers,
             } => {
                 self.handle_hello(
@@ -986,6 +1179,8 @@ impl MeshNode {
                     &author_name,
                     pub_key,
                     lamport,
+                    in_voice,
+                    voice_muted,
                     peers,
                     now_ms,
                     &mut actions,
@@ -1088,6 +1283,24 @@ impl MeshNode {
                     }
                 }
             }
+            WireFrame::VoiceState { in_voice, muted } => {
+                if let Some(peer) = self.peers.get_mut(from_peer) {
+                    peer.in_voice = in_voice;
+                    peer.voice_muted = if in_voice { muted } else { false };
+                    let name = peer.author_name.clone();
+                    let status_label = if !in_voice {
+                        "left voice chat"
+                    } else if muted {
+                        "muted mic in voice chat"
+                    } else {
+                        "joined E2EE voice chat"
+                    };
+                    actions.push(MeshAction::Telemetry {
+                        event: "peer_voice_state".to_owned(),
+                        detail: format!("{name} ({from_peer}) {status_label}"),
+                    });
+                }
+            }
         }
 
         Ok(actions)
@@ -1168,6 +1381,8 @@ impl MeshNode {
         author_name: &str,
         peer_pub_key: [u8; KEY_LEN],
         remote_lamport: u64,
+        remote_in_voice: bool,
+        remote_voice_muted: bool,
         remote_peers: Vec<PeerSummary>,
         now_ms: u64,
         actions: &mut Vec<MeshAction>,
@@ -1191,6 +1406,12 @@ impl MeshNode {
             if !author_name.trim().is_empty() {
                 peer.author_name = author_name.to_owned();
             }
+            peer.in_voice = remote_in_voice;
+            peer.voice_muted = if remote_in_voice {
+                remote_voice_muted
+            } else {
+                false
+            };
             peer.remote_peers = remote_peers.clone();
         }
 
@@ -1755,9 +1976,9 @@ impl MeshNode {
         Ok(())
     }
 
-    /// Serializes full node status, E2EE metadata, peers, topology, and counters for the UI.
+    /// Serializes full node status, E2EE metadata, voice state, peers, topology, and counters for the UI.
     pub fn status_json(&self) -> String {
-        let mut out = String::with_capacity(768);
+        let mut out = String::with_capacity(896);
         out.push_str("{\"peerId\":");
         write_json_string(&mut out, &self.peer_id);
         out.push_str(",\"authorName\":");
@@ -1770,8 +1991,10 @@ impl MeshNode {
         write_json_string(&mut out, &base64url_encode(&self.x25519_public));
         let _ = write!(
             out,
-            ",\"passphraseMode\":{}}},\"lamport\":{},\"logCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
+            ",\"passphraseMode\":{}}},\"voice\":{{\"inVoice\":{},\"muted\":{}}},\"lamport\":{},\"logCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
             self.passphrase_mode,
+            self.in_voice,
+            self.voice_muted,
             self.log.lamport(),
             self.log.len(),
             self.config.auto_mesh_enabled
@@ -1799,9 +2022,11 @@ impl MeshNode {
             }
             let _ = write!(
                 out,
-                ",\"knownCount\":{},\"lastPongMs\":{},\"rttMs\":",
+                ",\"knownCount\":{},\"lastPongMs\":{},\"inVoice\":{},\"voiceMuted\":{},\"rttMs\":",
                 peer.known_ids.len(),
-                peer.last_pong_ms
+                peer.last_pong_ms,
+                peer.in_voice,
+                peer.voice_muted
             );
             match peer.rtt_ms {
                 Some(r) => {
@@ -1850,7 +2075,7 @@ impl MeshNode {
         }
         let _ = write!(
             out,
-            "],\"stats\":{{\"framesSent\":{},\"framesReceived\":{},\"e2eeFramesEncrypted\":{},\"e2eeFramesDecrypted\":{},\"e2eeAuthFailures\":{},\"relaySignalsEncrypted\":{},\"gossipForwards\":{},\"gossipDuplicatesDropped\":{},\"syncInvSent\":{},\"syncInvReceived\":{},\"syncBatchesSent\":{},\"syncBatchesReceived\":{},\"autoMeshIntrosSent\":{},\"autoMeshOffersCreated\":{},\"relaySignalsForwarded\":{}}}}}",
+            "],\"stats\":{{\"framesSent\":{},\"framesReceived\":{},\"e2eeFramesEncrypted\":{},\"e2eeFramesDecrypted\":{},\"e2eeAuthFailures\":{},\"relaySignalsEncrypted\":{},\"gossipForwards\":{},\"gossipDuplicatesDropped\":{},\"syncInvSent\":{},\"syncInvReceived\":{},\"syncBatchesSent\":{},\"syncBatchesReceived\":{},\"autoMeshIntrosSent\":{},\"autoMeshOffersCreated\":{},\"relaySignalsForwarded\":{},\"voicePacketsSent\":{},\"voicePacketsReceived\":{}}}}}",
             self.stats.frames_sent,
             self.stats.frames_received,
             self.stats.e2ee_frames_encrypted,
@@ -1865,7 +2090,9 @@ impl MeshNode {
             self.stats.sync_batches_received,
             self.stats.auto_mesh_intros_sent,
             self.stats.auto_mesh_offers_created,
-            self.stats.relay_signals_forwarded
+            self.stats.relay_signals_forwarded,
+            self.stats.voice_packets_sent,
+            self.stats.voice_packets_received
         );
         out
     }
