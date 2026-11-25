@@ -5142,14 +5142,17 @@ class P2PDirectApp {
 
     let badgeText = "Connecting…";
     let badgeClass = "badge pending";
+    let statusTitle = "Connecting to room…";
     let isLive = false;
     if (peerCount > 0) {
       badgeText = `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
       badgeClass = "badge auto";
+      statusTitle = `Room online — ${peerCount} ${peerCount === 1 ? "peer" : "peers"} connected`;
       isLive = true;
     } else if (isActive && relayState === "live" && relayCount > 0) {
-      badgeText = "Listening";
+      badgeText = "Ready";
       badgeClass = "badge auto";
+      statusTitle = "Room ready — waiting for peers";
       isLive = true;
     }
 
@@ -5165,6 +5168,8 @@ class P2PDirectApp {
       this.el["simple-room-badge"].className = badgeClass;
       if (this.el["simple-room-status-wrap"]) {
         this.el["simple-room-status-wrap"].classList.toggle("is-live", isLive);
+        this.el["simple-room-status-wrap"].title = statusTitle;
+        this.el["simple-room-status-wrap"].setAttribute("aria-label", statusTitle);
       }
       this.el["btn-simple-copy-link"].classList.toggle("hidden", !isActive);
     }
