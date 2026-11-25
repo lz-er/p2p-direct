@@ -1,0 +1,13 @@
+.git
+.gitignore
+.nojekyll
+.assetsignore
+wrangler.jsonc
+Cargo.toml
+Cargo.lock
+CNAME
+README.md
+src
+tests
+target
+bot
