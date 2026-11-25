@@ -216,6 +216,8 @@ body {
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: contain;
 }
 
 button,
@@ -325,6 +327,7 @@ code {
 /* ================= App Shell & Mode Visibility ================= */
 .app-shell {
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
   background: var(--bg-canvas);
@@ -351,18 +354,22 @@ html[data-advanced="true"] .room-lobby {
   display: none !important;
 }
 
-/* Lock viewport cleanly on desktop so Lobby fills screen and Room keeps Chat Composer pinned */
+/* Lock viewport cleanly so Lobby fills screen and Room keeps Chat Composer pinned */
 html[data-advanced="false"][data-in-room="false"] .app-shell,
 html[data-advanced="false"][data-in-room="true"] .app-shell,
 html[data-advanced="true"] .app-shell {
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
 /* ================= Brandless Topbar — Big Prominent Name Field Left, Controls Right ================= */
 .topbar {
-  height: 62px;
-  min-height: 62px;
+  height: calc(62px + env(safe-area-inset-top));
+  min-height: calc(62px + env(safe-area-inset-top));
+  padding-top: env(safe-area-inset-top);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
   background: var(--bar-bg);
   color: var(--bar-ink);
   display: flex;
@@ -510,6 +517,17 @@ html[data-advanced="true"] .app-shell {
 
 .top-bar-icon {
   padding: 0 18px;
+}
+
+.top-bar-btn.btn-install {
+  background: var(--mint);
+  color: #0e0f12;
+  border-left-color: #0e0f12;
+}
+
+.top-bar-btn.btn-install:hover {
+  background: var(--acid);
+  color: #0e0f12;
 }
 
 /* ================= Default Simple Lobby: Expanding Split Doors ================= */
@@ -1896,6 +1914,9 @@ html[data-advanced="true"] .workbench {
 .composer {
   border-top: 2px solid var(--rule);
   background: var(--bg-surface);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
   flex-shrink: 0;
   transition: background-color 140ms ease;
 }
@@ -3922,10 +3943,23 @@ input[type="checkbox"].metro-switch:checked::after {
   }
 }
 
-@media (max-width: 560px) {
+@media (max-width: 640px) {
+  .mobile-hide {
+    display: none !important;
+  }
+
+  /* Compact Brandless Topbar with Flex Name Input */
   .topbar {
-    height: 56px;
-    min-height: 56px;
+    height: calc(46px + env(safe-area-inset-top));
+    min-height: calc(46px + env(safe-area-inset-top));
+  }
+
+  .name-hero-wrap {
+    flex: 1;
+    min-width: 0;
+    padding: 0 10px;
+    gap: 6px;
+    border-right: none;
   }
 
   .name-hero-tag {
@@ -3933,34 +3967,484 @@ input[type="checkbox"].metro-switch:checked::after {
   }
 
   .name-hero-input {
-    width: 124px;
+    width: 100%;
+    min-width: 0;
     font-size: 16px;
+    padding: 2px 0;
+  }
+
+  .name-hero-input:focus {
+    width: 100%;
+  }
+
+  .name-edit-hint svg {
+    width: 12px;
+    height: 12px;
   }
 
   .top-bar-btn {
+    padding: 0 10px;
+    font-size: 10px;
+    letter-spacing: 0.07em;
+    gap: 5px;
+  }
+
+  .top-bar-icon {
     padding: 0 12px;
-    font-size: 10.5px;
+  }
+
+  /* Compact Lobby Doors so Create + Join fit comfortably on mobile */
+  .lobby-door {
+    padding: 16px 16px 14px;
+  }
+
+  .door-num {
+    font-size: 10px;
+    padding: 3px 7px;
+  }
+
+  .door-arrow {
+    font-size: 22px;
+  }
+
+  .door-body {
+    margin: 12px 0;
+    max-width: none;
+  }
+
+  .door-title {
+    font-size: 27px;
+    margin-bottom: 8px;
+  }
+
+  .door-title .t-thin {
+    font-size: 0.56em;
+    margin-bottom: 3px;
+  }
+
+  .door-copy {
+    font-size: 13px;
+    line-height: 1.4;
+    margin-bottom: 14px;
+  }
+
+  .door-form {
+    gap: 8px;
+  }
+
+  .slab-input {
+    padding: 10px 12px;
+    font-size: 16px;
+  }
+
+  .slab-cta {
+    padding: 11px 14px;
+    font-size: 13px;
+  }
+
+  .door-foot {
+    font-size: 9.5px;
+    padding-top: 9px;
+    gap: 8px;
+  }
+
+  .lobby-passphrase-bar {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+
+  /* Single-Row Compact Room Ribbon (Zero Wrapping) */
+  .simple-room-bar {
+    flex-wrap: nowrap;
+    min-height: 40px;
+  }
+
+  .simple-room-info {
+    flex: 1;
+    min-width: 0;
   }
 
   .simple-room-title {
-    font-size: 16px;
-    padding: 10px 14px;
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    padding: 0 10px;
+  }
+
+  .simple-room-status-wrap {
+    min-width: 38px;
+    width: 38px;
+  }
+
+  .live-sq {
+    width: 8px;
+    height: 8px;
+  }
+
+  .simple-room-actions {
+    flex-shrink: 0;
+    margin-left: 0;
   }
 
   .ribbon-btn {
-    padding: 10px 14px;
+    padding: 0 11px;
+    font-size: 10px;
+    letter-spacing: 0.07em;
+    gap: 5px;
+  }
+
+  /* Single-Row Compact Voice Channel Header */
+  .voice-stage-header {
+    padding: 6px 10px;
+    min-height: 36px;
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+
+  .panel-header {
+    padding: 6px 10px;
+    min-height: 34px;
+    gap: 6px;
+  }
+
+  .panel-title {
+    font-size: 12px;
+    gap: 6px;
+  }
+
+  .voice-stage-header .badge {
+    font-size: 9.5px;
+    padding: 2px 6px;
+  }
+
+  #voice-codec-meta,
+  #voice-join-hint {
+    display: none !important;
+  }
+
+  .voice-settings-trigger {
+    padding: 4px 8px;
+    font-size: 10px;
+    gap: 5px;
+  }
+
+  /* Compact Scrollable Audio Settings Drawer */
+  .audio-settings-drawer {
+    padding: 10px 10px 12px;
+    gap: 10px;
+    max-height: 46dvh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .audio-settings-bar {
+    padding: 0 0 8px;
+    gap: 6px;
+  }
+
+  .audio-bar-label {
+    display: none;
+  }
+
+  .audio-presets-group {
+    gap: 4px;
+  }
+
+  .audio-preset-btn,
+  .audio-action-btn {
+    padding: 5px 8px;
+    font-size: 9.5px;
+  }
+
+  .audio-settings-grid {
+    padding: 0;
+    gap: 10px;
+  }
+
+  .audio-settings-col {
+    gap: 8px;
+  }
+
+  .audio-field-head {
+    font-size: 10px;
+  }
+
+  .audio-select {
+    padding: 6px 28px 6px 8px;
     font-size: 10.5px;
+  }
+
+  .audio-switch-row {
+    padding: 6px 8px;
+    gap: 8px;
+    font-size: 10px;
+  }
+
+  /* Ultra-Compact Voice Stage (Pre-Join & Active Call) */
+  .voice-stage-body {
+    max-height: 36dvh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
 
   .voice-mosaic {
     grid-template-columns: 1fr;
   }
 
+  .voice-empty-stage {
+    display: none !important;
+  }
+
+  .join-voice-card {
+    min-height: 0;
+    border-right: none;
+  }
+
+  .join-voice-main {
+    padding: 9px 12px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 10px;
+  }
+
+  .join-top-row {
+    width: auto;
+    flex-shrink: 0;
+  }
+
+  .join-top-row .chevrons {
+    display: none;
+  }
+
+  .join-plus {
+    width: 28px;
+    height: 28px;
+    font-size: 18px;
+  }
+
+  .join-tile-label {
+    font-size: 15px;
+    line-height: 1.1;
+  }
+
+  .join-tile-sub {
+    font-size: 11px;
+    margin-top: 1px;
+  }
+
+  .join-listen-strip {
+    padding: 6px 12px;
+    font-size: 9.5px;
+  }
+
+  .voice-card {
+    min-height: 92px;
+    padding: 8px 10px 0;
+    border-right: none;
+    gap: 6px;
+  }
+
+  .tile-mono {
+    font-size: 20px;
+  }
+
+  .tile-status-tag {
+    font-size: 9px;
+    padding: 2px 5px;
+  }
+
+  .tile-lower {
+    gap: 6px;
+  }
+
+  .voice-card-name {
+    font-size: 14.5px;
+  }
+
+  .voice-you-pill,
+  .voice-bot-pill {
+    font-size: 9px;
+    padding: 1px 5px;
+  }
+
+  .tile-control-slot {
+    min-height: 32px;
+    gap: 6px;
+  }
+
+  .self-card-controls {
+    gap: 10px;
+  }
+
+  .self-ctrl-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .self-ctrl-leave {
+    height: 34px;
+    min-width: 104px;
+    padding: 0 10px;
+    font-size: 10px;
+  }
+
+  .voice-peer-mixer {
+    min-height: 30px;
+    gap: 6px;
+  }
+
+  .tile-mute-btn {
+    height: 28px;
+    padding: 0 7px;
+    font-size: 9.5px;
+  }
+
+  .voice-eq {
+    height: 12px;
+    margin-top: 2px;
+  }
+
+  /* Compact Chat Feed, Messages & Bot Cards */
+  .chat-header-left {
+    gap: 6px;
+  }
+
+  .panel-meta {
+    font-size: 9.5px;
+  }
+
+  .log-feed .empty-state {
+    margin: 12px 10px;
+    padding: 16px 12px;
+    font-size: 12.5px;
+  }
+
+  .log-entry {
+    grid-template-columns: 4px minmax(0, 1fr);
+  }
+
+  .log-entry-main {
+    padding: 8px 10px;
+    gap: 4px;
+  }
+
+  .log-entry-head {
+    gap: 6px;
+  }
+
+  .log-author {
+    font-size: 12.5px;
+  }
+
+  .log-order-tuple {
+    font-size: 10px;
+  }
+
+  .log-text-body {
+    font-size: 14px;
+    line-height: 1.42;
+  }
+
+  .bot-card {
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  .bot-card-title {
+    font-size: 13.5px;
+  }
+
+  .bot-card-fields {
+    grid-template-columns: repeat(auto-fit, minmax(115px, 1fr));
+    gap: 6px;
+  }
+
+  .bot-action-btn {
+    padding: 6px 9px;
+    font-size: 10px;
+    min-height: 32px;
+  }
+
+  .chat-image-grid img {
+    max-height: 200px;
+  }
+
+  /* Compact Zero-Truncation Chat Composer */
+  .composer-row {
+    min-height: 48px;
+  }
+
+  .composer-text-input {
+    padding: 10px 8px 10px 10px;
+    font-size: 16px;
+  }
+
+  .comp-inline-badges {
+    padding-right: 6px;
+    gap: 4px;
+  }
+
   .comp-inline-badges .inline-chip:not(.inline-chip-btn) {
     display: none;
   }
 
+  .inline-chip-btn {
+    padding: 5px 8px;
+    font-size: 9.5px;
+  }
+
   .composer-send-btn {
-    padding: 0 16px;
+    padding: 0 14px;
+    font-size: 11.5px;
+    gap: 5px;
+  }
+
+  .composer-send-btn .chevrons {
+    display: none;
+  }
+
+  /* Compact Mobile Toast & Lightbox */
+  .toast {
+    left: 10px;
+    right: 10px;
+    max-width: none;
+    bottom: calc(56px + env(safe-area-inset-bottom));
+    padding: 8px 10px;
+    font-size: 10px;
+    text-align: center;
+  }
+
+  .lightbox {
+    padding: 12px;
+  }
+
+  .lightbox-close {
+    top: calc(12px + env(safe-area-inset-top));
+    right: 12px;
+    width: 38px;
+    height: 38px;
   }
 }
+
+@media (max-width: 380px) {
+  .top-bar-btn {
+    padding: 0 8px;
+    font-size: 9.5px;
+  }
+
+  .top-bar-btn.btn-install svg {
+    display: none;
+  }
+
+  .ribbon-btn {
+    padding: 0 9px;
+    font-size: 9.5px;
+  }
+
+  .composer-send-btn {
+    padding: 0 12px;
+    font-size: 11px;
+  }
+}
+

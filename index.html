@@ -2,13 +2,20 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Direct Voice &amp; Chat</title>
     <meta
       name="description"
       content="Direct browser-to-browser encrypted voice and chat rooms with zero servers and zero permanent storage."
     />
+    <meta name="theme-color" content="#0e0f12" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Voice" />
+    <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
     <script>
       (() => {
         try {
@@ -75,6 +82,20 @@
             Msgs <strong id="log-count-display">0</strong>
           </div>
           <span class="hidden" id="lamport-display">0</span>
+          <button
+            type="button"
+            id="btn-pwa-install"
+            class="top-bar-btn btn-install hidden"
+            title="Install Direct Voice & Chat as an app"
+            aria-label="Install app"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true">
+              <path d="M12 3v12" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="4" y1="20" x2="20" y2="20" />
+            </svg>
+            <span>Install</span>
+          </button>
           <button
             type="button"
             id="btn-advanced-toggle"
@@ -217,7 +238,7 @@
             </div>
             <div class="simple-room-actions">
               <button type="button" id="btn-simple-copy-link" class="ribbon-btn ribbon-btn-copy">
-                Copy Link
+                <span>Copy<span class="mobile-hide"> Link</span></span>
               </button>
               <button type="button" id="btn-simple-leave-room" class="ribbon-btn ribbon-btn-leave">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="square" aria-hidden="true">
@@ -225,7 +246,7 @@
                   <polyline points="16 17 21 12 16 7" />
                   <line x1="21" y1="12" x2="9" y2="12" />
                 </svg>
-                <span>Leave Room</span>
+                <span>Leave<span class="mobile-hide"> Room</span></span>
               </button>
             </div>
           </section>
@@ -549,7 +570,7 @@
                       title="Attach image (or press Ctrl+V / Cmd+V to paste)"
                       aria-label="Attach image"
                     >
-                      + IMG · CTRL+V
+                      + IMG<span class="mobile-hide"> · CTRL+V</span>
                     </button>
                   </div>
                 </div>

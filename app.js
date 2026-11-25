@@ -540,6 +540,7 @@ class P2PDirectApp {
       "voice-header-chip",
       "voice-header-count",
       "log-count-display",
+      "btn-pwa-install",
       "btn-advanced-toggle",
       "btn-theme-toggle",
       "icon-moon",
@@ -719,8 +720,11 @@ class P2PDirectApp {
   }
 
   bindEvents() {
-    // Simple vs Advanced mode toggle & Lobby / Simple Room Bar controls
+    // Simple vs Advanced mode toggle, PWA install & Lobby / Simple Room Bar controls
     this.el["btn-advanced-toggle"].addEventListener("click", () => this.toggleAdvancedMode());
+    if (this.el["btn-pwa-install"]) {
+      this.el["btn-pwa-install"].addEventListener("click", () => this.promptPwaInstall());
+    }
     this.el["lobby-create-form"].addEventListener("submit", (ev) => {
       ev.preventDefault();
       this.createRoomFromLobby();
@@ -1266,6 +1270,7 @@ class P2PDirectApp {
     this.initTheme();
     this.initAdvancedMode();
     this.bindEvents();
+    this.initPwa();
 
     // Ensure nothing is persisted permanently on the client
     purgeLegacyClientStorage();
@@ -1305,6 +1310,99 @@ class P2PDirectApp {
     this.broadcastMeshBeacon(true);
 
     window.__p2pDirect = this;
+  }
+
+  /* ================= PWA Installation & Static Shell Service Worker ================= */
+
+  initPwa() {
+    const standaloneQuery =
+      typeof window.matchMedia === "function"
+        ? window.matchMedia("(display-mode: standalone)")
+        : null;
+    const isStandalone = Boolean(
+      (standaloneQuery && standaloneQuery.matches) || window.navigator.standalone === true
+    );
+    const ua = navigator.userAgent || "";
+    const isIos =
+      /(iphone|ipad|ipod)/i.test(ua) ||
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+    this.pwa = {
+      deferredPrompt: null,
+      isStandalone,
+      isIos,
+    };
+
+    document.documentElement.setAttribute("data-pwa", isStandalone ? "standalone" : "browser");
+
+    if (standaloneQuery && typeof standaloneQuery.addEventListener === "function") {
+      standaloneQuery.addEventListener("change", (ev) => {
+        this.pwa.isStandalone = Boolean(ev.matches);
+        document.documentElement.setAttribute(
+          "data-pwa",
+          this.pwa.isStandalone ? "standalone" : "browser"
+        );
+        this.updatePwaInstallButton();
+      });
+    }
+
+    window.addEventListener("beforeinstallprompt", (ev) => {
+      ev.preventDefault();
+      this.pwa.deferredPrompt = ev;
+      this.updatePwaInstallButton();
+    });
+
+    window.addEventListener("appinstalled", () => {
+      this.pwa.deferredPrompt = null;
+      this.pwa.isStandalone = true;
+      document.documentElement.setAttribute("data-pwa", "standalone");
+      this.updatePwaInstallButton();
+      this.showToast("App installed");
+    });
+
+    this.updatePwaInstallButton();
+
+    // Register static app-shell Service Worker on secure origins (caches only public static shell)
+    const canRegisterSw =
+      "serviceWorker" in navigator &&
+      (window.isSecureContext ||
+        window.location.hostname === "localhost" ||
+        window.location.hostname === "127.0.0.1");
+    if (canRegisterSw) {
+      navigator.serviceWorker.register("./sw.js", { scope: "./" }).catch(() => {
+        // Ignore registration errors in restricted/private browsing contexts
+      });
+    }
+  }
+
+  updatePwaInstallButton() {
+    const btn = this.el["btn-pwa-install"];
+    if (!btn || !this.pwa) return;
+    const canShow = !this.pwa.isStandalone && (Boolean(this.pwa.deferredPrompt) || this.pwa.isIos);
+    btn.classList.toggle("hidden", !canShow);
+  }
+
+  async promptPwaInstall() {
+    if (!this.pwa || this.pwa.isStandalone) return;
+    if (this.pwa.deferredPrompt) {
+      const promptEv = this.pwa.deferredPrompt;
+      this.pwa.deferredPrompt = null;
+      try {
+        await promptEv.prompt();
+        const choice = await promptEv.userChoice;
+        if (choice && choice.outcome === "accepted") {
+          this.showToast("Installing app…");
+        }
+      } catch {
+        // user dismissed or prompt unavailable
+      } finally {
+        this.updatePwaInstallButton();
+      }
+      return;
+    }
+    if (this.pwa.isIos) {
+      this.showToast("Tap Share → Add to Home Screen to install");
+    }
   }
 
   /* ================= Simple vs Advanced Mode & Lobby ================= */
