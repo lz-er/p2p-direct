@@ -73,17 +73,39 @@ const STRUCTURED_PRESETS = {
   },
   task: {
     type: "task",
-    payload: { id: "task-1", title: "Verify E2EE P2P backfill", status: "open", priority: 2 },
+    payload: { id: "task-1", title: "Verify encrypted sync", status: "open", priority: 2 },
   },
   metric: {
     type: "metric",
-    payload: { name: "mesh_latency_ms", value: 14.2, unit: "ms", tags: ["webrtc", "e2ee", "wasm"] },
+    payload: { name: "mesh_latency_ms", value: 14.2, unit: "ms", tags: ["p2p", "encrypted", "realtime"] },
   },
   state: {
     type: "state",
     payload: { key: "config.mode", value: "encrypted", updatedBy: "peer" },
   },
 };
+
+const AVATAR_PALETTE = [
+  "#0f766e",
+  "#2563eb",
+  "#b45309",
+  "#4f46e5",
+  "#be123c",
+  "#047857",
+];
+
+const VOICE_EQ_WEIGHTS = [0.36, 0.66, 0.92, 1.0, 0.88, 0.62, 0.34];
+const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+const URL_REGEX = /https?:\/\/[^\s<>"']+/gi;
+const MAX_IMAGES_PER_MESSAGE = 3;
+const MAX_TOTAL_IMAGE_DATA_CHARS = 60000;
+
+const MIC_ON_SVG =
+  '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>';
+const MIC_OFF_SVG =
+  '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2"/></svg>';
+const LINK_ARROW_SVG =
+  '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
 
 function randomId(prefix) {
   const bytes = new Uint8Array(4);
@@ -106,6 +128,163 @@ function escapeHtml(str) {
     .replaceAll("'", "&#39;");
 }
 
+function avatarInitials(name) {
+  const parts = String(name || "P")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  const single = parts[0] || "P";
+  return single.slice(0, 2).toUpperCase();
+}
+
+function avatarColor(seed) {
+  const str = String(seed || "self");
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+  }
+  return AVATAR_PALETTE[Math.abs(hash) % AVATAR_PALETTE.length];
+}
+
+function formatByteSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+function extractAndLinkify(text) {
+  const raw = String(text || "");
+  const links = [];
+  const seenHref = new Set();
+  let html = "";
+  let lastIndex = 0;
+
+  URL_REGEX.lastIndex = 0;
+  let match;
+  while ((match = URL_REGEX.exec(raw)) !== null) {
+    const start = match.index;
+    let candidate = match[0];
+    let trailing = "";
+
+    // Trim trailing sentence punctuation or unmatched closing brackets
+    while (candidate.length > 0) {
+      const last = candidate[candidate.length - 1];
+      if (".!?,;:".includes(last)) {
+        trailing = last + trailing;
+        candidate = candidate.slice(0, -1);
+      } else if (last === ")" && (candidate.match(/\(/g) || []).length < (candidate.match(/\)/g) || []).length) {
+        trailing = last + trailing;
+        candidate = candidate.slice(0, -1);
+      } else if (last === "]" && (candidate.match(/\[/g) || []).length < (candidate.match(/\]/g) || []).length) {
+        trailing = last + trailing;
+        candidate = candidate.slice(0, -1);
+      } else {
+        break;
+      }
+    }
+
+    html += escapeHtml(raw.slice(lastIndex, start));
+    let parsed = null;
+    try {
+      const u = new URL(candidate);
+      if (u.protocol === "http:" || u.protocol === "https:") {
+        parsed = u;
+      }
+    } catch {
+      parsed = null;
+    }
+
+    if (parsed) {
+      const safeHref = escapeHtml(parsed.href);
+      html += `<a class="chat-link" href="${safeHref}" target="_blank" rel="noopener noreferrer">${escapeHtml(candidate)}</a>`;
+      if (!seenHref.has(parsed.href)) {
+        seenHref.add(parsed.href);
+        const pathLabel =
+          (parsed.pathname === "/" ? "" : parsed.pathname) + (parsed.search || "") + (parsed.hash || "");
+        links.push({
+          href: parsed.href,
+          host: parsed.hostname.replace(/^www\./, ""),
+          path: pathLabel || parsed.pathname || "/",
+        });
+      }
+    } else {
+      html += escapeHtml(candidate);
+    }
+
+    html += escapeHtml(trailing);
+    lastIndex = start + match[0].length;
+  }
+
+  html += escapeHtml(raw.slice(lastIndex));
+  return { html, links };
+}
+
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not decode pasted image"));
+    };
+    img.src = url;
+  });
+}
+
+async function compressImageFile(file, maxChars = 54000) {
+  const img = await loadImageFromFile(file);
+  const origW = img.naturalWidth || img.width || 1;
+  const origH = img.naturalHeight || img.height || 1;
+
+  const attempts = [
+    { maxDim: 880, quality: 0.8 },
+    { maxDim: 760, quality: 0.68 },
+    { maxDim: 620, quality: 0.56 },
+    { maxDim: 480, quality: 0.46 },
+    { maxDim: 360, quality: 0.38 },
+  ];
+
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Canvas 2D context unavailable");
+  }
+
+  let best = null;
+  for (const { maxDim, quality } of attempts) {
+    const scale = Math.min(1, maxDim / Math.max(origW, origH));
+    const w = Math.max(1, Math.round(origW * scale));
+    const h = Math.max(1, Math.round(origH * scale));
+    canvas.width = w;
+    canvas.height = h;
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+
+    let dataUrl = canvas.toDataURL("image/webp", quality);
+    if (!dataUrl.startsWith("data:image/webp")) {
+      dataUrl = canvas.toDataURL("image/jpeg", quality);
+    }
+    best = {
+      id: randomId("img"),
+      dataUrl,
+      width: w,
+      height: h,
+      name: file.name || "pasted-image.webp",
+      bytes: Math.round((dataUrl.length * 3) / 4),
+    };
+    if (dataUrl.length <= maxChars) {
+      return best;
+    }
+  }
+  return best;
+}
+
 function formatTime(tsMs) {
   try {
     const d = new Date(tsMs);
@@ -124,11 +303,10 @@ function basePageUrl() {
   return `${window.location.origin}${window.location.pathname}${window.location.search}`;
 }
 
-function rmsToMeterPercent(rms) {
+function rmsToLevel(rms) {
   if (!rms || rms <= 0) return 0;
-  // Logarithmic voice-friendly scaling so normal speech fills 25%-90% smoothly
-  const norm = Math.min(1, rms / 14000);
-  return Math.min(100, Math.round(Math.pow(norm, 0.55) * 100));
+  const norm = Math.min(1, rms / 5500);
+  return Math.min(1, Math.pow(norm, 0.48));
 }
 
 function waitForIceGathering(pc, maxWaitMs = 1400) {
@@ -172,6 +350,8 @@ class P2PDirectApp {
     this.status = null;
     this.logMessages = [];
     this.rawJsonMode = false;
+    this.composerMode = "chat";
+    this.pendingImages = [];
     this.telemetry = [];
     this.saveTimer = null;
     this.toastTimer = null;
@@ -213,7 +393,7 @@ class P2PDirectApp {
     this.keepaliveFallbackTimer = null;
     this.keepaliveTickCount = 0;
 
-    // Real-time multi-peer E2EE voice chat state
+    // Real-time multi-peer voice chat state
     this.voice = {
       inVoice: false,
       muted: false,
@@ -225,10 +405,12 @@ class P2PDirectApp {
       captureNode: null,
       silentGain: null,
       masterGain: null,
-      peerMixers: new Map(), // peerId -> { gainNode, volume, muted, nextPlayTime, rms, lastAudioAt, packetsReceived }
+      peerMixers: new Map(), // peerId -> { gainNode, volume, muted, nextPlayTime, rms, smoothLevel, lastAudioAt, packetsReceived }
       localRms: 0,
+      localSmoothLevel: 0,
       localSpeakingAt: 0,
       meterTimer: null,
+      meterTicks: 0,
       lastRosterKey: "",
     };
 
@@ -247,6 +429,9 @@ class P2PDirectApp {
       "voice-header-chip",
       "voice-header-count",
       "log-count-display",
+      "btn-theme-toggle",
+      "icon-moon",
+      "icon-sun",
       "connect-panel-title",
       "btn-wizard-reset",
       "connect-panel-meta",
@@ -317,6 +502,8 @@ class P2PDirectApp {
       "e2ee-bar-hint",
       "voice-panel",
       "voice-status-badge",
+      "voice-idle-controls",
+      "voice-active-controls",
       "voice-idle-view",
       "voice-idle-desc",
       "voice-waiting-peers",
@@ -340,6 +527,11 @@ class P2PDirectApp {
       "stat-batches",
       "stat-voice",
       "telemetry-log",
+      "chat-panel",
+      "chat-composer-dropzone",
+      "chat-image-tray",
+      "chat-image-input",
+      "btn-attach-image",
       "btn-toggle-raw",
       "btn-export-encrypted",
       "btn-export-log",
@@ -356,6 +548,9 @@ class P2PDirectApp {
       "json-type-input",
       "json-payload-input",
       "composer-error",
+      "image-lightbox",
+      "btn-lightbox-close",
+      "lightbox-img",
       "toast",
     ];
     for (const id of ids) {
@@ -531,12 +726,114 @@ class P2PDirectApp {
       });
     }
 
+    // Theme toggle
+    this.el["btn-theme-toggle"].addEventListener("click", () => this.toggleTheme());
+
+    // Image attach, paste, and drag-and-drop into chat
+    this.el["btn-attach-image"].addEventListener("click", () => {
+      this.el["chat-image-input"].click();
+    });
+    this.el["chat-image-input"].addEventListener("change", async (ev) => {
+      const files = Array.from(ev.target.files || []).filter((f) => f.type.startsWith("image/"));
+      this.el["chat-image-input"].value = "";
+      if (files.length > 0) {
+        await this.addPendingImageFiles(files);
+      }
+    });
+
+    const handleImagePaste = async (ev) => {
+      const cd = ev.clipboardData;
+      if (!cd) return;
+      const imageFiles = [];
+      if (cd.items) {
+        for (const item of cd.items) {
+          if (item.kind === "file" && item.type.startsWith("image/")) {
+            const f = item.getAsFile();
+            if (f) imageFiles.push(f);
+          }
+        }
+      }
+      if (imageFiles.length === 0 && cd.files) {
+        for (const f of cd.files) {
+          if (f.type.startsWith("image/")) {
+            imageFiles.push(f);
+          }
+        }
+      }
+      if (imageFiles.length > 0) {
+        ev.preventDefault();
+        if (this.composerMode !== "chat") {
+          this.switchComposerMode("chat");
+        }
+        await this.addPendingImageFiles(imageFiles);
+      }
+    };
+
+    this.el["chat-text-input"].addEventListener("paste", handleImagePaste);
+    document.addEventListener("paste", (ev) => {
+      if (ev.defaultPrevented || ev.target === this.el["chat-text-input"]) return;
+      const active = document.activeElement;
+      if (active === this.el["chat-text-input"]) return;
+      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
+      handleImagePaste(ev);
+    });
+
+    const chatPanel = this.el["chat-panel"];
+    const dropzone = this.el["chat-composer-dropzone"];
+    chatPanel.addEventListener("dragover", (ev) => {
+      if (ev.dataTransfer?.types && Array.from(ev.dataTransfer.types).includes("Files")) {
+        ev.preventDefault();
+        dropzone.classList.add("drag-over");
+      }
+    });
+    chatPanel.addEventListener("dragleave", (ev) => {
+      if (!chatPanel.contains(ev.relatedTarget)) {
+        dropzone.classList.remove("drag-over");
+      }
+    });
+    chatPanel.addEventListener("drop", async (ev) => {
+      dropzone.classList.remove("drag-over");
+      const files = Array.from(ev.dataTransfer?.files || []).filter((f) =>
+        f.type.startsWith("image/")
+      );
+      if (files.length > 0) {
+        ev.preventDefault();
+        if (this.composerMode !== "chat") {
+          this.switchComposerMode("chat");
+        }
+        await this.addPendingImageFiles(files);
+      }
+    });
+
+    // Image lightbox controls
+    this.el["btn-lightbox-close"].addEventListener("click", () => this.closeLightbox());
+    this.el["image-lightbox"].addEventListener("click", (ev) => {
+      if (ev.target === this.el["image-lightbox"]) {
+        this.closeLightbox();
+      }
+    });
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && !this.el["image-lightbox"].classList.contains("hidden")) {
+        this.closeLightbox();
+      }
+    });
+
     this.el["chat-composer-form"].addEventListener("submit", (ev) => {
       ev.preventDefault();
       const text = this.el["chat-text-input"].value.trim();
-      if (!text) return;
-      this.publishMessage("chat", { text });
+      const images = this.pendingImages.map(({ dataUrl, width, height, name }) => ({
+        dataUrl,
+        width,
+        height,
+        name,
+      }));
+      if (!text && images.length === 0) return;
+      const payload = images.length > 0 ? { text, images } : { text };
+      this.publishMessage("chat", payload);
       this.el["chat-text-input"].value = "";
+      this.pendingImages = [];
+      this.renderImageTray();
+      this.el["composer-error"].classList.add("hidden");
     });
 
     this.el["json-composer-form"].addEventListener("submit", (ev) => {
@@ -560,7 +857,7 @@ class P2PDirectApp {
 
     this.el["btn-toggle-raw"].addEventListener("click", () => {
       this.rawJsonMode = !this.rawJsonMode;
-      this.el["btn-toggle-raw"].textContent = this.rawJsonMode ? "Card View" : "Raw JSON";
+      this.el["btn-toggle-raw"].textContent = this.rawJsonMode ? "Chat View" : "Raw JSON";
       this.renderLog();
     });
 
@@ -620,6 +917,7 @@ class P2PDirectApp {
 
   async init() {
     this.bindElements();
+    this.initTheme();
     this.bindEvents();
 
     const slot = await acquireProfileSlot();
@@ -627,7 +925,7 @@ class P2PDirectApp {
     this.profile = await loadProfileState(slot);
 
     this.wasm = await SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm");
-    this.addTelemetry("wasm", "Loaded safe Rust WASM E2EE engine (X25519 + ChaCha20-Poly1305 + IMA ADPCM)");
+    this.addTelemetry("engine", "Local encrypted engine ready");
 
     const initRes = this.wasm.call({
       cmd: "init",
@@ -652,7 +950,7 @@ class P2PDirectApp {
         const imp = this.wasm.call({ cmd: "import_snapshot", snapshot: snap });
         this.status = imp.status;
         this.logMessages = imp.log;
-        this.addTelemetry("e2ee", `Authenticated & decrypted ${imp.added} persisted log record(s)`);
+        this.addTelemetry("sync", `Restored ${imp.added} encrypted message(s) from local storage`);
       } catch (err) {
         this.addTelemetry("error", `Stored snapshot could not be decrypted: ${err.message}`);
         const state = this.wasm.call({ cmd: "get_state" });
@@ -680,6 +978,116 @@ class P2PDirectApp {
     this.broadcastMeshBeacon(true);
 
     window.__p2pDirect = this;
+  }
+
+  /* ================= Theme & Chat Media Helpers ================= */
+
+  initTheme() {
+    const current =
+      document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+    this.applyTheme(current, /* persist = */ false);
+  }
+
+  applyTheme(theme, persist = true) {
+    const isDark = theme === "dark";
+    document.documentElement.setAttribute("data-theme", isDark ? "dark" : "light");
+    if (this.el["icon-moon"] && this.el["icon-sun"]) {
+      this.el["icon-moon"].classList.toggle("hidden", isDark);
+      this.el["icon-sun"].classList.toggle("hidden", !isDark);
+    }
+    if (this.el["btn-theme-toggle"]) {
+      const label = isDark ? "Switch to light mode" : "Switch to dark mode";
+      this.el["btn-theme-toggle"].title = label;
+      this.el["btn-theme-toggle"].setAttribute("aria-label", label);
+    }
+    if (persist) {
+      try {
+        localStorage.setItem("p2p-direct-theme", isDark ? "dark" : "light");
+      } catch {
+        // ignore storage restrictions
+      }
+    }
+    if (this.status) {
+      this.renderTopology();
+    }
+  }
+
+  toggleTheme() {
+    const current = document.documentElement.getAttribute("data-theme");
+    this.applyTheme(current === "dark" ? "light" : "dark", true);
+  }
+
+  async addPendingImageFiles(files) {
+    this.el["composer-error"].classList.add("hidden");
+    for (const file of files) {
+      if (this.pendingImages.length >= MAX_IMAGES_PER_MESSAGE) {
+        this.showComposerError(`Up to ${MAX_IMAGES_PER_MESSAGE} images per message.`);
+        break;
+      }
+      const usedChars = this.pendingImages.reduce((sum, img) => sum + img.dataUrl.length, 0);
+      const remainingChars = MAX_TOTAL_IMAGE_DATA_CHARS - usedChars;
+      if (remainingChars < 8000) {
+        this.showComposerError("Image attachment budget reached for this message — send it first.");
+        break;
+      }
+      try {
+        const budget = Math.min(54000, remainingChars);
+        const compressed = await compressImageFile(file, budget);
+        if (!SAFE_IMAGE_DATA_URL_RE.test(compressed.dataUrl)) {
+          throw new Error("Unsupported image encoding");
+        }
+        this.pendingImages.push(compressed);
+      } catch (err) {
+        this.showComposerError(`Could not attach image: ${err.message}`);
+      }
+    }
+    this.renderImageTray();
+    this.el["chat-text-input"].focus();
+  }
+
+  removePendingImage(id) {
+    this.pendingImages = this.pendingImages.filter((img) => img.id !== id);
+    this.renderImageTray();
+  }
+
+  renderImageTray() {
+    const tray = this.el["chat-image-tray"];
+    if (!tray) return;
+    if (this.pendingImages.length === 0) {
+      tray.innerHTML = "";
+      tray.classList.add("hidden");
+      return;
+    }
+    tray.classList.remove("hidden");
+    tray.innerHTML = this.pendingImages
+      .map(
+        (img) => `
+        <div class="staged-image-chip" data-staged-img="${escapeHtml(img.id)}">
+          <img src="${img.dataUrl}" alt="${escapeHtml(img.name)}" />
+          <div class="staged-image-meta">
+            <span class="staged-image-name">${escapeHtml(img.name)}</span>
+            <span>${img.width}×${img.height} · ${formatByteSize(img.bytes)}</span>
+          </div>
+          <button type="button" class="staged-image-remove" data-remove-img="${escapeHtml(img.id)}" aria-label="Remove image">×</button>
+        </div>
+      `
+      )
+      .join("");
+    for (const btn of tray.querySelectorAll("[data-remove-img]")) {
+      btn.addEventListener("click", () => this.removePendingImage(btn.dataset.removeImg));
+    }
+  }
+
+  openLightbox(src, alt) {
+    if (!SAFE_IMAGE_DATA_URL_RE.test(src)) return;
+    this.el["lightbox-img"].src = src;
+    this.el["lightbox-img"].alt = alt || "Shared image";
+    this.el["image-lightbox"].classList.remove("hidden");
+  }
+
+  closeLightbox() {
+    this.el["image-lightbox"].classList.add("hidden");
+    this.el["lightbox-img"].removeAttribute("src");
   }
 
   /* ================= Step-by-Step Connect Wizard Helpers ================= */
@@ -836,9 +1244,9 @@ class P2PDirectApp {
       this.el["join-step-2-body"].classList.toggle("hidden", w.step === 1 || connected);
 
       if (connected) {
-        this.el["join-step-3-title"].textContent = `Connected to ${w.peerName} (E2EE)`;
+        this.el["join-step-3-title"].textContent = `Connected to ${w.peerName}`;
         this.el["join-step-3-detail"].textContent =
-          `Encrypted WebRTC channel is live with ${w.peerName}. Your log is syncing automatically and you can join Voice Chat below.`;
+          `Direct encrypted connection is live with ${w.peerName}. Messages sync automatically and you can join Voice Chat anytime.`;
         this.el["join-step-3-body"].classList.remove("hidden");
       } else if (w.step === 3) {
         this.el["join-step-3-title"].textContent = `Waiting for ${w.peerName || "host"} to apply your reply…`;
@@ -1398,13 +1806,18 @@ class P2PDirectApp {
 
   switchComposerMode(mode) {
     const isChat = mode === "chat";
+    this.composerMode = isChat ? "chat" : "json";
     this.el["mode-btn-chat"].classList.toggle("active", isChat);
     this.el["mode-btn-chat"].setAttribute("aria-selected", String(isChat));
     this.el["mode-btn-json"].classList.toggle("active", !isChat);
     this.el["mode-btn-json"].setAttribute("aria-selected", String(!isChat));
     this.el["chat-composer-form"].classList.toggle("hidden", !isChat);
     this.el["json-composer-form"].classList.toggle("hidden", isChat);
+    this.el["chat-image-tray"].classList.toggle("hidden", !isChat || this.pendingImages.length === 0);
     this.el["composer-error"].classList.add("hidden");
+    this.el["next-lamport-preview"].textContent = isChat
+      ? "Paste images or links"
+      : `next lamport: ${(this.status?.lamport || 0) + 1}`;
   }
 
   showNotice(id, kind, text) {
@@ -1520,7 +1933,7 @@ class P2PDirectApp {
     a.download = `p2p-direct-e2ee-backup-${this.status.peerId}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    this.showToast(`Exported ${exp.snapshot.records.length} ChaCha20-Poly1305 encrypted record(s)`);
+    this.showToast(`Exported ${exp.snapshot.records.length} encrypted record(s)`);
   }
 
   exportDecryptedLog() {
@@ -1688,9 +2101,9 @@ class P2PDirectApp {
       hostCopied: false,
       joinCopied: false,
       peerName: "",
-      offerMeta: "gathering ICE…",
+      offerMeta: "preparing…",
       answerMeta: "",
-      offerHint: "Gathering WebRTC ICE candidates…",
+      offerHint: "Preparing direct invite link…",
       answerHint: "",
     };
     this.el["host-offer-code"].value = "";
@@ -1754,7 +2167,7 @@ class P2PDirectApp {
     this.el["btn-join-create-reply"].disabled = true;
     this.latestAnswer = null;
     if (!silentUi) {
-      this.showNotice("connect-notice", "info", "Decoding invite and gathering WebRTC ICE candidates…");
+      this.showNotice("connect-notice", "info", "Decoding invite and preparing reply link…");
     }
     try {
       const passInput = this.el["e2ee-passphrase-input"].value;
@@ -1921,7 +2334,7 @@ class P2PDirectApp {
       this.showNotice(
         "connect-notice",
         "info",
-        `Opening direct E2EE WebRTC channel with ${sig.authorName} (${sig.peerId})…`
+        `Connecting directly to ${sig.authorName}…`
       );
       this.addTelemetry("signal", `Applied P2P1 answer from ${sig.authorName} (${sig.peerId})`);
       return true;
@@ -2000,6 +2413,7 @@ class P2PDirectApp {
         muted: false,
         nextPlayTime: 0,
         rms: 0,
+        smoothLevel: 0,
         lastAudioAt: 0,
         packetsReceived: 0,
       };
@@ -2044,7 +2458,9 @@ class P2PDirectApp {
       this.voice.deafened = false;
       this.voice.inVoice = true;
       this.voice.localRms = 0;
+      this.voice.localSmoothLevel = 0;
       this.voice.localSpeakingAt = 0;
+      this.voice.meterTicks = 0;
 
       if (this.voice.masterGain) {
         this.voice.masterGain.gain.value = 1.0;
@@ -2054,7 +2470,6 @@ class P2PDirectApp {
         await this.startMicCaptureGraph(ctx, micStream);
       }
 
-      // Broadcast encrypted VoiceState across the mesh
       const res = this.wasm.call({
         cmd: "set_voice_state",
         inVoice: true,
@@ -2064,14 +2479,12 @@ class P2PDirectApp {
       this.executeActions(res.actions);
 
       if (!this.voice.meterTimer) {
-        this.voice.meterTimer = setInterval(() => this.updateVoiceMeters(), 100);
+        this.voice.meterTimer = setInterval(() => this.updateVoiceMeters(), 70);
       }
 
       this.renderAll();
       this.showToast(
-        effectiveListenOnly
-          ? "Joined E2EE voice chat (listen-only)"
-          : "Joined E2EE voice chat — everyone in the call can hear each other live"
+        effectiveListenOnly ? "Joined voice chat (listen-only)" : "Joined voice chat"
       );
     } catch (err) {
       this.cleanupVoiceAudioResources();
@@ -2384,43 +2797,92 @@ class P2PDirectApp {
     }
   }
 
+  _applySpeakerVisualizer(rowKey, level, defaultStateLabel, tickPhase) {
+    const list = this.el["voice-participant-list"];
+    const selector = rowKey === "self" ? "self" : CSS.escape(rowKey);
+    const card = list.querySelector(`[data-voice-row="${selector}"]`);
+    if (!card) return;
+    const speaking = level > 0.09;
+    card.style.setProperty("--voice-level", level.toFixed(3));
+    card.classList.toggle("is-speaking", speaking);
+
+    const stateEl = card.querySelector("[data-voice-state]");
+    if (stateEl) {
+      stateEl.textContent = speaking ? "Speaking" : defaultStateLabel;
+    }
+
+    const bars = card.querySelectorAll(".voice-eq-bar");
+    for (let i = 0; i < bars.length; i++) {
+      if (level <= 0.04) {
+        bars[i].style.height = "4px";
+      } else {
+        const w = VOICE_EQ_WEIGHTS[i] || 0.5;
+        const wobble = 0.72 + 0.28 * Math.sin(tickPhase * 0.9 + i * 1.15);
+        const h = Math.max(4, Math.min(22, Math.round(4 + level * 18 * w * wobble)));
+        bars[i].style.height = `${h}px`;
+      }
+    }
+  }
+
   updateVoiceMeters() {
     if (!this.voice.inVoice || !this.wasm) return;
     const now = Date.now();
+    this.voice.meterTicks = (this.voice.meterTicks + 1) % 100000;
+    const phase = this.voice.meterTicks;
 
-    // Local mic meter
-    const localFresh = !this.voice.muted && now - this.voice.localSpeakingAt < 350;
-    const localPct = localFresh ? rmsToMeterPercent(this.voice.localRms) : 0;
-    const selfMeter = this.el["voice-participant-list"].querySelector('[data-voice-meter="self"]');
-    const selfRow = this.el["voice-participant-list"].querySelector('[data-voice-row="self"]');
-    if (selfMeter) selfMeter.style.width = `${localPct}%`;
-    if (selfRow) selfRow.classList.toggle("is-speaking", localFresh && localPct > 12);
+    // Local speaker smoothing (fast attack, smooth release)
+    const localFresh = !this.voice.muted && now - this.voice.localSpeakingAt < 320;
+    const localTarget = localFresh ? rmsToLevel(this.voice.localRms) : 0;
+    this.voice.localSmoothLevel =
+      localTarget > this.voice.localSmoothLevel
+        ? this.voice.localSmoothLevel * 0.4 + localTarget * 0.6
+        : this.voice.localSmoothLevel * 0.72 + localTarget * 0.28;
+    if (this.voice.localSmoothLevel < 0.015) this.voice.localSmoothLevel = 0;
 
-    // Remote peer meters
-    for (const [peerId, mixer] of this.voice.peerMixers.entries()) {
-      const fresh = now - mixer.lastAudioAt < 350;
-      const pct = fresh ? rmsToMeterPercent(mixer.rms) : 0;
-      const meter = this.el["voice-participant-list"].querySelector(
-        `[data-voice-meter="${CSS.escape(peerId)}"]`
-      );
-      const row = this.el["voice-participant-list"].querySelector(
-        `[data-voice-row="${CSS.escape(peerId)}"]`
-      );
-      if (meter) meter.style.width = `${pct}%`;
-      if (row) row.classList.toggle("is-speaking", fresh && pct > 12);
+    const selfDefault = this.voice.listenOnly
+      ? "Listen-only"
+      : this.voice.muted
+        ? "Muted"
+        : this.voice.deafened
+          ? "Deafened"
+          : "Live";
+    this._applySpeakerVisualizer("self", this.voice.localSmoothLevel, selfDefault, phase);
+
+    // Remote speaker smoothing & live visualizer update
+    const peersInVoice = (this.status?.peers || []).filter((p) => p.inVoice);
+    for (const p of peersInVoice) {
+      const mixer = this.voice.peerMixers.get(p.peerId);
+      const fresh = mixer && now - mixer.lastAudioAt < 340;
+      const target = fresh ? rmsToLevel(mixer.rms) : 0;
+      if (mixer) {
+        mixer.smoothLevel =
+          target > (mixer.smoothLevel || 0)
+            ? (mixer.smoothLevel || 0) * 0.4 + target * 0.6
+            : (mixer.smoothLevel || 0) * 0.72 + target * 0.28;
+        if (mixer.smoothLevel < 0.015) mixer.smoothLevel = 0;
+      }
+      const level = mixer ? mixer.smoothLevel : 0;
+      const defaultState = p.voiceMuted
+        ? "Muted"
+        : mixer && mixer.muted
+          ? "Muted for you"
+          : "Live";
+      this._applySpeakerVisualizer(p.peerId, level, defaultState, phase + p.peerId.charCodeAt(2));
     }
 
-    // Refresh packet counters smoothly from WASM state
-    try {
-      const st = this.wasm.call({ cmd: "get_state" }).status;
-      this.status = st;
-      this.renderStats();
-      if (st?.stats) {
-        this.el["voice-packet-stats"].textContent =
-          `TX ${st.stats.voicePacketsSent} / RX ${st.stats.voicePacketsReceived}`;
+    // Refresh packet counters every ~4th visualizer frame (~280ms)
+    if (this.voice.meterTicks % 4 === 0) {
+      try {
+        const st = this.wasm.call({ cmd: "get_state" }).status;
+        this.status = st;
+        this.renderStats();
+        if (st?.stats) {
+          this.el["voice-packet-stats"].textContent =
+            `TX ${st.stats.voicePacketsSent} / RX ${st.stats.voicePacketsReceived}`;
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
     }
   }
 
@@ -2976,16 +3438,19 @@ class P2PDirectApp {
     this.el["lamport-display"].textContent = String(this.status.lamport);
     this.el["peer-count-display"].textContent = String(this.status.peers.length);
     this.el["log-count-display"].textContent = String(this.status.logCount);
-    this.el["next-lamport-preview"].textContent = `next lamport: ${this.status.lamport + 1}`;
+    this.el["next-lamport-preview"].textContent =
+      this.composerMode === "chat"
+        ? "Paste images or links"
+        : `next lamport: ${this.status.lamport + 1}`;
 
     if (this.status.e2ee) {
       const shortFp = this.status.e2ee.keyFingerprint.slice(0, 9);
       this.el["key-fp-display"].textContent = shortFp;
       this.el["key-fp-display"].parentElement.title =
-        `E2EE ${this.status.e2ee.cipher} · Full Key Fingerprint: ${this.status.e2ee.keyFingerprint}`;
+        `End-to-End Encrypted Room Key · Fingerprint: ${this.status.e2ee.keyFingerprint}`;
       this.el["e2ee-mode-label"].textContent = this.status.e2ee.passphraseMode
         ? `Passphrase · ${shortFp}`
-        : `Auto 256-bit · ${shortFp}`;
+        : `Auto · ${shortFp}`;
     }
 
     const isOnline = this.status.peers.length > 0;
@@ -3008,10 +3473,10 @@ class P2PDirectApp {
         : null;
     if (localTarget) {
       this.el["local-mesh-banner"].classList.remove("hidden");
-      this.el["local-mesh-fp"].textContent = `FP ${localTarget.keyFingerprint.slice(0, 9)}`;
+      this.el["local-mesh-fp"].textContent = `Key ${localTarget.keyFingerprint.slice(0, 9)}`;
       this.el["local-mesh-desc"].textContent =
-        `${localTarget.authorName} is open in another tab (${localTarget.logCount} log entries). Connect directly over E2EE WebRTC with 1 click.`;
-      this.el["btn-join-local-mesh"].textContent = `Join ${localTarget.authorName}'s Mesh`;
+        `${localTarget.authorName} is open in another tab (${localTarget.logCount} messages). Connect directly in 1 click.`;
+      this.el["btn-join-local-mesh"].textContent = `Join ${localTarget.authorName}`;
     } else {
       this.el["local-mesh-banner"].classList.add("hidden");
     }
@@ -3030,9 +3495,9 @@ class P2PDirectApp {
         .join(", ");
       const extra = known.length > 3 ? ` +${known.length - 3} more` : "";
       this.el["rejoin-banner"].classList.remove("hidden");
-      this.el["rejoin-fp"].textContent = `FP ${this.status.e2ee.keyFingerprint.slice(0, 9)}`;
+      this.el["rejoin-fp"].textContent = `Key ${this.status.e2ee.keyFingerprint.slice(0, 9)}`;
       this.el["rejoin-desc"].textContent =
-        `Previously meshed with ${names}${extra}. Open tabs on this browser rejoin automatically; for another device, create a Rejoin Invite.`;
+        `Previously connected with ${names}${extra}. Tabs in this browser reconnect automatically; for another device, create a Rejoin Invite.`;
     } else {
       this.el["rejoin-banner"].classList.add("hidden");
     }
@@ -3043,18 +3508,22 @@ class P2PDirectApp {
     const peersInVoice = (this.status.peers || []).filter((p) => p.inVoice);
     const totalInVoice = peersInVoice.length + (this.voice.inVoice ? 1 : 0);
 
+    this.el["voice-panel"].classList.toggle("is-live", this.voice.inVoice);
+
     const badge = this.el["voice-status-badge"];
     if (this.voice.inVoice) {
       badge.textContent = `${totalInVoice} in call`;
       badge.className = "badge auto";
     } else if (peersInVoice.length > 0) {
-      badge.textContent = `${peersInVoice.length} waiting`;
+      badge.textContent = `${peersInVoice.length} live`;
       badge.className = "badge pending";
     } else {
       badge.textContent = "Off";
       badge.className = "badge";
     }
 
+    this.el["voice-idle-controls"].classList.toggle("hidden", this.voice.inVoice);
+    this.el["voice-active-controls"].classList.toggle("hidden", !this.voice.inVoice);
     this.el["voice-idle-view"].classList.toggle("hidden", this.voice.inVoice);
     this.el["voice-active-view"].classList.toggle("hidden", !this.voice.inVoice);
 
@@ -3062,7 +3531,7 @@ class P2PDirectApp {
       const waitEl = this.el["voice-waiting-peers"];
       if (peersInVoice.length > 0) {
         const names = peersInVoice.map((p) => p.authorName).join(", ");
-        waitEl.textContent = `Live right now: ${names} — click Join Voice Chat to talk together.`;
+        waitEl.innerHTML = `<span class="status-dot online"></span><span>In voice now: ${escapeHtml(names)}</span>`;
         waitEl.classList.remove("hidden");
       } else {
         waitEl.classList.add("hidden");
@@ -3070,7 +3539,6 @@ class P2PDirectApp {
       return;
     }
 
-    // Active Voice Controls
     const muteBtn = this.el["btn-voice-mute"];
     muteBtn.textContent = this.voice.listenOnly
       ? "Listen Only"
@@ -3088,8 +3556,8 @@ class P2PDirectApp {
         `TX ${this.status.stats.voicePacketsSent} / RX ${this.status.stats.voicePacketsReceived}`;
     }
 
-    // Rebuild participant list DOM only when roster or mute flags change (preserves slider drag state)
     const rosterKey = JSON.stringify({
+      selfId: this.status.peerId,
       selfName: this.status.authorName,
       muted: this.voice.muted,
       listenOnly: this.voice.listenOnly,
@@ -3105,22 +3573,34 @@ class P2PDirectApp {
     }
     this.voice.lastRosterKey = rosterKey;
 
-    const selfStatusBadge = this.voice.listenOnly
-      ? '<span class="badge">listen-only</span>'
+    const eqBarsHtml = Array.from({ length: VOICE_EQ_WEIGHTS.length }, () => '<span class="voice-eq-bar"></span>').join("");
+    const selfBg = avatarColor(this.status.peerId);
+    const selfInitials = escapeHtml(avatarInitials(this.status.authorName));
+    const selfMuted = this.voice.muted || this.voice.listenOnly;
+    const selfStateText = this.voice.listenOnly
+      ? "Listen-only"
       : this.voice.muted
-        ? '<span class="badge pending">muted</span>'
-        : '<span class="badge auto">mic live</span>';
+        ? "Muted"
+        : this.voice.deafened
+          ? "Deafened"
+          : "Live";
 
     const items = [
       `
-        <li class="voice-participant" data-voice-row="self">
-          <div class="voice-participant-head">
-            <span class="voice-participant-name">${escapeHtml(this.status.authorName)} (you) ${selfStatusBadge}</span>
-            <span class="panel-meta">${this.voice.deafened ? "deafened" : "E2EE"}</span>
+        <li class="voice-card" data-voice-row="self">
+          <div class="voice-avatar-wrap">
+            <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
+            <span class="voice-ring" aria-hidden="true"></span>
+            <div class="voice-avatar" style="background: ${selfBg}">${selfInitials}</div>
+            <span class="voice-avatar-badge${selfMuted ? " muted" : ""}" aria-hidden="true">
+              ${selfMuted ? MIC_OFF_SVG : MIC_ON_SVG}
+            </span>
           </div>
-          <div class="voice-meter-track">
-            <div class="voice-meter-fill" data-voice-meter="self"></div>
+          <div class="voice-card-identity">
+            <span class="voice-card-name">${escapeHtml(this.status.authorName)} (you)</span>
+            <span class="voice-card-state" data-voice-state="self">${selfStateText}</span>
           </div>
+          <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
         </li>
       `,
     ];
@@ -3129,22 +3609,29 @@ class P2PDirectApp {
       const mixer = this.voice.peerMixers.get(p.peerId);
       const localMuted = mixer ? mixer.muted : false;
       const volPct = mixer ? Math.round(mixer.volume * 100) : 100;
-      const remoteBadge = p.voiceMuted
-        ? '<span class="badge pending">muted</span>'
-        : '<span class="badge auto">live</span>';
+      const bg = avatarColor(p.peerId);
+      const initials = escapeHtml(avatarInitials(p.authorName));
+      const peerStateText = p.voiceMuted ? "Muted" : localMuted ? "Muted for you" : "Live";
+
       items.push(`
-        <li class="voice-participant" data-voice-row="${escapeHtml(p.peerId)}">
-          <div class="voice-participant-head">
-            <span class="voice-participant-name">${escapeHtml(p.authorName)} ${remoteBadge}</span>
+        <li class="voice-card" data-voice-row="${escapeHtml(p.peerId)}">
+          <div class="voice-avatar-wrap">
+            <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
+            <span class="voice-ring" aria-hidden="true"></span>
+            <div class="voice-avatar" style="background: ${bg}">${initials}</div>
+            <span class="voice-avatar-badge${p.voiceMuted ? " muted" : ""}" aria-hidden="true">
+              ${p.voiceMuted ? MIC_OFF_SVG : MIC_ON_SVG}
+            </span>
+          </div>
+          <div class="voice-card-identity">
+            <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
+            <span class="voice-card-state" data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span>
+          </div>
+          <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
+          <div class="voice-peer-mixer">
             <button type="button" class="btn btn-sm" data-peer-voice-mute="${escapeHtml(p.peerId)}">
               ${localMuted ? "Unmute" : "Mute"}
             </button>
-          </div>
-          <div class="voice-meter-track">
-            <div class="voice-meter-fill" data-voice-meter="${escapeHtml(p.peerId)}"></div>
-          </div>
-          <div class="voice-peer-mixer">
-            <span class="panel-meta">Vol</span>
             <input
               type="range"
               class="voice-volume-slider"
@@ -3157,12 +3644,6 @@ class P2PDirectApp {
           </div>
         </li>
       `);
-    }
-
-    if (peersInVoice.length === 0) {
-      items.push(
-        '<li class="empty-state" style="padding: 10px">You are in voice chat. As soon as any peer in the mesh clicks Join Voice Chat, you will hear each other simultaneously.</li>'
-      );
     }
 
     const listEl = this.el["voice-participant-list"];
@@ -3194,14 +3675,14 @@ class P2PDirectApp {
 
     if (direct.length === 0 && pending.length === 0) {
       list.innerHTML =
-        '<li class="empty-state">No direct peers yet. Use the step-by-step Connect Peer panel above to invite or join a mesh.</li>';
+        '<li class="empty-state">No peers connected yet. Use Connect Peer above to invite or join someone.</li>';
       return;
     }
 
     const parts = [];
     for (const p of direct) {
       const originBadge = p.viaAutoMesh
-        ? `<span class="badge auto" title="Auto-introduced via ${escapeHtml(p.introducedBy || "mesh")}">auto-mesh</span>`
+        ? `<span class="badge auto" title="Auto-connected via ${escapeHtml(p.introducedBy || "peer")}">auto</span>`
         : '<span class="badge">direct</span>';
       const voiceBadge = p.inVoice
         ? `<span class="badge auto">${p.voiceMuted ? "voice · muted" : "in voice"}</span>`
@@ -3211,7 +3692,7 @@ class P2PDirectApp {
         <li class="peer-item" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
             <div class="peer-name">${escapeHtml(p.authorName)} ${originBadge} ${voiceBadge}</div>
-            <div class="peer-id">${escapeHtml(p.peerId)} · safety ${escapeHtml(p.safetyCode || "—")}${rttLabel} · synced ${p.knownCount}</div>
+            <div class="peer-id">${escapeHtml(p.peerId)} · code ${escapeHtml(p.safetyCode || "—")}${rttLabel}</div>
           </div>
           <button type="button" class="btn btn-sm btn-danger" data-disconnect="${escapeHtml(p.peerId)}">Drop</button>
         </li>
@@ -3222,7 +3703,7 @@ class P2PDirectApp {
       parts.push(`
         <li class="peer-item">
           <div class="peer-main">
-            <div class="peer-name">${escapeHtml(pend.authorName)} <span class="badge pending">E2EE relay via ${escapeHtml(pend.viaPeerId)}</span></div>
+            <div class="peer-name">${escapeHtml(pend.authorName)} <span class="badge pending">connecting via ${escapeHtml(pend.viaPeerId)}</span></div>
             <div class="peer-id">${escapeHtml(pend.peerId)}</div>
           </div>
         </li>
@@ -3271,9 +3752,9 @@ class P2PDirectApp {
     }
 
     const cx = 170;
-    const cy = 85;
+    const cy = 80;
     const rx = 112;
-    const ry = 56;
+    const ry = 52;
     if (nodes.length === 1) {
       nodes[0].x = cx;
       nodes[0].y = cy;
@@ -3296,15 +3777,15 @@ class P2PDirectApp {
       edgeSet.add(key);
       if (style === "pending") {
         lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="#b45309" stroke-width="1.6" stroke-dasharray="4 4" />`
+          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-warn)" stroke-width="1.6" stroke-dasharray="4 4" />`
         );
       } else if (style === "remote") {
         lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="#8fb8b1" stroke-width="1.5" />`
+          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-opacity="0.42" stroke-width="1.5" />`
         );
       } else {
         lines.push(
-          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="#0f766e" stroke-width="2.1" />`
+          `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent-live)" stroke-width="2.1" />`
         );
       }
     };
@@ -3324,18 +3805,22 @@ class P2PDirectApp {
 
     const circles = nodes.map((n) => {
       const fill =
-        n.kind === "self" ? "#17191c" : n.kind === "pending" ? "#b45309" : "#0f766e";
+        n.kind === "self"
+          ? "var(--ink-primary)"
+          : n.kind === "pending"
+            ? "var(--accent-warn)"
+            : "var(--accent-live)";
       const r = n.kind === "self" ? 9 : 7.5;
       const shortLabel = n.label.length > 16 ? `${n.label.slice(0, 15)}…` : n.label;
       const labelY = n.y > cy ? n.y + 18 : n.y - 12;
       const voiceRing = n.inVoice
-        ? `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r + 4}" fill="none" stroke="#0f766e" stroke-width="1.6" stroke-opacity="0.55" />`
+        ? `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r + 4}" fill="none" stroke="var(--accent-live)" stroke-width="1.6" stroke-opacity="0.6" />`
         : "";
       return `
         <g>
           ${voiceRing}
-          <circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r}" fill="${fill}" stroke="#ffffff" stroke-width="2" />
-          <text x="${n.x.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-size="10.5" font-weight="600" fill="#17191c">${escapeHtml(shortLabel)}</text>
+          <circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r}" fill="${fill}" stroke="var(--bg-surface)" stroke-width="2" />
+          <text x="${n.x.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-size="10.5" font-weight="600" fill="var(--ink-primary)">${escapeHtml(shortLabel)}</text>
         </g>
       `;
     });
@@ -3381,6 +3866,50 @@ class P2PDirectApp {
     }
   }
 
+  renderChatPayload(payload) {
+    const parts = [];
+    const text = typeof payload.text === "string" ? payload.text : "";
+    if (text) {
+      const { html, links } = extractAndLinkify(text);
+      parts.push(`<div class="log-text-body">${html}</div>`);
+      if (links.length > 0) {
+        const cards = links
+          .map(
+            (lnk) => `
+            <a class="chat-link-card" href="${escapeHtml(lnk.href)}" target="_blank" rel="noopener noreferrer">
+              ${LINK_ARROW_SVG}
+              <span class="chat-link-host">${escapeHtml(lnk.host)}</span>
+              <span class="chat-link-path">${escapeHtml(lnk.path)}</span>
+            </a>
+          `
+          )
+          .join("");
+        parts.push(`<div class="chat-link-cards">${cards}</div>`);
+      }
+    }
+
+    if (Array.isArray(payload.images) && payload.images.length > 0) {
+      const validImages = payload.images.filter(
+        (img) => img && typeof img.dataUrl === "string" && SAFE_IMAGE_DATA_URL_RE.test(img.dataUrl)
+      );
+      if (validImages.length > 0) {
+        const thumbs = validImages
+          .map((img) => {
+            const alt = escapeHtml(img.name || "Shared image");
+            return `
+              <button type="button" class="chat-image-btn" data-lightbox-src="${img.dataUrl}" data-lightbox-alt="${alt}">
+                <img class="chat-image-thumb" src="${img.dataUrl}" alt="${alt}" loading="lazy" />
+              </button>
+            `;
+          })
+          .join("");
+        parts.push(`<div class="chat-image-grid">${thumbs}</div>`);
+      }
+    }
+
+    return parts.join("");
+  }
+
   renderLog() {
     const feed = this.el["log-feed"];
     const query = this.el["log-search-input"].value.trim().toLowerCase();
@@ -3389,14 +3918,28 @@ class P2PDirectApp {
     const filtered = this.logMessages.filter((m) => {
       if (typeFilter && m.type !== typeFilter) return false;
       if (!query) return true;
-      return JSON.stringify(m).toLowerCase().includes(query);
+      // Avoid scanning huge base64 image strings when searching text
+      const searchable = {
+        id: m.id,
+        type: m.type,
+        author: m.author,
+        authorName: m.authorName,
+        payload:
+          m.type === "chat" && m.payload && Array.isArray(m.payload.images)
+            ? {
+                text: m.payload.text || "",
+                imageNames: m.payload.images.map((i) => i?.name || "image"),
+              }
+            : m.payload,
+      };
+      return JSON.stringify(searchable).toLowerCase().includes(query);
     });
 
     if (filtered.length === 0) {
       feed.innerHTML =
         this.logMessages.length === 0
-          ? '<div class="empty-state">Replicated log is empty. Publish a message below — every entry is AEAD-encrypted with ChaCha20-Poly1305 in IndexedDB and on the wire, staying alive as long as at least one peer remains in the network.</div>'
-          : '<div class="empty-state">No log entries match your current filter.</div>';
+          ? '<div class="empty-state">No messages yet. Type a message, paste an image or link, or share structured JSON below.</div>'
+          : '<div class="empty-state">No messages match your current filter.</div>';
       return;
     }
 
@@ -3410,20 +3953,25 @@ class P2PDirectApp {
     feed.innerHTML = filtered
       .map((m) => {
         const isSelf = m.author === myId;
-        const isChat = m.type === "chat" && m.payload && typeof m.payload.text === "string";
+        const isChat =
+          m.type === "chat" &&
+          m.payload &&
+          (typeof m.payload.text === "string" || Array.isArray(m.payload.images));
         const bodyHtml = isChat
-          ? `<div class="log-text-body">${escapeHtml(m.payload.text)}</div>`
+          ? this.renderChatPayload(m.payload)
           : `<pre class="log-json-pre">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
+        const typeTag = isChat
+          ? ""
+          : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
         return `
           <article class="log-entry${isSelf ? " is-self" : ""}" data-msg-id="${escapeHtml(m.id)}">
             <div class="log-entry-head">
               <div class="log-author-group">
                 <span class="log-author">${escapeHtml(m.authorName)}</span>
-                <span class="log-type-tag${isChat ? " type-chat" : ""}">${escapeHtml(m.type)}</span>
-                <span class="peer-id">${escapeHtml(m.author)}</span>
+                ${typeTag}
               </div>
-              <span class="log-order-tuple" title="Deterministic sort tuple (lamport, ts, id)">
-                L:${m.lamport} · ${escapeHtml(formatTime(m.ts))} · ${escapeHtml(m.id)}
+              <span class="log-order-tuple" title="Order (lamport ${m.lamport}) · ${escapeHtml(m.id)}">
+                ${escapeHtml(formatTime(m.ts))}
               </span>
             </div>
             ${bodyHtml}
@@ -3431,6 +3979,12 @@ class P2PDirectApp {
         `;
       })
       .join("");
+
+    for (const btn of feed.querySelectorAll("[data-lightbox-src]")) {
+      btn.addEventListener("click", () =>
+        this.openLightbox(btn.dataset.lightboxSrc, btn.dataset.lightboxAlt)
+      );
+    }
 
     feed.scrollTop = feed.scrollHeight;
   }
