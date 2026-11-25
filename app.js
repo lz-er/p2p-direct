@@ -19,6 +19,13 @@ import {
   saveSessionAudioSettings,
   saveSessionAuthorName,
 } from "./storage.js";
+import {
+  WatchTogetherPlayer,
+  formatClockTime,
+  frameIndexForGifTime,
+  parseWatchMediaUrl,
+  projectMediaPositionMs,
+} from "./watch_together.js";
 
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
@@ -1216,8 +1223,28 @@ class P2PDirectApp {
     this.composerMode = "chat";
     this.pendingImages = [];
     this.mediaBlobRegistry = new Map(); // msgId -> Set<blobUrl>
-    this.lightboxState = null; // { kind, blob, dataUrl, tempUrl }
+    this.lightboxState = null; // { kind, blob, dataUrl, tempUrl, syncTargetId, gifBinding, videoBinding }
     this.dcChunkSeq = 0;
+
+    // Room-wide E2EE Synchronized Media (Videos, GIFs) & Watch Together (YouTube/Spotify/SoundCloud)
+    // Volume and mute are STRICTLY local-only and never included in mediaSync state.
+    this.mediaSync = {
+      states: new Map(), // targetId -> MediaSyncState
+      videoBindings: new Map(), // "vid:<msgId>:<idx>" -> binding obj
+      gifBindings: new Map(), // "gif:<msgId>:<idx>" -> binding obj
+      gifRafId: null,
+      boundGifTick: () => this._tickSyncedGifs(),
+      driftTimer: null,
+      watchPlayer: null,
+      watchPanelOpenManual: false,
+      watchMinimized: false,
+      watchScrubbing: false,
+      watchUiTimer: null,
+      watchTitleOverride: "",
+      watchDurationMs: 0,
+      lightboxVideoApplying: false,
+      lightboxVideoSuppressUntil: 0,
+    };
     this.telemetry = [];
     this.toastTimer = null;
 
@@ -1601,12 +1628,49 @@ class P2PDirectApp {
       "composer-error",
       "image-lightbox",
       "btn-lightbox-close",
+      "lightbox-gif-wrap",
       "lightbox-img",
+      "lightbox-gif-canvas",
       "lightbox-video",
       "lightbox-toolbar",
       "btn-lightbox-replay",
       "btn-lightbox-loop",
       "lightbox-meta",
+      "btn-open-watch-panel",
+      "watch-panel",
+      "watch-provider-badge",
+      "watch-panel-title",
+      "watch-sync-meta",
+      "watch-open-external",
+      "btn-watch-minimize",
+      "btn-watch-close",
+      "watch-body",
+      "watch-stage-wrap",
+      "watch-embed-stage",
+      "btn-watch-autoplay-unmute",
+      "watch-transport",
+      "btn-watch-play",
+      "btn-watch-back10",
+      "btn-watch-fwd10",
+      "btn-watch-replay",
+      "btn-watch-next",
+      "btn-watch-loop",
+      "watch-speed-select",
+      "watch-time-cur",
+      "watch-scrubber",
+      "watch-time-dur",
+      "watch-local-vol-row",
+      "btn-watch-local-mute",
+      "watch-local-volume",
+      "watch-local-vol-val",
+      "watch-queue-section",
+      "watch-url-form",
+      "watch-url-input",
+      "btn-watch-load-now",
+      "btn-watch-queue-add",
+      "watch-queue-head",
+      "watch-queue-count",
+      "watch-queue-list",
       "toast",
     ];
     for (const id of ids) {
@@ -2156,13 +2220,146 @@ class P2PDirectApp {
       }
     });
 
-    // Media lightbox controls (Images, GIFs & Videos)
+    // Media lightbox controls (Images, GIFs & Videos — synced across room except volume)
     this.el["btn-lightbox-close"].addEventListener("click", () => this.closeLightbox());
     if (this.el["btn-lightbox-replay"]) {
       this.el["btn-lightbox-replay"].addEventListener("click", () => this.replayLightbox());
     }
     if (this.el["btn-lightbox-loop"]) {
       this.el["btn-lightbox-loop"].addEventListener("click", () => this.toggleLightboxLoop());
+    }
+    if (this.el["lightbox-video"]) {
+      const lbVid = this.el["lightbox-video"];
+      const broadcastLightboxVideo = (forcePlaying = null) => {
+        const st = this.lightboxState;
+        if (
+          !st ||
+          st.kind !== "video" ||
+          !st.syncTargetId ||
+          this.mediaSync.lightboxVideoApplying ||
+          performance.now() < this.mediaSync.lightboxVideoSuppressUntil
+        ) {
+          return;
+        }
+        const curMs = Math.max(0, Math.round((lbVid.currentTime || 0) * 1000));
+        const playing = forcePlaying !== null ? forcePlaying : !lbVid.paused && !lbVid.ended;
+        const rateMilli = Math.round((lbVid.playbackRate || 1) * 1000);
+        const existing = this.mediaSync.states.get(st.syncTargetId);
+        this.publishMediaSync({
+          targetId: st.syncTargetId,
+          kind: "video",
+          active: true,
+          playing,
+          positionMs: curMs,
+          rateMilli,
+          loop: Boolean(lbVid.loop),
+          epoch: existing ? existing.epoch || 0 : 0,
+        });
+      };
+      lbVid.addEventListener("play", () => broadcastLightboxVideo(true));
+      lbVid.addEventListener("pause", () => {
+        if (lbVid.ended || (lbVid.duration > 0 && Math.abs(lbVid.currentTime - lbVid.duration) < 0.15)) {
+          return;
+        }
+        broadcastLightboxVideo(false);
+      });
+      lbVid.addEventListener("seeked", () => {
+        const st = this.lightboxState;
+        if (!st || !st.syncTargetId) return;
+        const existing = this.mediaSync.states.get(st.syncTargetId);
+        const expectedSec = existing ? projectMediaPositionMs(existing, Date.now()) / 1000 : 0;
+        if (Math.abs((lbVid.currentTime || 0) - expectedSec) > 0.3) {
+          broadcastLightboxVideo(null);
+        }
+      });
+      lbVid.addEventListener("ratechange", () => broadcastLightboxVideo(null));
+    }
+
+    // Watch Together (YouTube / Spotify / SoundCloud) UI bindings
+    if (this.el["btn-open-watch-panel"]) {
+      this.el["btn-open-watch-panel"].addEventListener("click", () => this.toggleWatchPanelDrawer());
+    }
+    if (this.el["btn-watch-minimize"]) {
+      this.el["btn-watch-minimize"].addEventListener("click", () => this.toggleWatchMinimize());
+    }
+    if (this.el["btn-watch-close"]) {
+      this.el["btn-watch-close"].addEventListener("click", () => this.stopWatchTogetherForRoom());
+    }
+    if (this.el["btn-watch-play"]) {
+      this.el["btn-watch-play"].addEventListener("click", () => this.toggleWatchPlay());
+    }
+    if (this.el["btn-watch-back10"]) {
+      this.el["btn-watch-back10"].addEventListener("click", () => this.seekWatchBy(-10000));
+    }
+    if (this.el["btn-watch-fwd10"]) {
+      this.el["btn-watch-fwd10"].addEventListener("click", () => this.seekWatchBy(10000));
+    }
+    if (this.el["btn-watch-replay"]) {
+      this.el["btn-watch-replay"].addEventListener("click", () => this.replayWatch());
+    }
+    if (this.el["btn-watch-next"]) {
+      this.el["btn-watch-next"].addEventListener("click", () => this.playNextWatchQueueItem());
+    }
+    if (this.el["btn-watch-loop"]) {
+      this.el["btn-watch-loop"].addEventListener("click", () => this.toggleWatchLoop());
+    }
+    if (this.el["watch-speed-select"]) {
+      this.el["watch-speed-select"].addEventListener("change", () => {
+        this.setWatchSpeed(Number(this.el["watch-speed-select"].value) || 1000);
+      });
+    }
+    if (this.el["watch-scrubber"]) {
+      const scrubber = this.el["watch-scrubber"];
+      scrubber.addEventListener("pointerdown", () => {
+        this.mediaSync.watchScrubbing = true;
+      });
+      scrubber.addEventListener("input", () => {
+        this.mediaSync.watchScrubbing = true;
+        const dur = this.mediaSync.watchDurationMs || 0;
+        const targetMs = dur > 0 ? Math.round((Number(scrubber.value) / 1000) * dur) : Number(scrubber.value) * 1000;
+        if (this.el["watch-time-cur"]) {
+          this.el["watch-time-cur"].textContent = formatClockTime(targetMs);
+        }
+      });
+      scrubber.addEventListener("change", () => {
+        this.mediaSync.watchScrubbing = false;
+        const dur = this.mediaSync.watchDurationMs || 0;
+        const targetMs = dur > 0 ? Math.round((Number(scrubber.value) / 1000) * dur) : Number(scrubber.value) * 1000;
+        this.seekWatchTo(targetMs);
+      });
+    }
+    if (this.el["watch-local-volume"]) {
+      this.el["watch-local-volume"].addEventListener("input", () => {
+        const vol = Number(this.el["watch-local-volume"].value) || 0;
+        this.setWatchLocalVolume(vol);
+      });
+    }
+    if (this.el["btn-watch-local-mute"]) {
+      this.el["btn-watch-local-mute"].addEventListener("click", () => this.toggleWatchLocalMute());
+    }
+    if (this.el["btn-watch-autoplay-unmute"]) {
+      this.el["btn-watch-autoplay-unmute"].addEventListener("click", () => {
+        this.setWatchLocalMuted(false);
+      });
+    }
+    if (this.el["watch-url-form"]) {
+      this.el["watch-url-form"].addEventListener("submit", (ev) => {
+        ev.preventDefault();
+        const url = this.el["watch-url-input"]?.value.trim() || "";
+        if (!url) return;
+        if (this.startWatchTogetherFromUrl(url, "")) {
+          this.el["watch-url-input"].value = "";
+        }
+      });
+    }
+    if (this.el["btn-watch-queue-add"]) {
+      this.el["btn-watch-queue-add"].addEventListener("click", () => {
+        const url = this.el["watch-url-input"]?.value.trim() || "";
+        if (!url) return;
+        if (this.enqueueWatchUrl(url)) {
+          this.el["watch-url-input"].value = "";
+        }
+      });
     }
     this.el["image-lightbox"].addEventListener("click", (ev) => {
       if (ev.target === this.el["image-lightbox"]) {
@@ -2965,10 +3162,14 @@ class P2PDirectApp {
 
     this._cleanupLightboxTempUrl();
     const imgEl = this.el["lightbox-img"];
+    const gifCanvasEl = this.el["lightbox-gif-canvas"];
+    const gifWrapEl = this.el["lightbox-gif-wrap"];
     const videoEl = this.el["lightbox-video"];
     const toolbar = this.el["lightbox-toolbar"];
     const loopBtn = this.el["btn-lightbox-loop"];
     const metaEl = this.el["lightbox-meta"];
+
+    if (gifCanvasEl) gifCanvasEl.classList.add("hidden");
 
     if (cfg.kind === "video") {
       let videoSrc = cfg.src || "";
@@ -2979,14 +3180,58 @@ class P2PDirectApp {
       } else if (!SAFE_VIDEO_DATA_URL_RE.test(videoSrc) && !videoSrc.startsWith("blob:")) {
         return;
       }
+      if (gifWrapEl) gifWrapEl.classList.add("hidden");
       imgEl.classList.add("hidden");
       imgEl.removeAttribute("src");
       videoEl.classList.remove("hidden");
-      videoEl.loop = Boolean(cfg.loop);
+
+      const syncId = cfg.syncTargetId || "";
+      const synced = syncId ? this.mediaSync.states.get(syncId) : null;
+      const inlineBinding = syncId ? this.mediaSync.videoBindings.get(syncId) : null;
+
+      this.mediaSync.lightboxVideoApplying = true;
+      this.mediaSync.lightboxVideoSuppressUntil = performance.now() + 650;
+      // Preserve user's strictly-local volume/mute from inline video
+      if (inlineBinding && inlineBinding.videoEl) {
+        try {
+          videoEl.volume = inlineBinding.videoEl.volume;
+          videoEl.muted = inlineBinding.videoEl.muted;
+        } catch {
+          // ignore
+        }
+      }
+      videoEl.loop = synced ? Boolean(synced.loop) : Boolean(cfg.loop);
+      videoEl.playbackRate = synced ? (Number(synced.rateMilli) || 1000) / 1000 : 1;
       videoEl.src = videoSrc;
-      videoEl.currentTime = 0;
-      const p = videoEl.play();
-      if (p && typeof p.catch === "function") p.catch(() => {});
+      const targetSec = synced ? projectMediaPositionMs(synced, Date.now()) / 1000 : 0;
+      const applyInitialSeekAndPlay = () => {
+        this.mediaSync.lightboxVideoApplying = true;
+        this.mediaSync.lightboxVideoSuppressUntil = performance.now() + 500;
+        try {
+          if (videoEl.duration && Number.isFinite(videoEl.duration) && videoEl.duration > 0) {
+            videoEl.currentTime = videoEl.loop
+              ? targetSec % videoEl.duration
+              : Math.min(targetSec, Math.max(0, videoEl.duration - 0.05));
+          } else {
+            videoEl.currentTime = targetSec;
+          }
+        } catch {
+          // ignore
+        }
+        const shouldPlay = synced ? Boolean(synced.playing) : true;
+        if (shouldPlay) {
+          const p = videoEl.play();
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        }
+        this.mediaSync.lightboxVideoApplying = false;
+      };
+      if (videoEl.readyState >= 1) {
+        applyInitialSeekAndPlay();
+      } else {
+        videoEl.addEventListener("loadedmetadata", applyInitialSeekAndPlay, { once: true });
+      }
+      this.mediaSync.lightboxVideoApplying = false;
+
       if (toolbar) toolbar.classList.remove("hidden");
       if (loopBtn) {
         loopBtn.classList.remove("hidden");
@@ -2999,6 +3244,7 @@ class P2PDirectApp {
         blob: cfg.blob || null,
         dataUrl: cfg.dataUrl || "",
         tempUrl: ownsUrl ? videoSrc : null,
+        syncTargetId: syncId,
       };
     } else if (cfg.kind === "gif") {
       let gifSrc = cfg.src || "";
@@ -3009,9 +3255,12 @@ class P2PDirectApp {
       } else if (!isSafeImageSrc(gifSrc) && !gifSrc.startsWith("blob:")) {
         return;
       }
+      this.mediaSync.lightboxVideoApplying = true;
       videoEl.pause();
+      this.mediaSync.lightboxVideoApplying = false;
       videoEl.classList.add("hidden");
       videoEl.removeAttribute("src");
+      if (gifWrapEl) gifWrapEl.classList.remove("hidden");
       imgEl.classList.remove("hidden");
       imgEl.src = gifSrc;
       imgEl.alt = cfg.alt || "Animated GIF";
@@ -3023,19 +3272,39 @@ class P2PDirectApp {
         blob: cfg.blob || null,
         dataUrl: cfg.dataUrl || gifSrc,
         tempUrl: ownsUrl ? gifSrc : null,
+        syncTargetId: cfg.syncTargetId || "",
       };
+      const gifBind = cfg.syncTargetId ? this.mediaSync.gifBindings.get(cfg.syncTargetId) : null;
+      if (gifBind && gifBind.decoder && gifBind.timings) {
+        this._ensureGifSyncLoop();
+        const st = this.mediaSync.states.get(cfg.syncTargetId);
+        if (st && !st.playing) {
+          const idx = frameIndexForGifTime(gifBind.timings, st.positionMs || 0);
+          this._renderGifFrameToCanvas(gifBind, idx, gifCanvasEl);
+          if (gifCanvasEl) gifCanvasEl.classList.remove("hidden");
+        }
+      }
     } else {
       if (!isSafeImageSrc(cfg.src || "")) return;
+      this.mediaSync.lightboxVideoApplying = true;
       videoEl.pause();
+      this.mediaSync.lightboxVideoApplying = false;
       videoEl.classList.add("hidden");
       videoEl.removeAttribute("src");
+      if (gifWrapEl) gifWrapEl.classList.remove("hidden");
       imgEl.classList.remove("hidden");
       imgEl.src = cfg.src;
       imgEl.alt = cfg.alt || "Shared image";
       if (toolbar) toolbar.classList.add("hidden");
       if (loopBtn) loopBtn.classList.add("hidden");
       if (metaEl) metaEl.textContent = "";
-      this.lightboxState = { kind: "image", blob: null, dataUrl: cfg.src, tempUrl: null };
+      this.lightboxState = {
+        kind: "image",
+        blob: null,
+        dataUrl: cfg.src,
+        tempUrl: null,
+        syncTargetId: "",
+      };
     }
 
     this.el["image-lightbox"].classList.remove("hidden");
@@ -3047,6 +3316,7 @@ class P2PDirectApp {
     const replayBtn = this.el["btn-lightbox-replay"];
     if (st.kind === "video") {
       const videoEl = this.el["lightbox-video"];
+      this.mediaSync.lightboxVideoSuppressUntil = performance.now() + 550;
       try {
         videoEl.currentTime = 0;
       } catch {
@@ -3055,6 +3325,19 @@ class P2PDirectApp {
       const p = videoEl.play();
       if (p && typeof p.catch === "function") p.catch(() => {});
       videoEl.dataset.replayCount = String((Number(videoEl.dataset.replayCount) || 0) + 1);
+      if (st.syncTargetId) {
+        const prev = this.mediaSync.states.get(st.syncTargetId);
+        this.publishMediaSync({
+          targetId: st.syncTargetId,
+          kind: "video",
+          active: true,
+          playing: true,
+          positionMs: 0,
+          rateMilli: Math.round((videoEl.playbackRate || 1) * 1000),
+          loop: Boolean(videoEl.loop),
+          epoch: (prev?.epoch || 0) + 1,
+        });
+      }
     } else if (st.kind === "gif") {
       const imgEl = this.el["lightbox-img"];
       if (st.blob) {
@@ -3069,6 +3352,19 @@ class P2PDirectApp {
         });
       }
       imgEl.dataset.replayCount = String((Number(imgEl.dataset.replayCount) || 0) + 1);
+      if (st.syncTargetId) {
+        const prev = this.mediaSync.states.get(st.syncTargetId);
+        this.publishMediaSync({
+          targetId: st.syncTargetId,
+          kind: "gif",
+          active: true,
+          playing: true,
+          positionMs: 0,
+          rateMilli: 1000,
+          loop: true,
+          epoch: (prev?.epoch || 0) + 1,
+        });
+      }
     }
     if (replayBtn) {
       replayBtn.classList.add("is-active");
@@ -3085,6 +3381,19 @@ class P2PDirectApp {
       loopBtn.textContent = videoEl.loop ? "Loop: On" : "Loop: Off";
       loopBtn.classList.toggle("is-active", videoEl.loop);
     }
+    if (this.lightboxState.syncTargetId) {
+      const prev = this.mediaSync.states.get(this.lightboxState.syncTargetId);
+      this.publishMediaSync({
+        targetId: this.lightboxState.syncTargetId,
+        kind: "video",
+        active: true,
+        playing: !videoEl.paused && !videoEl.ended,
+        positionMs: Math.max(0, Math.round((videoEl.currentTime || 0) * 1000)),
+        rateMilli: Math.round((videoEl.playbackRate || 1) * 1000),
+        loop: Boolean(videoEl.loop),
+        epoch: prev?.epoch || 0,
+      });
+    }
   }
 
   _cleanupLightboxTempUrl() {
@@ -3099,9 +3408,22 @@ class P2PDirectApp {
   }
 
   closeLightbox() {
+    const prevSyncVideoId =
+      this.lightboxState?.kind === "video" ? this.lightboxState.syncTargetId : "";
+    const prevLbVol = this.el["lightbox-video"]?.volume;
+    const prevLbMuted = this.el["lightbox-video"]?.muted;
+
     this.el["image-lightbox"].classList.add("hidden");
     this.el["lightbox-img"].removeAttribute("src");
+    if (this.el["lightbox-gif-canvas"]) {
+      this.el["lightbox-gif-canvas"].classList.add("hidden");
+    }
+    if (this.el["lightbox-gif-wrap"]) {
+      this.el["lightbox-gif-wrap"].classList.remove("hidden");
+    }
     if (this.el["lightbox-video"]) {
+      this.mediaSync.lightboxVideoApplying = true;
+      this.mediaSync.lightboxVideoSuppressUntil = performance.now() + 400;
       try {
         this.el["lightbox-video"].pause();
       } catch {
@@ -3110,12 +3432,1261 @@ class P2PDirectApp {
       this.el["lightbox-video"].removeAttribute("src");
       this.el["lightbox-video"].load();
       this.el["lightbox-video"].classList.add("hidden");
+      this.mediaSync.lightboxVideoApplying = false;
     }
     if (this.el["lightbox-toolbar"]) {
       this.el["lightbox-toolbar"].classList.add("hidden");
     }
     this._cleanupLightboxTempUrl();
     this.lightboxState = null;
+
+    // Hand playback smoothly back to the inline video card with preserved local volume
+    if (prevSyncVideoId) {
+      const bind = this.mediaSync.videoBindings.get(prevSyncVideoId);
+      const st = this.mediaSync.states.get(prevSyncVideoId);
+      if (bind && bind.videoEl) {
+        if (typeof prevLbVol === "number") {
+          try {
+            bind.videoEl.volume = prevLbVol;
+            bind.videoEl.muted = Boolean(prevLbMuted);
+          } catch {
+            // ignore
+          }
+        }
+        if (st) {
+          this._applyVideoSyncState(bind, st);
+        }
+      }
+    }
+  }
+
+  /* ================= E2EE Synchronized Media (Videos, GIFs) & Watch Together ================= */
+
+  /**
+   * Publishes a synchronized media state update to all peers in the room via Safe Rust WASM.
+   * Volume and mute are never transmitted.
+   */
+  publishMediaSync(partialState) {
+    if (!this.wasm || !partialState || !partialState.targetId) return null;
+    const nowMs = Date.now();
+    const prev = this.mediaSync.states.get(partialState.targetId);
+    const merged = {
+      targetId: partialState.targetId,
+      kind: partialState.kind || prev?.kind || "video",
+      rev: prev?.rev || 0,
+      active: partialState.active !== undefined ? Boolean(partialState.active) : true,
+      playing: partialState.playing !== undefined ? Boolean(partialState.playing) : Boolean(prev?.playing),
+      positionMs:
+        partialState.positionMs !== undefined
+          ? Math.max(0, Math.round(partialState.positionMs))
+          : prev
+            ? projectMediaPositionMs(prev, nowMs)
+            : 0,
+      rateMilli:
+        partialState.rateMilli !== undefined
+          ? Math.max(250, Math.min(4000, Math.round(partialState.rateMilli)))
+          : prev?.rateMilli || 1000,
+      loop: partialState.loop !== undefined ? Boolean(partialState.loop) : Boolean(prev?.loop),
+      epoch: partialState.epoch !== undefined ? Number(partialState.epoch) : prev?.epoch || 0,
+      url: partialState.url !== undefined ? partialState.url : prev?.url || "",
+      provider: partialState.provider !== undefined ? partialState.provider : prev?.provider || "",
+      mediaId: partialState.mediaId !== undefined ? partialState.mediaId : prev?.mediaId || "",
+      title: partialState.title !== undefined ? partialState.title : prev?.title || "",
+      sourceMsgId:
+        partialState.sourceMsgId !== undefined ? partialState.sourceMsgId : prev?.sourceMsgId || "",
+      queue: Array.isArray(partialState.queue) ? partialState.queue : prev?.queue || [],
+    };
+    try {
+      const res = this.wasm.mediaSyncUpdate(merged, nowMs);
+      if (res && res.status) {
+        this.status = res.status;
+      }
+      if (res && Array.isArray(res.actions)) {
+        this.executeActions(res.actions);
+      }
+      return res?.state || null;
+    } catch (err) {
+      this.addTelemetry("error", `Media sync update failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Handles a synchronized media state arriving from local mutation or a remote E2EE peer.
+   */
+  handleIncomingMediaSync(state) {
+    if (!state || !state.targetId) return;
+    const prev = this.mediaSync.states.get(state.targetId);
+    const normalized = {
+      ...state,
+      anchorMs: Date.now(),
+    };
+    this.mediaSync.states.set(state.targetId, normalized);
+
+    if (state.targetId === "watch" || state.kind === "watch") {
+      this._applyWatchTogetherState(normalized, prev);
+      this._ensureMediaDriftTimer();
+      return;
+    }
+
+    if (state.kind === "video" || state.targetId.startsWith("vid:")) {
+      const bind = this.mediaSync.videoBindings.get(state.targetId);
+      if (bind) {
+        this._applyVideoSyncState(bind, normalized, prev);
+      }
+      const isLocalLightboxEcho =
+        normalized.actor === this.status?.peerId &&
+        this.mediaSync.lightboxVideoSuppressUntil > performance.now();
+      if (
+        !isLocalLightboxEcho &&
+        this.lightboxState &&
+        this.lightboxState.kind === "video" &&
+        this.lightboxState.syncTargetId === state.targetId
+      ) {
+        this._applyLightboxVideoSyncState(normalized, prev);
+      }
+      this._ensureMediaDriftTimer();
+      return;
+    }
+
+    if (state.kind === "gif" || state.targetId.startsWith("gif:")) {
+      const bind = this.mediaSync.gifBindings.get(state.targetId);
+      if (bind) {
+        this._applyGifSyncState(bind, normalized, prev);
+      }
+      if (
+        normalized.actor !== this.status?.peerId &&
+        this.lightboxState &&
+        this.lightboxState.kind === "gif" &&
+        this.lightboxState.syncTargetId === state.targetId &&
+        normalized.epoch > 0 &&
+        (!prev || normalized.epoch > (prev.epoch || 0))
+      ) {
+        const imgEl = this.el["lightbox-img"];
+        if (imgEl && this.lightboxState.blob) {
+          const nextUrl = URL.createObjectURL(this.lightboxState.blob);
+          this._cleanupLightboxTempUrl();
+          this.lightboxState.tempUrl = nextUrl;
+          imgEl.src = nextUrl;
+          imgEl.dataset.replayCount = String((Number(imgEl.dataset.replayCount) || 0) + 1);
+        }
+      }
+    }
+  }
+
+  _resetAllMediaSyncState() {
+    if (this.mediaSync.gifRafId) {
+      cancelAnimationFrame(this.mediaSync.gifRafId);
+      this.mediaSync.gifRafId = null;
+    }
+    if (this.mediaSync.driftTimer) {
+      clearInterval(this.mediaSync.driftTimer);
+      this.mediaSync.driftTimer = null;
+    }
+    if (this.mediaSync.watchUiTimer) {
+      clearInterval(this.mediaSync.watchUiTimer);
+      this.mediaSync.watchUiTimer = null;
+    }
+    for (const bind of this.mediaSync.gifBindings.values()) {
+      this._disposeGifBinding(bind);
+    }
+    this.mediaSync.gifBindings.clear();
+    this.mediaSync.videoBindings.clear();
+    this.mediaSync.states.clear();
+    this.mediaSync.watchPanelOpenManual = false;
+    this.mediaSync.watchMinimized = false;
+    this.mediaSync.watchTitleOverride = "";
+    this.mediaSync.watchDurationMs = 0;
+    if (this.mediaSync.watchPlayer) {
+      this.mediaSync.watchPlayer.destroy();
+    }
+    this._syncWatchTogetherUi(null);
+  }
+
+  _disposeGifBinding(bind) {
+    if (!bind) return;
+    bind.pendingRender = null;
+    if (bind.decoder) {
+      try {
+        bind.decoder.close();
+      } catch {
+        // ignore
+      }
+      bind.decoder = null;
+    }
+    bind.timings = null;
+  }
+
+  _cleanupMediaBindingsForMsg(msgId) {
+    if (!msgId) return;
+    const msgStillExists = this.logMessages.some((item) => item.id === msgId);
+    const vidPrefix = `vid:${msgId}:`;
+    const gifPrefix = `gif:${msgId}:`;
+    for (const [k, bind] of Array.from(this.mediaSync.gifBindings.entries())) {
+      if (k.startsWith(gifPrefix)) {
+        this._disposeGifBinding(bind);
+        this.mediaSync.gifBindings.delete(k);
+        if (!msgStillExists) {
+          this.mediaSync.states.delete(k);
+        }
+      }
+    }
+    for (const k of Array.from(this.mediaSync.videoBindings.keys())) {
+      if (k.startsWith(vidPrefix)) {
+        this.mediaSync.videoBindings.delete(k);
+        if (!msgStillExists) {
+          this.mediaSync.states.delete(k);
+        }
+      }
+    }
+  }
+
+  /* ---- Frame-Accurate Rust + ImageDecoder GIF Synchronization ---- */
+
+  async _initGifSyncEngine(bind, blob) {
+    if (!bind || !blob || !this.wasm) return;
+    try {
+      // Yield a macrotask when voice is active so large GIF decoding never competes with 20ms audio frames
+      if (this.voice?.joined) {
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      const buf = await blob.arrayBuffer();
+      if (!bind.imgEl || !bind.imgEl.isConnected) return;
+      const bytes = new Uint8Array(buf);
+      const timings = this.wasm.parseGifTimings(bytes);
+      if (!timings || timings.frameCount <= 1 || timings.totalDurationMs <= 0) {
+        return;
+      }
+      bind.timings = timings;
+
+      if (typeof ImageDecoder === "function") {
+        if (this.voice?.joined) {
+          await new Promise((r) => setTimeout(r, 16));
+        }
+        let supported = true;
+        if (typeof ImageDecoder.isTypeSupported === "function") {
+          supported = await ImageDecoder.isTypeSupported("image/gif").catch(() => false);
+        }
+        if (supported && bind.imgEl.isConnected) {
+          // Zero-copy: bytes is already our exclusive copy from blob.arrayBuffer()
+          const decoder = new ImageDecoder({
+            data: bytes,
+            type: "image/gif",
+          });
+          await decoder.tracks.ready;
+          if (!bind.imgEl.isConnected) {
+            decoder.close();
+            return;
+          }
+          bind.decoder = decoder;
+          const st = this.mediaSync.states.get(bind.syncTargetId);
+          if (st) {
+            this._applyGifSyncState(bind, st, null);
+          } else {
+            // Deterministic local anchor until a synced peer broadcasts state
+            this.mediaSync.states.set(bind.syncTargetId, {
+              targetId: bind.syncTargetId,
+              kind: "gif",
+              rev: 0,
+              actor: "",
+              actorName: "",
+              active: true,
+              playing: true,
+              positionMs: 0,
+              rateMilli: 1000,
+              loop: true,
+              epoch: 0,
+              anchorMs: Date.now(),
+            });
+            if (bind.syncCanvasEl) bind.syncCanvasEl.classList.remove("hidden");
+          }
+          this._ensureGifSyncLoop();
+        }
+      }
+    } catch {
+      // Fallback gracefully to native <img> + freeze canvas sync
+    }
+  }
+
+  _ensureGifSyncLoop() {
+    if (this.mediaSync.gifRafId || this.mediaSync.gifBindings.size === 0) return;
+    this.mediaSync.gifRafId = requestAnimationFrame(this.mediaSync.boundGifTick);
+  }
+
+  _renderGifFrameToCanvas(bind, frameIdx, targetCanvas, mirrorCanvas = null) {
+    if (!bind || !bind.decoder || !targetCanvas) return;
+    if (bind.decoding) {
+      bind.pendingRender = { frameIdx, targetCanvas, mirrorCanvas };
+      return;
+    }
+    bind.decoding = true;
+    const clampedIdx = Math.max(0, Math.min((bind.timings?.frameCount || 1) - 1, frameIdx));
+    bind.decoder
+      .decode({ frameIndex: clampedIdx })
+      .then((res) => {
+        const frame = res?.image;
+        if (!frame) return;
+        try {
+          const w = frame.displayWidth || frame.codedWidth || bind.timings?.width || 0;
+          const h = frame.displayHeight || frame.codedHeight || bind.timings?.height || 0;
+          if (w > 0 && h > 0) {
+            if (targetCanvas.width !== w || targetCanvas.height !== h) {
+              targetCanvas.width = w;
+              targetCanvas.height = h;
+            }
+            const ctx = targetCanvas.getContext("2d");
+            if (ctx) {
+              ctx.clearRect(0, 0, w, h);
+              ctx.drawImage(frame, 0, 0, w, h);
+            }
+            targetCanvas.dataset.gifFrame = String(clampedIdx);
+            if (bind.imgEl) {
+              bind.imgEl.dataset.gifFrame = String(clampedIdx);
+            }
+            if (mirrorCanvas) {
+              if (mirrorCanvas.width !== w || mirrorCanvas.height !== h) {
+                mirrorCanvas.width = w;
+                mirrorCanvas.height = h;
+              }
+              const mCtx = mirrorCanvas.getContext("2d");
+              if (mCtx) {
+                mCtx.clearRect(0, 0, w, h);
+                mCtx.drawImage(frame, 0, 0, w, h);
+              }
+              mirrorCanvas.dataset.gifFrame = String(clampedIdx);
+            }
+          }
+          bind.lastRenderedFrame = clampedIdx;
+        } finally {
+          frame.close();
+        }
+      })
+      .catch(() => {
+        // ignore transient decode race
+      })
+      .finally(() => {
+        bind.decoding = false;
+        const next = bind.pendingRender;
+        bind.pendingRender = null;
+        if (next && bind.decoder) {
+          this._renderGifFrameToCanvas(bind, next.frameIdx, next.targetCanvas, next.mirrorCanvas);
+        }
+      });
+  }
+
+  _tickSyncedGifs() {
+    this.mediaSync.gifRafId = null;
+    if (this.mediaSync.gifBindings.size === 0) return;
+
+    const nowMs = Date.now();
+    let anyActive = false;
+    const lbOpenGifId =
+      this.lightboxState?.kind === "gif" ? this.lightboxState.syncTargetId : "";
+    const lbCanvas = lbOpenGifId ? this.el["lightbox-gif-canvas"] : null;
+
+    for (const [id, bind] of this.mediaSync.gifBindings.entries()) {
+      if (!bind.imgEl || !bind.imgEl.isConnected) {
+        this._disposeGifBinding(bind);
+        this.mediaSync.gifBindings.delete(id);
+        continue;
+      }
+      if (!bind.decoder || !bind.timings) continue;
+      const st = this.mediaSync.states.get(id);
+      if (!st || !st.playing) continue;
+      anyActive = true;
+
+      const posMs = projectMediaPositionMs(st, nowMs);
+      const frameIdx = frameIndexForGifTime(bind.timings, posMs);
+      const isInLightbox = lbOpenGifId === id && lbCanvas;
+      if (isInLightbox && lbCanvas.classList.contains("hidden")) {
+        lbCanvas.classList.remove("hidden");
+      }
+      if (frameIdx !== bind.lastRenderedFrame && !bind.decoding) {
+        if (bind.syncCanvasEl && bind.syncCanvasEl.classList.contains("hidden")) {
+          bind.syncCanvasEl.classList.remove("hidden");
+        }
+        this._renderGifFrameToCanvas(
+          bind,
+          frameIdx,
+          bind.syncCanvasEl || bind.canvasEl,
+          isInLightbox ? lbCanvas : null
+        );
+      }
+    }
+
+    if (anyActive) {
+      this.mediaSync.gifRafId = requestAnimationFrame(this.mediaSync.boundGifTick);
+    }
+  }
+
+  _applyGifSyncState(bind, state, prev) {
+    if (!bind || !bind.imgEl) return;
+    const isEpochReplay = Boolean(
+      state.epoch > 0 &&
+        state.epoch > (bind.lastAppliedEpoch || 0) &&
+        (!prev || state.epoch > (prev.epoch || 0)) &&
+        (prev || (state.playing && (state.positionMs || 0) < 500))
+    );
+    const wasPaused = bind.isPaused;
+    bind.lastAppliedEpoch = Math.max(bind.lastAppliedEpoch || 0, state.epoch || 0);
+
+    if (bind.syncPillEl) {
+      const who =
+        state.actorName && state.actor && state.actor !== this.status?.peerId
+          ? `Synced · ${state.actorName}`
+          : "Synced";
+      bind.syncPillEl.textContent = state.playing ? who : `${who} (Paused)`;
+    }
+
+    if (!state.playing) {
+      // Exact synchronized Pause!
+      bind.isPaused = true;
+      if (bind.pauseBtn) {
+        bind.pauseBtn.textContent = "Play";
+        bind.pauseBtn.classList.add("is-active");
+      }
+      if (bind.syncCanvasEl) {
+        bind.syncCanvasEl.classList.add("hidden");
+      }
+      if (bind.canvasEl) {
+        if (bind.decoder && bind.timings) {
+          const pausedFrame = frameIndexForGifTime(bind.timings, state.positionMs || 0);
+          const lbCanvas =
+            this.lightboxState?.kind === "gif" && this.lightboxState.syncTargetId === bind.syncTargetId
+              ? this.el["lightbox-gif-canvas"]
+              : null;
+          bind.lastRenderedFrame = -1;
+          this._renderGifFrameToCanvas(bind, pausedFrame, bind.canvasEl, lbCanvas);
+          bind.canvasEl.classList.remove("hidden");
+          if (lbCanvas) lbCanvas.classList.remove("hidden");
+        } else {
+          const w = bind.imgEl.naturalWidth || bind.imgEl.width || 0;
+          const h = bind.imgEl.naturalHeight || bind.imgEl.height || 0;
+          if (w > 0 && h > 0) {
+            bind.canvasEl.width = w;
+            bind.canvasEl.height = h;
+            const ctx2d = bind.canvasEl.getContext("2d");
+            if (ctx2d) {
+              ctx2d.clearRect(0, 0, w, h);
+              ctx2d.drawImage(bind.imgEl, 0, 0, w, h);
+            }
+          }
+          bind.canvasEl.classList.remove("hidden");
+        }
+      }
+      return;
+    }
+
+    // Playing (either resumed from pause, replayed from frame 0, or initial sync)
+    bind.isPaused = false;
+    if (bind.canvasEl) bind.canvasEl.classList.add("hidden");
+    if (bind.pauseBtn) {
+      bind.pauseBtn.textContent = "Pause";
+      bind.pauseBtn.classList.remove("is-active");
+    }
+
+    if (isEpochReplay || wasPaused) {
+      // Refresh native <img> Blob URL too for fallback browsers & replay count parity
+      if (isEpochReplay && bind.g.blob) {
+        const prevUrl = bind.g.currentUrl;
+        const nextUrl = URL.createObjectURL(bind.g.blob);
+        bind.g.currentUrl = nextUrl;
+        this._swapMessageMediaUrl(bind.msgId, prevUrl, nextUrl);
+        bind.imgEl.src = nextUrl;
+      } else if (isEpochReplay && bind.g.dataUrl) {
+        bind.imgEl.src = "";
+        requestAnimationFrame(() => {
+          if (bind.imgEl.isConnected) bind.imgEl.src = bind.g.dataUrl;
+        });
+      }
+      bind.imgEl.dataset.replayCount = String((Number(bind.imgEl.dataset.replayCount) || 0) + 1);
+      if (isEpochReplay && bind.replayBtn) {
+        bind.replayBtn.classList.add("is-replayed");
+        setTimeout(() => bind.replayBtn?.classList.remove("is-replayed"), 320);
+      }
+    }
+
+    if (bind.decoder && bind.timings) {
+      if (bind.syncCanvasEl) bind.syncCanvasEl.classList.remove("hidden");
+      bind.lastRenderedFrame = -1;
+      const curFrame = frameIndexForGifTime(bind.timings, projectMediaPositionMs(state, Date.now()));
+      const lbCanvas =
+        this.lightboxState?.kind === "gif" && this.lightboxState.syncTargetId === bind.syncTargetId
+          ? this.el["lightbox-gif-canvas"]
+          : null;
+      this._renderGifFrameToCanvas(bind, curFrame, bind.syncCanvasEl || bind.canvasEl, lbCanvas);
+      this._ensureGifSyncLoop();
+    }
+  }
+
+  /* ---- Bidirectional E2EE Chat Video Synchronization (Local-Only Volume) ---- */
+
+  _applyVideoSyncState(bind, state, prev = null) {
+    if (!bind || !bind.videoEl) return;
+    const videoEl = bind.videoEl;
+
+    // If this video is currently open in Lightbox, let Lightbox drive playback instead of playing twice
+    const openInLightbox =
+      this.lightboxState?.kind === "video" && this.lightboxState.syncTargetId === bind.syncTargetId;
+
+    const isReplay = Boolean(
+      state.epoch > 0 &&
+        state.epoch > (bind.lastAppliedEpoch || 0) &&
+        (!prev || state.epoch > (prev.epoch || 0)) &&
+        (prev || (state.playing && (state.positionMs || 0) < 500))
+    );
+    bind.lastAppliedEpoch = Math.max(bind.lastAppliedEpoch || 0, state.epoch || 0);
+
+    // Always sync Loop button & indicator (even while in Lightbox)
+    videoEl.loop = Boolean(state.loop);
+    if (bind.loopBtn) {
+      bind.loopBtn.textContent = videoEl.loop ? "Loop: On" : "Loop: Off";
+      bind.loopBtn.classList.toggle("is-active", videoEl.loop);
+    }
+    if (bind.syncPillEl) {
+      const who =
+        state.actorName && state.actor && state.actor !== this.status?.peerId
+          ? `Synced · ${state.actorName}`
+          : "Synced";
+      bind.syncPillEl.textContent = state.playing ? who : `${who} (Paused)`;
+    }
+    if (videoEl.loop && bind.endedOverlay) {
+      bind.endedOverlay.classList.add("hidden");
+    }
+
+    if (openInLightbox) return;
+
+    if (isReplay) {
+      if (bind.endedOverlay) bind.endedOverlay.classList.add("hidden");
+      videoEl.dataset.replayCount = String((Number(videoEl.dataset.replayCount) || 0) + 1);
+      for (const rb of bind.replayBtns || []) {
+        if (rb.classList.contains("media-ctrl-btn")) {
+          rb.classList.add("is-replayed");
+          setTimeout(() => rb.classList.remove("is-replayed"), 320);
+        }
+      }
+    }
+
+    const applyToElement = () => {
+      let didMutate = false;
+      bind.applyingRemote = true;
+      const baseRate = (Number(state.rateMilli) || 1000) / 1000;
+      if (Math.abs((videoEl.playbackRate || 1) - baseRate) > 0.02) {
+        try {
+          videoEl.playbackRate = baseRate;
+          didMutate = true;
+        } catch {
+          // ignore
+        }
+      }
+
+      let targetSec = projectMediaPositionMs(state, Date.now()) / 1000;
+      const dur = videoEl.duration;
+      if (dur && Number.isFinite(dur) && dur > 0) {
+        if (videoEl.loop) {
+          targetSec = targetSec % dur;
+        } else {
+          targetSec = Math.min(targetSec, Math.max(0, dur - 0.04));
+        }
+      }
+
+      if (isReplay || Math.abs((videoEl.currentTime || 0) - targetSec) > 0.25) {
+        try {
+          videoEl.currentTime = isReplay && targetSec < 0.12 ? 0 : targetSec;
+          didMutate = true;
+        } catch {
+          // ignore if not seekable yet
+        }
+      }
+
+      if (state.playing) {
+        if (bind.endedOverlay) bind.endedOverlay.classList.add("hidden");
+        if (videoEl.paused || isReplay) {
+          didMutate = true;
+          const p = videoEl.play();
+          if (p && typeof p.catch === "function") {
+            p.catch((err) => {
+              // Browser autoplay policy blocked unmuted play -> retry locally muted WITHOUT affecting peers!
+              if (err && err.name === "NotAllowedError" && !videoEl.muted) {
+                videoEl.muted = true;
+                if (bind.unmuteOverlay) {
+                  bind.unmuteOverlay.classList.remove("hidden");
+                }
+                const p2 = videoEl.play();
+                if (p2 && typeof p2.catch === "function") p2.catch(() => {});
+              }
+            });
+          }
+        }
+      } else if (!videoEl.paused) {
+        try {
+          videoEl.pause();
+          didMutate = true;
+        } catch {
+          // ignore
+        }
+      }
+      if (didMutate) {
+        bind.suppressUntil = performance.now() + 380;
+      }
+      bind.applyingRemote = false;
+    };
+
+    if (videoEl.readyState >= 1) {
+      applyToElement();
+    } else {
+      videoEl.addEventListener("loadedmetadata", applyToElement, { once: true });
+    }
+  }
+
+  _applyLightboxVideoSyncState(state, prev = null) {
+    const videoEl = this.el["lightbox-video"];
+    const loopBtn = this.el["btn-lightbox-loop"];
+    if (!videoEl || videoEl.classList.contains("hidden")) return;
+
+    this.mediaSync.lightboxVideoApplying = true;
+    this.mediaSync.lightboxVideoSuppressUntil = performance.now() + 450;
+    videoEl.loop = Boolean(state.loop);
+    if (loopBtn) {
+      loopBtn.textContent = videoEl.loop ? "Loop: On" : "Loop: Off";
+      loopBtn.classList.toggle("is-active", videoEl.loop);
+    }
+    const baseRate = (Number(state.rateMilli) || 1000) / 1000;
+    if (Math.abs((videoEl.playbackRate || 1) - baseRate) > 0.02) {
+      try {
+        videoEl.playbackRate = baseRate;
+      } catch {
+        // ignore
+      }
+    }
+    const isReplay = Boolean(prev && state.epoch > (prev.epoch || 0));
+    let targetSec = projectMediaPositionMs(state, Date.now()) / 1000;
+    if (videoEl.duration && Number.isFinite(videoEl.duration) && videoEl.duration > 0) {
+      targetSec = videoEl.loop
+        ? targetSec % videoEl.duration
+        : Math.min(targetSec, Math.max(0, videoEl.duration - 0.04));
+    }
+    if (isReplay || Math.abs((videoEl.currentTime || 0) - targetSec) > 0.28) {
+      try {
+        videoEl.currentTime = isReplay ? 0 : targetSec;
+      } catch {
+        // ignore
+      }
+    }
+    if (state.playing) {
+      if (videoEl.paused || isReplay) {
+        const p = videoEl.play();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      }
+    } else if (!videoEl.paused) {
+      try {
+        videoEl.pause();
+      } catch {
+        // ignore
+      }
+    }
+    this.mediaSync.lightboxVideoApplying = false;
+  }
+
+  _ensureMediaDriftTimer() {
+    if (this.mediaSync.driftTimer) return;
+    this.mediaSync.driftTimer = setInterval(() => this._runMediaDriftCorrection(), 1200);
+  }
+
+  _runMediaDriftCorrection() {
+    const nowMs = Date.now();
+    let anyPlaying = false;
+
+    for (const [id, bind] of this.mediaSync.videoBindings.entries()) {
+      if (!bind.videoEl || !bind.videoEl.isConnected) {
+        this.mediaSync.videoBindings.delete(id);
+        continue;
+      }
+      const st = this.mediaSync.states.get(id);
+      if (!st || !st.active || !st.playing) continue;
+      anyPlaying = true;
+      if (this.lightboxState?.kind === "video" && this.lightboxState.syncTargetId === id) {
+        continue;
+      }
+      const vid = bind.videoEl;
+      if (vid.paused || vid.ended || vid.readyState < 2 || performance.now() < bind.suppressUntil) {
+        continue;
+      }
+      const baseRate = (Number(st.rateMilli) || 1000) / 1000;
+      let expectedSec = projectMediaPositionMs(st, nowMs) / 1000;
+      if (vid.duration && Number.isFinite(vid.duration) && vid.duration > 0) {
+        if (vid.loop) {
+          expectedSec = expectedSec % vid.duration;
+        } else if (expectedSec >= vid.duration) {
+          continue;
+        }
+      }
+      const drift = expectedSec - (vid.currentTime || 0);
+      if (Math.abs(drift) > 0.75) {
+        bind.applyingRemote = true;
+        bind.suppressUntil = performance.now() + 450;
+        try {
+          vid.playbackRate = baseRate;
+          vid.currentTime = expectedSec;
+        } catch {
+          // ignore
+        }
+        bind.applyingRemote = false;
+      } else if (Math.abs(drift) > 0.18) {
+        // Gentle ±5% speed catch-up avoids audible seek glitches
+        bind.applyingRemote = true;
+        try {
+          vid.playbackRate = baseRate * (drift > 0 ? 1.05 : 0.95);
+        } catch {
+          // ignore
+        }
+        bind.applyingRemote = false;
+      } else if (Math.abs((vid.playbackRate || 1) - baseRate) > 0.01) {
+        bind.applyingRemote = true;
+        try {
+          vid.playbackRate = baseRate;
+        } catch {
+          // ignore
+        }
+        bind.applyingRemote = false;
+      }
+    }
+
+    const watchSt = this.mediaSync.states.get("watch");
+    if (watchSt && watchSt.active && watchSt.playing) {
+      anyPlaying = true;
+      if (this.mediaSync.watchPlayer) {
+        this.mediaSync.watchPlayer.correctDrift(watchSt, nowMs);
+      }
+    }
+
+    if (!anyPlaying && this.mediaSync.driftTimer) {
+      clearInterval(this.mediaSync.driftTimer);
+      this.mediaSync.driftTimer = null;
+    }
+  }
+
+  /* ---- Synced Watch Together (YouTube / Spotify / SoundCloud) ---- */
+
+  _ensureWatchPlayer() {
+    if (this.mediaSync.watchPlayer) return this.mediaSync.watchPlayer;
+    const mountEl = this.el["watch-embed-stage"];
+    this.mediaSync.watchPlayer = new WatchTogetherPlayer(mountEl, {
+      onUserAction: (ev) => {
+        const cur = this.mediaSync.states.get("watch");
+        if (!cur || !cur.active) return;
+        if (ev.ended) {
+          if (cur.loop) {
+            this.replayWatch();
+          } else if (Array.isArray(cur.queue) && cur.queue.length > 0) {
+            // Actor advances immediately; other peers act as backup after 900ms if actor disconnected
+            const isActor = cur.actor === this.status?.peerId;
+            const prevRev = cur.rev;
+            const delay = isActor ? 50 : 900;
+            setTimeout(() => {
+              const live = this.mediaSync.states.get("watch");
+              if (live && live.active && live.rev === prevRev && live.queue.length > 0) {
+                this.playNextWatchQueueItem();
+              }
+            }, delay);
+          } else if (cur.playing) {
+            this.publishMediaSync({
+              targetId: "watch",
+              kind: "watch",
+              playing: false,
+              positionMs: ev.positionMs || this.mediaSync.watchDurationMs || cur.positionMs,
+            });
+          }
+          return;
+        }
+        this.publishMediaSync({
+          targetId: "watch",
+          kind: "watch",
+          active: true,
+          playing: Boolean(ev.playing),
+          positionMs: Math.max(0, Math.round(ev.positionMs || 0)),
+          rateMilli: ev.rateMilli || cur.rateMilli || 1000,
+        });
+      },
+      onTelemetry: (meta) => {
+        if (meta.durationMs > 0) {
+          this.mediaSync.watchDurationMs = meta.durationMs;
+        }
+        if (meta.title) {
+          this.mediaSync.watchTitleOverride = meta.title;
+          if (this.el["watch-panel-title"]) {
+            this.el["watch-panel-title"].textContent = meta.title;
+          }
+        }
+        this._updateWatchTimeUi();
+      },
+      onAutoplayMuted: (isMuted) => {
+        if (this.el["btn-watch-autoplay-unmute"]) {
+          this.el["btn-watch-autoplay-unmute"].classList.toggle("hidden", !isMuted);
+        }
+        this._updateWatchLocalVolUi();
+      },
+    });
+    return this.mediaSync.watchPlayer;
+  }
+
+  toggleWatchPanelDrawer() {
+    const cur = this.mediaSync.states.get("watch");
+    if (cur && cur.active) {
+      this.toggleWatchMinimize();
+      return;
+    }
+    this.mediaSync.watchPanelOpenManual = !this.mediaSync.watchPanelOpenManual;
+    this._syncWatchTogetherUi(cur || null);
+    if (this.mediaSync.watchPanelOpenManual && this.el["watch-url-input"]) {
+      this.el["watch-url-input"].focus();
+    }
+  }
+
+  toggleWatchMinimize() {
+    this.mediaSync.watchMinimized = !this.mediaSync.watchMinimized;
+    const panel = this.el["watch-panel"];
+    const btn = this.el["btn-watch-minimize"];
+    if (panel) panel.classList.toggle("is-minimized", this.mediaSync.watchMinimized);
+    if (btn) {
+      btn.textContent = this.mediaSync.watchMinimized ? "Expand" : "Minimize";
+      btn.setAttribute("aria-expanded", String(!this.mediaSync.watchMinimized));
+    }
+  }
+
+  startWatchTogetherFromUrl(rawUrl, sourceMsgId = "") {
+    const parsed = parseWatchMediaUrl(rawUrl);
+    if (!parsed) {
+      this.showToast("Paste a valid YouTube, Spotify, or SoundCloud link");
+      return false;
+    }
+    const prev = this.mediaSync.states.get("watch");
+    this.mediaSync.watchMinimized = false;
+    this.mediaSync.watchPanelOpenManual = true;
+    this.mediaSync.watchTitleOverride = "";
+    this.mediaSync.watchDurationMs = 0;
+
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      playing: true,
+      positionMs: parsed.startMs || 0,
+      rateMilli: 1000,
+      loop: Boolean(prev?.loop),
+      epoch: (prev?.epoch || 0) + 1,
+      url: parsed.url,
+      provider: parsed.provider,
+      mediaId: parsed.mediaId,
+      title: parsed.title,
+      sourceMsgId: sourceMsgId || "",
+      queue: Array.isArray(prev?.queue) ? prev.queue : [],
+    });
+    this.showToast(`Started synced ${parsed.providerLabel} for room`);
+    return true;
+  }
+
+  enqueueWatchUrl(rawUrl) {
+    const parsed = parseWatchMediaUrl(rawUrl);
+    if (!parsed) {
+      this.showToast("Paste a valid YouTube, Spotify, or SoundCloud link");
+      return false;
+    }
+    const prev = this.mediaSync.states.get("watch");
+    if (!prev || !prev.active || !prev.mediaId) {
+      return this.startWatchTogetherFromUrl(rawUrl, "");
+    }
+    const nextQueue = Array.isArray(prev.queue) ? prev.queue.slice(0, 63) : [];
+    nextQueue.push({
+      id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      url: parsed.url,
+      provider: parsed.provider,
+      mediaId: parsed.mediaId,
+      title: parsed.title,
+      addedBy: this.status?.authorName || "Peer",
+      startMs: parsed.startMs || 0,
+    });
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      queue: nextQueue,
+    });
+    this.showToast(`Queued ${parsed.providerLabel} track (#${nextQueue.length})`);
+    return true;
+  }
+
+  toggleWatchPlay() {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active) return;
+    const nowPos = projectMediaPositionMs(cur, Date.now());
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      playing: !cur.playing,
+      positionMs: nowPos,
+    });
+  }
+
+  seekWatchBy(deltaMs) {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active) return;
+    const nowPos = projectMediaPositionMs(cur, Date.now());
+    const dur = this.mediaSync.watchDurationMs || 0;
+    let nextPos = Math.max(0, nowPos + deltaMs);
+    if (dur > 0) nextPos = Math.min(nextPos, dur);
+    this.seekWatchTo(nextPos);
+  }
+
+  seekWatchTo(posMs) {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active) return;
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      playing: cur.playing,
+      positionMs: Math.max(0, Math.round(posMs)),
+    });
+  }
+
+  replayWatch() {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active) return;
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      playing: true,
+      positionMs: 0,
+      epoch: (cur.epoch || 0) + 1,
+    });
+  }
+
+  toggleWatchLoop() {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active) return;
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      loop: !cur.loop,
+    });
+  }
+
+  setWatchSpeed(rateMilli) {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active) return;
+    const clamped = Math.max(250, Math.min(4000, Math.round(rateMilli || 1000)));
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      positionMs: projectMediaPositionMs(cur, Date.now()),
+      rateMilli: clamped,
+    });
+  }
+
+  playNextWatchQueueItem() {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !Array.isArray(cur.queue) || cur.queue.length === 0) return;
+    this.playWatchQueueItemAt(0);
+  }
+
+  playWatchQueueItemAt(idx) {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !Array.isArray(cur.queue) || idx < 0 || idx >= cur.queue.length) return;
+    const item = cur.queue[idx];
+    const remaining = cur.queue.slice(0, idx).concat(cur.queue.slice(idx + 1));
+    this.mediaSync.watchTitleOverride = "";
+    this.mediaSync.watchDurationMs = 0;
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      playing: true,
+      positionMs: item.startMs || 0,
+      rateMilli: 1000,
+      epoch: (cur.epoch || 0) + 1,
+      url: item.url,
+      provider: item.provider,
+      mediaId: item.mediaId,
+      title: item.title,
+      sourceMsgId: "",
+      queue: remaining,
+    });
+  }
+
+  removeWatchQueueItemAt(idx) {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !Array.isArray(cur.queue) || idx < 0 || idx >= cur.queue.length) return;
+    const remaining = cur.queue.slice(0, idx).concat(cur.queue.slice(idx + 1));
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: cur.active,
+      queue: remaining,
+    });
+  }
+
+  stopWatchTogetherForRoom() {
+    const cur = this.mediaSync.states.get("watch");
+    this.mediaSync.watchPanelOpenManual = false;
+    this.mediaSync.watchMinimized = false;
+    if (cur && cur.active) {
+      this.publishMediaSync({
+        targetId: "watch",
+        kind: "watch",
+        active: false,
+        playing: false,
+        positionMs: 0,
+        url: "",
+        provider: "",
+        mediaId: "",
+        title: "",
+        queue: [],
+      });
+    } else {
+      this._syncWatchTogetherUi(null);
+    }
+  }
+
+  setWatchLocalVolume(vol0To100) {
+    const player = this._ensureWatchPlayer();
+    player.setLocalVolume(vol0To100);
+    this._updateWatchLocalVolUi();
+  }
+
+  setWatchLocalMuted(muted) {
+    const player = this._ensureWatchPlayer();
+    player.setLocalMuted(muted);
+    this._updateWatchLocalVolUi();
+  }
+
+  toggleWatchLocalMute() {
+    const player = this._ensureWatchPlayer();
+    player.setLocalMuted(!player.localMuted);
+    this._updateWatchLocalVolUi();
+  }
+
+  _updateWatchLocalVolUi() {
+    const player = this.mediaSync.watchPlayer;
+    if (!player) return;
+    if (this.el["watch-local-volume"]) {
+      this.el["watch-local-volume"].value = String(player.localVolume);
+    }
+    if (this.el["btn-watch-local-mute"]) {
+      this.el["btn-watch-local-mute"].textContent = player.localMuted ? "Muted" : "Vol";
+      this.el["btn-watch-local-mute"].classList.toggle("is-active", player.localMuted);
+    }
+    if (this.el["watch-local-vol-val"]) {
+      this.el["watch-local-vol-val"].textContent = player.localMuted
+        ? "Muted · Local"
+        : `${player.localVolume}% · Local`;
+    }
+  }
+
+  _applyWatchTogetherState(state, prev) {
+    if (!state || !state.active || !state.provider || !state.mediaId) {
+      if (prev && prev.active) {
+        this.mediaSync.watchPanelOpenManual = false;
+        this.mediaSync.watchMinimized = false;
+      }
+      if (this.mediaSync.watchPlayer) {
+        this.mediaSync.watchPlayer.destroy();
+      }
+      this.mediaSync.watchDurationMs = 0;
+      this.mediaSync.watchTitleOverride = "";
+      if (this.mediaSync.watchUiTimer) {
+        clearInterval(this.mediaSync.watchUiTimer);
+        this.mediaSync.watchUiTimer = null;
+      }
+      this._syncWatchTogetherUi(state);
+      return;
+    }
+
+    if (!prev || prev.mediaId !== state.mediaId || prev.provider !== state.provider) {
+      this.mediaSync.watchTitleOverride = "";
+      this.mediaSync.watchDurationMs = 0;
+      this.mediaSync.watchMinimized = false;
+      if (this.el["btn-watch-autoplay-unmute"]) {
+        this.el["btn-watch-autoplay-unmute"].classList.add("hidden");
+      }
+    }
+
+    this._syncWatchTogetherUi(state);
+    const player = this._ensureWatchPlayer();
+    player.applyState(state, Date.now());
+
+    if (!this.mediaSync.watchUiTimer) {
+      this.mediaSync.watchUiTimer = setInterval(() => this._updateWatchTimeUi(), 400);
+    }
+  }
+
+  _syncWatchTogetherUi(state) {
+    const panel = this.el["watch-panel"];
+    const triggerBtn = this.el["btn-open-watch-panel"];
+    if (!panel) return;
+
+    const isActive = Boolean(state && state.active && state.provider && state.mediaId);
+    const shouldShow = isActive || this.mediaSync.watchPanelOpenManual;
+    panel.classList.toggle("hidden", !shouldShow);
+    if (triggerBtn) {
+      triggerBtn.classList.toggle("is-active", isActive);
+      triggerBtn.textContent = isActive ? "● Watch Together" : "▶ Watch Together";
+    }
+    if (!shouldShow) return;
+
+    panel.classList.remove("provider-youtube", "provider-spotify", "provider-soundcloud", "is-spotify-collection");
+    panel.classList.toggle("is-minimized", this.mediaSync.watchMinimized);
+    if (this.el["btn-watch-minimize"]) {
+      this.el["btn-watch-minimize"].textContent = this.mediaSync.watchMinimized ? "Expand" : "Minimize";
+      this.el["btn-watch-minimize"].setAttribute("aria-expanded", String(!this.mediaSync.watchMinimized));
+    }
+
+    if (!isActive) {
+      if (this.el["watch-provider-badge"]) this.el["watch-provider-badge"].textContent = "WATCH";
+      if (this.el["watch-panel-title"]) this.el["watch-panel-title"].textContent = "Watch Together";
+      if (this.el["watch-sync-meta"]) {
+        this.el["watch-sync-meta"].textContent = "Paste a YouTube, Spotify, or SoundCloud link to sync with everyone";
+      }
+      if (this.el["watch-stage-wrap"]) this.el["watch-stage-wrap"].classList.add("hidden");
+      if (this.el["watch-transport"]) this.el["watch-transport"].classList.add("hidden");
+      if (this.el["watch-open-external"]) this.el["watch-open-external"].classList.add("hidden");
+      if (this.el["btn-watch-close"]) this.el["btn-watch-close"].textContent = "Close";
+      this._renderWatchQueue([]);
+      return;
+    }
+
+    panel.classList.add(`provider-${state.provider}`);
+    if (state.provider === "spotify") {
+      const p = parseWatchMediaUrl(state.url);
+      if (p && (p.entityType === "playlist" || p.entityType === "album" || p.entityType === "show")) {
+        panel.classList.add("is-spotify-collection");
+      }
+    }
+
+    if (this.el["watch-provider-badge"]) {
+      this.el["watch-provider-badge"].textContent = state.provider.toUpperCase();
+    }
+    if (this.el["watch-panel-title"]) {
+      this.el["watch-panel-title"].textContent =
+        this.mediaSync.watchTitleOverride || state.title || state.url;
+    }
+    if (this.el["watch-sync-meta"]) {
+      const who = state.actorName || "Room";
+      const statusText = state.playing ? "Playing" : "Paused";
+      const hint =
+        state.provider === "spotify"
+          ? " · Full track if logged into Spotify"
+          : " · Volume is local-only";
+      this.el["watch-sync-meta"].textContent = `SYNCED · ${statusText} · Last control: ${who}${hint}`;
+    }
+    if (this.el["watch-open-external"]) {
+      this.el["watch-open-external"].href = state.url;
+      this.el["watch-open-external"].classList.remove("hidden");
+    }
+    if (this.el["btn-watch-close"]) this.el["btn-watch-close"].textContent = "Stop";
+    if (this.el["watch-stage-wrap"]) this.el["watch-stage-wrap"].classList.remove("hidden");
+    if (this.el["watch-transport"]) this.el["watch-transport"].classList.remove("hidden");
+
+    if (this.el["btn-watch-play"]) {
+      this.el["btn-watch-play"].textContent = state.playing ? "❚❚ Pause" : "▶ Play";
+    }
+    if (this.el["btn-watch-loop"]) {
+      this.el["btn-watch-loop"].textContent = state.loop ? "Loop: On" : "Loop: Off";
+      this.el["btn-watch-loop"].classList.toggle("is-active", Boolean(state.loop));
+    }
+    if (this.el["watch-speed-select"]) {
+      const showSpeed = state.provider === "youtube";
+      this.el["watch-speed-select"].classList.toggle("hidden", !showSpeed);
+      if (showSpeed) {
+        this.el["watch-speed-select"].value = String(state.rateMilli || 1000);
+      }
+    }
+    // Spotify Embed API does not expose external setVolume — keep local slider for YouTube & SoundCloud
+    if (this.el["watch-local-vol-row"]) {
+      this.el["watch-local-vol-row"].classList.toggle("hidden", state.provider === "spotify");
+    }
+    this._updateWatchLocalVolUi();
+
+    const queue = Array.isArray(state.queue) ? state.queue : [];
+    if (this.el["btn-watch-next"]) {
+      this.el["btn-watch-next"].classList.toggle("hidden", queue.length === 0);
+    }
+    this._renderWatchQueue(queue);
+    this._updateWatchTimeUi();
+  }
+
+  _updateWatchTimeUi() {
+    const st = this.mediaSync.states.get("watch");
+    if (!st || !st.active) return;
+    const posMs = projectMediaPositionMs(st, Date.now());
+    const durMs = this.mediaSync.watchDurationMs || 0;
+    const clampedPos = durMs > 0 ? Math.min(posMs, durMs) : posMs;
+    if (!this.mediaSync.watchScrubbing) {
+      if (this.el["watch-time-cur"]) {
+        this.el["watch-time-cur"].textContent = formatClockTime(clampedPos);
+      }
+      if (this.el["watch-scrubber"]) {
+        if (durMs > 0) {
+          this.el["watch-scrubber"].max = "1000";
+          this.el["watch-scrubber"].value = String(Math.round((clampedPos / durMs) * 1000));
+        } else {
+          const maxSec = Math.max(300, Math.ceil(clampedPos / 1000) + 60);
+          this.el["watch-scrubber"].max = String(maxSec);
+          this.el["watch-scrubber"].value = String(Math.floor(clampedPos / 1000));
+        }
+      }
+    }
+    if (this.el["watch-time-dur"]) {
+      this.el["watch-time-dur"].textContent = durMs > 0 ? formatClockTime(durMs) : "--:--";
+    }
+  }
+
+  _renderWatchQueue(queue) {
+    const head = this.el["watch-queue-head"];
+    const countEl = this.el["watch-queue-count"];
+    const listEl = this.el["watch-queue-list"];
+    if (!head || !listEl) return;
+
+    if (!Array.isArray(queue) || queue.length === 0) {
+      head.classList.add("hidden");
+      listEl.classList.add("hidden");
+      listEl.innerHTML = "";
+      return;
+    }
+
+    head.classList.remove("hidden");
+    listEl.classList.remove("hidden");
+    if (countEl) {
+      countEl.textContent = `Up Next (${queue.length})`;
+    }
+    listEl.innerHTML = queue
+      .map(
+        (item, idx) => `
+        <li class="watch-queue-item provider-${escapeHtml(item.provider)}">
+          <div class="watch-queue-item-main">
+            <span class="chat-media-provider-tag">${escapeHtml(item.provider)}</span>
+            <span class="watch-queue-item-title">${escapeHtml(item.title || item.url)}</span>
+            ${item.addedBy ? `<span class="watch-queue-item-by">by ${escapeHtml(item.addedBy)}</span>` : ""}
+          </div>
+          <div class="watch-queue-item-actions">
+            <button type="button" class="media-ctrl-btn" data-watch-q-play="${idx}" title="Play now for everyone">▶</button>
+            <button type="button" class="media-ctrl-btn" data-watch-q-del="${idx}" title="Remove from queue">×</button>
+          </div>
+        </li>
+      `
+      )
+      .join("");
+
+    for (const btn of listEl.querySelectorAll("[data-watch-q-play]")) {
+      btn.addEventListener("click", () => this.playWatchQueueItemAt(Number(btn.dataset.watchQPlay)));
+    }
+    for (const btn of listEl.querySelectorAll("[data-watch-q-del]")) {
+      btn.addEventListener("click", () => this.removeWatchQueueItemAt(Number(btn.dataset.watchQDel)));
+    }
   }
 
   /* ================= Step-by-Step Connect Wizard Helpers ================= */
@@ -4056,10 +5627,32 @@ class P2PDirectApp {
       for (const item of readyWireFrames) {
         this._sendWireFrameToPeer(item.peer, item.frame);
       }
+      this._announceInitialGifSync(meta.id, payload);
       this.renderStats();
     } catch (err) {
       this.addTelemetry("error", `Off-thread bulk seal fallback: ${err.message}`);
       this.renderStats();
+    }
+  }
+
+  _announceInitialGifSync(msgId, payload) {
+    if (!msgId || !payload || !Array.isArray(payload.images)) return;
+    let gifIdx = 0;
+    for (const img of payload.images) {
+      if (img && typeof img.dataUrl === "string" && (img.animated || img.dataUrl.startsWith("data:image/gif;"))) {
+        this.publishMediaSync({
+          targetId: `gif:${msgId}:${gifIdx}`,
+          kind: "gif",
+          active: true,
+          playing: true,
+          positionMs: 0,
+          rateMilli: 1000,
+          loop: true,
+          epoch: 0,
+          sourceMsgId: msgId,
+        });
+        gifIdx++;
+      }
     }
   }
 
@@ -4077,6 +5670,9 @@ class P2PDirectApp {
       const msgObj = res.messageMeta ? { ...res.messageMeta, payload } : res.message;
       const inserted = msgObj ? this._insertLocalMessageOrdered(msgObj) : false;
       this.executeActions(res.actions, { skipLogRefresh: inserted });
+      if (msgObj && msgObj.id) {
+        this._announceInitialGifSync(msgObj.id, payload);
+      }
       this.renderMessageUpdate();
     } catch (err) {
       this.showComposerError(err.message);
@@ -4532,6 +6128,7 @@ class P2PDirectApp {
     this.seenRelayChunkKeys.clear();
     this._clearRelayVoiceReorder();
     this.directUpgradeState.clear();
+    this._resetAllMediaSyncState();
   }
 
   async _ensureRoomMyTag() {
@@ -9152,6 +10749,12 @@ class P2PDirectApp {
           );
           break;
         }
+        case "media_sync": {
+          if (act.state) {
+            this.handleIncomingMediaSync(act.state);
+          }
+          break;
+        }
         case "telemetry": {
           this.addTelemetry(act.event, act.detail);
           break;
@@ -10985,6 +12588,7 @@ class P2PDirectApp {
   }
 
   _revokeMessageMediaUrls(msgId) {
+    this._cleanupMediaBindingsForMsg(msgId);
     const entry = this.mediaBlobRegistry.get(msgId);
     if (!entry) return;
     for (const url of entry) {
@@ -11023,15 +12627,34 @@ class P2PDirectApp {
       parts.push(`<div class="log-text-body">${html}</div>`);
       if (links.length > 0) {
         const cards = links
-          .map(
-            (lnk) => `
-            <a class="chat-link-card" href="${escapeHtml(lnk.href)}" target="_blank" rel="noopener noreferrer">
-              ${LINK_ARROW_SVG}
-              <span class="chat-link-host">${escapeHtml(lnk.host)}</span>
-              <span class="chat-link-path">${escapeHtml(lnk.path)}</span>
-            </a>
-          `
-          )
+          .map((lnk) => {
+            const watch = parseWatchMediaUrl(lnk.href);
+            if (watch) {
+              return `
+                <div class="chat-media-link-card provider-${escapeHtml(watch.provider)}" data-watch-provider="${escapeHtml(watch.provider)}">
+                  <div class="chat-media-link-info">
+                    <div class="chat-media-link-top">
+                      <span class="chat-media-provider-tag">${escapeHtml(watch.providerLabel)}</span>
+                      <span class="chat-media-link-sub">${escapeHtml(watch.subtitle)}</span>
+                    </div>
+                    <span class="chat-media-link-title" title="${escapeHtml(watch.url)}">${escapeHtml(watch.title)}</span>
+                  </div>
+                  <div class="chat-media-link-actions">
+                    <button type="button" class="chat-watch-cta" data-watch-play="${escapeHtml(watch.url)}">▶ ${escapeHtml(watch.ctaLabel)}</button>
+                    <button type="button" class="media-ctrl-btn" data-watch-queue="${escapeHtml(watch.url)}" title="Add to Watch Together queue">+ Queue</button>
+                    <a class="chat-media-link-ext" href="${escapeHtml(watch.url)}" target="_blank" rel="noopener noreferrer" title="Open link in new tab">↗</a>
+                  </div>
+                </div>
+              `;
+            }
+            return `
+              <a class="chat-link-card" href="${escapeHtml(lnk.href)}" target="_blank" rel="noopener noreferrer">
+                ${LINK_ARROW_SVG}
+                <span class="chat-link-host">${escapeHtml(lnk.host)}</span>
+                <span class="chat-link-path">${escapeHtml(lnk.path)}</span>
+              </a>
+            `;
+          })
           .join("");
         parts.push(`<div class="chat-link-cards">${cards}</div>`);
       }
@@ -11075,12 +12698,14 @@ class P2PDirectApp {
                 <button type="button" class="chat-image-btn" data-gif-expand="${idx}" aria-label="View full size GIF">
                   <img class="chat-image-thumb" data-gif-img="${idx}"${srcAttr} alt="${alt}" loading="lazy" />
                 </button>
+                <canvas class="gif-sync-canvas hidden" data-gif-sync-canvas="${idx}" aria-hidden="true"></canvas>
                 <canvas class="gif-freeze-canvas hidden" data-gif-canvas="${idx}" aria-hidden="true"></canvas>
               </div>
               <div class="chat-media-bar">
-                <button type="button" class="media-ctrl-btn" data-gif-replay="${idx}" title="Replay GIF from frame 1">↺ Replay</button>
-                <button type="button" class="media-ctrl-btn" data-gif-pause="${idx}" title="Pause or resume GIF">Pause</button>
+                <button type="button" class="media-ctrl-btn" data-gif-replay="${idx}" title="Replay GIF from frame 1 (synced)">↺ Replay</button>
+                <button type="button" class="media-ctrl-btn" data-gif-pause="${idx}" title="Pause or resume GIF (synced)">Pause</button>
                 <button type="button" class="media-ctrl-btn" data-gif-expand="${idx}" title="Open full size">⤢</button>
+                <span class="chat-media-sync-pill" data-gif-sync-pill="${idx}" title="Frame-synchronized across all peers">Synced</span>
                 <span class="chat-media-meta">${escapeHtml(metaLabel)}</span>
               </div>
             </div>
@@ -11136,14 +12761,16 @@ class P2PDirectApp {
                 playsinline
                 preload="metadata"
               ></video>
+              <button type="button" class="video-unmute-overlay hidden" data-video-unmute="${idx}">Muted by browser · Tap to unmute (local only)</button>
               <div class="video-ended-overlay hidden" data-video-ended="${idx}">
                 <button type="button" class="video-replay-overlay-btn" data-video-replay="${idx}">↺ Replay Video</button>
               </div>
             </div>
             <div class="chat-media-bar">
-              <button type="button" class="media-ctrl-btn" data-video-replay="${idx}" title="Replay video from 0:00">↺ Replay</button>
-              <button type="button" class="media-ctrl-btn" data-video-loop="${idx}" title="Toggle loop playback">Loop: Off</button>
+              <button type="button" class="media-ctrl-btn" data-video-replay="${idx}" title="Replay video from 0:00 (synced)">↺ Replay</button>
+              <button type="button" class="media-ctrl-btn" data-video-loop="${idx}" title="Toggle loop playback (synced)">Loop: Off</button>
               <button type="button" class="media-ctrl-btn" data-video-expand="${idx}" title="Open full size">⤢</button>
+              <span class="chat-media-sync-pill" data-video-sync-pill="${idx}" title="Playback synced across peers (volume stays local)">Synced</span>
               <span class="chat-media-meta">${escapeHtml(metaLabel)}</span>
             </div>
           </div>
@@ -11348,13 +12975,58 @@ class P2PDirectApp {
       );
     }
 
-    // Interactive animated GIF controls (1-click Frame-0 Replay, Pause/Play freeze frame, Lightbox)
+    for (const btn of article.querySelectorAll("[data-watch-play]")) {
+      btn.addEventListener("click", () => {
+        if (btn.dataset.watchPlay) {
+          this.startWatchTogetherFromUrl(btn.dataset.watchPlay, m.id);
+        }
+      });
+    }
+
+    for (const btn of article.querySelectorAll("[data-watch-queue]")) {
+      btn.addEventListener("click", () => {
+        if (btn.dataset.watchQueue) {
+          this.enqueueWatchUrl(btn.dataset.watchQueue);
+        }
+      });
+    }
+
+    // Interactive animated GIF controls (Frame-accurate E2EE sync, 1-click Replay, Pause/Play, Lightbox)
     for (const g of gifBindings) {
+      const syncTargetId = m.id ? `gif:${m.id}:${g.idx}` : "";
       const imgEl = article.querySelector(`[data-gif-img="${g.idx}"]`);
+      const syncCanvasEl = article.querySelector(`[data-gif-sync-canvas="${g.idx}"]`);
       const canvasEl = article.querySelector(`[data-gif-canvas="${g.idx}"]`);
       const replayBtn = article.querySelector(`[data-gif-replay="${g.idx}"]`);
       const pauseBtn = article.querySelector(`[data-gif-pause="${g.idx}"]`);
-      let isPaused = false;
+      const syncPillEl = article.querySelector(`[data-gif-sync-pill="${g.idx}"]`);
+
+      const bind = {
+        syncTargetId,
+        msgId: m.id,
+        g,
+        imgEl,
+        syncCanvasEl,
+        canvasEl,
+        replayBtn,
+        pauseBtn,
+        syncPillEl,
+        timings: null,
+        decoder: null,
+        decoding: false,
+        pendingRender: null,
+        lastRenderedFrame: -1,
+        lastAppliedEpoch: 0,
+        isPaused: false,
+      };
+
+      if (syncTargetId) {
+        const existingBind = this.mediaSync.gifBindings.get(syncTargetId);
+        if (existingBind) {
+          this._disposeGifBinding(existingBind);
+        }
+        this.mediaSync.gifBindings.set(syncTargetId, bind);
+      }
 
       if (g.asyncDecode && !g.blob && imgEl) {
         dataUrlToBlobAsync(g.dataUrl).then((blob) => {
@@ -11365,16 +13037,40 @@ class P2PDirectApp {
             g.currentUrl = url;
             this._registerMessageMediaUrl(m.id, url);
             imgEl.src = url;
+            if (syncTargetId) {
+              this._initGifSyncEngine(bind, blob);
+            }
           } else {
             g.currentUrl = g.dataUrl;
             imgEl.src = g.dataUrl;
           }
         });
+      } else if (g.blob && syncTargetId) {
+        this._initGifSyncEngine(bind, g.blob);
+      }
+
+      if (syncTargetId && this.mediaSync.states.has(syncTargetId)) {
+        this._applyGifSyncState(bind, this.mediaSync.states.get(syncTargetId), null);
       }
 
       const replayGif = () => {
         if (!imgEl) return;
-        isPaused = false;
+        if (syncTargetId && this.wasm) {
+          const prev = this.mediaSync.states.get(syncTargetId);
+          this.publishMediaSync({
+            targetId: syncTargetId,
+            kind: "gif",
+            active: true,
+            playing: true,
+            positionMs: 0,
+            rateMilli: 1000,
+            loop: true,
+            epoch: (prev?.epoch || 0) + 1,
+            sourceMsgId: m.id,
+          });
+          return;
+        }
+        bind.isPaused = false;
         if (canvasEl) canvasEl.classList.add("hidden");
         if (pauseBtn) {
           pauseBtn.textContent = "Pause";
@@ -11405,7 +13101,26 @@ class P2PDirectApp {
 
       if (pauseBtn && imgEl && canvasEl) {
         pauseBtn.addEventListener("click", () => {
-          if (!isPaused) {
+          if (!bind.isPaused) {
+            if (syncTargetId && this.wasm) {
+              const cur = this.mediaSync.states.get(syncTargetId);
+              let posMs = cur ? projectMediaPositionMs(cur, Date.now()) : 0;
+              if (bind.timings && bind.timings.totalDurationMs > 0) {
+                posMs = posMs % bind.timings.totalDurationMs;
+              }
+              this.publishMediaSync({
+                targetId: syncTargetId,
+                kind: "gif",
+                active: true,
+                playing: false,
+                positionMs: posMs,
+                rateMilli: 1000,
+                loop: true,
+                epoch: cur?.epoch || 0,
+                sourceMsgId: m.id,
+              });
+              return;
+            }
             const w = imgEl.naturalWidth || imgEl.width || 0;
             const h = imgEl.naturalHeight || imgEl.height || 0;
             if (w > 0 && h > 0) {
@@ -11418,10 +13133,25 @@ class P2PDirectApp {
                 canvasEl.classList.remove("hidden");
               }
             }
-            isPaused = true;
+            bind.isPaused = true;
             pauseBtn.textContent = "Play";
             pauseBtn.classList.add("is-active");
           } else {
+            if (syncTargetId && this.wasm) {
+              const cur = this.mediaSync.states.get(syncTargetId);
+              this.publishMediaSync({
+                targetId: syncTargetId,
+                kind: "gif",
+                active: true,
+                playing: true,
+                positionMs: cur?.positionMs || 0,
+                rateMilli: 1000,
+                loop: true,
+                epoch: cur?.epoch || 0,
+                sourceMsgId: m.id,
+              });
+              return;
+            }
             replayGif();
           }
         });
@@ -11436,18 +13166,57 @@ class P2PDirectApp {
             dataUrl: g.dataUrl,
             alt: g.alt,
             meta: g.metaLabel ? `${g.alt} · ${g.metaLabel}` : g.alt,
+            syncTargetId,
           });
         });
       }
     }
 
-    // Interactive Video controls (Replay from 0:00, Ended Replay Overlay, Loop toggle, Lightbox)
+    // Interactive Video controls (Bidirectional E2EE sync excluding volume/mute, Replay, Loop, Lightbox)
     for (const v of videoBindings) {
+      const syncTargetId = m.id ? `vid:${m.id}:${v.idx}` : "";
       const videoEl = article.querySelector(`[data-video-el="${v.idx}"]`);
       const endedOverlay = article.querySelector(`[data-video-ended="${v.idx}"]`);
+      const unmuteOverlay = article.querySelector(`[data-video-unmute="${v.idx}"]`);
       const loopBtn = article.querySelector(`[data-video-loop="${v.idx}"]`);
       const replayBtns = article.querySelectorAll(`[data-video-replay="${v.idx}"]`);
       const expandBtn = article.querySelector(`[data-video-expand="${v.idx}"]`);
+      const syncPillEl = article.querySelector(`[data-video-sync-pill="${v.idx}"]`);
+
+      const bind = {
+        syncTargetId,
+        msgId: m.id,
+        videoEl,
+        endedOverlay,
+        unmuteOverlay,
+        loopBtn,
+        replayBtns: Array.from(replayBtns),
+        syncPillEl,
+        applyingRemote: false,
+        suppressUntil: 0,
+        lastAppliedEpoch: 0,
+      };
+
+      if (syncTargetId) {
+        this.mediaSync.videoBindings.set(syncTargetId, bind);
+      }
+
+      const publishLocalVideoState = (overrides = {}) => {
+        if (!syncTargetId || !this.wasm || !videoEl) return;
+        const prev = this.mediaSync.states.get(syncTargetId);
+        this.publishMediaSync({
+          targetId: syncTargetId,
+          kind: "video",
+          active: true,
+          playing: !videoEl.paused && !videoEl.ended,
+          positionMs: Math.max(0, Math.round((videoEl.currentTime || 0) * 1000)),
+          rateMilli: Math.round((videoEl.playbackRate || 1) * 1000),
+          loop: Boolean(videoEl.loop),
+          epoch: prev?.epoch || 0,
+          sourceMsgId: m.id,
+          ...overrides,
+        });
+      };
 
       if (v.asyncDecode && !v.blob && videoEl) {
         dataUrlToBlobAsync(v.dataUrl).then((blob) => {
@@ -11462,11 +13231,25 @@ class P2PDirectApp {
             v.srcUrl = v.dataUrl;
             videoEl.src = v.dataUrl;
           }
+          if (syncTargetId && this.mediaSync.states.has(syncTargetId)) {
+            this._applyVideoSyncState(bind, this.mediaSync.states.get(syncTargetId), null);
+          }
         });
+      } else if (syncTargetId && this.mediaSync.states.has(syncTargetId)) {
+        this._applyVideoSyncState(bind, this.mediaSync.states.get(syncTargetId), null);
       }
 
       const replayVideo = () => {
         if (!videoEl) return;
+        if (syncTargetId && this.wasm) {
+          const prev = this.mediaSync.states.get(syncTargetId);
+          publishLocalVideoState({
+            playing: true,
+            positionMs: 0,
+            epoch: (prev?.epoch || 0) + 1,
+          });
+          return;
+        }
         if (endedOverlay) endedOverlay.classList.add("hidden");
         try {
           videoEl.currentTime = 0;
@@ -11494,9 +13277,40 @@ class P2PDirectApp {
         });
         videoEl.addEventListener("play", () => {
           if (endedOverlay) endedOverlay.classList.add("hidden");
+          if (bind.applyingRemote || performance.now() < bind.suppressUntil) return;
+          publishLocalVideoState({ playing: true });
+        });
+        videoEl.addEventListener("pause", () => {
+          if (bind.applyingRemote || performance.now() < bind.suppressUntil) return;
+          if (videoEl.ended) return;
+          publishLocalVideoState({ playing: false });
         });
         videoEl.addEventListener("seeking", () => {
           if (endedOverlay) endedOverlay.classList.add("hidden");
+        });
+        videoEl.addEventListener("seeked", () => {
+          if (bind.applyingRemote || performance.now() < bind.suppressUntil) return;
+          const st = this.mediaSync.states.get(syncTargetId);
+          const expectedSec = st ? projectMediaPositionMs(st, Date.now()) / 1000 : -1;
+          if (!st || Math.abs((videoEl.currentTime || 0) - expectedSec) > 0.3) {
+            publishLocalVideoState();
+          }
+        });
+        videoEl.addEventListener("ratechange", () => {
+          if (bind.applyingRemote || performance.now() < bind.suppressUntil) return;
+          const st = this.mediaSync.states.get(syncTargetId);
+          const expectedRate = st ? (st.rateMilli || 1000) / 1000 : 1;
+          if (Math.abs((videoEl.playbackRate || 1) - expectedRate) > 0.08) {
+            publishLocalVideoState();
+          }
+        });
+      }
+
+      if (unmuteOverlay && videoEl) {
+        unmuteOverlay.addEventListener("click", () => {
+          // Local-only unmute — never broadcast volume or mute state
+          videoEl.muted = false;
+          unmuteOverlay.classList.add("hidden");
         });
       }
 
@@ -11506,7 +13320,12 @@ class P2PDirectApp {
 
       if (loopBtn && videoEl) {
         loopBtn.addEventListener("click", () => {
-          videoEl.loop = !videoEl.loop;
+          const nextLoop = !videoEl.loop;
+          if (syncTargetId && this.wasm) {
+            publishLocalVideoState({ loop: nextLoop });
+            return;
+          }
+          videoEl.loop = nextLoop;
           loopBtn.textContent = videoEl.loop ? "Loop: On" : "Loop: Off";
           loopBtn.classList.toggle("is-active", videoEl.loop);
           if (videoEl.loop && endedOverlay) {
@@ -11517,11 +13336,14 @@ class P2PDirectApp {
 
       if (expandBtn && videoEl) {
         expandBtn.addEventListener("click", () => {
+          bind.applyingRemote = true;
+          bind.suppressUntil = performance.now() + 450;
           try {
             videoEl.pause();
           } catch {
             // ignore
           }
+          bind.applyingRemote = false;
           this.openLightbox({
             kind: "video",
             src: v.srcUrl || v.dataUrl,
@@ -11530,6 +13352,7 @@ class P2PDirectApp {
             alt: v.alt,
             meta: v.metaLabel ? `${v.alt} · ${v.metaLabel}` : v.alt,
             loop: Boolean(videoEl.loop),
+            syncTargetId,
           });
         });
       }

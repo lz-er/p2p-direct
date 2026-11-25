@@ -2,13 +2,14 @@
 // Caches ONLY immutable public static shell assets (HTML, CSS, JS, WASM, fonts, icons).
 // Never caches chat messages, room secrets, URL fragments, or cross-origin traffic.
 
-const CACHE_NAME = "p2p-direct-shell-v11";
+const CACHE_NAME = "p2p-direct-shell-v12";
 
 const SHELL_ASSETS = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./watch_together.js",
   "./storage.js",
   "./wasm_client.js",
   "./mqtt_relay.js",

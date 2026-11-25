@@ -7,6 +7,7 @@ use crate::crypto::{
 use crate::deflate::{base64url_decode, base64url_encode_into};
 use crate::json::{JsonValue, parse_json, write_json_string, write_json_value};
 use crate::log::SealedLogRecord;
+use crate::media::MediaSyncState;
 
 pub const DEFAULT_GOSSIP_TTL: u32 = 16;
 pub const DEFAULT_RELAY_TTL: u32 = 8;
@@ -766,6 +767,7 @@ pub enum WireFrame {
     },
     Pong {
         ts: u64,
+        peer_ts: Option<u64>,
     },
     VoiceState {
         in_voice: bool,
@@ -784,6 +786,11 @@ pub enum WireFrame {
         hops: Vec<String>,
         ttl: u32,
     },
+    MediaSync {
+        origin: String,
+        ttl: u32,
+        state: MediaSyncState,
+    },
 }
 
 impl WireFrame {
@@ -800,6 +807,7 @@ impl WireFrame {
             Self::RelaySignal {
                 sealed_ciphertext, ..
             } => sealed_ciphertext.len().div_ceil(3) * 4 + 320,
+            Self::MediaSync { state, .. } => 384 + state.queue.len() * 192,
             _ => 256,
         };
         let mut out = String::with_capacity(cap);
@@ -954,8 +962,12 @@ impl WireFrame {
             Self::Ping { ts } => {
                 let _ = write!(out, "{{\"kind\":\"ping\",\"t\":{ts}}}");
             }
-            Self::Pong { ts } => {
-                let _ = write!(out, "{{\"kind\":\"pong\",\"t\":{ts}}}");
+            Self::Pong { ts, peer_ts } => {
+                if let Some(pt) = peer_ts {
+                    let _ = write!(out, "{{\"kind\":\"pong\",\"t\":{ts},\"pt\":{pt}}}");
+                } else {
+                    let _ = write!(out, "{{\"kind\":\"pong\",\"t\":{ts}}}");
+                }
             }
             Self::VoiceState { in_voice, muted } => {
                 let _ = write!(
@@ -994,6 +1006,13 @@ impl WireFrame {
                 write_json_value(&mut out, value);
                 let _ = write!(out, ",\"ts\":{ts},\"ttl\":{ttl},\"hops\":");
                 write_string_array(&mut out, hops);
+                out.push('}');
+            }
+            Self::MediaSync { origin, ttl, state } => {
+                out.push_str("{\"kind\":\"media-sync\",\"origin\":");
+                write_json_string(&mut out, origin);
+                let _ = write!(out, ",\"ttl\":{ttl},\"state\":");
+                state.write_json(&mut out, state.anchor_local_ms);
                 out.push('}');
             }
         }
@@ -1164,6 +1183,7 @@ impl WireFrame {
             }),
             "pong" => Ok(Self::Pong {
                 ts: val.get_u64("t").unwrap_or(0),
+                peer_ts: val.get_u64("pt"),
             }),
             "voice-state" => Ok(Self::VoiceState {
                 in_voice: val.get_bool("inVoice").unwrap_or(false),
@@ -1197,6 +1217,18 @@ impl WireFrame {
                     hops,
                     ttl,
                 })
+            }
+            "media-sync" => {
+                let origin = req_str(&val, "origin")?;
+                let ttl = val
+                    .get_u64("ttl")
+                    .unwrap_or(u64::from(DEFAULT_GOSSIP_TTL))
+                    .min(u64::from(u32::MAX)) as u32;
+                let state_val = val
+                    .get("state")
+                    .ok_or_else(|| "media-sync frame missing 'state' object".to_owned())?;
+                let state = MediaSyncState::from_json_value(state_val, 0, 0)?;
+                Ok(Self::MediaSync { origin, ttl, state })
             }
             other => Err(format!("unknown wire frame kind '{other}'")),
         }

@@ -18,6 +18,7 @@ use crate::json::{JsonValue, write_json_string, write_json_value};
 use crate::log::{
     LogMessage, MSG_TYPE_DELETE, ReplicatedLog, SealedLogRecord, is_internal_log_type,
 };
+use crate::media::{MAX_MEDIA_SYNC_TARGETS, MAX_ONE_WAY_COMPENSATION_MS, MediaSyncState};
 use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
     DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
@@ -118,6 +119,9 @@ pub enum MeshAction {
         label: String,
         value: JsonValue,
         ts: u64,
+    },
+    MediaSync {
+        state: MediaSyncState,
     },
     Telemetry {
         event: String,
@@ -237,6 +241,11 @@ impl MeshAction {
                 out.push_str(",\"value\":");
                 write_json_value(out, value);
                 let _ = write!(out, ",\"ts\":{ts}}}");
+            }
+            Self::MediaSync { state } => {
+                out.push_str("{\"action\":\"media_sync\",\"state\":");
+                state.write_json(out, state.anchor_local_ms);
+                out.push('}');
             }
             Self::Telemetry { event, detail } => {
                 out.push_str("{\"action\":\"telemetry\",\"event\":");
@@ -384,6 +393,8 @@ pub struct ConnectedPeer {
     pub remote_peers: Vec<PeerSummary>,
     pub last_pong_ms: u64,
     pub rtt_ms: Option<u64>,
+    pub min_rtt_ms: Option<u64>,
+    pub clock_offset_ms: Option<i64>,
     pub in_voice: bool,
     pub voice_muted: bool,
     pub is_bot: bool,
@@ -435,6 +446,7 @@ pub struct MeshNode {
     indirect_routes: BTreeMap<String, IndirectPeerRoute>,
     auto_mesh_pending: BTreeMap<String, PendingAutoMesh>,
     seen_bot_actions: HashSet<String>,
+    media_states: BTreeMap<String, MediaSyncState>,
     stats: MeshStats,
     seq: u64,
 }
@@ -484,6 +496,7 @@ impl MeshNode {
             indirect_routes: BTreeMap::new(),
             auto_mesh_pending: BTreeMap::new(),
             seen_bot_actions: HashSet::new(),
+            media_states: BTreeMap::new(),
             stats: MeshStats::default(),
             seq: 0,
         }
@@ -786,10 +799,38 @@ impl MeshNode {
     /// Clears only this node's local replicated log so re-syncing pulls encrypted history from surviving peers.
     pub fn reset_local_log(&mut self) {
         self.log = ReplicatedLog::new();
+        self.media_states
+            .retain(|k, _| !k.starts_with("vid:") && !k.starts_with("gif:"));
         for peer in self.peers.values_mut() {
             peer.known_ids.clear();
             peer.pending_inv = None;
             peer.we_sent_inv = false;
+        }
+    }
+
+    fn prune_media_states_for_deleted_msg(&mut self, msg_id: &str) {
+        if msg_id.is_empty() {
+            return;
+        }
+        let vid_prefix = format!("vid:{msg_id}:");
+        let gif_prefix = format!("gif:{msg_id}:");
+        self.media_states
+            .retain(|k, _| !k.starts_with(&vid_prefix) && !k.starts_with(&gif_prefix));
+    }
+
+    fn prune_media_states_capacity(&mut self) {
+        if self.media_states.len() <= MAX_MEDIA_SYNC_TARGETS {
+            return;
+        }
+        // Evict oldest non-"watch" entry by anchor_local_ms
+        if let Some(oldest_key) = self
+            .media_states
+            .iter()
+            .filter(|(k, _)| k.as_str() != "watch")
+            .min_by_key(|(_, st)| (st.active, st.anchor_local_ms))
+            .map(|(k, _)| k.clone())
+        {
+            self.media_states.remove(&oldest_key);
         }
     }
 
@@ -807,7 +848,6 @@ impl MeshNode {
             Some(cid) if !cid.trim().is_empty() => cid,
             _ => format!("{}-{}-{}-{}", self.peer_id, next_lp, ts_ms, seq),
         };
-
         let (msg, sealed) = self.log.append_local_sealed(
             id,
             msg_type,
@@ -823,6 +863,7 @@ impl MeshNode {
         let mut deleted_ids = Vec::new();
         if msg.msg_type == MSG_TYPE_DELETE {
             if let Some(target_id) = msg.payload.get_str("targetId") {
+                self.prune_media_states_for_deleted_msg(target_id);
                 deleted_ids.push(target_id.to_owned());
             }
         } else {
@@ -1038,6 +1079,8 @@ impl MeshNode {
                 remote_peers: Vec::new(),
                 last_pong_ms: 0,
                 rtt_ms: None,
+                min_rtt_ms: None,
+                clock_offset_ms: None,
                 in_voice: false,
                 voice_muted: false,
                 is_bot: false,
@@ -1126,6 +1169,66 @@ impl MeshNode {
             detail,
         });
         actions
+    }
+
+    /// Applies a local synchronized media state update (video, GIF, or Watch Together),
+    /// increments its deterministic LWW revision counter, and gossips it end-to-end encrypted
+    /// to all connected peers in the room. Volume/mute are never synchronized.
+    pub fn update_media_sync(
+        &mut self,
+        mut incoming: MediaSyncState,
+        now_ms: u64,
+    ) -> (MediaSyncState, Vec<MeshAction>) {
+        let prev_rev = self
+            .media_states
+            .get(&incoming.target_id)
+            .map(|s| s.rev)
+            .unwrap_or(0);
+        incoming.rev = prev_rev.max(incoming.rev).saturating_add(1);
+        incoming.actor = self.peer_id.clone();
+        incoming.actor_name = self.author_name.clone();
+        incoming.anchor_local_ms = now_ms;
+
+        self.media_states
+            .insert(incoming.target_id.clone(), incoming.clone());
+        self.prune_media_states_capacity();
+
+        let mut actions = Vec::new();
+        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+        if !peer_ids.is_empty() {
+            let wire = WireFrame::MediaSync {
+                origin: self.peer_id.clone(),
+                ttl: self.config.gossip_ttl,
+                state: incoming.clone(),
+            };
+            let plaintext = wire.to_json_string();
+            for pid in peer_ids {
+                self.emit_wire_plaintext(&mut actions, &pid, &plaintext);
+            }
+        }
+        actions.push(MeshAction::MediaSync {
+            state: incoming.clone(),
+        });
+        (incoming, actions)
+    }
+
+    /// Serializes all tracked room media sync states with positions projected to `now_ms`.
+    pub fn media_states_json(&self, now_ms: u64) -> String {
+        let mut out = String::with_capacity(self.media_states.len().saturating_mul(256) + 2);
+        out.push('[');
+        for (i, st) in self.media_states.values().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            st.write_json(&mut out, now_ms);
+        }
+        out.push(']');
+        out
+    }
+
+    /// Returns a read-only reference to all tracked room media sync states.
+    pub fn media_states(&self) -> &BTreeMap<String, MediaSyncState> {
+        &self.media_states
     }
 
     /// Encodes a 16 kHz mono signed 16-bit PCM frame with IMA ADPCM once and seals a binary `V1`
@@ -2041,14 +2144,34 @@ impl MeshNode {
                 )?;
             }
             WireFrame::Ping { ts } => {
-                let pong = WireFrame::Pong { ts };
+                let pong = WireFrame::Pong {
+                    ts,
+                    peer_ts: Some(now_ms),
+                };
                 self.emit_wire(&mut actions, from_peer, &pong);
             }
-            WireFrame::Pong { ts } => {
+            WireFrame::Pong { ts, peer_ts } => {
                 if let Some(peer) = self.peers.get_mut(from_peer) {
                     peer.last_pong_ms = now_ms;
                     if now_ms >= ts && ts > 0 {
-                        peer.rtt_ms = Some(now_ms - ts);
+                        let rtt = now_ms - ts;
+                        peer.rtt_ms = Some(rtt);
+                        if let Some(t2) = peer_ts {
+                            let mid = ts.saturating_add(rtt / 2);
+                            let offset = (i128::from(t2) - i128::from(mid))
+                                .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                                as i64;
+                            let accept = match peer.min_rtt_ms {
+                                None => true,
+                                Some(best) => rtt <= best.saturating_add(15),
+                            };
+                            if peer.min_rtt_ms.is_none_or(|best| rtt < best) {
+                                peer.min_rtt_ms = Some(rtt);
+                            }
+                            if accept {
+                                peer.clock_offset_ms = Some(offset);
+                            }
+                        }
                     }
                 }
             }
@@ -2099,9 +2222,70 @@ impl MeshNode {
                     &mut actions,
                 );
             }
+            WireFrame::MediaSync { origin, ttl, state } => {
+                self.handle_media_sync(from_peer, origin, ttl, state, now_ms, &mut actions);
+            }
         }
 
         Ok(actions)
+    }
+
+    fn handle_media_sync(
+        &mut self,
+        from_peer: &str,
+        origin: String,
+        ttl: u32,
+        mut incoming: MediaSyncState,
+        now_ms: u64,
+        actions: &mut Vec<MeshAction>,
+    ) {
+        let one_way_ms = self
+            .peers
+            .get(from_peer)
+            .and_then(|p| p.rtt_ms)
+            .map(|r| r / 2)
+            .unwrap_or(20)
+            .min(MAX_ONE_WAY_COMPENSATION_MS);
+        if incoming.active && incoming.playing {
+            let delta = ((u128::from(one_way_ms) * u128::from(incoming.rate_milli)) / 1000u128)
+                as u64;
+            incoming.position_ms = incoming.position_ms.saturating_add(delta);
+        }
+        incoming.anchor_local_ms = now_ms;
+
+        if let Some(existing) = self.media_states.get(&incoming.target_id)
+            && !incoming.is_strictly_newer_than(existing)
+        {
+            return;
+        }
+
+        self.media_states
+            .insert(incoming.target_id.clone(), incoming.clone());
+        self.prune_media_states_capacity();
+
+        actions.push(MeshAction::MediaSync {
+            state: incoming.clone(),
+        });
+
+        if ttl > 0 {
+            let forward_targets: Vec<String> = self
+                .peers
+                .keys()
+                .filter(|pid| pid.as_str() != from_peer && pid.as_str() != origin.as_str())
+                .cloned()
+                .collect();
+            if !forward_targets.is_empty() {
+                let wire = WireFrame::MediaSync {
+                    origin,
+                    ttl: ttl - 1,
+                    state: incoming,
+                };
+                let plaintext = wire.to_json_string();
+                for pid in forward_targets {
+                    self.emit_wire_plaintext(actions, &pid, &plaintext);
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2318,6 +2502,29 @@ impl MeshNode {
             ),
         });
 
+        // Reconcile active room media sync states (videos, GIFs, Watch Together) with the peer
+        // immediately upon handshake, projected to `now_ms` so late joiners land in lockstep.
+        if !self.media_states.is_empty() {
+            let snapshots: Vec<MediaSyncState> = self
+                .media_states
+                .values()
+                .map(|st| {
+                    let mut proj = st.clone();
+                    proj.position_ms = st.projected_position_ms(now_ms);
+                    proj.anchor_local_ms = now_ms;
+                    proj
+                })
+                .collect();
+            for st in snapshots {
+                let wire = WireFrame::MediaSync {
+                    origin: self.peer_id.clone(),
+                    ttl: 0,
+                    state: st,
+                };
+                self.emit_wire(actions, &effective_peer, &wire);
+            }
+        }
+
         if !self.config.auto_mesh_enabled {
             return;
         }
@@ -2408,6 +2615,7 @@ impl MeshNode {
         let mut deleted_ids = Vec::new();
         if inserted_msg.msg_type == MSG_TYPE_DELETE {
             if let Some(target_id) = inserted_msg.payload.get_str("targetId") {
+                self.prune_media_states_for_deleted_msg(target_id);
                 deleted_ids.push(target_id.to_owned());
             }
         } else {
@@ -2598,6 +2806,7 @@ impl MeshNode {
         for (m, _) in &added_records {
             if m.msg_type == MSG_TYPE_DELETE {
                 if let Some(target_id) = m.payload.get_str("targetId") {
+                    self.prune_media_states_for_deleted_msg(target_id);
                     deleted_ids.push(target_id.to_owned());
                 }
             } else {

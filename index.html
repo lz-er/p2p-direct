@@ -576,6 +576,122 @@
             </div>
           </section>
 
+          <!-- Synced Watch Together Stage (YouTube / Spotify / SoundCloud — E2EE Room Sync, Local-Only Volume) -->
+          <section class="panel watch-panel hidden" id="watch-panel" aria-labelledby="watch-panel-title">
+            <div class="panel-header watch-header">
+              <div class="watch-title-group">
+                <span class="watch-provider-badge" id="watch-provider-badge">WATCH</span>
+                <div class="watch-title-copy">
+                  <h2 class="panel-title" id="watch-panel-title">Watch Together</h2>
+                  <span class="watch-sync-meta" id="watch-sync-meta">Paste a YouTube, Spotify, or SoundCloud link</span>
+                </div>
+              </div>
+              <div class="watch-header-actions">
+                <a
+                  id="watch-open-external"
+                  class="btn btn-sm hidden"
+                  href="#"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title="Open source link in a new tab"
+                >Open ↗</a>
+                <button
+                  type="button"
+                  id="btn-watch-minimize"
+                  class="btn btn-sm"
+                  aria-expanded="true"
+                  title="Minimize or expand player while keeping audio running"
+                >Minimize</button>
+                <button
+                  type="button"
+                  id="btn-watch-close"
+                  class="btn btn-sm btn-danger"
+                  title="Stop Watch Together for everyone in the room"
+                >Stop</button>
+              </div>
+            </div>
+
+            <div class="watch-body" id="watch-body">
+              <div class="watch-stage-wrap hidden" id="watch-stage-wrap">
+                <div class="watch-embed-stage" id="watch-embed-stage"></div>
+                <button
+                  type="button"
+                  id="btn-watch-autoplay-unmute"
+                  class="watch-autoplay-banner hidden"
+                >
+                  Browser muted autoplay · Click to unmute (local only)
+                </button>
+              </div>
+
+              <div class="watch-transport hidden" id="watch-transport">
+                <div class="watch-transport-main">
+                  <button type="button" id="btn-watch-play" class="media-ctrl-btn watch-play-btn" title="Play or pause for everyone">▶ Play</button>
+                  <button type="button" id="btn-watch-back10" class="media-ctrl-btn" title="Seek back 10s for everyone">-10s</button>
+                  <button type="button" id="btn-watch-fwd10" class="media-ctrl-btn" title="Seek forward 10s for everyone">+10s</button>
+                  <button type="button" id="btn-watch-replay" class="media-ctrl-btn" title="Restart from 0:00 for everyone">↺ 0:00</button>
+                  <button type="button" id="btn-watch-next" class="media-ctrl-btn hidden" title="Play next queued item for everyone">⏭ Next</button>
+                  <button type="button" id="btn-watch-loop" class="media-ctrl-btn" title="Toggle synced loop">Loop: Off</button>
+                  <select id="watch-speed-select" class="select-input watch-speed-select" aria-label="Synced playback speed" title="Synced playback speed">
+                    <option value="500">0.5×</option>
+                    <option value="750">0.75×</option>
+                    <option value="1000" selected>1×</option>
+                    <option value="1250">1.25×</option>
+                    <option value="1500">1.5×</option>
+                    <option value="2000">2×</option>
+                  </select>
+                </div>
+
+                <div class="watch-scrub-row">
+                  <span class="watch-timecode" id="watch-time-cur">0:00</span>
+                  <input
+                    id="watch-scrubber"
+                    class="watch-scrubber"
+                    type="range"
+                    min="0"
+                    max="1000"
+                    step="1"
+                    value="0"
+                    aria-label="Synced seek position"
+                  />
+                  <span class="watch-timecode" id="watch-time-dur">--:--</span>
+                </div>
+
+                <div class="watch-local-vol-row" id="watch-local-vol-row" title="Local volume only — never synced to other peers">
+                  <button type="button" id="btn-watch-local-mute" class="media-ctrl-btn" title="Mute locally (does not affect other peers)">Vol</button>
+                  <input
+                    id="watch-local-volume"
+                    class="watch-vol-slider"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value="80"
+                    aria-label="Your local volume (not synced)"
+                  />
+                  <span class="watch-vol-label" id="watch-local-vol-val">80% · Local</span>
+                </div>
+              </div>
+
+              <div class="watch-queue-section" id="watch-queue-section">
+                <form id="watch-url-form" class="watch-url-form">
+                  <input
+                    id="watch-url-input"
+                    class="text-input watch-url-input"
+                    type="url"
+                    placeholder="Paste YouTube, Spotify, or SoundCloud link…"
+                    autocomplete="off"
+                  />
+                  <button type="submit" id="btn-watch-load-now" class="btn btn-primary btn-sm">Play Now</button>
+                  <button type="button" id="btn-watch-queue-add" class="btn btn-sm">+ Queue</button>
+                </form>
+                <div class="watch-queue-head hidden" id="watch-queue-head">
+                  <span class="watch-queue-kicker" id="watch-queue-count">Up Next (0)</span>
+                </div>
+                <ul class="watch-queue-list hidden" id="watch-queue-list"></ul>
+              </div>
+            </div>
+          </section>
+
           <!-- Primary Chat Workspace -->
           <section class="panel chat-panel" id="chat-panel" aria-labelledby="log-panel-title">
             <div id="chat-drop-overlay" class="chat-drop-overlay hidden" aria-hidden="true">
@@ -590,18 +706,26 @@
                 <h2 class="panel-title" id="log-panel-title">Chat</h2>
                 <span class="panel-meta" id="chat-sync-meta">In-memory · Encrypted</span>
               </div>
-              <div class="btn-row advanced-only" style="margin-top: 0">
-                <button type="button" id="btn-toggle-raw" class="btn btn-sm">Raw JSON</button>
-                <button type="button" id="btn-export-encrypted" class="btn btn-sm">Backup</button>
-                <button type="button" id="btn-export-log" class="btn btn-sm">Export</button>
+              <div class="chat-header-right">
                 <button
                   type="button"
-                  id="btn-clear-local-log"
-                  class="btn btn-sm btn-danger"
-                  title="Clears only this tab's in-memory messages; syncing restores messages from connected peers"
-                >
-                  Clear Local
-                </button>
+                  id="btn-open-watch-panel"
+                  class="btn btn-sm watch-header-trigger"
+                  title="Open synced Watch Together for YouTube, Spotify, or SoundCloud"
+                >▶ Watch Together</button>
+                <div class="btn-row advanced-only" style="margin-top: 0">
+                  <button type="button" id="btn-toggle-raw" class="btn btn-sm">Raw JSON</button>
+                  <button type="button" id="btn-export-encrypted" class="btn btn-sm">Backup</button>
+                  <button type="button" id="btn-export-log" class="btn btn-sm">Export</button>
+                  <button
+                    type="button"
+                    id="btn-clear-local-log"
+                    class="btn btn-sm btn-danger"
+                    title="Clears only this tab's in-memory messages; syncing restores messages from connected peers"
+                  >
+                    Clear Local
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -1273,7 +1397,10 @@
     <div id="image-lightbox" class="lightbox hidden" role="dialog" aria-modal="true" aria-label="Media preview">
       <button type="button" id="btn-lightbox-close" class="lightbox-close" aria-label="Close media preview">×</button>
       <div class="lightbox-stage">
-        <img id="lightbox-img" class="lightbox-img" alt="Shared image" />
+        <div class="lightbox-gif-wrap" id="lightbox-gif-wrap">
+          <img id="lightbox-img" class="lightbox-img" alt="Shared image" />
+          <canvas id="lightbox-gif-canvas" class="lightbox-gif-canvas hidden" aria-hidden="true"></canvas>
+        </div>
         <video id="lightbox-video" class="lightbox-video hidden" controls playsinline></video>
         <div id="lightbox-toolbar" class="lightbox-toolbar hidden">
           <button type="button" id="btn-lightbox-replay" class="lightbox-btn" title="Replay from start (R)">↺ Replay</button>

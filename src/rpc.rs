@@ -13,6 +13,7 @@ use crate::json::{
     JsonValue, parse_json, parse_json_object_skipping_field, write_json_string,
 };
 use crate::log::{LogMessage, SealedLogRecord, is_internal_log_type};
+use crate::media::MediaSyncState;
 use crate::mesh::{BulkPeerKeyTarget, MeshConfig, MeshNode, actions_to_json_array};
 use crate::protocol::{
     EncryptedWireEnvelope, RelaySignalType, WireFrame, write_msg_wire_json_borrowed,
@@ -251,6 +252,28 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             Ok(format!(
                 "{{\"ok\":true,\"status\":{status},\"log\":{log}}}"
             ))
+        }
+        "media_sync_update" => {
+            let node = require_node(state)?;
+            let now_ms = val.get_u64("nowMs").unwrap_or(0);
+            let st_val = val
+                .get("state")
+                .ok_or_else(|| "media_sync_update missing 'state' object".to_owned())?;
+            let incoming = MediaSyncState::from_json_value(st_val, now_ms, 0)?;
+            let (applied, actions) = node.update_media_sync(incoming, now_ms);
+            let actions_json = actions_to_json_array(&actions);
+            let status = node.status_json();
+            let mut state_json = String::with_capacity(320);
+            applied.write_json(&mut state_json, now_ms);
+            Ok(format!(
+                "{{\"ok\":true,\"state\":{state_json},\"actions\":{actions_json},\"status\":{status}}}"
+            ))
+        }
+        "get_media_sync" => {
+            let node = require_node(state)?;
+            let now_ms = val.get_u64("nowMs").unwrap_or(0);
+            let states = node.media_states_json(now_ms);
+            Ok(format!("{{\"ok\":true,\"states\":{states}}}"))
         }
         "get_log_delta" => {
             let node = require_node(state)?;

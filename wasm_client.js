@@ -27,6 +27,8 @@ const OP_WORKER_SEAL_FORWARD = 20;
 const OP_STREAM_EXEC_WORKER_SEAL_FORWARD = 21;
 const OP_GET_COUNTERS = 22;
 const OP_SHA256 = 23;
+const OP_PARSE_GIF_TIMINGS = 24;
+const OP_STREAM_EXEC_PARSE_GIF_TIMINGS = 25;
 
 const STATUS_OK = 1;
 const EXPECTED_BUF_CAP = 262144;
@@ -1003,6 +1005,92 @@ export class SafeRustWasmMesh {
       headerObj,
       sealedCtBytes
     );
+  }
+
+  /**
+   * Parses GIF87a/GIF89a logical dimensions and exact per-frame display delays (ms) in Safe Rust WASM
+   * without decoding pixels, returning `{ width, height, totalDurationMs, frameCount, delaysMs, cumulativeMs }`.
+   */
+  parseGifTimings(gifBytes) {
+    const bytes = gifBytes instanceof Uint8Array ? gifBytes : new Uint8Array(gifBytes || 0);
+    if (bytes.length < 13) return null;
+    let hdr;
+    if (bytes.length <= this.bufCap) {
+      this._ensureViews();
+      this._inU8.set(bytes, 0);
+      hdr = this._invoke(OP_PARSE_GIF_TIMINGS, bytes.length);
+    } else {
+      let offset = 0;
+      while (offset < bytes.length) {
+        const end = Math.min(offset + this.bufCap, bytes.length);
+        const slice = bytes.subarray(offset, end);
+        this._ensureViews();
+        this._inU8.set(slice, 0);
+        hdr = this._invoke(OP_STREAM_APPEND, slice.length);
+        if (hdr[8] !== STATUS_OK) {
+          return null;
+        }
+        offset = end;
+      }
+      hdr = this._invoke(OP_STREAM_EXEC_PARSE_GIF_TIMINGS, 0);
+    }
+    const outLen = hdr[7];
+    if (hdr[8] !== STATUS_OK || outLen < 12) {
+      return null;
+    }
+    this._ensureViews();
+    const outBytes = this._outU8;
+    const width = outBytes[0] | (outBytes[1] << 8);
+    const height = outBytes[2] | (outBytes[3] << 8);
+    const totalDurationMs =
+      (outBytes[4] | (outBytes[5] << 8) | (outBytes[6] << 16) | (outBytes[7] << 24)) >>> 0;
+    const frameCount =
+      (outBytes[8] | (outBytes[9] << 8) | (outBytes[10] << 16) | (outBytes[11] << 24)) >>> 0;
+    if (12 + frameCount * 4 > outLen) {
+      return null;
+    }
+    const delaysMs = new Uint32Array(frameCount);
+    const cumulativeMs = new Uint32Array(frameCount);
+    let acc = 0;
+    let off = 12;
+    for (let i = 0; i < frameCount; i++) {
+      const d =
+        (outBytes[off] | (outBytes[off + 1] << 8) | (outBytes[off + 2] << 16) | (outBytes[off + 3] << 24)) >>>
+        0;
+      delaysMs[i] = d;
+      acc += d;
+      cumulativeMs[i] = acc;
+      off += 4;
+    }
+    return {
+      width,
+      height,
+      totalDurationMs,
+      frameCount,
+      delaysMs,
+      cumulativeMs,
+    };
+  }
+
+  /**
+   * Publishes a synchronized media state update (video, GIF, or Watch Together) across the E2EE mesh.
+   */
+  mediaSyncUpdate(state, nowMs = Date.now()) {
+    return this.call({
+      cmd: "media_sync_update",
+      state,
+      nowMs,
+    });
+  }
+
+  /**
+   * Fetches all tracked room media sync states with positions projected to `nowMs`.
+   */
+  getMediaSync(nowMs = Date.now()) {
+    return this.call({
+      cmd: "get_media_sync",
+      nowMs,
+    });
   }
 
   rehandshake() {

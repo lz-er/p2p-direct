@@ -1769,4 +1769,183 @@ fn mesh_binary_counters_and_48k_dsp_fast_path_consistency() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn gif_timings_parser_and_frame_index_lookup() -> TestResult {
+    use p2p_direct::media::parse_gif_timings;
+
+    // Minimal valid 3-frame GIF89a with delays: 0 cs (-> 100ms), 6 cs (60ms), 25 cs (250ms)
+    let mut gif = Vec::new();
+    gif.extend_from_slice(b"GIF89a");
+    gif.extend_from_slice(&16u16.to_le_bytes()); // width
+    gif.extend_from_slice(&12u16.to_le_bytes()); // height
+    gif.push(0x80); // GCT present, 2 colors (6 bytes)
+    gif.push(0); // bg
+    gif.push(0); // aspect
+    gif.extend_from_slice(&[0, 0, 0, 255, 255, 255]); // 2-entry GCT
+
+    let delays_cs: [u16; 3] = [0, 6, 25];
+    for &cs in &delays_cs {
+        // Graphic Control Extension
+        gif.extend_from_slice(&[0x21, 0xF9, 0x04, 0x00]);
+        gif.extend_from_slice(&cs.to_le_bytes());
+        gif.extend_from_slice(&[0x00, 0x00]);
+        // Image Descriptor (no LCT) + dummy 1-byte LZW block
+        gif.push(0x2C);
+        gif.extend_from_slice(&[0, 0, 0, 0, 16, 0, 12, 0, 0]);
+        gif.extend_from_slice(&[0x02, 0x02, 0x4C, 0x01, 0x00]);
+    }
+    gif.push(0x3B); // Trailer
+
+    let timings = parse_gif_timings(&gif)?;
+    assert_eq!(timings.width, 16);
+    assert_eq!(timings.height, 12);
+    assert_eq!(timings.frame_delays_ms, vec![100, 60, 250]);
+    assert_eq!(timings.cumulative_ms, vec![100, 160, 410]);
+    assert_eq!(timings.total_duration_ms, 410);
+
+    assert_eq!(timings.frame_index_at(0), 0);
+    assert_eq!(timings.frame_index_at(99), 0);
+    assert_eq!(timings.frame_index_at(100), 1);
+    assert_eq!(timings.frame_index_at(159), 1);
+    assert_eq!(timings.frame_index_at(160), 2);
+    assert_eq!(timings.frame_index_at(409), 2);
+    assert_eq!(timings.frame_index_at(410), 0); // wraps modulo 410ms
+    assert_eq!(timings.frame_index_at(410 + 120), 1);
+    Ok(())
+}
+
+#[test]
+fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> TestResult {
+    use p2p_direct::media::{MediaSyncState, WatchQueueItem};
+    use p2p_direct::mesh::MeshAction;
+
+    let mesh_key = [0x5Au8; 32];
+    let sk_a = [0x11u8; 32];
+    let sk_b = [0x22u8; 32];
+    let sk_c = [0x33u8; 32];
+    let pk_a = x25519_public_key(&sk_a);
+    let pk_b = x25519_public_key(&sk_b);
+    let pk_c = x25519_public_key(&sk_c);
+
+    let mut a = MeshNode::new("alice".into(), "Alice".into(), "R".into(), sk_a, mesh_key, &[1; 16], MeshConfig::default());
+    let mut b = MeshNode::new("bob".into(), "Bob".into(), "R".into(), sk_b, mesh_key, &[2; 16], MeshConfig::default());
+    let mut c = MeshNode::new("carol".into(), "Carol".into(), "R".into(), sk_c, mesh_key, &[3; 16], MeshConfig::default());
+
+    // Connect Alice <-> Bob; deliberately give Bob a clock 10 HOURS behind Alice!
+    let t_a0: u64 = 1_700_000_000_000;
+    let t_b0: u64 = t_a0 - 36_000_000; // 10 hours skewed!
+    let t_c0: u64 = t_a0 + 72_000_000; // 20 hours ahead!
+
+    let deliver = |src_id: &str, acts: Vec<MeshAction>, dst: &mut MeshNode, now: u64| -> Result<Vec<MeshAction>, String> {
+        let mut out = Vec::new();
+        for act in acts {
+            if let MeshAction::SendWire { peer_id, frame } = act
+                && peer_id == dst.peer_id()
+            {
+                out.extend(dst.on_wire_message(src_id, &frame, now)?);
+            }
+        }
+        Ok(out)
+    };
+
+    let a_conn = a.on_peer_connected("bob".into(), "Bob".into(), pk_b, false, None)?;
+    let b_conn = b.on_peer_connected("alice".into(), "Alice".into(), pk_a, false, None)?;
+    let _ = deliver("alice", a_conn, &mut b, t_b0)?;
+    let _ = deliver("bob", b_conn, &mut a, t_a0)?;
+
+    // Measure RTT = 40ms via Ping/Pong (one-way = 20ms)
+    let ping_acts = a.send_keepalive_pings(t_a0);
+    let pong_acts = deliver("alice", ping_acts, &mut b, t_b0 + 20)?;
+    let _ = deliver("bob", pong_acts, &mut a, t_a0 + 40)?;
+    let ping_b = b.send_keepalive_pings(t_b0 + 50);
+    let pong_a = deliver("bob", ping_b, &mut a, t_a0 + 70)?;
+    let _ = deliver("alice", pong_a, &mut b, t_b0 + 90)?;
+
+    // Alice starts a Watch Together YouTube video at 10.0s playing at 1.0x
+    let watch_init = MediaSyncState {
+        target_id: "watch".into(),
+        kind: "watch".into(),
+        rev: 0,
+        actor: String::new(),
+        actor_name: String::new(),
+        active: true,
+        playing: true,
+        position_ms: 10_000,
+        rate_milli: 1000,
+        loop_enabled: false,
+        epoch: 1,
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        provider: "youtube".into(),
+        media_id: "dQw4w9WgXcQ".into(),
+        title: "Demo".into(),
+        source_msg_id: "msg-1".into(),
+        queue: vec![WatchQueueItem {
+            id: "q1".into(),
+            url: "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT".into(),
+            provider: "spotify".into(),
+            media_id: "spotify:track:4cOdK2wGLETKBW3PvgPWqT".into(),
+            title: "Track".into(),
+            added_by: "Alice".into(),
+            start_ms: 0,
+        }],
+        anchor_local_ms: t_a0 + 100,
+    };
+    let (_, watch_acts) = a.update_media_sync(watch_init, t_a0 + 100);
+    let b_rx = deliver("alice", watch_acts, &mut b, t_b0 + 120)?;
+    assert!(b_rx.iter().any(|act| matches!(act, MeshAction::MediaSync { state } if state.target_id == "watch")));
+
+    // Despite 10-hour clock skew, Bob's projected position is 10_000 + 20ms one-way RTT = 10_020ms!
+    let b_watch = b.media_states().get("watch").ok_or("missing watch on Bob")?;
+    assert_eq!(b_watch.projected_position_ms(t_b0 + 120), 10_020);
+    // 5 seconds later on Bob's skewed clock, Bob is at 15_020ms!
+    assert_eq!(b_watch.projected_position_ms(t_b0 + 5_120), 15_020);
+
+    // Late joiner Carol connects to Bob 5 seconds later (with a clock 20 hours ahead!)
+    let b_c = b.on_peer_connected("carol".into(), "Carol".into(), pk_c, false, None)?;
+    let c_b = c.on_peer_connected("bob".into(), "Bob".into(), pk_b, false, None)?;
+    let _ = deliver("bob", b_c, &mut c, t_c0 + 5_120)?;
+    // When Bob receives Carol's Hello, Bob sends projected MediaSync at t_b0 + 5_120 (= 15_020ms)!
+    let bob_hello_reply = deliver("carol", c_b, &mut b, t_b0 + 5_120)?;
+    let _ = deliver("bob", bob_hello_reply, &mut c, t_c0 + 5_140)?;
+    let c_watch = c.media_states().get("watch").ok_or("missing watch on late joiner Carol")?;
+    // Carol gets 15_020 + default 20ms one-way = 15_040ms (zero 20-hour skew error!)
+    assert_eq!(c_watch.projected_position_ms(t_c0 + 5_140), 15_040);
+    assert_eq!(c_watch.queue.len(), 1);
+
+    // Chat video sync state gets pruned automatically when its message is CRDT-deleted
+    let (chat_msg, pub_acts) = a.publish_local("chat".into(), parse_json(r#"{"text":"vid"}"#)?, t_a0 + 200, Some("m-vid-1".into()))?;
+    let _ = deliver("alice", pub_acts, &mut b, t_b0 + 220)?;
+    let vid_st = MediaSyncState {
+        target_id: format!("vid:{}:0", chat_msg.id),
+        kind: "video".into(),
+        rev: 0,
+        actor: String::new(),
+        actor_name: String::new(),
+        active: true,
+        playing: true,
+        position_ms: 0,
+        rate_milli: 1000,
+        loop_enabled: true,
+        epoch: 1,
+        url: String::new(),
+        provider: String::new(),
+        media_id: String::new(),
+        title: String::new(),
+        source_msg_id: chat_msg.id.clone(),
+        queue: Vec::new(),
+        anchor_local_ms: t_a0 + 250,
+    };
+    let (_, vid_acts) = a.update_media_sync(vid_st, t_a0 + 250);
+    let _ = deliver("alice", vid_acts, &mut b, t_b0 + 270)?;
+    assert!(a.media_states().contains_key("vid:m-vid-1:0"));
+    assert!(b.media_states().contains_key("vid:m-vid-1:0"));
+
+    let (_, del_acts) = a.delete_message("m-vid-1".into(), t_a0 + 300)?;
+    let _ = deliver("alice", del_acts, &mut b, t_b0 + 320)?;
+    assert!(!a.media_states().contains_key("vid:m-vid-1:0"));
+    assert!(!b.media_states().contains_key("vid:m-vid-1:0"));
+    Ok(())
+}
+
+
 

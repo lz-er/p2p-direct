@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod deflate;
 pub mod json;
 pub mod log;
+pub mod media;
 pub mod mesh;
 pub mod protocol;
 pub mod rpc;

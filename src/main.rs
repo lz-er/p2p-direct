@@ -7,6 +7,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use p2p_direct::crypto::sha256;
+use p2p_direct::media::parse_gif_timings;
 use p2p_direct::mesh::MeshNode;
 use p2p_direct::rpc::{
     dispatch_commit_bulk_publish, dispatch_commit_bulk_rx, dispatch_rpc, dispatch_wire_message,
@@ -40,6 +41,8 @@ const OP_WORKER_SEAL_FORWARD: u32 = 20;
 const OP_STREAM_EXEC_WORKER_SEAL_FORWARD: u32 = 21;
 const OP_GET_COUNTERS: u32 = 22;
 const OP_SHA256: u32 = 23;
+const OP_PARSE_GIF_TIMINGS: u32 = 24;
+const OP_STREAM_EXEC_PARSE_GIF_TIMINGS: u32 = 25;
 
 const STATUS_OK: u32 = 1;
 const STATUS_ERR: u32 = 2;
@@ -666,6 +669,38 @@ fn main() {
                     read_in_buf_into(&mut rt.in_scratch, arg_len);
                     let digest = sha256(&rt.in_scratch);
                     publish_binary_out(hdr, &digest, true);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_PARSE_GIF_TIMINGS => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let rt = &mut *rt;
+                    read_in_buf_into(&mut rt.in_scratch, arg_len);
+                    if let Ok(timings) = parse_gif_timings(&rt.in_scratch) {
+                        timings.write_binary(&mut rt.out_scratch);
+                        publish_binary_out(hdr, &rt.out_scratch, true);
+                    } else {
+                        publish_binary_out(hdr, &[], false);
+                    }
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_STREAM_EXEC_PARSE_GIF_TIMINGS => {
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    let rt = &mut *rt;
+                    let data = std::mem::take(&mut rt.in_staging);
+                    if let Ok(timings) = parse_gif_timings(&data) {
+                        timings.write_binary(&mut rt.out_scratch);
+                        publish_binary_out(hdr, &rt.out_scratch, true);
+                    } else {
+                        publish_binary_out(hdr, &[], false);
+                    }
                 } else {
                     hdr.status.store(STATUS_ERR, Ordering::SeqCst);
                 }

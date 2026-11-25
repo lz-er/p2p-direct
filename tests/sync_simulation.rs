@@ -269,6 +269,7 @@ impl SimNetwork {
                 MeshAction::BotActionReceived { .. }
                 | MeshAction::AutoMeshAddIce { .. }
                 | MeshAction::LogUpdated { .. }
+                | MeshAction::MediaSync { .. }
                 | MeshAction::Telemetry { .. } => {}
             }
         }
