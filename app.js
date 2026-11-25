@@ -558,10 +558,17 @@ const METRO_TILE_THEMES = [
 
 const VOICE_EQ_WEIGHTS = [0.32, 0.54, 0.76, 0.92, 1.0, 1.0, 0.92, 0.76, 0.54, 0.32];
 const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+const SAFE_VIDEO_DATA_URL_RE = /^data:video\/(mp4|webm|ogg|quicktime);base64,[A-Za-z0-9+/=]+$/;
 const SAFE_HTTP_URL_RE = /^https?:\/\/[^\s<>"']+$/i;
 const URL_REGEX = /https?:\/\/[^\s<>"']+/gi;
-const MAX_IMAGES_PER_MESSAGE = 3;
-const MAX_TOTAL_IMAGE_DATA_CHARS = 60000;
+const MAX_MEDIA_PER_MESSAGE = 3;
+const MAX_STATIC_IMAGE_CHARS = 54000;
+const MAX_GIF_RAW_BYTES = 4 * 1024 * 1024;
+const MAX_VIDEO_RAW_BYTES = 8 * 1024 * 1024;
+const MAX_TOTAL_MEDIA_BYTES = 10 * 1024 * 1024;
+const DC_CHUNK_THRESHOLD = 48000;
+const DC_CHUNK_SIZE = 32768;
+const DC_CHUNK_MAX_PARTS = 1024;
 
 const SPEAK_STAR_SVG =
   '<svg class="speak-star" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="12,1 14.8,8.2 22,5 16.8,12 22,19 14.8,15.8 12,23 9.2,15.8 2,19 7.2,12 2,5 9.2,8.2"/></svg>';
@@ -829,6 +836,9 @@ async function compressImageFile(file, maxChars = 54000) {
     }
     best = {
       id: randomId("img"),
+      kind: "image",
+      animated: false,
+      mime: dataUrl.startsWith("data:image/webp") ? "image/webp" : "image/jpeg",
       dataUrl,
       width: w,
       height: h,
@@ -840,6 +850,239 @@ async function compressImageFile(file, maxChars = 54000) {
     }
   }
   return best;
+}
+
+const EXT_TO_MEDIA_MIME = Object.freeze({
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  webm: "video/webm",
+  ogv: "video/ogg",
+  ogg: "video/ogg",
+  mov: "video/quicktime",
+});
+
+const SUPPORTED_MEDIA_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/webp",
+  "image/gif",
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+  "video/quicktime",
+]);
+
+function inferMediaMime(file) {
+  if (!file) return null;
+  const rawType = String(file.type || "").split(";")[0].trim().toLowerCase();
+  if (rawType === "image/jpg") return "image/jpeg";
+  if (SUPPORTED_MEDIA_MIMES.has(rawType)) return rawType;
+  const name = String(file.name || "").trim().toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot >= 0) {
+    const ext = name.slice(dot + 1);
+    if (EXT_TO_MEDIA_MIME[ext]) return EXT_TO_MEDIA_MIME[ext];
+  }
+  return null;
+}
+
+function isAnimatedWebpBytes(bytes) {
+  if (!bytes || bytes.length < 24) return false;
+  // RIFF....WEBP containing VP8X animation flag or ANIM chunk in header
+  if (
+    bytes[0] !== 0x52 ||
+    bytes[1] !== 0x49 ||
+    bytes[2] !== 0x46 ||
+    bytes[3] !== 0x46 ||
+    bytes[8] !== 0x57 ||
+    bytes[9] !== 0x45 ||
+    bytes[10] !== 0x42 ||
+    bytes[11] !== 0x50
+  ) {
+    return false;
+  }
+  for (let i = 12; i + 4 <= bytes.length; i++) {
+    if (bytes[i] === 0x41 && bytes[i + 1] === 0x4e && bytes[i + 2] === 0x49 && bytes[i + 3] === 0x4d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function fileToDataUrl(file, forcedMime) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      let res = typeof reader.result === "string" ? reader.result : "";
+      const comma = res.indexOf(",");
+      if (comma < 0) {
+        reject(new Error("Failed to read file bytes"));
+        return;
+      }
+      if (forcedMime) {
+        const b64 = res.slice(comma + 1);
+        res = `data:${forcedMime};base64,${b64}`;
+      }
+      resolve(res);
+    };
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function dataUrlToBlob(dataUrl) {
+  if (typeof dataUrl !== "string") return null;
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) return null;
+  const header = dataUrl.slice(0, comma);
+  const mimeMatch = /^data:([^;,]+);base64$/i.exec(header);
+  if (!mimeMatch) return null;
+  try {
+    const b64 = dataUrl.slice(comma + 1);
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeMatch[1] });
+  } catch {
+    return null;
+  }
+}
+
+function probeVideoMetadata(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.muted = true;
+    video.playsInline = true;
+    let done = false;
+    const finish = (meta) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      try {
+        video.removeAttribute("src");
+        video.load();
+      } catch {
+        // ignore
+      }
+      URL.revokeObjectURL(url);
+      resolve(meta);
+    };
+    const timer = setTimeout(() => finish({ width: 0, height: 0, duration: 0 }), 3000);
+    video.onloadedmetadata = () => {
+      const dur = Number.isFinite(video.duration) && video.duration > 0 ? Math.round(video.duration * 10) / 10 : 0;
+      finish({
+        width: video.videoWidth || 0,
+        height: video.videoHeight || 0,
+        duration: dur,
+      });
+    };
+    video.onerror = () => finish({ width: 0, height: 0, duration: 0 });
+    video.src = url;
+  });
+}
+
+function formatMediaDuration(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  const mins = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${mins}:${String(rem).padStart(2, "0")}`;
+}
+
+async function prepareMediaFile(file, mime, remainingBytes) {
+  if (mime.startsWith("video/")) {
+    if (file.size > MAX_VIDEO_RAW_BYTES) {
+      throw new Error(
+        `Video is ${formatByteSize(file.size)} (max ${formatByteSize(MAX_VIDEO_RAW_BYTES)})`
+      );
+    }
+    if (file.size > remainingBytes) {
+      throw new Error("Exceeds 10 MB per-message attachment limit — send staged media first");
+    }
+    const [dataUrl, meta] = await Promise.all([
+      fileToDataUrl(file, mime),
+      probeVideoMetadata(file),
+    ]);
+    if (!SAFE_VIDEO_DATA_URL_RE.test(dataUrl)) {
+      throw new Error("Unsupported video encoding");
+    }
+    return {
+      id: randomId("vid"),
+      kind: "video",
+      animated: true,
+      mime,
+      dataUrl,
+      previewUrl: URL.createObjectURL(file),
+      width: meta.width,
+      height: meta.height,
+      duration: meta.duration,
+      name: file.name || `clip.${mime.split("/")[1] || "mp4"}`,
+      bytes: file.size || Math.round((dataUrl.length * 3) / 4),
+    };
+  }
+
+  let preserveAnimated = mime === "image/gif";
+  if (!preserveAnimated && mime === "image/webp" && typeof file.slice === "function") {
+    try {
+      const head = new Uint8Array(await file.slice(0, 128).arrayBuffer());
+      preserveAnimated = isAnimatedWebpBytes(head);
+    } catch {
+      preserveAnimated = false;
+    }
+  }
+
+  if (preserveAnimated) {
+    if (file.size > MAX_GIF_RAW_BYTES) {
+      throw new Error(
+        `Animated GIF/WebP is ${formatByteSize(file.size)} (max ${formatByteSize(MAX_GIF_RAW_BYTES)})`
+      );
+    }
+    if (file.size > remainingBytes) {
+      throw new Error("Exceeds 10 MB per-message attachment limit — send staged media first");
+    }
+    const dataUrl = await fileToDataUrl(file, mime);
+    if (!SAFE_IMAGE_DATA_URL_RE.test(dataUrl)) {
+      throw new Error("Unsupported animated image encoding");
+    }
+    let width = 0;
+    let height = 0;
+    try {
+      const img = await loadImageFromFile(file);
+      width = img.naturalWidth || img.width || 0;
+      height = img.naturalHeight || img.height || 0;
+    } catch {
+      // keep dimensions 0 if probe fails
+    }
+    return {
+      id: randomId("gif"),
+      kind: "gif",
+      animated: true,
+      mime,
+      dataUrl,
+      width,
+      height,
+      name: file.name || "animated.gif",
+      bytes: file.size || Math.round((dataUrl.length * 3) / 4),
+    };
+  }
+
+  const charBudget = Math.min(MAX_STATIC_IMAGE_CHARS, Math.floor((remainingBytes * 4) / 3));
+  const compressed = await compressImageFile(file, Math.max(12000, charBudget));
+  if (!SAFE_IMAGE_DATA_URL_RE.test(compressed.dataUrl)) {
+    throw new Error("Unsupported image encoding");
+  }
+  return compressed;
 }
 
 function formatTime(tsMs) {
@@ -925,6 +1168,9 @@ class P2PDirectApp {
     this.rawJsonMode = false;
     this.composerMode = "chat";
     this.pendingImages = [];
+    this.mediaBlobRegistry = new Map(); // msgId -> Set<blobUrl>
+    this.lightboxState = null; // { kind, blob, dataUrl, tempUrl }
+    this.dcChunkSeq = 0;
     this.telemetry = [];
     this.toastTimer = null;
 
@@ -1231,6 +1477,7 @@ class P2PDirectApp {
       "btn-turn-test",
       "turn-test-status",
       "chat-panel",
+      "chat-drop-overlay",
       "chat-composer-dropzone",
       "chat-image-tray",
       "chat-image-input",
@@ -1254,6 +1501,11 @@ class P2PDirectApp {
       "image-lightbox",
       "btn-lightbox-close",
       "lightbox-img",
+      "lightbox-video",
+      "lightbox-toolbar",
+      "btn-lightbox-replay",
+      "btn-lightbox-loop",
+      "lightbox-meta",
       "toast",
     ];
     for (const id of ids) {
@@ -1623,106 +1875,224 @@ class P2PDirectApp {
     // Theme toggle
     this.el["btn-theme-toggle"].addEventListener("click", () => this.toggleTheme());
 
-    // Image attach, paste, and drag-and-drop into chat
+    // Media attach (images, animated GIFs, videos), paste, and drag-and-drop into chat
     this.el["btn-attach-image"].addEventListener("click", () => {
       this.el["chat-image-input"].click();
     });
     this.el["chat-image-input"].addEventListener("change", async (ev) => {
-      const files = Array.from(ev.target.files || []).filter((f) => f.type.startsWith("image/"));
+      const files = Array.from(ev.target.files || []);
       this.el["chat-image-input"].value = "";
       if (files.length > 0) {
         await this.addPendingImageFiles(files);
       }
     });
 
-    const handleImagePaste = async (ev) => {
+    const handleMediaPaste = async (ev) => {
       const cd = ev.clipboardData;
       if (!cd) return;
-      const imageFiles = [];
+      const mediaFiles = [];
       if (cd.items) {
         for (const item of cd.items) {
-          if (item.kind === "file" && item.type.startsWith("image/")) {
+          if (item.kind === "file") {
             const f = item.getAsFile();
-            if (f) imageFiles.push(f);
+            if (f && inferMediaMime(f)) mediaFiles.push(f);
           }
         }
       }
-      if (imageFiles.length === 0 && cd.files) {
+      if (mediaFiles.length === 0 && cd.files) {
         for (const f of cd.files) {
-          if (f.type.startsWith("image/")) {
-            imageFiles.push(f);
+          if (inferMediaMime(f)) {
+            mediaFiles.push(f);
           }
         }
       }
-      if (imageFiles.length > 0) {
+      if (mediaFiles.length > 0) {
         ev.preventDefault();
         if (this.composerMode !== "chat") {
           this.switchComposerMode("chat");
         }
-        await this.addPendingImageFiles(imageFiles);
+        await this.addPendingImageFiles(mediaFiles);
       }
     };
 
-    this.el["chat-text-input"].addEventListener("paste", handleImagePaste);
+    this.el["chat-text-input"].addEventListener("paste", handleMediaPaste);
     document.addEventListener("paste", (ev) => {
       if (ev.defaultPrevented || ev.target === this.el["chat-text-input"]) return;
       const active = document.activeElement;
       if (active === this.el["chat-text-input"]) return;
       if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
-      handleImagePaste(ev);
+      handleMediaPaste(ev);
     });
 
     const chatPanel = this.el["chat-panel"];
     const dropzone = this.el["chat-composer-dropzone"];
-    chatPanel.addEventListener("dragover", (ev) => {
-      if (ev.dataTransfer?.types && Array.from(ev.dataTransfer.types).includes("Files")) {
+    const dropOverlay = this.el["chat-drop-overlay"];
+    let dragDepth = 0;
+
+    const isFileDrag = (dt) => {
+      if (!dt) return false;
+      const types = dt.types ? Array.from(dt.types) : [];
+      return types.includes("Files") || (dt.files && dt.files.length > 0);
+    };
+    const isChatVisible = () =>
+      Boolean(this.activeRoom || this.advancedMode) &&
+      chatPanel &&
+      !chatPanel.closest(".hidden");
+
+    const setDropHighlight = (active) => {
+      dropzone.classList.toggle("drag-over", active);
+      if (dropOverlay) {
+        dropOverlay.classList.toggle("hidden", !active);
+      }
+    };
+
+    const handleDroppedDataTransfer = async (dt) => {
+      const rawFiles = Array.from(dt?.files || []);
+      if (rawFiles.length > 0) {
+        if (this.composerMode !== "chat") {
+          this.switchComposerMode("chat");
+        }
+        await this.addPendingImageFiles(rawFiles);
+        return true;
+      }
+      const droppedUri = (dt?.getData("text/uri-list") || dt?.getData("text/plain") || "").trim();
+      const firstLine = droppedUri.split(/\r?\n/).find((l) => l && !l.startsWith("#")) || "";
+      if (SAFE_HTTP_URL_RE.test(firstLine)) {
+        if (this.composerMode !== "chat") {
+          this.switchComposerMode("chat");
+        }
+        const cur = this.el["chat-text-input"].value;
+        this.el["chat-text-input"].value = cur ? `${cur} ${firstLine}` : firstLine;
+        this.el["chat-text-input"].focus();
+        return true;
+      }
+      return false;
+    };
+
+    // Full-window drag/drop guard while in a room so dropping a GIF/video anywhere never navigates away
+    window.addEventListener("dragenter", (ev) => {
+      if (!isChatVisible() || !isFileDrag(ev.dataTransfer)) return;
+      ev.preventDefault();
+      dragDepth += 1;
+      setDropHighlight(true);
+    });
+    window.addEventListener("dragover", (ev) => {
+      if (!isChatVisible() || !isFileDrag(ev.dataTransfer)) return;
+      ev.preventDefault();
+      if (ev.dataTransfer) {
+        ev.dataTransfer.dropEffect = "copy";
+      }
+      setDropHighlight(true);
+    });
+    window.addEventListener("dragleave", () => {
+      if (dragDepth > 0) {
+        dragDepth -= 1;
+      }
+      if (dragDepth === 0) {
+        setDropHighlight(false);
+      }
+    });
+    window.addEventListener("drop", async (ev) => {
+      dragDepth = 0;
+      setDropHighlight(false);
+      if (ev.defaultPrevented || !isChatVisible()) return;
+      if (isFileDrag(ev.dataTransfer)) {
         ev.preventDefault();
-        dropzone.classList.add("drag-over");
+        await handleDroppedDataTransfer(ev.dataTransfer);
+      }
+    });
+    window.addEventListener("blur", () => {
+      dragDepth = 0;
+      setDropHighlight(false);
+    });
+
+    // Also allow dropping directly onto #chat-panel even when synthesized in automated tests
+    chatPanel.addEventListener("dragover", (ev) => {
+      if (isFileDrag(ev.dataTransfer)) {
+        ev.preventDefault();
+        setDropHighlight(true);
       }
     });
     chatPanel.addEventListener("dragleave", (ev) => {
       if (!chatPanel.contains(ev.relatedTarget)) {
-        dropzone.classList.remove("drag-over");
+        dragDepth = 0;
+        setDropHighlight(false);
       }
     });
     chatPanel.addEventListener("drop", async (ev) => {
-      dropzone.classList.remove("drag-over");
-      const files = Array.from(ev.dataTransfer?.files || []).filter((f) =>
-        f.type.startsWith("image/")
-      );
-      if (files.length > 0) {
+      dragDepth = 0;
+      setDropHighlight(false);
+      if (ev.defaultPrevented) return;
+      if (isFileDrag(ev.dataTransfer) || (ev.dataTransfer?.types && Array.from(ev.dataTransfer.types).includes("text/uri-list"))) {
         ev.preventDefault();
-        if (this.composerMode !== "chat") {
-          this.switchComposerMode("chat");
-        }
-        await this.addPendingImageFiles(files);
+        await handleDroppedDataTransfer(ev.dataTransfer);
       }
     });
 
-    // Image lightbox controls
+    // Media lightbox controls (Images, GIFs & Videos)
     this.el["btn-lightbox-close"].addEventListener("click", () => this.closeLightbox());
+    if (this.el["btn-lightbox-replay"]) {
+      this.el["btn-lightbox-replay"].addEventListener("click", () => this.replayLightbox());
+    }
+    if (this.el["btn-lightbox-loop"]) {
+      this.el["btn-lightbox-loop"].addEventListener("click", () => this.toggleLightboxLoop());
+    }
     this.el["image-lightbox"].addEventListener("click", (ev) => {
       if (ev.target === this.el["image-lightbox"]) {
         this.closeLightbox();
       }
     });
     document.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape" && !this.el["image-lightbox"].classList.contains("hidden")) {
+      if (this.el["image-lightbox"].classList.contains("hidden")) return;
+      if (ev.key === "Escape") {
         this.closeLightbox();
+      } else if ((ev.key === "r" || ev.key === "R") && (this.lightboxState?.kind === "gif" || this.lightboxState?.kind === "video")) {
+        ev.preventDefault();
+        this.replayLightbox();
+      } else if (ev.key === " " && this.lightboxState?.kind === "video") {
+        ev.preventDefault();
+        const vid = this.el["lightbox-video"];
+        if (vid.paused) {
+          const p = vid.play();
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        } else {
+          vid.pause();
+        }
       }
     });
 
     this.el["chat-composer-form"].addEventListener("submit", (ev) => {
       ev.preventDefault();
       const text = this.el["chat-text-input"].value.trim();
-      const images = this.pendingImages.map(({ dataUrl, width, height, name }) => ({
-        dataUrl,
-        width,
-        height,
-        name,
-      }));
-      if (!text && images.length === 0) return;
-      const payload = images.length > 0 ? { text, images } : { text };
+      const images = [];
+      const videos = [];
+      for (const item of this.pendingImages) {
+        if (item.kind === "video") {
+          videos.push({
+            dataUrl: item.dataUrl,
+            width: item.width,
+            height: item.height,
+            duration: item.duration || 0,
+            name: item.name,
+            mime: item.mime,
+            bytes: item.bytes,
+          });
+        } else {
+          images.push({
+            dataUrl: item.dataUrl,
+            width: item.width,
+            height: item.height,
+            name: item.name,
+            animated: Boolean(item.animated || item.kind === "gif"),
+            bytes: item.bytes,
+          });
+        }
+        this._revokePendingPreviewUrl(item);
+      }
+      if (!text && images.length === 0 && videos.length === 0) return;
+      const payload = { text };
+      if (images.length > 0) payload.images = images;
+      if (videos.length > 0) payload.videos = videos;
       this.publishMessage("chat", payload);
       this.el["chat-text-input"].value = "";
       this.pendingImages = [];
@@ -2350,33 +2720,59 @@ class P2PDirectApp {
 
   async addPendingImageFiles(files) {
     this.el["composer-error"].classList.add("hidden");
-    for (const file of files) {
-      if (this.pendingImages.length >= MAX_IMAGES_PER_MESSAGE) {
-        this.showComposerError(`Up to ${MAX_IMAGES_PER_MESSAGE} images per message.`);
+    const list = Array.from(files || []);
+    let addedAny = false;
+    let skippedUnsupported = 0;
+
+    for (const file of list) {
+      const mime = inferMediaMime(file);
+      if (!mime) {
+        skippedUnsupported += 1;
+        continue;
+      }
+      if (this.pendingImages.length >= MAX_MEDIA_PER_MESSAGE) {
+        this.showComposerError(`Up to ${MAX_MEDIA_PER_MESSAGE} attachments per message.`);
         break;
       }
-      const usedChars = this.pendingImages.reduce((sum, img) => sum + img.dataUrl.length, 0);
-      const remainingChars = MAX_TOTAL_IMAGE_DATA_CHARS - usedChars;
-      if (remainingChars < 8000) {
-        this.showComposerError("Image attachment budget reached for this message — send it first.");
+      const usedBytes = this.pendingImages.reduce((sum, item) => sum + (item.bytes || 0), 0);
+      const remainingBytes = MAX_TOTAL_MEDIA_BYTES - usedBytes;
+      if (remainingBytes < 16_384) {
+        this.showComposerError("Attachment size budget (10 MB) reached for this message — send it first.");
         break;
       }
       try {
-        const budget = Math.min(54000, remainingChars);
-        const compressed = await compressImageFile(file, budget);
-        if (!SAFE_IMAGE_DATA_URL_RE.test(compressed.dataUrl)) {
-          throw new Error("Unsupported image encoding");
-        }
-        this.pendingImages.push(compressed);
+        const prepared = await prepareMediaFile(file, mime, remainingBytes);
+        this.pendingImages.push(prepared);
+        addedAny = true;
       } catch (err) {
-        this.showComposerError(`Could not attach image: ${err.message}`);
+        this.showComposerError(`Could not attach ${file.name || "file"}: ${err.message}`);
       }
     }
+
+    if (!addedAny && skippedUnsupported > 0) {
+      this.showComposerError(
+        "Unsupported file type — drop PNG, JPG, WebP, animated GIF (≤4 MB), or MP4/WebM/MOV/OGG video (≤8 MB)."
+      );
+    }
+
     this.renderImageTray();
     this.el["chat-text-input"].focus();
   }
 
+  _revokePendingPreviewUrl(item) {
+    if (item && item.previewUrl && item.previewUrl.startsWith("blob:")) {
+      try {
+        URL.revokeObjectURL(item.previewUrl);
+      } catch {
+        // ignore
+      }
+      item.previewUrl = null;
+    }
+  }
+
   removePendingImage(id) {
+    const target = this.pendingImages.find((img) => img.id === id);
+    if (target) this._revokePendingPreviewUrl(target);
     this.pendingImages = this.pendingImages.filter((img) => img.id !== id);
     this.renderImageTray();
   }
@@ -2391,34 +2787,208 @@ class P2PDirectApp {
     }
     tray.classList.remove("hidden");
     tray.innerHTML = this.pendingImages
-      .map(
-        (img) => `
-        <div class="staged-image-chip" data-staged-img="${escapeHtml(img.id)}">
-          <img src="${img.dataUrl}" alt="${escapeHtml(img.name)}" />
-          <div class="staged-image-meta">
-            <span class="staged-image-name">${escapeHtml(img.name)}</span>
-            <span>${img.width}×${img.height} · ${formatByteSize(img.bytes)}</span>
+      .map((item) => {
+        const isVideo = item.kind === "video";
+        const isGif = item.kind === "gif" || Boolean(item.animated);
+        const previewSrc = item.previewUrl || item.dataUrl;
+        const thumbHtml = isVideo
+          ? `<video src="${previewSrc}" muted playsinline preload="metadata"></video><span class="staged-media-tag is-video">VID</span>`
+          : `<img src="${previewSrc}" alt="${escapeHtml(item.name)}" />${isGif ? '<span class="staged-media-tag">GIF</span>' : ""}`;
+        const durPart =
+          isVideo && typeof item.duration === "number" && item.duration > 0
+            ? `${formatMediaDuration(item.duration)} · `
+            : "";
+        const dimsPart = item.width && item.height ? `${item.width}×${item.height} · ` : "";
+        return `
+          <div class="staged-image-chip" data-staged-img="${escapeHtml(item.id)}" data-media-kind="${escapeHtml(item.kind || "image")}">
+            <div class="staged-media-thumb-wrap">${thumbHtml}</div>
+            <div class="staged-image-meta">
+              <span class="staged-image-name">${escapeHtml(item.name)}</span>
+              <span>${durPart}${dimsPart}${formatByteSize(item.bytes)}</span>
+            </div>
+            <button type="button" class="staged-image-remove" data-remove-img="${escapeHtml(item.id)}" aria-label="Remove attachment">×</button>
           </div>
-          <button type="button" class="staged-image-remove" data-remove-img="${escapeHtml(img.id)}" aria-label="Remove image">×</button>
-        </div>
-      `
-      )
+        `;
+      })
       .join("");
     for (const btn of tray.querySelectorAll("[data-remove-img]")) {
       btn.addEventListener("click", () => this.removePendingImage(btn.dataset.removeImg));
     }
   }
 
-  openLightbox(src, alt) {
-    if (!SAFE_IMAGE_DATA_URL_RE.test(src)) return;
-    this.el["lightbox-img"].src = src;
-    this.el["lightbox-img"].alt = alt || "Shared image";
+  openLightbox(targetOrSrc, altFallback = "") {
+    let cfg;
+    if (typeof targetOrSrc === "string") {
+      if (!isSafeImageSrc(targetOrSrc)) return;
+      const isGif = targetOrSrc.startsWith("data:image/gif;");
+      cfg = {
+        kind: isGif ? "gif" : "image",
+        src: targetOrSrc,
+        blob: isGif ? dataUrlToBlob(targetOrSrc) : null,
+        dataUrl: targetOrSrc,
+        alt: altFallback || "Shared image",
+        meta: altFallback || "",
+        loop: false,
+      };
+    } else if (targetOrSrc && typeof targetOrSrc === "object") {
+      cfg = targetOrSrc;
+    } else {
+      return;
+    }
+
+    this._cleanupLightboxTempUrl();
+    const imgEl = this.el["lightbox-img"];
+    const videoEl = this.el["lightbox-video"];
+    const toolbar = this.el["lightbox-toolbar"];
+    const loopBtn = this.el["btn-lightbox-loop"];
+    const metaEl = this.el["lightbox-meta"];
+
+    if (cfg.kind === "video") {
+      let videoSrc = cfg.src || "";
+      let ownsUrl = false;
+      if (cfg.blob) {
+        videoSrc = URL.createObjectURL(cfg.blob);
+        ownsUrl = true;
+      } else if (!SAFE_VIDEO_DATA_URL_RE.test(videoSrc) && !videoSrc.startsWith("blob:")) {
+        return;
+      }
+      imgEl.classList.add("hidden");
+      imgEl.removeAttribute("src");
+      videoEl.classList.remove("hidden");
+      videoEl.loop = Boolean(cfg.loop);
+      videoEl.src = videoSrc;
+      videoEl.currentTime = 0;
+      const p = videoEl.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+      if (toolbar) toolbar.classList.remove("hidden");
+      if (loopBtn) {
+        loopBtn.classList.remove("hidden");
+        loopBtn.textContent = videoEl.loop ? "Loop: On" : "Loop: Off";
+        loopBtn.classList.toggle("is-active", videoEl.loop);
+      }
+      if (metaEl) metaEl.textContent = cfg.meta || cfg.alt || "Video";
+      this.lightboxState = {
+        kind: "video",
+        blob: cfg.blob || null,
+        dataUrl: cfg.dataUrl || "",
+        tempUrl: ownsUrl ? videoSrc : null,
+      };
+    } else if (cfg.kind === "gif") {
+      let gifSrc = cfg.src || "";
+      let ownsUrl = false;
+      if (cfg.blob) {
+        gifSrc = URL.createObjectURL(cfg.blob);
+        ownsUrl = true;
+      } else if (!isSafeImageSrc(gifSrc) && !gifSrc.startsWith("blob:")) {
+        return;
+      }
+      videoEl.pause();
+      videoEl.classList.add("hidden");
+      videoEl.removeAttribute("src");
+      imgEl.classList.remove("hidden");
+      imgEl.src = gifSrc;
+      imgEl.alt = cfg.alt || "Animated GIF";
+      if (toolbar) toolbar.classList.remove("hidden");
+      if (loopBtn) loopBtn.classList.add("hidden");
+      if (metaEl) metaEl.textContent = cfg.meta || cfg.alt || "Animated GIF";
+      this.lightboxState = {
+        kind: "gif",
+        blob: cfg.blob || null,
+        dataUrl: cfg.dataUrl || gifSrc,
+        tempUrl: ownsUrl ? gifSrc : null,
+      };
+    } else {
+      if (!isSafeImageSrc(cfg.src || "")) return;
+      videoEl.pause();
+      videoEl.classList.add("hidden");
+      videoEl.removeAttribute("src");
+      imgEl.classList.remove("hidden");
+      imgEl.src = cfg.src;
+      imgEl.alt = cfg.alt || "Shared image";
+      if (toolbar) toolbar.classList.add("hidden");
+      if (loopBtn) loopBtn.classList.add("hidden");
+      if (metaEl) metaEl.textContent = "";
+      this.lightboxState = { kind: "image", blob: null, dataUrl: cfg.src, tempUrl: null };
+    }
+
     this.el["image-lightbox"].classList.remove("hidden");
+  }
+
+  replayLightbox() {
+    const st = this.lightboxState;
+    if (!st) return;
+    const replayBtn = this.el["btn-lightbox-replay"];
+    if (st.kind === "video") {
+      const videoEl = this.el["lightbox-video"];
+      try {
+        videoEl.currentTime = 0;
+      } catch {
+        // ignore
+      }
+      const p = videoEl.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+      videoEl.dataset.replayCount = String((Number(videoEl.dataset.replayCount) || 0) + 1);
+    } else if (st.kind === "gif") {
+      const imgEl = this.el["lightbox-img"];
+      if (st.blob) {
+        const nextUrl = URL.createObjectURL(st.blob);
+        this._cleanupLightboxTempUrl();
+        st.tempUrl = nextUrl;
+        imgEl.src = nextUrl;
+      } else if (st.dataUrl) {
+        imgEl.src = "";
+        requestAnimationFrame(() => {
+          imgEl.src = st.dataUrl;
+        });
+      }
+      imgEl.dataset.replayCount = String((Number(imgEl.dataset.replayCount) || 0) + 1);
+    }
+    if (replayBtn) {
+      replayBtn.classList.add("is-active");
+      setTimeout(() => replayBtn.classList.remove("is-active"), 300);
+    }
+  }
+
+  toggleLightboxLoop() {
+    if (!this.lightboxState || this.lightboxState.kind !== "video") return;
+    const videoEl = this.el["lightbox-video"];
+    const loopBtn = this.el["btn-lightbox-loop"];
+    videoEl.loop = !videoEl.loop;
+    if (loopBtn) {
+      loopBtn.textContent = videoEl.loop ? "Loop: On" : "Loop: Off";
+      loopBtn.classList.toggle("is-active", videoEl.loop);
+    }
+  }
+
+  _cleanupLightboxTempUrl() {
+    if (this.lightboxState?.tempUrl && this.lightboxState.tempUrl.startsWith("blob:")) {
+      try {
+        URL.revokeObjectURL(this.lightboxState.tempUrl);
+      } catch {
+        // ignore
+      }
+      this.lightboxState.tempUrl = null;
+    }
   }
 
   closeLightbox() {
     this.el["image-lightbox"].classList.add("hidden");
     this.el["lightbox-img"].removeAttribute("src");
+    if (this.el["lightbox-video"]) {
+      try {
+        this.el["lightbox-video"].pause();
+      } catch {
+        // ignore
+      }
+      this.el["lightbox-video"].removeAttribute("src");
+      this.el["lightbox-video"].load();
+      this.el["lightbox-video"].classList.add("hidden");
+    }
+    if (this.el["lightbox-toolbar"]) {
+      this.el["lightbox-toolbar"].classList.add("hidden");
+    }
+    this._cleanupLightboxTempUrl();
+    this.lightboxState = null;
   }
 
   /* ================= Step-by-Step Connect Wizard Helpers ================= */
@@ -3630,6 +4200,12 @@ class P2PDirectApp {
 
   leaveLongLivedRoom() {
     this.stopPreCallMicMonitor();
+    this.closeLightbox();
+    for (const item of this.pendingImages) {
+      this._revokePendingPreviewUrl(item);
+    }
+    this.pendingImages = [];
+    this.renderImageTray();
     this.notifyRelayPeersClosing();
     if (this.roomRendezvous) {
       this.roomRendezvous.stop();
@@ -4100,6 +4676,39 @@ class P2PDirectApp {
       },
     };
 
+    const dfQueue = [];
+    let dfPumpTimer = null;
+    const pumpDfQueue = () => {
+      if (dfPumpTimer) {
+        clearTimeout(dfPumpTimer);
+        dfPumpTimer = null;
+      }
+      if (virtualDc.readyState !== "open" || !app.roomRendezvous || !app.activeRoom) {
+        dfQueue.length = 0;
+        return;
+      }
+      const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
+      let sentThisTick = 0;
+      while (dfQueue.length > 0 && sentThisTick < 4) {
+        const nextPkt = dfQueue[0];
+        const sent = app.roomRendezvous.publishBinary(nextPkt, {
+          preferredUrls,
+          maxBrokers: dfQueue.length > 6 ? 1 : 2,
+          queueIfOffline: dfQueue.length <= 4,
+        });
+        if (sent === 0 && dfQueue.length > 1) {
+          // Relay socket briefly congested — retry next tick without dropping chunks
+          dfPumpTimer = setTimeout(pumpDfQueue, 35);
+          return;
+        }
+        dfQueue.shift();
+        sentThisTick += 1;
+      }
+      if (dfQueue.length > 0) {
+        dfPumpTimer = setTimeout(pumpDfQueue, 20);
+      }
+    };
+
     const virtualDc = {
       label: "p2p-mesh",
       transport: "relay",
@@ -4119,18 +4728,30 @@ class P2PDirectApp {
           String(frameStr),
           RELAY_DATA_CHUNK_SIZE
         );
-        const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
-        for (const chunkPkt of chunks) {
-          app.roomRendezvous.publishBinary(chunkPkt, {
-            preferredUrls,
-            maxBrokers: 2,
-            queueIfOffline: true,
-          });
+        if (chunks.length <= 4 && dfQueue.length === 0) {
+          const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
+          for (const chunkPkt of chunks) {
+            app.roomRendezvous.publishBinary(chunkPkt, {
+              preferredUrls,
+              maxBrokers: 2,
+              queueIfOffline: true,
+            });
+          }
+          return;
         }
+        for (const chunkPkt of chunks) {
+          dfQueue.push(chunkPkt);
+        }
+        pumpDfQueue();
       },
       close(silentRemote = false) {
         if (this.readyState === "closed") return;
         this.readyState = "closed";
+        dfQueue.length = 0;
+        if (dfPumpTimer) {
+          clearTimeout(dfPumpTimer);
+          dfPumpTimer = null;
+        }
         const entry = app.directPeers.get(peerId);
         const superseded = Boolean(entry && entry.dc === this && entry.superseded);
         if (!silentRemote && !superseded && app.activeRoom && app.roomRendezvous && app.status) {
@@ -7058,7 +7679,28 @@ class P2PDirectApp {
       introducedBy,
       lastActivityMs: Date.now(),
       superseded: false,
+      dcSendQueue: [],
+      dcSendTimer: null,
+      dcChunkAssemblies: new Map(),
     };
+
+    const clearPeerSendQueue = () => {
+      if (peerEntry.dcSendTimer) {
+        clearTimeout(peerEntry.dcSendTimer);
+        peerEntry.dcSendTimer = null;
+      }
+      peerEntry.dcSendQueue.length = 0;
+      peerEntry.dcChunkAssemblies.clear();
+    };
+
+    if (transport === "direct" && dc && typeof dc === "object") {
+      try {
+        dc.bufferedAmountLowThreshold = 131072;
+        dc.onbufferedamountlow = () => this._pumpDirectSendQueue(peerEntry);
+      } catch {
+        // ignore if unsupported
+      }
+    }
 
     const handleOpen = () => {
       if (closed || peerEntry.superseded) return;
@@ -7095,6 +7737,12 @@ class P2PDirectApp {
           }
         }
         existing.superseded = true;
+        if (existing.dcSendTimer) {
+          clearTimeout(existing.dcSendTimer);
+          existing.dcSendTimer = null;
+        }
+        if (existing.dcSendQueue) existing.dcSendQueue.length = 0;
+        if (existing.dcChunkAssemblies) existing.dcChunkAssemblies.clear();
         try {
           existing.dc.onclose = null;
           existing.dc.onerror = null;
@@ -7166,7 +7814,7 @@ class P2PDirectApp {
                 const lt = local?.candidateType || "?";
                 const rt = remote?.candidateType || "?";
                 const proto = local?.protocol || "";
-                this._storeDirectPeerTech(peerId, local, remote, chosen);
+                this._storeDirectPeerTech(peerId, local, remote, pair);
                 const prefix = upgradingFromRelay
                   ? `Upgraded ${peerEntry.authorName} from E2EE Relay → Direct P2P`
                   : `WebRTC path to ${peerEntry.authorName}`;
@@ -7224,6 +7872,7 @@ class P2PDirectApp {
       if (closed) return;
       closed = true;
       clearDisconnectTimer();
+      clearPeerSendQueue();
       const current = this.directPeers.get(peerId);
       const isOwningPeer = Boolean(current && current.dc === dc);
       try {
@@ -7302,15 +7951,12 @@ class P2PDirectApp {
       }
     };
 
-    dc.onmessage = (ev) => {
-      if (typeof ev.data !== "string" || peerEntry.superseded) return;
-      peerEntry.lastActivityMs = Date.now();
-      this.recordTopologyPacket(peerId, "rx", "data", ev.data.length);
+    const deliverWireFrame = (frameStr) => {
       try {
         const res = this.wasm.call({
           cmd: "wire_message",
           fromPeer: peerId,
-          frame: ev.data,
+          frame: frameStr,
           nowMs: Date.now(),
         });
         this.status = res.status;
@@ -7324,6 +7970,53 @@ class P2PDirectApp {
         this.addTelemetry("error", `E2EE wire rejection from ${peerId}: ${err.message}`);
         this.renderStats();
       }
+    };
+
+    dc.onmessage = (ev) => {
+      if (typeof ev.data !== "string" || peerEntry.superseded) return;
+      peerEntry.lastActivityMs = Date.now();
+      this.recordTopologyPacket(peerId, "rx", "data", ev.data.length);
+
+      if (ev.data.startsWith('{"kind":"dc_chunk"')) {
+        try {
+          const ch = JSON.parse(ev.data);
+          if (
+            ch &&
+            ch.kind === "dc_chunk" &&
+            typeof ch.id === "number" &&
+            typeof ch.i === "number" &&
+            typeof ch.n === "number" &&
+            typeof ch.d === "string" &&
+            ch.n > 0 &&
+            ch.n <= DC_CHUNK_MAX_PARTS &&
+            ch.i >= 0 &&
+            ch.i < ch.n
+          ) {
+            let asm = peerEntry.dcChunkAssemblies.get(ch.id);
+            if (!asm) {
+              if (peerEntry.dcChunkAssemblies.size >= 16) {
+                const oldestKey = peerEntry.dcChunkAssemblies.keys().next().value;
+                if (oldestKey !== undefined) peerEntry.dcChunkAssemblies.delete(oldestKey);
+              }
+              asm = { n: ch.n, parts: new Array(ch.n), received: 0 };
+              peerEntry.dcChunkAssemblies.set(ch.id, asm);
+            }
+            if (asm.parts[ch.i] === undefined) {
+              asm.parts[ch.i] = ch.d;
+              asm.received += 1;
+            }
+            if (asm.received === asm.n) {
+              peerEntry.dcChunkAssemblies.delete(ch.id);
+              deliverWireFrame(asm.parts.join(""));
+            }
+            return;
+          }
+        } catch {
+          return;
+        }
+      }
+
+      deliverWireFrame(ev.data);
     };
 
     dc.onclose = handleClose;
@@ -7342,6 +8035,12 @@ class P2PDirectApp {
     const entry = this.directPeers.get(peerId);
     if (!entry) return;
     entry.superseded = true;
+    if (entry.dcSendTimer) {
+      clearTimeout(entry.dcSendTimer);
+      entry.dcSendTimer = null;
+    }
+    if (entry.dcSendQueue) entry.dcSendQueue.length = 0;
+    if (entry.dcChunkAssemblies) entry.dcChunkAssemblies.clear();
     this.directPeers.delete(peerId);
     const vdc = this.voiceChannels.get(peerId);
     if (vdc) {
@@ -7368,6 +8067,72 @@ class P2PDirectApp {
     this.showToast(`Disconnected from ${entry.authorName || peerId}`);
   }
 
+  _pumpDirectSendQueue(peer) {
+    if (!peer || peer.superseded || !peer.dc || peer.dc.readyState !== "open") {
+      if (peer?.dcSendTimer) {
+        clearTimeout(peer.dcSendTimer);
+        peer.dcSendTimer = null;
+      }
+      if (peer?.dcSendQueue) peer.dcSendQueue.length = 0;
+      return;
+    }
+    if (peer.dcSendTimer) {
+      clearTimeout(peer.dcSendTimer);
+      peer.dcSendTimer = null;
+    }
+    while (peer.dcSendQueue.length > 0) {
+      if ((peer.dc.bufferedAmount || 0) >= 524288) {
+        peer.dcSendTimer = setTimeout(() => this._pumpDirectSendQueue(peer), 15);
+        return;
+      }
+      const pkt = peer.dcSendQueue.shift();
+      try {
+        peer.dc.send(pkt);
+        this.recordTopologyPacket(peer.peerId, "tx", "data", pkt.length);
+      } catch (err) {
+        this.addTelemetry("error", `Send failed to ${peer.peerId}: ${err.message}`);
+        peer.dcSendQueue.length = 0;
+        return;
+      }
+    }
+  }
+
+  _sendWireFrameToPeer(peer, frameStr) {
+    if (!peer || !peer.dc || peer.dc.readyState !== "open") return;
+    if (peer.transport === "relay") {
+      try {
+        peer.dc.send(frameStr);
+        this.recordTopologyPacket(peer.peerId, "tx", "data", frameStr.length);
+      } catch (err) {
+        this.addTelemetry("error", `Send failed to ${peer.peerId}: ${err.message}`);
+      }
+      return;
+    }
+
+    const q = peer.dcSendQueue || (peer.dcSendQueue = []);
+    if (frameStr.length <= DC_CHUNK_THRESHOLD && q.length === 0 && (peer.dc.bufferedAmount || 0) < 262144) {
+      try {
+        peer.dc.send(frameStr);
+        this.recordTopologyPacket(peer.peerId, "tx", "data", frameStr.length);
+      } catch (err) {
+        this.addTelemetry("error", `Send failed to ${peer.peerId}: ${err.message}`);
+      }
+      return;
+    }
+
+    if (frameStr.length <= DC_CHUNK_THRESHOLD) {
+      q.push(frameStr);
+    } else {
+      const id = (this.dcChunkSeq = (this.dcChunkSeq + 1) >>> 0) || 1;
+      const total = Math.ceil(frameStr.length / DC_CHUNK_SIZE);
+      for (let i = 0; i < total; i++) {
+        const d = frameStr.slice(i * DC_CHUNK_SIZE, (i + 1) * DC_CHUNK_SIZE);
+        q.push(JSON.stringify({ kind: "dc_chunk", id, i, n: total, d }));
+      }
+    }
+    this._pumpDirectSendQueue(peer);
+  }
+
   executeActions(actions) {
     if (!Array.isArray(actions)) return;
     let logChanged = false;
@@ -7377,12 +8142,7 @@ class P2PDirectApp {
         case "send_wire": {
           const peer = this.directPeers.get(act.peerId);
           if (peer && peer.dc && peer.dc.readyState === "open") {
-            try {
-              peer.dc.send(act.frame);
-              this.recordTopologyPacket(act.peerId, "tx", "data", act.frame.length);
-            } catch (err) {
-              this.addTelemetry("error", `Send failed to ${act.peerId}: ${err.message}`);
-            }
+            this._sendWireFrameToPeer(peer, act.frame);
           }
           break;
         }
@@ -9160,8 +9920,56 @@ class P2PDirectApp {
     }
   }
 
-  renderChatPayload(payload) {
+  _registerMessageMediaUrl(msgId, url) {
+    if (!msgId || !url) return;
+    let entry = this.mediaBlobRegistry.get(msgId);
+    if (!entry) {
+      entry = new Set();
+      this.mediaBlobRegistry.set(msgId, entry);
+    }
+    entry.add(url);
+  }
+
+  _swapMessageMediaUrl(msgId, oldUrl, newUrl) {
+    const entry = this.mediaBlobRegistry.get(msgId);
+    if (entry && oldUrl) {
+      entry.delete(oldUrl);
+    }
+    if (oldUrl && oldUrl.startsWith("blob:")) {
+      try {
+        URL.revokeObjectURL(oldUrl);
+      } catch {
+        // ignore
+      }
+    }
+    this._registerMessageMediaUrl(msgId, newUrl);
+  }
+
+  _revokeMessageMediaUrls(msgId) {
+    const entry = this.mediaBlobRegistry.get(msgId);
+    if (!entry) return;
+    for (const url of entry) {
+      if (url && url.startsWith("blob:")) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    this.mediaBlobRegistry.delete(msgId);
+  }
+
+  _revokeAllMediaUrls() {
+    for (const msgId of Array.from(this.mediaBlobRegistry.keys())) {
+      this._revokeMessageMediaUrls(msgId);
+    }
+  }
+
+  renderChatPayload(payload, msgId = "") {
     const parts = [];
+    const gifBindings = [];
+    const videoBindings = [];
     if (payload.replyTo && typeof payload.replyTo === "object") {
       const targetName = escapeHtml(payload.replyTo.botName || "Bot");
       const viaLabel = escapeHtml(payload.replyTo.label || payload.replyTo.actionId || "Button");
@@ -9190,26 +9998,124 @@ class P2PDirectApp {
       }
     }
 
+    const mediaCards = [];
+
     if (Array.isArray(payload.images) && payload.images.length > 0) {
       const validImages = payload.images.filter(
         (img) => img && typeof img.dataUrl === "string" && SAFE_IMAGE_DATA_URL_RE.test(img.dataUrl)
       );
-      if (validImages.length > 0) {
-        const thumbs = validImages
-          .map((img) => {
-            const alt = escapeHtml(img.name || "Shared image");
-            return `
-              <button type="button" class="chat-image-btn" data-lightbox-src="${img.dataUrl}" data-lightbox-alt="${alt}">
-                <img class="chat-image-thumb" src="${img.dataUrl}" alt="${alt}" loading="lazy" />
-              </button>
-            `;
-          })
-          .join("");
-        parts.push(`<div class="chat-image-grid">${thumbs}</div>`);
+      for (const img of validImages) {
+        const alt = escapeHtml(img.name || "Shared image");
+        const isAnimated = Boolean(img.animated || img.dataUrl.startsWith("data:image/gif;"));
+        if (isAnimated) {
+          const idx = gifBindings.length;
+          const blob = dataUrlToBlob(img.dataUrl);
+          const srcUrl = blob ? URL.createObjectURL(blob) : img.dataUrl;
+          if (blob && msgId) {
+            this._registerMessageMediaUrl(msgId, srcUrl);
+          }
+          const dims = img.width && img.height ? `${img.width}×${img.height}` : "";
+          const approxBytes = img.bytes || Math.round((img.dataUrl.length * 3) / 4);
+          const metaParts = [dims, approxBytes ? formatByteSize(approxBytes) : ""].filter(Boolean);
+          const metaLabel = metaParts.join(" · ");
+          gifBindings.push({
+            idx,
+            blob,
+            dataUrl: img.dataUrl,
+            currentUrl: srcUrl,
+            alt: img.name || "Animated GIF",
+            metaLabel,
+          });
+          mediaCards.push(`
+            <div class="chat-media-card is-gif" data-gif-card="${idx}">
+              <div class="chat-media-stage">
+                <span class="chat-media-badge">GIF</span>
+                <button type="button" class="chat-image-btn" data-gif-expand="${idx}" aria-label="View full size GIF">
+                  <img class="chat-image-thumb" data-gif-img="${idx}" src="${srcUrl}" alt="${alt}" loading="lazy" />
+                </button>
+                <canvas class="gif-freeze-canvas hidden" data-gif-canvas="${idx}" aria-hidden="true"></canvas>
+              </div>
+              <div class="chat-media-bar">
+                <button type="button" class="media-ctrl-btn" data-gif-replay="${idx}" title="Replay GIF from frame 1">↺ Replay</button>
+                <button type="button" class="media-ctrl-btn" data-gif-pause="${idx}" title="Pause or resume GIF">Pause</button>
+                <button type="button" class="media-ctrl-btn" data-gif-expand="${idx}" title="Open full size">⤢</button>
+                <span class="chat-media-meta">${escapeHtml(metaLabel)}</span>
+              </div>
+            </div>
+          `);
+        } else {
+          mediaCards.push(`
+            <button type="button" class="chat-image-btn" data-lightbox-src="${img.dataUrl}" data-lightbox-alt="${alt}">
+              <img class="chat-image-thumb" src="${img.dataUrl}" alt="${alt}" loading="lazy" />
+            </button>
+          `);
+        }
       }
     }
 
-    return parts.join("");
+    if (Array.isArray(payload.videos) && payload.videos.length > 0) {
+      const validVideos = payload.videos.filter(
+        (vid) => vid && typeof vid.dataUrl === "string" && SAFE_VIDEO_DATA_URL_RE.test(vid.dataUrl)
+      );
+      for (const vid of validVideos) {
+        const idx = videoBindings.length;
+        const blob = dataUrlToBlob(vid.dataUrl);
+        const srcUrl = blob ? URL.createObjectURL(blob) : vid.dataUrl;
+        if (blob && msgId) {
+          this._registerMessageMediaUrl(msgId, srcUrl);
+        }
+        const durStr =
+          typeof vid.duration === "number" && Number.isFinite(vid.duration) && vid.duration > 0
+            ? formatMediaDuration(vid.duration)
+            : "";
+        const dims = vid.width && vid.height ? `${vid.width}×${vid.height}` : "";
+        const approxBytes = vid.bytes || Math.round((vid.dataUrl.length * 3) / 4);
+        const metaParts = [durStr, dims, approxBytes ? formatByteSize(approxBytes) : ""].filter(Boolean);
+        const metaLabel = metaParts.join(" · ");
+        videoBindings.push({
+          idx,
+          blob,
+          dataUrl: vid.dataUrl,
+          srcUrl,
+          alt: vid.name || "Shared video",
+          metaLabel,
+        });
+        mediaCards.push(`
+          <div class="chat-media-card is-video" data-video-card="${idx}">
+            <div class="chat-media-stage">
+              <span class="chat-media-badge">VIDEO</span>
+              <video
+                class="chat-video-player"
+                data-video-el="${idx}"
+                src="${srcUrl}"
+                controls
+                playsinline
+                preload="metadata"
+              ></video>
+              <div class="video-ended-overlay hidden" data-video-ended="${idx}">
+                <button type="button" class="video-replay-overlay-btn" data-video-replay="${idx}">↺ Replay Video</button>
+              </div>
+            </div>
+            <div class="chat-media-bar">
+              <button type="button" class="media-ctrl-btn" data-video-replay="${idx}" title="Replay video from 0:00">↺ Replay</button>
+              <button type="button" class="media-ctrl-btn" data-video-loop="${idx}" title="Toggle loop playback">Loop: Off</button>
+              <button type="button" class="media-ctrl-btn" data-video-expand="${idx}" title="Open full size">⤢</button>
+              <span class="chat-media-meta">${escapeHtml(metaLabel)}</span>
+            </div>
+          </div>
+        `);
+      }
+    }
+
+    if (mediaCards.length > 0) {
+      parts.push(`<div class="chat-image-grid">${mediaCards.join("")}</div>`);
+    }
+
+    return {
+      html: parts.join(""),
+      gifBindings,
+      videoBindings,
+    };
   }
 
   normalizeBotButtonRows(rawButtons) {
@@ -9327,16 +10233,23 @@ class P2PDirectApp {
     const isChat =
       m.type === "chat" &&
       m.payload &&
-      (typeof m.payload.text === "string" || Array.isArray(m.payload.images));
+      (typeof m.payload.text === "string" ||
+        Array.isArray(m.payload.images) ||
+        Array.isArray(m.payload.videos));
 
     let bodyHtml;
     let botButtons = [];
+    let gifBindings = [];
+    let videoBindings = [];
     if (isBotMsg) {
       const rendered = this.renderBotCardPayload(m.payload);
       bodyHtml = rendered.html;
       botButtons = rendered.buttons;
     } else if (isChat) {
-      bodyHtml = this.renderChatPayload(m.payload);
+      const rendered = this.renderChatPayload(m.payload, m.id);
+      bodyHtml = rendered.html;
+      gifBindings = rendered.gifBindings;
+      videoBindings = rendered.videoBindings;
     } else {
       bodyHtml = `<pre class="log-json-pre">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
     }
@@ -9391,6 +10304,161 @@ class P2PDirectApp {
       );
     }
 
+    // Interactive animated GIF controls (1-click Frame-0 Replay, Pause/Play freeze frame, Lightbox)
+    for (const g of gifBindings) {
+      const imgEl = article.querySelector(`[data-gif-img="${g.idx}"]`);
+      const canvasEl = article.querySelector(`[data-gif-canvas="${g.idx}"]`);
+      const replayBtn = article.querySelector(`[data-gif-replay="${g.idx}"]`);
+      const pauseBtn = article.querySelector(`[data-gif-pause="${g.idx}"]`);
+      let isPaused = false;
+
+      const replayGif = () => {
+        if (!imgEl) return;
+        isPaused = false;
+        if (canvasEl) canvasEl.classList.add("hidden");
+        if (pauseBtn) {
+          pauseBtn.textContent = "Pause";
+          pauseBtn.classList.remove("is-active");
+        }
+        if (g.blob) {
+          const prevUrl = g.currentUrl;
+          const nextUrl = URL.createObjectURL(g.blob);
+          g.currentUrl = nextUrl;
+          this._swapMessageMediaUrl(m.id, prevUrl, nextUrl);
+          imgEl.src = nextUrl;
+        } else {
+          imgEl.src = "";
+          requestAnimationFrame(() => {
+            imgEl.src = g.dataUrl;
+          });
+        }
+        imgEl.dataset.replayCount = String((Number(imgEl.dataset.replayCount) || 0) + 1);
+        if (replayBtn) {
+          replayBtn.classList.add("is-replayed");
+          setTimeout(() => replayBtn.classList.remove("is-replayed"), 320);
+        }
+      };
+
+      if (replayBtn) {
+        replayBtn.addEventListener("click", replayGif);
+      }
+
+      if (pauseBtn && imgEl && canvasEl) {
+        pauseBtn.addEventListener("click", () => {
+          if (!isPaused) {
+            const w = imgEl.naturalWidth || imgEl.width || 0;
+            const h = imgEl.naturalHeight || imgEl.height || 0;
+            if (w > 0 && h > 0) {
+              canvasEl.width = w;
+              canvasEl.height = h;
+              const ctx2d = canvasEl.getContext("2d");
+              if (ctx2d) {
+                ctx2d.clearRect(0, 0, w, h);
+                ctx2d.drawImage(imgEl, 0, 0, w, h);
+                canvasEl.classList.remove("hidden");
+              }
+            }
+            isPaused = true;
+            pauseBtn.textContent = "Play";
+            pauseBtn.classList.add("is-active");
+          } else {
+            replayGif();
+          }
+        });
+      }
+
+      for (const expBtn of article.querySelectorAll(`[data-gif-expand="${g.idx}"]`)) {
+        expBtn.addEventListener("click", () => {
+          this.openLightbox({
+            kind: "gif",
+            src: g.currentUrl,
+            blob: g.blob,
+            dataUrl: g.dataUrl,
+            alt: g.alt,
+            meta: g.metaLabel ? `${g.alt} · ${g.metaLabel}` : g.alt,
+          });
+        });
+      }
+    }
+
+    // Interactive Video controls (Replay from 0:00, Ended Replay Overlay, Loop toggle, Lightbox)
+    for (const v of videoBindings) {
+      const videoEl = article.querySelector(`[data-video-el="${v.idx}"]`);
+      const endedOverlay = article.querySelector(`[data-video-ended="${v.idx}"]`);
+      const loopBtn = article.querySelector(`[data-video-loop="${v.idx}"]`);
+      const replayBtns = article.querySelectorAll(`[data-video-replay="${v.idx}"]`);
+      const expandBtn = article.querySelector(`[data-video-expand="${v.idx}"]`);
+
+      const replayVideo = () => {
+        if (!videoEl) return;
+        if (endedOverlay) endedOverlay.classList.add("hidden");
+        try {
+          videoEl.currentTime = 0;
+        } catch {
+          // ignore if metadata not yet loaded
+        }
+        const playPromise = videoEl.play();
+        if (playPromise && typeof playPromise.catch === "function") {
+          playPromise.catch(() => {});
+        }
+        videoEl.dataset.replayCount = String((Number(videoEl.dataset.replayCount) || 0) + 1);
+        for (const rb of replayBtns) {
+          if (rb.classList.contains("media-ctrl-btn")) {
+            rb.classList.add("is-replayed");
+            setTimeout(() => rb.classList.remove("is-replayed"), 320);
+          }
+        }
+      };
+
+      if (videoEl) {
+        videoEl.addEventListener("ended", () => {
+          if (!videoEl.loop && endedOverlay) {
+            endedOverlay.classList.remove("hidden");
+          }
+        });
+        videoEl.addEventListener("play", () => {
+          if (endedOverlay) endedOverlay.classList.add("hidden");
+        });
+        videoEl.addEventListener("seeking", () => {
+          if (endedOverlay) endedOverlay.classList.add("hidden");
+        });
+      }
+
+      for (const rb of replayBtns) {
+        rb.addEventListener("click", replayVideo);
+      }
+
+      if (loopBtn && videoEl) {
+        loopBtn.addEventListener("click", () => {
+          videoEl.loop = !videoEl.loop;
+          loopBtn.textContent = videoEl.loop ? "Loop: On" : "Loop: Off";
+          loopBtn.classList.toggle("is-active", videoEl.loop);
+          if (videoEl.loop && endedOverlay) {
+            endedOverlay.classList.add("hidden");
+          }
+        });
+      }
+
+      if (expandBtn && videoEl) {
+        expandBtn.addEventListener("click", () => {
+          try {
+            videoEl.pause();
+          } catch {
+            // ignore
+          }
+          this.openLightbox({
+            kind: "video",
+            src: v.srcUrl,
+            blob: v.blob,
+            dataUrl: v.dataUrl,
+            alt: v.alt,
+            meta: v.metaLabel ? `${v.alt} · ${v.metaLabel}` : v.alt,
+            loop: Boolean(videoEl.loop),
+          });
+        });
+      }
+    }
+
     for (const btnEl of article.querySelectorAll("[data-bot-btn-idx]")) {
       const idx = Number(btnEl.dataset.botBtnIdx);
       const btnObj = botButtons[idx];
@@ -9410,25 +10478,34 @@ class P2PDirectApp {
     const filtered = this.logMessages.filter((m) => {
       if (typeFilter && m.type !== typeFilter) return false;
       if (!query) return true;
-      // Avoid scanning huge base64 image strings when searching text
+      // Avoid scanning huge base64 image/GIF/video strings when searching text
+      const hasMedia =
+        m.type === "chat" &&
+        m.payload &&
+        (Array.isArray(m.payload.images) || Array.isArray(m.payload.videos));
       const searchable = {
         id: m.id,
         type: m.type,
         author: m.author,
         authorName: m.authorName,
-        payload:
-          m.type === "chat" && m.payload && Array.isArray(m.payload.images)
-            ? {
-                text: m.payload.text || "",
-                imageNames: m.payload.images.map((i) => i?.name || "image"),
-              }
-            : m.payload,
+        payload: hasMedia
+          ? {
+              text: m.payload.text || "",
+              imageNames: Array.isArray(m.payload.images)
+                ? m.payload.images.map((i) => i?.name || "image")
+                : [],
+              videoNames: Array.isArray(m.payload.videos)
+                ? m.payload.videos.map((v) => v?.name || "video")
+                : [],
+            }
+          : m.payload,
       };
       return JSON.stringify(searchable).toLowerCase().includes(query);
     });
 
     if (filtered.length === 0) {
       if (this.logMessages.length === 0) {
+        this._revokeAllMediaUrls();
         if (this.logRenderState.mode === "empty" && this.logRenderState.key === "empty:none") {
           return;
         }
@@ -9441,6 +10518,7 @@ class P2PDirectApp {
       if (this.logRenderState.mode === "empty" && this.logRenderState.key === emptyKey) {
         return;
       }
+      this._revokeAllMediaUrls();
       feed.innerHTML = `<div class="empty-state">${emptyText}</div>`;
       this.logRenderState = { mode: "empty", key: emptyKey };
       return;
@@ -9451,6 +10529,7 @@ class P2PDirectApp {
       if (this.logRenderState.mode === "raw" && this.logRenderState.key === rawKey) {
         return;
       }
+      this._revokeAllMediaUrls();
       const jsonl = filtered.map((m) => JSON.stringify(m)).join("\n");
       feed.innerHTML = `<pre class="raw-jsonl-view">${escapeHtml(jsonl)}</pre>`;
       this.logRenderState = { mode: "raw", key: rawKey };
@@ -9467,6 +10546,7 @@ class P2PDirectApp {
     const wasNearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 64;
 
     if (prevMode !== "chat") {
+      this._revokeAllMediaUrls();
       feed.innerHTML = "";
     }
 
@@ -9485,6 +10565,7 @@ class P2PDirectApp {
       if (!wantedIds.has(id)) {
         node.remove();
         existingNodes.delete(id);
+        this._revokeMessageMediaUrls(id);
       }
     }
 
@@ -9500,6 +10581,7 @@ class P2PDirectApp {
         if (isSelf) addedSelfMessage = true;
       } else if (node.dataset.rev !== rev) {
         // Live bot card update: replace ONLY this message node in place (zero flicker on others)
+        this._revokeMessageMediaUrls(m.id);
         const updatedNode = this.buildLogEntryElement(m, isSelf, false);
         feed.replaceChild(updatedNode, node);
         node = updatedNode;

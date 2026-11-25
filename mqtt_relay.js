@@ -823,7 +823,7 @@ export function decodeRelayDataChunk(bytes) {
   const msgId = dv.getUint32(18, false);
   const idx = dv.getUint16(22, false);
   const total = dv.getUint16(24, false);
-  if (total === 0 || idx >= total || total > 512) return null;
+  if (total === 0 || idx >= total || total > 1536) return null;
   return {
     fromHex,
     toHex,

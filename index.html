@@ -477,6 +477,13 @@
 
           <!-- Primary Chat Workspace -->
           <section class="panel chat-panel" id="chat-panel" aria-labelledby="log-panel-title">
+            <div id="chat-drop-overlay" class="chat-drop-overlay hidden" aria-hidden="true">
+              <div class="chat-drop-overlay-box">
+                <span class="chat-drop-tag">DROP TO ATTACH · E2EE</span>
+                <strong class="chat-drop-title">Drop Images, GIFs, or Videos</strong>
+                <span class="chat-drop-sub">PNG · JPG · WebP · Animated GIF (4 MB) · MP4 / WebM / MOV (8 MB)</span>
+              </div>
+            </div>
             <div class="panel-header">
               <div class="chat-header-left">
                 <h2 class="panel-title" id="log-panel-title">Chat</h2>
@@ -533,10 +540,10 @@
                     Structured JSON
                   </button>
                 </div>
-                <span class="panel-meta" id="next-lamport-preview">URLs &amp; images supported</span>
+                <span class="panel-meta" id="next-lamport-preview">URLs, images, GIFs &amp; videos</span>
               </div>
 
-              <!-- Staged Pasted / Attached Images Preview Tray -->
+              <!-- Staged Pasted / Dropped / Attached Media Preview Tray -->
               <div id="chat-image-tray" class="chat-image-tray hidden"></div>
 
               <!-- Quick Chat Mode: Inline Badges Flat Composer -->
@@ -544,7 +551,7 @@
                 <input
                   id="chat-image-input"
                   type="file"
-                  accept="image/*"
+                  accept="image/*,video/mp4,video/webm,video/ogg,video/quicktime,.gif,.mp4,.webm,.mov,.m4v,.ogv"
                   multiple
                   class="hidden"
                 />
@@ -562,10 +569,10 @@
                       type="button"
                       id="btn-attach-image"
                       class="inline-chip inline-chip-btn"
-                      title="Attach image (or press Ctrl+V / Cmd+V to paste)"
-                      aria-label="Attach image"
+                      title="Attach image, GIF, or video (drag & drop or Ctrl+V / Cmd+V)"
+                      aria-label="Attach image, GIF, or video"
                     >
-                      + IMG<span class="mobile-hide"> · CTRL+V</span>
+                      + IMG<span class="mobile-hide"> · GIF · VID</span>
                     </button>
                   </div>
                 </div>
@@ -1161,10 +1168,18 @@
       </main>
     </div>
 
-    <!-- Image Lightbox Modal -->
-    <div id="image-lightbox" class="lightbox hidden" role="dialog" aria-modal="true" aria-label="Full size image">
-      <button type="button" id="btn-lightbox-close" class="lightbox-close" aria-label="Close image">×</button>
-      <img id="lightbox-img" class="lightbox-img" alt="Shared image" />
+    <!-- Media Lightbox Modal (Images, Animated GIFs & Videos) -->
+    <div id="image-lightbox" class="lightbox hidden" role="dialog" aria-modal="true" aria-label="Media preview">
+      <button type="button" id="btn-lightbox-close" class="lightbox-close" aria-label="Close media preview">×</button>
+      <div class="lightbox-stage">
+        <img id="lightbox-img" class="lightbox-img" alt="Shared image" />
+        <video id="lightbox-video" class="lightbox-video hidden" controls playsinline></video>
+        <div id="lightbox-toolbar" class="lightbox-toolbar hidden">
+          <button type="button" id="btn-lightbox-replay" class="lightbox-btn" title="Replay from start (R)">↺ Replay</button>
+          <button type="button" id="btn-lightbox-loop" class="lightbox-btn hidden" title="Toggle loop">Loop: Off</button>
+          <span id="lightbox-meta" class="lightbox-meta"></span>
+        </div>
+      </div>
     </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>

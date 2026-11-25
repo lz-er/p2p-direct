@@ -1865,15 +1865,13 @@ export class P2PBot extends EventEmitter {
       }
     };
 
-    dc.onmessage = (ev) => {
-      if (!this.wasm || closed || peerEntry.superseded) return;
-      peerEntry.lastActivityMs = Date.now();
-      const raw = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
+    const dcChunkAssemblies = new Map();
+    const deliverWireFrame = (frameStr) => {
       try {
         const res = this.wasm.call({
           cmd: "wire_message",
           fromPeer: peerId,
-          frame: raw,
+          frame: frameStr,
           nowMs: Date.now(),
         });
         this.status = res.status;
@@ -1882,6 +1880,51 @@ export class P2PBot extends EventEmitter {
       } catch (err) {
         this.emit("error", err);
       }
+    };
+
+    dc.onmessage = (ev) => {
+      if (!this.wasm || closed || peerEntry.superseded) return;
+      peerEntry.lastActivityMs = Date.now();
+      const raw = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
+      if (raw.startsWith('{"kind":"dc_chunk"')) {
+        try {
+          const ch = JSON.parse(raw);
+          if (
+            ch &&
+            ch.kind === "dc_chunk" &&
+            typeof ch.id === "number" &&
+            typeof ch.i === "number" &&
+            typeof ch.n === "number" &&
+            typeof ch.d === "string" &&
+            ch.n > 0 &&
+            ch.n <= 1024 &&
+            ch.i >= 0 &&
+            ch.i < ch.n
+          ) {
+            let asm = dcChunkAssemblies.get(ch.id);
+            if (!asm) {
+              if (dcChunkAssemblies.size >= 16) {
+                const oldestKey = dcChunkAssemblies.keys().next().value;
+                if (oldestKey !== undefined) dcChunkAssemblies.delete(oldestKey);
+              }
+              asm = { n: ch.n, parts: new Array(ch.n), received: 0 };
+              dcChunkAssemblies.set(ch.id, asm);
+            }
+            if (asm.parts[ch.i] === undefined) {
+              asm.parts[ch.i] = ch.d;
+              asm.received += 1;
+            }
+            if (asm.received === asm.n) {
+              dcChunkAssemblies.delete(ch.id);
+              deliverWireFrame(asm.parts.join(""));
+            }
+            return;
+          }
+        } catch {
+          return;
+        }
+      }
+      deliverWireFrame(raw);
     };
 
     dc.onclose = handleClose;
