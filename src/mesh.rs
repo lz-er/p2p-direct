@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-use crate::audio::{compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm};
+use crate::audio::{
+    CaptureDspResult, VoiceCaptureDsp48k, compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm,
+};
 use crate::crypto::{
     KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, derive_invite_wrap_key,
     derive_link_keys, derive_log_key, derive_mesh_key_from_passphrase, derive_relay_signal_key,
@@ -390,6 +392,7 @@ pub struct MeshNode {
     passphrase_mode: bool,
     in_voice: bool,
     voice_muted: bool,
+    voice_dsp_48k: VoiceCaptureDsp48k,
     is_bot: bool,
     csprng: SafeCsprng,
     config: MeshConfig,
@@ -438,6 +441,7 @@ impl MeshNode {
             passphrase_mode: false,
             in_voice: false,
             voice_muted: false,
+            voice_dsp_48k: VoiceCaptureDsp48k::new(),
             is_bot: false,
             csprng,
             config,
@@ -1062,6 +1066,9 @@ impl MeshNode {
     /// Updates local voice-call membership/mute state and broadcasts an encrypted `VoiceState` frame to all direct peers.
     pub fn set_voice_state(&mut self, in_voice: bool, muted: bool) -> Vec<MeshAction> {
         let effective_muted = if in_voice { muted } else { false };
+        if !in_voice || effective_muted || !self.in_voice {
+            self.voice_dsp_48k.reset();
+        }
         self.in_voice = in_voice;
         self.voice_muted = effective_muted;
 
@@ -1185,6 +1192,27 @@ impl MeshNode {
         let rms = compute_rms_i16(&pcm);
         self.stats.voice_packets_received = self.stats.voice_packets_received.saturating_add(1);
         Ok((rms, pcm))
+    }
+
+    /// Runs the full 48 kHz microphone capture DSP chain in safe Rust (DC blocker, RMS meter,
+    /// smooth hysteresis noise gate with cosine fade-in/fade-out, soft-knee safety limiter,
+    /// and optional alias-free 15-tap FIR decimation + V1 ADPCM E2EE sealing for legacy/bot peers).
+    pub fn process_voice_capture_48k(
+        &mut self,
+        samples_48k: &[f32],
+        gate_pct: u8,
+        need_v1: bool,
+    ) -> (CaptureDspResult, Vec<(String, Vec<u8>)>) {
+        let muted = !self.in_voice || self.voice_muted;
+        let dsp = self
+            .voice_dsp_48k
+            .process_frame(samples_48k, gate_pct, muted, need_v1);
+        let v1_packets = if need_v1 && !dsp.gated && !dsp.downsampled_16k.is_empty() {
+            self.seal_voice_pcm(&dsp.downsampled_16k).1
+        } else {
+            Vec::new()
+        };
+        (dsp, v1_packets)
     }
 
     /// Seals an opaque encoded high-definition voice payload (e.g. 48 kHz Opus from WebCodecs)

@@ -16,12 +16,18 @@ export const DEFAULT_MQTT_RELAYS = [
 
 const TOPIC_PREFIX = "p2pdirect/v1/";
 const KEEPALIVE_SECONDS = 30;
-const PING_INTERVAL_MS = 20_000;
+const PING_INTERVAL_MS = 15_000;
 const MAX_OUTBOUND_QUEUE = 32;
 const MAX_SEEN_CACHE = 600;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+
+function nowPerf() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
 
 function randomClientId() {
   const bytes = new Uint8Array(7);
@@ -187,10 +193,14 @@ class MqttWsClient {
     this.rxBuf = new Uint8Array(0);
     this.outboundQueue = [];
     this.pingTimer = null;
+    this.earlyPingTimer = null;
     this.reconnectTimer = null;
     this.connectTimeoutTimer = null;
     this.backoffMs = 1500;
     this.packetId = 1;
+    this.rttMs = null;
+    this.subSentAt = 0;
+    this.pingSentAt = 0;
   }
 
   start() {
@@ -201,6 +211,9 @@ class MqttWsClient {
   stop() {
     this.stopped = true;
     this.ready = false;
+    this.rttMs = null;
+    this.subSentAt = 0;
+    this.pingSentAt = 0;
     this._clearTimers();
     if (this.ws) {
       const sock = this.ws;
@@ -266,6 +279,10 @@ class MqttWsClient {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
+    if (this.earlyPingTimer) {
+      clearTimeout(this.earlyPingTimer);
+      this.earlyPingTimer = null;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -276,10 +293,24 @@ class MqttWsClient {
     }
   }
 
+  _sendPing() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.pingSentAt = nowPerf();
+        this.ws.send(PINGREQ_PACKET);
+      } catch {
+        this.pingSentAt = 0;
+      }
+    }
+  }
+
   _connect() {
     if (this.stopped) return;
     this._clearTimers();
     this.ready = false;
+    this.rttMs = null;
+    this.subSentAt = 0;
+    this.pingSentAt = 0;
     this.rxBuf = new Uint8Array(0);
 
     let ws;
@@ -342,6 +373,9 @@ class MqttWsClient {
       this.ws = null;
       const wasReady = this.ready;
       this.ready = false;
+      this.rttMs = null;
+      this.subSentAt = 0;
+      this.pingSentAt = 0;
       this._clearTimers();
       if (wasReady && this.onStateChange) {
         this.onStateChange();
@@ -427,19 +461,12 @@ class MqttWsClient {
         const pid = this.packetId;
         this.packetId = (this.packetId % 65534) + 1;
         try {
+          this.subSentAt = nowPerf();
           this.ws.send(buildSubscribePacket(pid, this.topic));
         } catch {
-          // ignore
+          this.subSentAt = 0;
         }
-        this.pingTimer = setInterval(() => {
-          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            try {
-              this.ws.send(PINGREQ_PACKET);
-            } catch {
-              // ignore
-            }
-          }
-        }, PING_INTERVAL_MS);
+        this.pingTimer = setInterval(() => this._sendPing(), PING_INTERVAL_MS);
       } else if (this.ws) {
         try {
           this.ws.close();
@@ -452,6 +479,10 @@ class MqttWsClient {
 
     if (packetType === 9) {
       // SUBACK
+      if (this.subSentAt > 0) {
+        this.rttMs = Math.max(1, Math.round(nowPerf() - this.subSentAt));
+        this.subSentAt = 0;
+      }
       this.ready = true;
       this.backoffMs = 1500;
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -464,11 +495,29 @@ class MqttWsClient {
           }
         }
       }
+      if (!this.earlyPingTimer) {
+        this.earlyPingTimer = setTimeout(() => {
+          this.earlyPingTimer = null;
+          if (!this.stopped && this.ready) {
+            this._sendPing();
+          }
+        }, 3000);
+      }
       if (this.onStateChange) {
         this.onStateChange();
       }
       if (this.onReady) {
         this.onReady(this);
+      }
+      return;
+    }
+
+    if (packetType === 13) {
+      // PINGRESP
+      if (this.pingSentAt > 0) {
+        const sample = Math.max(1, Math.round(nowPerf() - this.pingSentAt));
+        this.pingSentAt = 0;
+        this.rttMs = this.rttMs === null ? sample : Math.round(this.rttMs * 0.65 + sample * 0.35);
       }
       return;
     }
@@ -513,6 +562,7 @@ export class MultiRelayRendezvous {
 
     this.clients = [];
     this.seenPayloads = new Set();
+    this.voiceStripeIdx = 0;
     this.stopped = false;
   }
 
@@ -553,6 +603,7 @@ export class MultiRelayRendezvous {
     }
     this.clients = [];
     this.seenPayloads.clear();
+    this.voiceStripeIdx = 0;
   }
 
   publish(sealedPayload) {
@@ -569,9 +620,14 @@ export class MultiRelayRendezvous {
 
   /**
    * Publishes raw E2EE binary fallback payloads ("DF" data frames / "VB" voice bundles),
-   * preferring brokers that BOTH the local node and remote peer are actively connected to.
+   * preferring low-RTT, uncongested brokers shared by both local and remote peers.
+   * When `stripe` is true (realtime voice), round-robins across the fastest shared brokers
+   * so no single public MQTT sandbox hits its per-second publish token bucket.
    */
-  publishBinary(payloadBytes, { preferredUrls = null, maxBrokers = 1, queueIfOffline = false } = {}) {
+  publishBinary(
+    payloadBytes,
+    { preferredUrls = null, maxBrokers = 1, queueIfOffline = false, stripe = false } = {}
+  ) {
     if (this.stopped || !payloadBytes || payloadBytes.length === 0) return 0;
     const ready = this.clients.filter(
       (c) => c.ready && c.ws && c.ws.readyState === WebSocket.OPEN && (c.ws.bufferedAmount || 0) <= 131072
@@ -584,13 +640,44 @@ export class MultiRelayRendezvous {
       return 0;
     }
 
-    let ordered = ready;
+    const uncongested = ready.filter((c) => (c.ws.bufferedAmount || 0) <= 16384);
+    const pool = uncongested.length > 0 ? uncongested : ready;
+
+    let ordered = pool;
     if (Array.isArray(preferredUrls) && preferredUrls.length > 0) {
       const prefSet = new Set(preferredUrls);
-      const shared = ready.filter((c) => prefSet.has(c.url));
-      if (shared.length > 0) {
-        ordered = shared;
+      const sharedFresh = pool.filter((c) => prefSet.has(c.url));
+      if (sharedFresh.length > 0) {
+        ordered = sharedFresh;
+      } else {
+        const sharedAny = ready.filter((c) => prefSet.has(c.url));
+        if (sharedAny.length > 0) {
+          ordered = sharedAny;
+        }
       }
+    }
+
+    ordered = ordered.slice().sort((a, b) => (a.rttMs ?? 150) - (b.rttMs ?? 150));
+
+    if (stripe && ordered.length > 1) {
+      const bestRtt = ordered[0].rttMs ?? 150;
+      const fastPool = ordered
+        .filter((c) => (c.rttMs ?? 150) <= bestRtt + 100)
+        .slice(0, 3);
+      const stripePool = fastPool.length > 0 ? fastPool : [ordered[0]];
+      const startIdx = this.voiceStripeIdx % stripePool.length;
+      this.voiceStripeIdx = (this.voiceStripeIdx + 1) >>> 0;
+      for (let k = 0; k < stripePool.length; k++) {
+        if (stripePool[(startIdx + k) % stripePool.length].publishBinary(payloadBytes, false)) {
+          return 1;
+        }
+      }
+      for (const c of ordered) {
+        if (c.publishBinary(payloadBytes, false)) {
+          return 1;
+        }
+      }
+      return 0;
     }
 
     const limit = Math.max(1, Math.min(ordered.length, maxBrokers));
@@ -614,11 +701,16 @@ export class MultiRelayRendezvous {
         : totalCount > 0
           ? "connecting"
           : "offline";
+    const brokerRtts = {};
+    for (const c of readyClients) {
+      brokerRtts[c.url] = c.rttMs;
+    }
     return {
       state,
       connectedCount,
       totalCount,
       connectedUrls: readyClients.map((c) => c.url),
+      brokerRtts,
       topic: this.roomTopic,
     };
   }

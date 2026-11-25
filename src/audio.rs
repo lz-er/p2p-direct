@@ -206,3 +206,273 @@ pub fn decode_ima_adpcm(data: &[u8]) -> Result<Vec<i16>, String> {
 
     Ok(out)
 }
+
+/// 15-tap Blackman-windowed sinc low-pass FIR (`fc = 7.0 kHz @ 48 kHz`, unity DC gain)
+/// for alias-free 3:1 decimation from 48 kHz fullband capture to 16 kHz V1 ADPCM.
+const FIR_48_TO_16_TAPS: [f32; 15] = [
+    0.000_000_0,
+    -0.001_588_4,
+    -0.008_719_6,
+    -0.011_484_1,
+    0.014_576_6,
+    0.090_997_1,
+    0.194_494,
+    0.243_448_8,
+    0.194_494,
+    0.090_997_1,
+    0.014_576_6,
+    -0.011_484_1,
+    -0.008_719_6,
+    -0.001_588_4,
+    0.000_000_0,
+];
+
+const CAPTURE_HOLD_FRAMES: u32 = 14; // 14 * 20ms = 280ms smooth hold time
+const FADE_IN_SAMPLES_48K: usize = 240; // 5ms @ 48 kHz
+const MAX_CAPTURE_48K_SAMPLES: usize = 4096;
+
+/// Output of one 48 kHz capture frame processed in safe Rust DSP.
+#[derive(Debug, Clone)]
+pub struct CaptureDspResult {
+    /// Pre-gate RMS on the `0..=32767` scale (for live audio-settings meter).
+    pub raw_rms: u16,
+    /// Active transmitted RMS (`0` when gated, muted, or fade-out tail).
+    pub active_rms: u16,
+    /// True when the noise gate is closed (caller should pause TX).
+    pub gated: bool,
+    /// True for the single 20 ms cosine fade-out tail frame transmitted right before pausing.
+    pub is_fade_out_tail: bool,
+    /// Processed 48 kHz float32 samples (DC-blocked, envelope-gated, soft-limited).
+    pub processed_48k: Vec<f32>,
+    /// Optional alias-free 16 kHz i16 downsampled frame (populated only when `need_v1` is true).
+    pub downsampled_16k: Vec<i16>,
+}
+
+/// Stateful pure-Rust 48 kHz microphone capture DSP processor:
+/// DC blocker -> RMS metering -> hysteresis envelope noise gate (5 ms cosine fade-in,
+/// 280 ms hold, 20 ms cosine fade-out tail) -> soft-knee peak safety limiter ->
+/// optional 15-tap Blackman-windowed sinc anti-aliasing 3:1 FIR downsampler.
+#[derive(Debug, Clone)]
+pub struct VoiceCaptureDsp48k {
+    dc_prev_x: f32,
+    dc_prev_y: f32,
+    gate_was_open: bool,
+    gate_fade_out_sent: bool,
+    hold_frames_left: u32,
+    fir_tail: [f32; 14],
+}
+
+impl Default for VoiceCaptureDsp48k {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VoiceCaptureDsp48k {
+    pub fn new() -> Self {
+        Self {
+            dc_prev_x: 0.0,
+            dc_prev_y: 0.0,
+            gate_was_open: false,
+            gate_fade_out_sent: false,
+            hold_frames_left: 0,
+            fir_tail: [0.0; 14],
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.dc_prev_x = 0.0;
+        self.dc_prev_y = 0.0;
+        self.gate_was_open = false;
+        self.gate_fade_out_sent = false;
+        self.hold_frames_left = 0;
+        self.fir_tail = [0.0; 14];
+    }
+
+    /// Processes a single 48 kHz mono float32 frame (`960` samples = 20 ms).
+    pub fn process_frame(
+        &mut self,
+        input: &[f32],
+        gate_pct: u8,
+        muted: bool,
+        need_v1: bool,
+    ) -> CaptureDspResult {
+        let len = input.len().min(MAX_CAPTURE_48K_SAMPLES);
+        if len == 0 {
+            return CaptureDspResult {
+                raw_rms: 0,
+                active_rms: 0,
+                gated: true,
+                is_fade_out_tail: false,
+                processed_48k: Vec::new(),
+                downsampled_16k: Vec::new(),
+            };
+        }
+
+        // 1. DC-offset high-pass blocker (~38 Hz @ 48 kHz) + exact RMS metering
+        let mut buf = Vec::with_capacity(len);
+        let mut sum_sq: f64 = 0.0;
+        let mut prev_x = self.dc_prev_x;
+        let mut prev_y = self.dc_prev_y;
+        for &raw in input.iter().take(len) {
+            let x = if raw.is_finite() { raw } else { 0.0 };
+            let y = (x - prev_x) + 0.995 * prev_y;
+            prev_x = x;
+            prev_y = y;
+            buf.push(y);
+            let yd = f64::from(y);
+            sum_sq += yd * yd;
+        }
+        self.dc_prev_x = prev_x;
+        self.dc_prev_y = prev_y;
+
+        let raw_rms = if muted {
+            0
+        } else {
+            let rms_f = (sum_sq / (len as f64)).sqrt() * 32_768.0;
+            rms_f.round().clamp(0.0, 32_767.0) as u16
+        };
+
+        // 2. Smooth hysteresis envelope noise gate (5ms fade-in, 280ms hold, 20ms cosine fade-out)
+        let mut gated = false;
+        let mut apply_fade_in = false;
+        let mut apply_fade_out = false;
+
+        if muted {
+            gated = true;
+            self.gate_was_open = false;
+            self.gate_fade_out_sent = false;
+            self.hold_frames_left = 0;
+        } else if gate_pct > 0 {
+            let open_threshold = (f32::from(gate_pct) / 100.0) * 14_000.0;
+            let hold_threshold = open_threshold * 0.65;
+            let trigger = if self.gate_was_open {
+                hold_threshold
+            } else {
+                open_threshold
+            };
+            if f32::from(raw_rms) >= trigger {
+                self.hold_frames_left = CAPTURE_HOLD_FRAMES;
+                if !self.gate_was_open {
+                    apply_fade_in = true;
+                    self.gate_was_open = true;
+                }
+                self.gate_fade_out_sent = false;
+            } else if self.hold_frames_left > 0 {
+                self.hold_frames_left -= 1;
+            } else if self.gate_was_open && !self.gate_fade_out_sent {
+                apply_fade_out = true;
+                self.gate_was_open = false;
+                self.gate_fade_out_sent = true;
+            } else {
+                gated = true;
+                self.gate_was_open = false;
+            }
+        } else {
+            self.gate_was_open = true;
+            self.gate_fade_out_sent = false;
+            self.hold_frames_left = CAPTURE_HOLD_FRAMES;
+        }
+
+        if gated {
+            self.fir_tail = [0.0; 14];
+            return CaptureDspResult {
+                raw_rms,
+                active_rms: 0,
+                gated: true,
+                is_fade_out_tail: false,
+                processed_48k: Vec::new(),
+                downsampled_16k: Vec::new(),
+            };
+        }
+
+        // 3. Apply cosine fade-in / fade-out envelope + transparent soft-knee safety limiter
+        if apply_fade_in {
+            let ramp = FADE_IN_SAMPLES_48K.min(len);
+            let ramp_f = ramp as f32;
+            for (i, s) in buf.iter_mut().take(ramp).enumerate() {
+                let w = 0.5 * (1.0 - (std::f32::consts::PI * (i as f32) / ramp_f).cos());
+                *s *= w;
+            }
+        } else if apply_fade_out {
+            let len_f = len as f32;
+            for (i, s) in buf.iter_mut().enumerate() {
+                let w = 0.5 * (1.0 + (std::f32::consts::PI * (i as f32) / len_f).cos());
+                *s *= w;
+            }
+        }
+
+        for s in buf.iter_mut() {
+            *s = soft_limit_f32(*s);
+        }
+
+        // 4. Optional alias-free 15-tap Blackman-windowed sinc 48kHz -> 16kHz FIR decimation
+        let downsampled_16k = if need_v1 {
+            self.downsample_48k_to_16k_i16(&buf)
+        } else {
+            if len >= 14
+                && let Some(tail_src) = buf.get(len - 14..len)
+            {
+                self.fir_tail.copy_from_slice(tail_src);
+            }
+            Vec::new()
+        };
+
+        CaptureDspResult {
+            raw_rms,
+            active_rms: if apply_fade_out { 0 } else { raw_rms },
+            gated: false,
+            is_fade_out_tail: apply_fade_out,
+            processed_48k: buf,
+            downsampled_16k,
+        }
+    }
+
+    fn downsample_48k_to_16k_i16(&mut self, buf: &[f32]) -> Vec<i16> {
+        const TAIL_LEN: usize = 14;
+        let out_len = buf.len() / 3;
+        let mut out = Vec::with_capacity(out_len);
+
+        for o in 0..out_len {
+            let end_idx = (o * 3) as isize;
+            let mut acc: f32 = 0.0;
+            for (k, &tap) in FIR_48_TO_16_TAPS.iter().enumerate() {
+                let src_idx = end_idx - (k as isize);
+                let x = if src_idx >= 0 {
+                    buf.get(src_idx as usize).copied().unwrap_or(0.0)
+                } else {
+                    let t_idx = (TAIL_LEN as isize + src_idx) as usize;
+                    self.fir_tail.get(t_idx).copied().unwrap_or(0.0)
+                };
+                acc += x * tap;
+            }
+            let clamped = acc.clamp(-1.0, 1.0);
+            let sample = if clamped < 0.0 {
+                (clamped * 32_768.0).round() as i32
+            } else {
+                (clamped * 32_767.0).round() as i32
+            };
+            out.push(sample.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
+        }
+
+        if buf.len() >= TAIL_LEN
+            && let Some(tail_src) = buf.get(buf.len() - TAIL_LEN..buf.len())
+        {
+            self.fir_tail.copy_from_slice(tail_src);
+        }
+        out
+    }
+}
+
+/// Bit-transparent below `-1.4 dBFS` (`0.85`), smooth `tanh` soft-knee peak limiter above `0.85`.
+fn soft_limit_f32(x: f32) -> f32 {
+    const KNEE: f32 = 0.85;
+    const HEADROOM: f32 = 0.14;
+    let abs_x = x.abs();
+    if abs_x <= KNEE {
+        return x;
+    }
+    let excess = (abs_x - KNEE) / HEADROOM;
+    let limited = KNEE + HEADROOM * excess.tanh();
+    if x < 0.0 { -limited } else { limited }
+}

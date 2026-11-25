@@ -69,8 +69,8 @@ const DIRECT_HARD_TIMEOUT_MS = 14000;
 const RELAY_INACTIVITY_TIMEOUT_MS = 22000;
 const DIRECT_UPGRADE_INTERVAL_MS = 45000;
 const DIRECT_UPGRADE_MAX_ATTEMPTS = 2;
-const VOICE_RELAY_BATCH_MS = 60;
-const VOICE_RELAY_MAX_FRAMES = 3;
+const VOICE_RELAY_BATCH_MS = 80;
+const VOICE_RELAY_MAX_FRAMES = 4;
 
 const VOICE_SAMPLE_RATE = 16000;
 const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16kHz legacy ADPCM V1 (bots & fallback browsers)
@@ -80,7 +80,7 @@ const VOICE_V2_CODEC_OPUS48 = 1;
 const VOICE_V2_HEADER_BYTES = 8; // [codecId:u8, sampleRateKhz:u8, rms:u16le, tsSamples:u32le]
 const VOICE_OPUS_BITRATE_DIRECT = 96000; // 96 kbps VBR fullband 48kHz mono (~240B/frame)
 const VOICE_OPUS_BITRATE_RAW = 128000;   // 128 kbps VBR studio/music preset on Direct P2P
-const VOICE_OPUS_BITRATE_RELAY = 64000;  // 64 kbps VBR fullband 48kHz mono (~160B/frame, smaller than 16kHz ADPCM)
+const VOICE_OPUS_BITRATE_RELAY = 48000;  // 48 kbps VBR fullband 48kHz mono (~120B/frame; crisp voice, light relay load)
 
 const AUDIO_PRESETS = Object.freeze({
   voice: {
@@ -216,24 +216,28 @@ class P2PVoiceCaptureProcessor extends AudioWorkletProcessor {
 class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.cap = 32768;
-    this.mask = 32767;
+    this.cap = 65536;
+    this.mask = 65535;
     this.ring = new Float32Array(this.cap);
     this.writeIdx = 0;
     this.readPos = 0;
     this.playing = false;
-    this.targetMs = 26;
-    this.maxMs = 140;
+    this.targetMs = 20;
+    this.startMs = 26;
+    this.maxMs = 150;
     this.targetSamples = Math.round((this.targetMs * sampleRate) / 1000);
+    this.startSamples = Math.round((this.startMs * sampleRate) / 1000);
     this.maxSamples = Math.round((this.maxMs * sampleRate) / 1000);
     this.jitterMs = 0;
+    this.smoothTrough = -1;
+    this.waitSamples = 0;
     this.lastBurstFrame = -1;
     this.curBurstMs = 0;
     this.prevBurstMs = 20;
     this.fadeInTotal = Math.max(64, Math.round(sampleRate * 0.004));
     this.fadeInPos = this.fadeInTotal;
     this.plcCount = 0;
-    this.plcMax = Math.max(128, Math.round(sampleRate * 0.01));
+    this.plcMax = Math.max(128, Math.round(sampleRate * 0.012));
     this.lastOut = 0;
     this.xfadeLen = 64;
     this.xfadeBuf = new Float32Array(this.xfadeLen);
@@ -253,10 +257,18 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
           this.targetMs = msg.targetMs;
           this.targetSamples = Math.round((this.targetMs * sampleRate) / 1000);
         }
+        if (typeof msg.startMs === "number" && msg.startMs > 0) {
+          this.startMs = msg.startMs;
+          this.startSamples = Math.round((this.startMs * sampleRate) / 1000);
+        } else if (typeof msg.targetMs === "number" && msg.targetMs > 0) {
+          this.startMs = Math.max(this.targetMs, this.startMs);
+          this.startSamples = Math.round((this.startMs * sampleRate) / 1000);
+        }
         if (typeof msg.maxMs === "number" && msg.maxMs > 0) {
           this.maxMs = msg.maxMs;
           this.maxSamples = Math.round((this.maxMs * sampleRate) / 1000);
         }
+        this.smoothTrough = -1;
         return;
       }
       if (msg.type === "reset") {
@@ -264,6 +276,8 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
         this.readPos = 0;
         this.playing = false;
         this.jitterMs = 0;
+        this.smoothTrough = -1;
+        this.waitSamples = 0;
         this.lastBurstFrame = -1;
         this.curBurstMs = 0;
         this.prevBurstMs = 20;
@@ -281,33 +295,46 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
     };
   }
 
-  effectiveTargetSamples() {
-    const dynamicMs = this.targetMs + Math.min(this.jitterMs * 1.25, this.maxMs * 0.45);
+  effectiveTargetTrough() {
+    const dynamicMs = this.targetMs + Math.min(this.jitterMs * 1.1, this.maxMs * 0.35);
     const dynSamples = Math.round((dynamicMs * sampleRate) / 1000);
-    return Math.min(Math.round(this.maxSamples * 0.7), Math.max(this.targetSamples, dynSamples));
+    return Math.min(Math.round(this.maxSamples * 0.55), Math.max(this.targetSamples, dynSamples));
+  }
+
+  effectiveStartSamples() {
+    const effTrough = this.effectiveTargetTrough();
+    return Math.min(Math.round(this.maxSamples * 0.65), Math.max(this.startSamples, effTrough));
   }
 
   pushPcm(samples, inRate) {
     const n = samples.length;
     const frameMs = (n * 1000) / inRate;
+    const preAvail = Math.max(0, this.writeIdx - this.readPos);
+
     if (this.lastBurstFrame < 0) {
       this.lastBurstFrame = currentFrame;
       this.curBurstMs = frameMs;
       this.prevBurstMs = frameMs;
     } else {
       const elapsedMs = ((currentFrame - this.lastBurstFrame) * 1000) / sampleRate;
-      if (elapsedMs <= 4) {
-        // Same bundled burst (e.g. relay VB frame bundle)
+      if (elapsedMs <= 8) {
+        // Subsequent frame belonging to the same decoded relay VB bundle
         this.curBurstMs += frameMs;
-      } else if (elapsedMs > 400) {
+      } else if (elapsedMs > 500) {
         this.jitterMs = 0;
+        this.smoothTrough = -1;
         this.prevBurstMs = frameMs;
         this.curBurstMs = frameMs;
         this.lastBurstFrame = currentFrame;
       } else {
+        // Start of a new incoming burst: sample the sawtooth trough BEFORE refilling
+        if (this.playing) {
+          this.smoothTrough =
+            this.smoothTrough < 0 ? preAvail : this.smoothTrough * 0.8 + preAvail * 0.2;
+        }
         const expectedMs = this.curBurstMs > 0 ? this.curBurstMs : this.prevBurstMs;
         const diff = Math.abs(elapsedMs - expectedMs);
-        this.jitterMs = this.jitterMs * 0.9 + Math.min(diff, 100) * 0.1;
+        this.jitterMs = this.jitterMs * 0.88 + Math.min(diff, 120) * 0.12;
         this.prevBurstMs = expectedMs;
         this.curBurstMs = frameMs;
         this.lastBurstFrame = currentFrame;
@@ -371,7 +398,12 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
     this.writeIdx = w;
 
     const avail = this.writeIdx - this.readPos;
-    const hardCap = Math.min(this.cap - 1024, Math.max(this.maxSamples, this.targetSamples * 3));
+    const effTrough = this.effectiveTargetTrough();
+    const burstSamples = Math.round((Math.max(this.curBurstMs, this.prevBurstMs, 20) * sampleRate) / 1000);
+    const hardCap = Math.min(
+      this.cap - 1024,
+      Math.max(this.maxSamples, effTrough + burstSamples + Math.round(sampleRate * 0.05))
+    );
     if (avail > hardCap) {
       if (this.playing) {
         const base = Math.floor(this.readPos);
@@ -380,7 +412,8 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
         }
         this.xfadePos = 0;
       }
-      this.readPos = this.writeIdx - this.effectiveTargetSamples();
+      this.readPos = this.writeIdx - (effTrough + burstSamples);
+      this.smoothTrough = effTrough;
     }
   }
 
@@ -392,32 +425,45 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
     const len = out.length;
     const ring = this.ring;
     const mask = this.mask;
-    const effTarget = this.effectiveTargetSamples();
+    const effTrough = this.effectiveTargetTrough();
+    const effStart = this.effectiveStartSamples();
     let avail = this.writeIdx - this.readPos;
 
     if (!this.playing) {
-      if (avail < effTarget) {
+      if (avail <= 0) {
+        this.waitSamples = 0;
+        out.fill(0);
+        return true;
+      }
+      this.waitSamples += len;
+      const maxWait = Math.max(effStart + Math.round(sampleRate * 0.03), Math.round(sampleRate * 0.04));
+      if (avail < effStart && this.waitSamples < maxWait) {
         out.fill(0);
         return true;
       }
       this.playing = true;
+      this.waitSamples = 0;
+      this.smoothTrough = -1;
       this.fadeInPos = 0;
       this.plcCount = 0;
       this.curRate = 1.0;
     }
 
-    const err = avail - effTarget;
-    const deadband = Math.max(240, effTarget * 0.25);
+    // Drive clock-drift compensation ONLY from the sawtooth trough (never the bundle peak!)
     let desiredRate = 1.0;
-    if (err > deadband) {
-      const over = err - deadband;
-      const maxBoost = avail > this.maxSamples * 0.75 ? 0.012 : 0.004;
-      desiredRate = 1.0 + Math.min(maxBoost, over / (sampleRate * 2.2));
-    } else if (err < -deadband) {
-      const under = -err - deadband;
-      desiredRate = 1.0 - Math.min(0.004, under / (sampleRate * 2.2));
+    if (this.smoothTrough >= 0) {
+      const err = this.smoothTrough - effTrough;
+      const deadband = Math.max(Math.round(sampleRate * 0.015), Math.round(effTrough * 0.35));
+      if (err > deadband) {
+        const over = err - deadband;
+        const maxBoost = this.smoothTrough > this.maxSamples * 0.65 ? 0.01 : 0.004;
+        desiredRate = 1.0 + Math.min(maxBoost, over / (sampleRate * 2.5));
+      } else if (err < -deadband) {
+        const under = -err - deadband;
+        desiredRate = 1.0 - Math.min(0.004, under / (sampleRate * 2.5));
+      }
     }
-    this.curRate = this.curRate * 0.92 + desiredRate * 0.08;
+    this.curRate = this.curRate * 0.94 + desiredRate * 0.06;
     const step = this.curRate;
 
     for (let i = 0; i < len; i++) {
@@ -451,6 +497,8 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
           sample = 0;
           this.lastOut = 0;
           this.playing = false;
+          this.waitSamples = 0;
+          this.smoothTrough = -1;
         }
       }
 
@@ -563,29 +611,6 @@ function computeFloat32RmsI16Scale(float32Pcm) {
   }
   return Math.min(32767, Math.round(Math.sqrt(sumSq / float32Pcm.length) * 32768));
 }
-
-// 15-tap Blackman-windowed sinc low-pass FIR (fc = 7.0 kHz @ 48 kHz) for alias-free 3:1 V1 downsampling
-const VOICE_V1_FIR_TAPS = (() => {
-  const numTaps = 15;
-  const mid = (numTaps - 1) / 2;
-  const fc = 7000 / VOICE_HD_SAMPLE_RATE;
-  const taps = new Float32Array(numTaps);
-  let sum = 0;
-  for (let i = 0; i < numTaps; i++) {
-    const n = i - mid;
-    const sinc = n === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * n) / (Math.PI * n);
-    const w =
-      0.42 -
-      0.5 * Math.cos((2 * Math.PI * i) / (numTaps - 1)) +
-      0.08 * Math.cos((4 * Math.PI * i) / (numTaps - 1));
-    taps[i] = sinc * w;
-    sum += taps[i];
-  }
-  for (let i = 0; i < numTaps; i++) {
-    taps[i] /= sum;
-  }
-  return taps;
-})();
 
 function extractFloat32FromAudioData(audioData) {
   const n = audioData.numberOfFrames;
@@ -978,10 +1003,9 @@ class P2PDirectApp {
     this.earlyRelayDataFrames = new Map(); // fromHex -> [{ frame, ts }]
     this.relayChunkAssemblies = new Map(); // key -> { total, parts, received, ts }
     this.seenRelayChunkKeys = new Map(); // key -> ts
-    this.seenVoiceBundleSeq = new Map(); // fromHex -> lastSeq
+    this.relayVoiceReorder = new Map(); // fromHex -> { expectedSeq, pending, seen, flushTimer }
     this.directUpgradeState = new Map(); // peerId -> { lastAttemptAt, attempts }
     this.relayDataMsgSeq = 1;
-    this.relayVoiceBundleSeq = 1;
 
     // Background-resilient Web Worker keepalive
     this.keepaliveWorker = null;
@@ -1021,11 +1045,7 @@ class P2PDirectApp {
       silentGain: null,
       masterGain: null,
       masterLimiter: null,
-      gateOpenUntil: 0,
       gateClosed: false,
-      gateWasOpen: false,
-      gateFadeOutPending: false,
-      v1DownsampleTail: new Float32Array(VOICE_V1_FIR_TAPS.length - 1),
       settingsOpen: false,
       preCallMonitor: null, // { ctx, stream, source, highPass, presence, compressor, micGain, monitorGain, analyser, timer }
       audioDevices: [],
@@ -3656,7 +3676,7 @@ class P2PDirectApp {
     this.earlyRelayDataFrames.clear();
     this.relayChunkAssemblies.clear();
     this.seenRelayChunkKeys.clear();
-    this.seenVoiceBundleSeq.clear();
+    this._clearRelayVoiceReorder();
     this.directUpgradeState.clear();
   }
 
@@ -4130,6 +4150,7 @@ class P2PDirectApp {
 
     const voiceQueue = [];
     let voiceFlushTimer = null;
+    let peerVoiceBundleSeq = 0;
     const flushVoiceQueue = () => {
       if (voiceFlushTimer) {
         clearTimeout(voiceFlushTimer);
@@ -4140,16 +4161,17 @@ class P2PDirectApp {
         return;
       }
       const batch = voiceQueue.splice(0, VOICE_RELAY_MAX_FRAMES);
-      const seq = (app.relayVoiceBundleSeq = (app.relayVoiceBundleSeq + 1) >>> 0) || 1;
-      const bundle = encodeRelayVoiceBundle(myTag.bytes, peerInfo.tagBytes, seq, batch);
+      peerVoiceBundleSeq = ((peerVoiceBundleSeq + 1) >>> 0) || 1;
+      const bundle = encodeRelayVoiceBundle(myTag.bytes, peerInfo.tagBytes, peerVoiceBundleSeq, batch);
       const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
       app.roomRendezvous.publishBinary(bundle, {
         preferredUrls,
         maxBrokers: 1,
         queueIfOffline: false,
+        stripe: true,
       });
       if (voiceQueue.length > 0) {
-        voiceFlushTimer = setTimeout(flushVoiceQueue, VOICE_RELAY_BATCH_MS);
+        voiceFlushTimer = setTimeout(flushVoiceQueue, VOICE_RELAY_BATCH_MS + 15);
       }
     };
 
@@ -4173,7 +4195,7 @@ class P2PDirectApp {
         if (voiceQueue.length >= VOICE_RELAY_MAX_FRAMES) {
           flushVoiceQueue();
         } else if (!voiceFlushTimer) {
-          voiceFlushTimer = setTimeout(flushVoiceQueue, VOICE_RELAY_BATCH_MS);
+          voiceFlushTimer = setTimeout(flushVoiceQueue, VOICE_RELAY_BATCH_MS + 15);
         }
       },
       close() {
@@ -4219,6 +4241,129 @@ class P2PDirectApp {
       "room",
       `Connected to ${peerInfo.name} via E2EE Relay fallback (zero TURN; will auto-upgrade if Direct P2P opens)`
     );
+  }
+
+  _clearRelayVoiceReorder() {
+    for (const st of this.relayVoiceReorder.values()) {
+      if (st.flushTimer) {
+        clearTimeout(st.flushTimer);
+        st.flushTimer = null;
+      }
+      st.pending.clear();
+    }
+    this.relayVoiceReorder.clear();
+  }
+
+  _clearRelayVoiceReorderForPeer(peerId) {
+    const known = this.roomKnownPeers.get(peerId);
+    if (!known?.tagHex) return;
+    const st = this.relayVoiceReorder.get(known.tagHex);
+    if (st) {
+      if (st.flushTimer) {
+        clearTimeout(st.flushTimer);
+        st.flushTimer = null;
+      }
+      st.pending.clear();
+      this.relayVoiceReorder.delete(known.tagHex);
+    }
+  }
+
+  _enqueueOrderedRelayVoiceBundle(fromHex, senderPeerId, seq, frames) {
+    let st = this.relayVoiceReorder.get(fromHex);
+    if (!st) {
+      st = {
+        expectedSeq: null,
+        pending: new Map(),
+        seen: new Set(),
+        flushTimer: null,
+      };
+      this.relayVoiceReorder.set(fromHex, st);
+    }
+
+    if (st.seen.has(seq)) return;
+    st.seen.add(seq);
+    if (st.seen.size > 64) {
+      const oldest = st.seen.values().next().value;
+      if (oldest !== undefined) {
+        st.seen.delete(oldest);
+      }
+    }
+
+    const nextSeq = (s) => ((s + 1) >>> 0) || 1;
+    const deliver = (bundleFrames) => {
+      for (const frameBytes of bundleFrames) {
+        this.handleIncomingVoicePacket(senderPeerId, frameBytes);
+      }
+    };
+    const drain = () => {
+      while (st.expectedSeq !== null && st.pending.has(st.expectedSeq)) {
+        const item = st.pending.get(st.expectedSeq);
+        st.pending.delete(st.expectedSeq);
+        st.expectedSeq = nextSeq(st.expectedSeq);
+        deliver(item.frames);
+      }
+      if (st.pending.size === 0 && st.flushTimer) {
+        clearTimeout(st.flushTimer);
+        st.flushTimer = null;
+      }
+    };
+    const flushLowestPending = () => {
+      if (st.flushTimer) {
+        clearTimeout(st.flushTimer);
+        st.flushTimer = null;
+      }
+      if (this.relayVoiceReorder.get(fromHex) !== st || !this.voice.inVoice) {
+        st.pending.clear();
+        return;
+      }
+      if (st.pending.size === 0) return;
+      let lowest = null;
+      for (const k of st.pending.keys()) {
+        if (lowest === null || ((k - lowest) | 0) < 0) {
+          lowest = k;
+        }
+      }
+      if (lowest !== null) {
+        st.expectedSeq = lowest;
+        drain();
+        if (st.pending.size > 0) {
+          st.flushTimer = setTimeout(flushLowestPending, 60);
+        }
+      }
+    };
+
+    if (st.expectedSeq === null || Math.abs((seq - st.expectedSeq) | 0) > 16) {
+      if (st.flushTimer) {
+        clearTimeout(st.flushTimer);
+        st.flushTimer = null;
+      }
+      st.pending.clear();
+      st.expectedSeq = nextSeq(seq);
+      deliver(frames);
+      return;
+    }
+
+    const diff = (seq - st.expectedSeq) | 0;
+    if (diff === 0) {
+      st.expectedSeq = nextSeq(seq);
+      deliver(frames);
+      drain();
+      return;
+    }
+    if (diff < 0) {
+      // Stale late bundle already skipped after timeout; drop cleanly to avoid out-of-order glitches
+      return;
+    }
+
+    st.pending.set(seq, {
+      frames: frames.map((f) => f.slice()),
+      receivedAt: Date.now(),
+    });
+    if (st.pending.size >= 6) {
+      flushLowestPending();
+    } else if (!st.flushTimer) {
+      st.flushTimer = setTimeout(flushLowestPending, 60);
+    }
   }
 
   handleIncomingRelayBinary(bytes, brokerUrl) {
@@ -4322,21 +4467,24 @@ class P2PDirectApp {
     }
 
     if (bytes[0] === 0x56 && bytes[1] === 0x42) {
-      // "VB" E2EE Voice Bundle
+      // "VB" E2EE Voice Bundle (striped across multiple low-RTT brokers; reordered & deduped per peer)
+      if (!this.voice.inVoice) return;
       const bundle = decodeRelayVoiceBundle(bytes);
       if (!bundle || bundle.toHex !== myHex || bundle.fromHex === myHex) return;
-      const lastSeq = this.seenVoiceBundleSeq.get(bundle.fromHex);
-      if (lastSeq === bundle.seq) return;
-      this.seenVoiceBundleSeq.set(bundle.fromHex, bundle.seq);
 
       const senderPeerId = this.roomTagToPeerId.get(bundle.fromHex);
       if (!senderPeerId) return;
       const peerEntry = this.directPeers.get(senderPeerId);
       if (!peerEntry) return;
 
-      for (const frameBytes of bundle.frames) {
-        this.handleIncomingVoicePacket(senderPeerId, frameBytes);
+      if (brokerUrl) {
+        const known = this.roomKnownPeers.get(senderPeerId);
+        if (known && !known.relays.includes(brokerUrl)) {
+          known.relays.push(brokerUrl);
+        }
       }
+
+      this._enqueueOrderedRelayVoiceBundle(bundle.fromHex, senderPeerId, bundle.seq, bundle.frames);
     }
   }
 
@@ -5890,8 +6038,9 @@ class P2PDirectApp {
       node.connect(mixer.gainNode);
       node.port.postMessage({
         type: "config",
-        targetMs: isRelayed ? 68 : 26,
-        maxMs: isRelayed ? 240 : 140,
+        targetMs: isRelayed ? 60 : 20,
+        startMs: isRelayed ? 100 : 26,
+        maxMs: isRelayed ? 420 : 150,
       });
       mixer.playbackNode = node;
       mixer.isRelayed = Boolean(isRelayed);
@@ -6154,8 +6303,9 @@ class P2PDirectApp {
         mixer.isRelayed = Boolean(isRelayed);
         mixer.playbackNode.port.postMessage({
           type: "config",
-          targetMs: isRelayed ? 68 : 26,
-          maxMs: isRelayed ? 240 : 140,
+          targetMs: isRelayed ? 60 : 20,
+          startMs: isRelayed ? 100 : 26,
+          maxMs: isRelayed ? 420 : 150,
         });
       }
       mixer.playbackNode.port.postMessage(
@@ -6180,39 +6330,13 @@ class P2PDirectApp {
     src.buffer = buf;
     src.connect(mixer.gainNode);
     const now = ctx.currentTime;
-    const targetBufferSec = isRelayed ? 0.075 : 0.032;
-    const maxDriftSec = isRelayed ? 0.28 : 0.16;
+    const targetBufferSec = isRelayed ? 0.11 : 0.032;
+    const maxDriftSec = isRelayed ? 0.42 : 0.16;
     if (mixer.nextPlayTime < now + 0.004 || mixer.nextPlayTime > now + maxDriftSec) {
       mixer.nextPlayTime = now + targetBufferSec;
     }
     src.start(mixer.nextPlayTime);
     mixer.nextPlayTime += buf.duration;
-  }
-
-  downsample48kTo16kI16(float48k) {
-    const taps = VOICE_V1_FIR_TAPS;
-    const numTaps = taps.length; // 15
-    const tailLen = numTaps - 1; // 14
-    const tail = this.voice.v1DownsampleTail;
-    const outLen = Math.floor(float48k.length / 3);
-    const out = new Int16Array(outLen);
-
-    for (let o = 0; o < outLen; o++) {
-      const endIdx = o * 3;
-      let acc = 0;
-      for (let k = 0; k < numTaps; k++) {
-        const srcIdx = endIdx - k;
-        const x = srcIdx >= 0 ? float48k[srcIdx] : tail[tailLen + srcIdx];
-        acc += x * taps[k];
-      }
-      const clamped = acc > 1 ? 1 : acc < -1 ? -1 : acc;
-      out[o] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
-    }
-
-    if (float48k.length >= tailLen) {
-      tail.set(float48k.subarray(float48k.length - tailLen));
-    }
-    return out;
   }
 
   async joinVoiceChat({ listenOnly = false } = {}) {
@@ -6250,13 +6374,9 @@ class P2PDirectApp {
       this.voice.localRms = 0;
       this.voice.localSmoothLevel = 0;
       this.voice.localSpeakingAt = 0;
-      this.voice.gateOpenUntil = 0;
       this.voice.gateClosed = false;
-      this.voice.gateWasOpen = false;
-      this.voice.gateFadeOutPending = false;
       this.voice.opusTxSampleCounter = 0;
       this.voice.opusPendingMeta = [];
-      this.voice.v1DownsampleTail.fill(0);
       this.voice.meterTicks = 0;
 
       if (this.voice.masterGain) {
@@ -6426,76 +6546,9 @@ class P2PDirectApp {
 
   onCapturedFloat32Frame(float32Pcm) {
     if (!this.voice.inVoice || !this.wasm || !float32Pcm || float32Pcm.length === 0) return;
-    const rawRms = this.voice.muted ? 0 : computeFloat32RmsI16Scale(float32Pcm);
-    const now = Date.now();
-    const gatePct = this.audioSettings.noiseGate;
-
-    // Smooth hysteresis noise gate: 5ms fade-in on open, 280ms hold, 20ms cosine fade-out tail (zero clicks!)
-    let gated = false;
-    let applyFadeIn = false;
-    let applyFadeOut = false;
-
-    if (!this.voice.muted && gatePct > 0) {
-      const openThreshold = (gatePct / 100) * 14000;
-      const holdThreshold = openThreshold * 0.65;
-      const trigger = this.voice.gateWasOpen ? holdThreshold : openThreshold;
-      if (rawRms >= trigger) {
-        this.voice.gateOpenUntil = now + 280;
-        if (!this.voice.gateWasOpen) {
-          applyFadeIn = true;
-          this.voice.gateWasOpen = true;
-        }
-        this.voice.gateFadeOutPending = false;
-      } else if (now > this.voice.gateOpenUntil) {
-        if (this.voice.gateWasOpen && !this.voice.gateFadeOutPending) {
-          // Transmit one smooth 20ms cosine fade-out tail frame before pausing TX
-          applyFadeOut = true;
-          this.voice.gateWasOpen = false;
-          this.voice.gateFadeOutPending = true;
-        } else {
-          gated = true;
-          this.voice.gateWasOpen = false;
-        }
-      }
-    } else {
-      this.voice.gateWasOpen = !this.voice.muted;
-      this.voice.gateFadeOutPending = false;
-    }
-
-    this.voice.gateClosed = gated;
-    if (this.voice.settingsOpen) {
-      this.updateAudioMeterUi(rawRms, gated, "Live");
-    }
-
-    if (gated || this.voice.muted) {
-      this.voice.localRms = 0;
-      return;
-    }
-
-    if (applyFadeIn) {
-      const ramp = Math.min(240, float32Pcm.length); // 5ms @ 48 kHz
-      for (let i = 0; i < ramp; i++) {
-        float32Pcm[i] *= 0.5 * (1 - Math.cos((Math.PI * i) / ramp));
-      }
-    } else if (applyFadeOut) {
-      const len = float32Pcm.length;
-      for (let i = 0; i < len; i++) {
-        float32Pcm[i] *= 0.5 * (1 + Math.cos((Math.PI * i) / len));
-      }
-    }
-
-    const activeRms = applyFadeOut ? 0 : rawRms;
-    this.voice.localRms = activeRms;
-    if (activeRms > 220) {
-      this.voice.localSpeakingAt = now;
-    }
 
     // Partition active voice peers into HD 48 kHz Opus (V2) vs legacy/bot 16 kHz ADPCM (V1)
     const remoteVoicePeers = (this.status?.peers || []).filter((p) => p.inVoice);
-    if (remoteVoicePeers.length === 0) {
-      return;
-    }
-
     let needOpusV2 = false;
     let needAdpcmV1 = false;
     for (const p of remoteVoicePeers) {
@@ -6506,53 +6559,95 @@ class P2PDirectApp {
       }
     }
 
-    // Fast path 1: Studio 48 kHz Opus V2 via WebCodecs + Rust ChaCha20-Poly1305 AEAD
+    let opusEnc = null;
     if (needOpusV2) {
-      const enc = this.ensureLocalOpusEncoder();
-      if (enc && enc.state === "configured") {
-        if (enc.encodeQueueSize <= 4) {
-          const tsSamples = this.voice.opusTxSampleCounter >>> 0;
-          const tsUs = Math.round((this.voice.opusTxSampleCounter * 1_000_000) / VOICE_HD_SAMPLE_RATE);
-          this.voice.opusTxSampleCounter += float32Pcm.length;
-          if (this.voice.opusPendingMeta.length >= 12) {
-            this.voice.opusPendingMeta.shift();
-          }
-          this.voice.opusPendingMeta.push({ tsUs, tsSamples, rms: activeRms });
-          let audioData = null;
-          try {
-            audioData = new AudioData({
-              format: "f32-planar",
-              sampleRate: VOICE_HD_SAMPLE_RATE,
-              numberOfFrames: float32Pcm.length,
-              numberOfChannels: 1,
-              timestamp: tsUs,
-              data: float32Pcm,
-            });
-            enc.encode(audioData);
-          } catch {
-            needAdpcmV1 = true;
-          } finally {
-            if (audioData) {
-              try {
-                audioData.close();
-              } catch {
-                // ignore
-              }
-            }
-          }
-        }
-      } else {
-        needAdpcmV1 = true;
+      opusEnc = this.ensureLocalOpusEncoder();
+      if (!opusEnc || opusEnc.state !== "configured") {
+        needOpusV2 = false;
+        needAdpcmV1 = remoteVoicePeers.length > 0;
       }
     }
 
-    // Fast path 2: Anti-aliased 16 kHz V1 ADPCM ONLY when a Node.js bot or legacy browser is in voice
-    if (needAdpcmV1) {
-      const int16Pcm = this.downsample48kTo16kI16(float32Pcm);
-      const { packets } = this.wasm.sealVoicePcm(int16Pcm);
-      const sendToOpusToo = !this.voice.opusSupported || !this.voice.opusEncoder;
-      for (const { peerId, data } of packets) {
-        if (!sendToOpusToo && this.getPeerVoiceCodec(peerId) === "opus48") continue;
+    // Execute full 48 kHz capture DSP in compiled safe Rust WASM:
+    // DC blocker -> RMS meter -> smooth hysteresis noise gate (5ms fade-in / 280ms hold /
+    // 20ms cosine fade-out) -> soft-knee peak safety limiter -> optional 15-tap FIR + V1 ADPCM E2EE
+    const dsp = this.wasm.processCapture48k(float32Pcm, {
+      gatePct: this.audioSettings.noiseGate,
+      needV1: needAdpcmV1,
+      returnProcessed48k: needOpusV2,
+    });
+
+    this.voice.gateClosed = dsp.gated;
+    if (this.voice.settingsOpen) {
+      this.updateAudioMeterUi(dsp.rawRms, dsp.gated, "Live");
+    }
+
+    if (dsp.gated || this.voice.muted) {
+      this.voice.localRms = 0;
+      return;
+    }
+
+    const activeRms = dsp.activeRms;
+    this.voice.localRms = activeRms;
+    if (activeRms > 220) {
+      this.voice.localSpeakingAt = Date.now();
+    }
+
+    if (remoteVoicePeers.length === 0) {
+      return;
+    }
+
+    let v1Packets = dsp.v1Packets || [];
+    let sendV1ToOpusFallback = !needOpusV2;
+
+    // Fast path 1: Studio 48 kHz Opus V2 via native browser WebCodecs + Rust ChaCha20-Poly1305 AEAD
+    if (needOpusV2 && opusEnc && dsp.processed48k && dsp.processed48k.length > 0) {
+      if (opusEnc.encodeQueueSize <= 4) {
+        const processed = dsp.processed48k;
+        const tsSamples = this.voice.opusTxSampleCounter >>> 0;
+        const tsUs = Math.round((this.voice.opusTxSampleCounter * 1_000_000) / VOICE_HD_SAMPLE_RATE);
+        this.voice.opusTxSampleCounter += processed.length;
+        if (this.voice.opusPendingMeta.length >= 12) {
+          this.voice.opusPendingMeta.shift();
+        }
+        this.voice.opusPendingMeta.push({ tsUs, tsSamples, rms: activeRms });
+        let audioData = null;
+        try {
+          audioData = new AudioData({
+            format: "f32-planar",
+            sampleRate: VOICE_HD_SAMPLE_RATE,
+            numberOfFrames: processed.length,
+            numberOfChannels: 1,
+            timestamp: tsUs,
+            data: processed,
+          });
+          opusEnc.encode(audioData);
+        } catch {
+          sendV1ToOpusFallback = true;
+          if (v1Packets.length === 0) {
+            const fallbackDsp = this.wasm.processCapture48k(processed, {
+              gatePct: 0,
+              needV1: true,
+              returnProcessed48k: false,
+            });
+            v1Packets = fallbackDsp.v1Packets || [];
+          }
+        } finally {
+          if (audioData) {
+            try {
+              audioData.close();
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+    }
+
+    // Fast path 2: Anti-aliased 16 kHz V1 ADPCM (downsampled & E2EE sealed in Rust) for bots/legacy peers
+    if (v1Packets.length > 0) {
+      for (const { peerId, data } of v1Packets) {
+        if (!sendV1ToOpusFallback && this.getPeerVoiceCodec(peerId) === "opus48") continue;
         const vdc = this.voiceChannels.get(peerId);
         if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
           try {
@@ -6676,8 +6771,6 @@ class P2PDirectApp {
     if (this.voice.muted) {
       this.voice.localRms = 0;
       this.voice.localSmoothLevel = 0;
-      this.voice.gateWasOpen = false;
-      this.voice.gateFadeOutPending = false;
     }
     const res = this.wasm.call({
       cmd: "set_voice_state",
@@ -6736,6 +6829,7 @@ class P2PDirectApp {
   }
 
   cleanupVoiceAudioResources() {
+    this._clearRelayVoiceReorder();
     if (this.voice.meterTimer) {
       clearInterval(this.voice.meterTimer);
       this.voice.meterTimer = null;
@@ -6809,8 +6903,6 @@ class P2PDirectApp {
     this.voice.localRms = 0;
     this.voice.localSmoothLevel = 0;
     this.voice.gateClosed = false;
-    this.voice.gateWasOpen = false;
-    this.voice.gateFadeOutPending = false;
     this.voice.joinOrder = this.voice.joinOrder.filter((id) => id !== "self");
     this.voice.renderedKeys.delete("self");
     this.voice.lastRosterKey = "";
@@ -7155,6 +7247,7 @@ class P2PDirectApp {
           this.voiceChannels.delete(peerId);
         }
         this.disposePeerVoiceMixer(peerId);
+        this._clearRelayVoiceReorderForPeer(peerId);
         this._cleanupPeerTopologyState(peerId);
         const res = this.wasm.call({ cmd: "peer_disconnected", peerId });
         this.status = res.status;
@@ -7260,6 +7353,7 @@ class P2PDirectApp {
       }
     }
     this.disposePeerVoiceMixer(peerId);
+    this._clearRelayVoiceReorderForPeer(peerId);
     this._cleanupPeerTopologyState(peerId);
     try {
       entry.dc.close();
@@ -8020,8 +8114,18 @@ class P2PDirectApp {
     if (liveConn?.transport === "relay") {
       let brokerHost = "WSS Multi-Relay";
       const known = this.roomKnownPeers.get(peerId);
-      const relayUrl =
-        known?.relays?.[0] || this.roomRendezvous?.getStatus?.()?.connectedUrls?.[0] || "";
+      const relayStatus = this.roomRendezvous?.getStatus?.();
+      const connectedUrls = relayStatus?.connectedUrls || [];
+      const sharedUrls =
+        known?.relays?.length > 0
+          ? connectedUrls.filter((u) => known.relays.includes(u))
+          : connectedUrls;
+      const activePool = sharedUrls.length > 0 ? sharedUrls : connectedUrls;
+      const rtts = relayStatus?.brokerRtts || {};
+      const sortedPool = activePool
+        .slice()
+        .sort((a, b) => (rtts[a] ?? 150) - (rtts[b] ?? 150));
+      const relayUrl = sortedPool[0] || known?.relays?.[0] || "";
       if (relayUrl) {
         try {
           brokerHost = new URL(relayUrl).host;
@@ -8029,14 +8133,16 @@ class P2PDirectApp {
           brokerHost = relayUrl;
         }
       }
+      const bestRtt = relayUrl && typeof rtts[relayUrl] === "number" ? rtts[relayUrl] : null;
+      const stripeTag = sortedPool.length > 1 ? `${Math.min(3, sortedPool.length)}x striped` : "DF/VB";
       return {
         transport: "relay",
-        shortLabel: "WSS RELAY",
-        detailLabel: `E2EE WSS Multi-Relay (DF/VB · Zero TURN · ${brokerHost})`,
+        shortLabel: sortedPool.length > 1 ? `WSS ${Math.min(3, sortedPool.length)}x RELAY` : "WSS RELAY",
+        detailLabel: `E2EE WSS Multi-Relay (${stripeTag} · Zero TURN · ${brokerHost})`,
         protocol: "WSS/TLS",
         localType: "wss",
         remoteType: "wss",
-        statsRttMs: null,
+        statsRttMs: bestRtt,
         brokerHost,
       };
     }
@@ -8845,8 +8951,8 @@ class P2PDirectApp {
     const voiceText = peer.inVoice
       ? peerCodec === "opus48"
         ? isRelayed
-          ? "48 kHz Opus · 64 kbps (V2)"
-          : `48 kHz Opus · ${this.audioSettings.preset === "raw" ? 128 : 96} kbps (V2)`
+          ? `48 kHz Opus · ${Math.round(VOICE_OPUS_BITRATE_RELAY / 1000)} kbps (V2)`
+          : `48 kHz Opus · ${Math.round((this.audioSettings.preset === "raw" ? VOICE_OPUS_BITRATE_RAW : VOICE_OPUS_BITRATE_DIRECT) / 1000)} kbps (V2)`
         : "16 kHz IMA-ADPCM (V1)"
       : "Not in voice";
     const flowText = st

@@ -12,6 +12,7 @@ const OP_VOICE_ENCODE_SEAL = 5;
 const OP_VOICE_OPEN_DECODE = 6;
 const OP_VOICE_SEAL_RAW = 7;
 const OP_VOICE_OPEN_RAW = 8;
+const OP_VOICE_PROCESS_CAPTURE_48K = 9;
 
 const STATUS_OK = 1;
 const EXPECTED_BUF_CAP = 262144;
@@ -308,6 +309,75 @@ export class SafeRustWasmMesh {
       return null;
     }
     return new Uint8Array(this.memory.buffer, this.outPtr, outLen).slice();
+  }
+
+  /**
+   * Pure binary fast-path: executes the entire 48 kHz microphone capture DSP chain inside
+   * safe Rust WASM (DC blocker, RMS meter, hysteresis envelope noise gate with cosine
+   * fade-in/out, soft-knee peak safety limiter, and optional 15-tap anti-aliasing FIR +
+   * V1 ADPCM E2EE sealing for legacy/bot peers).
+   */
+  processCapture48k(float32Frame, { gatePct = 0, needV1 = false, returnProcessed48k = true } = {}) {
+    if (!float32Frame || float32Frame.length === 0) {
+      return { rawRms: 0, activeRms: 0, gated: true, isFadeOutTail: false, processed48k: null, v1Packets: [] };
+    }
+    const rawView = new Uint8Array(
+      float32Frame.buffer,
+      float32Frame.byteOffset,
+      float32Frame.byteLength
+    );
+    const maxSampleBytes = Math.max(0, this.bufCap - 4);
+    const sampleByteLen = Math.min(rawView.byteLength, maxSampleBytes) & ~3;
+    const totalIn = 4 + sampleByteLen;
+    const inBuf = new Uint8Array(this.memory.buffer, this.inPtr, totalIn);
+    inBuf[0] = Math.max(0, Math.min(100, Math.round(gatePct)));
+    inBuf[1] = (needV1 ? 1 : 0) | (returnProcessed48k ? 2 : 0);
+    inBuf[2] = 0;
+    inBuf[3] = 0;
+    inBuf.set(rawView.subarray(0, sampleByteLen), 4);
+
+    const hdr = this._invoke(OP_VOICE_PROCESS_CAPTURE_48K, totalIn);
+    const outLen = hdr[7];
+    if (hdr[8] !== STATUS_OK || outLen < 12) {
+      return { rawRms: 0, activeRms: 0, gated: true, isFadeOutTail: false, processed48k: null, v1Packets: [] };
+    }
+
+    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
+    const outBytes = new Uint8Array(this.memory.buffer, this.outPtr, outLen);
+    const rawRms = dv.getUint16(0, true);
+    const activeRms = dv.getUint16(2, true);
+    const outFlags = outBytes[4];
+    const gated = (outFlags & 1) !== 0;
+    const isFadeOutTail = (outFlags & 2) !== 0;
+    const sampleCount = dv.getUint16(6, true);
+    const v1PeerCount = dv.getUint16(8, true);
+
+    let offset = 12;
+    let processed48k = null;
+    const processedBytesLen = sampleCount * 4;
+    if (sampleCount > 0 && offset + processedBytesLen <= outLen) {
+      const copyBytes = outBytes.slice(offset, offset + processedBytesLen);
+      processed48k = new Float32Array(copyBytes.buffer);
+      offset += processedBytesLen;
+    }
+
+    const v1Packets = [];
+    for (let i = 0; i < v1PeerCount; i++) {
+      if (offset + 2 > outLen) break;
+      const pidLen = dv.getUint16(offset, true);
+      offset += 2;
+      if (offset + pidLen + 2 > outLen) break;
+      const peerId = textDecoder.decode(outBytes.subarray(offset, offset + pidLen));
+      offset += pidLen;
+      const pktLen = dv.getUint16(offset, true);
+      offset += 2;
+      if (offset + pktLen > outLen) break;
+      const data = outBytes.slice(offset, offset + pktLen);
+      offset += pktLen;
+      v1Packets.push({ peerId, data });
+    }
+
+    return { rawRms, activeRms, gated, isFadeOutTail, processed48k, v1Packets };
   }
 
   rehandshake() {

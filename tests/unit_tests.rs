@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use p2p_direct::audio::{compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm};
+use p2p_direct::audio::{VoiceCaptureDsp48k, compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm};
 use p2p_direct::codec::{
     PROTOCOL_VERSION, SignalCodeKind, SignalCodePayload, decode_signal_code, encode_fragment_url,
     encode_signal_code, extract_fragment_code,
@@ -1148,3 +1148,182 @@ fn voice_v2_raw_opus_e2ee_roundtrip_and_replay_protection() -> TestResult {
     assert!(node_b.open_voice_v2_packet("peer-a", &wire_pkt).is_err());
     Ok(())
 }
+
+#[test]
+fn voice_capture_48k_rust_dsp_dc_gate_limiter_and_fir_antialiasing() -> TestResult {
+    const FRAME_48K: usize = 960;
+
+    // 1. DC-offset blocker attenuates steady DC bias well below -30 dB after settling
+    let mut dsp = VoiceCaptureDsp48k::new();
+    let dc_frame = vec![0.4f32; FRAME_48K];
+    let mut last_dc_rms = u16::MAX;
+    for _ in 0..4 {
+        let res = dsp.process_frame(&dc_frame, 0, false, false);
+        last_dc_rms = res.raw_rms;
+    }
+    assert!(
+        last_dc_rms < 150,
+        "expected DC blocker to crush 0.4 DC bias, got RMS {last_dc_rms}"
+    );
+
+    // 2. Smooth hysteresis noise gate: gated -> 5ms cosine fade-in -> 14-frame hold -> 20ms cosine fade-out tail -> gated
+    dsp.reset();
+    let quiet = vec![0.002f32; FRAME_48K];
+    let g0 = dsp.process_frame(&quiet, 10, false, false);
+    assert!(g0.gated);
+    assert_eq!(g0.active_rms, 0);
+    assert!(g0.processed_48k.is_empty());
+
+    let tone_1khz: Vec<f32> = (0..FRAME_48K)
+        .map(|i| 0.35 * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48_000.0).sin())
+        .collect();
+    let open_frame = dsp.process_frame(&tone_1khz, 10, false, false);
+    assert!(!open_frame.gated);
+    assert!(!open_frame.is_fade_out_tail);
+    assert!(open_frame.raw_rms > 6000);
+    assert_eq!(open_frame.active_rms, open_frame.raw_rms);
+    assert_eq!(open_frame.processed_48k.len(), FRAME_48K);
+    // Sample 0 of cosine fade-in must be exactly 0.0 (click-free opening)
+    let first_sample = open_frame.processed_48k.first().copied().ok_or("empty frame")?;
+    assert!(first_sample.abs() < 1e-6, "expected 0.0 fade-in start, got {first_sample}");
+
+    // 14 silence frames remain open (280 ms hold time)
+    let silence = vec![0.0f32; FRAME_48K];
+    for hold_idx in 0..14 {
+        let hold_res = dsp.process_frame(&silence, 10, false, false);
+        assert!(
+            !hold_res.gated && !hold_res.is_fade_out_tail,
+            "expected gate hold on frame {hold_idx}"
+        );
+    }
+    // Frame 15 emits the single smooth 20 ms cosine fade-out tail with active_rms == 0
+    let tail_res = dsp.process_frame(&tone_1khz, 99, false, false);
+    assert!(!tail_res.gated);
+    assert!(tail_res.is_fade_out_tail);
+    assert_eq!(tail_res.active_rms, 0);
+    let tail_end = tail_res.processed_48k.last().copied().ok_or("empty tail")?;
+    assert!(
+        tail_end.abs() < 0.005,
+        "expected fade-out tail to taper near 0.0 at end, got {tail_end}"
+    );
+    // Next quiet frame is fully gated
+    let closed_res = dsp.process_frame(&silence, 10, false, false);
+    assert!(closed_res.gated);
+    assert!(!closed_res.is_fade_out_tail);
+
+    // 3. Transparent soft-knee safety limiter: bit-transparent <= 0.85, smoothly capped < 1.0 above
+    dsp.reset();
+    let hot_tone: Vec<f32> = (0..FRAME_48K)
+        .map(|i| 2.0 * (2.0 * std::f32::consts::PI * 500.0 * (i as f32) / 48_000.0).sin())
+        .collect();
+    let lim_res = dsp.process_frame(&hot_tone, 0, false, false);
+    let max_abs = lim_res
+        .processed_48k
+        .iter()
+        .fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(
+        max_abs > 0.90 && max_abs < 0.995,
+        "expected soft-knee limiter peak in (0.90, 0.995), got {max_abs}"
+    );
+
+    // Mid-level signal (0.5) stays strictly below knee (0.85) with no clipping distortion
+    dsp.reset();
+    let mid_tone: Vec<f32> = (0..FRAME_48K)
+        .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48_000.0).sin())
+        .collect();
+    let mid_res = dsp.process_frame(&mid_tone, 0, false, false);
+    let mid_peak = mid_res
+        .processed_48k
+        .iter()
+        .fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(
+        (mid_peak - 0.5).abs() < 0.03,
+        "expected linear pass-through for 0.5 tone, got peak {mid_peak}"
+    );
+
+    // 4. 15-tap Blackman-windowed sinc FIR anti-aliasing downsampler (48 kHz -> 16 kHz)
+    // Passband 1 kHz tone passes near unity; stopband 14 kHz tone (>8 kHz Nyquist) is heavily rejected
+    dsp.reset();
+    let _ = dsp.process_frame(&tone_1khz, 0, false, true);
+    let pass_res = dsp.process_frame(&tone_1khz, 0, false, true);
+    assert_eq!(pass_res.downsampled_16k.len(), 320);
+    let pass_rms = compute_rms_i16(&pass_res.downsampled_16k);
+
+    dsp.reset();
+    let tone_14khz: Vec<f32> = (0..FRAME_48K)
+        .map(|i| 0.35 * (2.0 * std::f32::consts::PI * 14_000.0 * (i as f32) / 48_000.0).sin())
+        .collect();
+    let _ = dsp.process_frame(&tone_14khz, 0, false, true);
+    let stop_res = dsp.process_frame(&tone_14khz, 0, false, true);
+    assert_eq!(stop_res.downsampled_16k.len(), 320);
+    let stop_rms = compute_rms_i16(&stop_res.downsampled_16k);
+    assert!(
+        pass_rms > 6000 && stop_rms * 35 < pass_rms,
+        "expected strong FIR stopband rejection at 14 kHz: pass_rms={pass_rms}, stop_rms={stop_rms}"
+    );
+
+    // 5. Fused MeshNode::process_voice_capture_48k seals V1 ADPCM packets and decrypts cleanly on peer
+    let sk_a = [0x51u8; 32];
+    let sk_b = [0x62u8; 32];
+    let pk_a = x25519_public_key(&sk_a);
+    let pk_b = x25519_public_key(&sk_b);
+    let mesh_key = [0x77u8; 32];
+    let mut node_a = MeshNode::new(
+        "peer-a".to_owned(),
+        "Alice".to_owned(),
+        "dsp-room".to_owned(),
+        sk_a,
+        mesh_key,
+        b"seed-dsp-a",
+        MeshConfig::default(),
+    );
+    let mut node_b = MeshNode::new(
+        "peer-b".to_owned(),
+        "Bob".to_owned(),
+        "dsp-room".to_owned(),
+        sk_b,
+        mesh_key,
+        b"seed-dsp-b",
+        MeshConfig::default(),
+    );
+    for act in node_a.on_peer_connected("peer-b".to_owned(), "Bob".to_owned(), pk_b, false, None)? {
+        if let p2p_direct::mesh::MeshAction::SendWire { frame, .. } = act {
+            let _ = node_b.on_wire_message("peer-a", &frame, 1_000);
+        }
+    }
+    for act in node_b.on_peer_connected("peer-a".to_owned(), "Alice".to_owned(), pk_a, false, None)? {
+        if let p2p_direct::mesh::MeshAction::SendWire { frame, .. } = act {
+            let _ = node_a.on_wire_message("peer-b", &frame, 1_000);
+        }
+    }
+    for act in node_a.set_voice_state(true, false) {
+        if let p2p_direct::mesh::MeshAction::SendWire { frame, .. } = act {
+            let _ = node_b.on_wire_message("peer-a", &frame, 1_001);
+        }
+    }
+    for act in node_b.set_voice_state(true, false) {
+        if let p2p_direct::mesh::MeshAction::SendWire { frame, .. } = act {
+            let _ = node_a.on_wire_message("peer-b", &frame, 1_001);
+        }
+    }
+
+    let (cap_res, v1_pkts) = node_a.process_voice_capture_48k(&tone_1khz, 5, true);
+    assert!(!cap_res.gated);
+    assert_eq!(cap_res.processed_48k.len(), FRAME_48K);
+    assert_eq!(v1_pkts.len(), 1);
+    let (to_peer, pkt) = v1_pkts.into_iter().next().ok_or("missing V1 packet")?;
+    assert_eq!(to_peer, "peer-b");
+    assert_eq!(pkt.get(0..2), Some(&b"V1"[..]));
+    let (rx_rms, decoded_pcm) = node_b.open_voice_packet("peer-a", &pkt)?;
+    assert_eq!(decoded_pcm.len(), 320);
+    assert!(rx_rms > 4000, "expected decoded V1 RMS > 4000, got {rx_rms}");
+
+    // Muted node returns gated=true and emits zero V1 packets
+    let _ = node_a.set_voice_state(true, true);
+    let (muted_res, muted_pkts) = node_a.process_voice_capture_48k(&tone_1khz, 0, true);
+    assert!(muted_res.gated);
+    assert_eq!(muted_res.raw_rms, 0);
+    assert!(muted_pkts.is_empty());
+    Ok(())
+}
+

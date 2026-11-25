@@ -20,6 +20,7 @@ const OP_VOICE_ENCODE_SEAL: u32 = 5;
 const OP_VOICE_OPEN_DECODE: u32 = 6;
 const OP_VOICE_SEAL_RAW: u32 = 7;
 const OP_VOICE_OPEN_RAW: u32 = 8;
+const OP_VOICE_PROCESS_CAPTURE_48K: u32 = 9;
 
 const STATUS_OK: u32 = 1;
 const STATUS_ERR: u32 = 2;
@@ -280,6 +281,70 @@ fn execute_voice_open_raw(hdr: &BridgeHeader, rt: &mut RuntimeState, in_bytes: &
     }
 }
 
+fn execute_voice_process_capture_48k(hdr: &BridgeHeader, rt: &mut RuntimeState, in_bytes: &[u8]) {
+    let Some(node) = rt.node.as_mut() else {
+        publish_binary_out(hdr, &[], false);
+        return;
+    };
+    if in_bytes.len() < 4 {
+        publish_binary_out(hdr, &[], false);
+        return;
+    }
+    let gate_pct = in_bytes.first().copied().unwrap_or(0);
+    let in_flags = in_bytes.get(1).copied().unwrap_or(0);
+    let need_v1 = (in_flags & 1) != 0;
+    let return_48k = (in_flags & 2) != 0;
+
+    let sample_bytes = in_bytes.get(4..).unwrap_or(&[]);
+    let mut samples = Vec::with_capacity(sample_bytes.len() / 4);
+    for &[b0, b1, b2, b3] in sample_bytes.as_chunks::<4>().0 {
+        samples.push(f32::from_le_bytes([b0, b1, b2, b3]));
+    }
+
+    let (dsp, v1_packets) = node.process_voice_capture_48k(&samples, gate_pct, need_v1);
+    let out_flags: u8 =
+        u8::from(dsp.gated) | (u8::from(dsp.is_fade_out_tail) << 1);
+
+    let emit_samples = if return_48k && !dsp.gated {
+        dsp.processed_48k.len().min((BUF_CAP.saturating_sub(12)) / 4).min(usize::from(u16::MAX))
+    } else {
+        0
+    };
+    let samples_byte_len = emit_samples * 4;
+
+    let mut fit_v1: u16 = 0;
+    let mut v1_body: Vec<u8> = Vec::with_capacity(v1_packets.len().saturating_mul(220));
+    for (peer_id, pkt) in v1_packets {
+        let pid_bytes = peer_id.as_bytes();
+        if pid_bytes.len() > usize::from(u16::MAX) || pkt.len() > usize::from(u16::MAX) {
+            continue;
+        }
+        let needed = 12 + samples_byte_len + v1_body.len() + 2 + pid_bytes.len() + 2 + pkt.len();
+        if needed > BUF_CAP {
+            break;
+        }
+        v1_body.extend_from_slice(&(pid_bytes.len() as u16).to_le_bytes());
+        v1_body.extend_from_slice(pid_bytes);
+        v1_body.extend_from_slice(&(pkt.len() as u16).to_le_bytes());
+        v1_body.extend_from_slice(&pkt);
+        fit_v1 = fit_v1.saturating_add(1);
+    }
+
+    let mut out = Vec::with_capacity(12 + samples_byte_len + v1_body.len());
+    out.extend_from_slice(&dsp.raw_rms.to_le_bytes());
+    out.extend_from_slice(&dsp.active_rms.to_le_bytes());
+    out.push(out_flags);
+    out.push(0);
+    out.extend_from_slice(&(emit_samples as u16).to_le_bytes());
+    out.extend_from_slice(&fit_v1.to_le_bytes());
+    out.extend_from_slice(&[0u8, 0u8]);
+    for &s in dsp.processed_48k.iter().take(emit_samples) {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out.extend_from_slice(&v1_body);
+    publish_binary_out(hdr, &out, true);
+}
+
 fn main() {
     let hdr = black_box(&HEADER);
     let op = hdr.op.load(Ordering::SeqCst);
@@ -384,6 +449,16 @@ fn main() {
             RUNTIME.with(|cell| {
                 if let Ok(mut rt) = cell.try_borrow_mut() {
                     execute_voice_open_raw(hdr, &mut rt, &in_bytes);
+                } else {
+                    hdr.status.store(STATUS_ERR, Ordering::SeqCst);
+                }
+            });
+        }
+        OP_VOICE_PROCESS_CAPTURE_48K => {
+            let in_bytes = read_in_buf(arg_len);
+            RUNTIME.with(|cell| {
+                if let Ok(mut rt) = cell.try_borrow_mut() {
+                    execute_voice_process_capture_48k(hdr, &mut rt, &in_bytes);
                 } else {
                     hdr.status.store(STATUS_ERR, Ordering::SeqCst);
                 }
