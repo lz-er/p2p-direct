@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 use crate::audio::{
@@ -21,9 +21,9 @@ use crate::log::{
 use crate::media::{MAX_MEDIA_SYNC_TARGETS, MAX_ONE_WAY_COMPENSATION_MS, MediaSyncState};
 use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
-    DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
-    VOICE_PACKET_HEADER_LEN, WireFrame, chunk_inv_ids, chunk_sealed_records,
-    open_voice_packet_ciphertext, open_voice_packet_ciphertext_into,
+    DEFAULT_RELAY_TTL, EncryptedWireEnvelope, MAX_COLOR_SYNC_CLAIMS, PeerColorClaim, PeerSummary,
+    RelaySignalBody, RelaySignalType, VOICE_PACKET_HEADER_LEN, WireFrame, chunk_inv_ids,
+    chunk_sealed_records, open_voice_packet_ciphertext, open_voice_packet_ciphertext_into,
     open_voice_v2_packet_ciphertext, open_voice_v2_packet_ciphertext_into,
     parse_voice_packet_header, parse_voice_v2_packet_header, seal_voice_packet,
     seal_voice_packet_into, seal_voice_v2_packet, seal_voice_v2_packet_into,
@@ -122,6 +122,9 @@ pub enum MeshAction {
     },
     MediaSync {
         state: MediaSyncState,
+    },
+    PeerColors {
+        colors: BTreeMap<String, u32>,
     },
     Telemetry {
         event: String,
@@ -246,6 +249,17 @@ impl MeshAction {
                 out.push_str("{\"action\":\"media_sync\",\"state\":");
                 state.write_json(out, state.anchor_local_ms);
                 out.push('}');
+            }
+            Self::PeerColors { colors } => {
+                out.push_str("{\"action\":\"peer_colors\",\"colors\":{");
+                for (i, (pid, idx)) in colors.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_json_string(out, pid);
+                    let _ = write!(out, ":{idx}");
+                }
+                out.push_str("}}");
             }
             Self::Telemetry { event, detail } => {
                 out.push_str("{\"action\":\"telemetry\",\"event\":");
@@ -447,6 +461,7 @@ pub struct MeshNode {
     auto_mesh_pending: BTreeMap<String, PendingAutoMesh>,
     seen_bot_actions: HashSet<String>,
     media_states: BTreeMap<String, MediaSyncState>,
+    peer_colors: BTreeMap<String, PeerColorClaim>,
     stats: MeshStats,
     seq: u64,
 }
@@ -472,6 +487,15 @@ impl MeshNode {
         seed_buf.extend_from_slice(&mesh_key);
         seed_buf.extend_from_slice(entropy_seed);
         let csprng = SafeCsprng::from_seed(&seed_buf);
+        let mut peer_colors = BTreeMap::new();
+        peer_colors.insert(
+            peer_id.clone(),
+            PeerColorClaim {
+                peer_id: peer_id.clone(),
+                color_idx: 0,
+                claimed_lamport: 0,
+            },
+        );
         Self {
             peer_id,
             author_name,
@@ -497,6 +521,7 @@ impl MeshNode {
             auto_mesh_pending: BTreeMap::new(),
             seen_bot_actions: HashSet::new(),
             media_states: BTreeMap::new(),
+            peer_colors,
             stats: MeshStats::default(),
             seq: 0,
         }
@@ -698,6 +723,8 @@ impl MeshNode {
             peer.crypto.safety_code =
                 pair_safety_code(&self.x25519_public, &peer.crypto.pub_key, &self.mesh_key);
         }
+        self.media_states.clear();
+        self.reset_peer_colors();
         Ok(())
     }
 
@@ -801,10 +828,296 @@ impl MeshNode {
         self.log = ReplicatedLog::new();
         self.media_states
             .retain(|k, _| !k.starts_with("vid:") && !k.starts_with("gif:"));
+        if self.peers.is_empty() {
+            self.reset_peer_colors();
+        }
         for peer in self.peers.values_mut() {
             peer.known_ids.clear();
             peer.pending_inv = None;
             peer.we_sent_inv = false;
+        }
+    }
+
+    fn reset_peer_colors(&mut self) {
+        self.peer_colors.clear();
+        self.peer_colors.insert(
+            self.peer_id.clone(),
+            PeerColorClaim {
+                peer_id: self.peer_id.clone(),
+                color_idx: 0,
+                claimed_lamport: 0,
+            },
+        );
+        self.normalize_peer_colors();
+    }
+
+    fn incoming_color_claim_wins(existing: &PeerColorClaim, incoming: &PeerColorClaim) -> bool {
+        match (existing.claimed_lamport == 0, incoming.claimed_lamport == 0) {
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => {
+                (incoming.claimed_lamport, incoming.color_idx)
+                    < (existing.claimed_lamport, existing.color_idx)
+            }
+            (true, true) => incoming.color_idx < existing.color_idx,
+        }
+    }
+
+    fn max_committed_color_lamport(&self) -> u64 {
+        self.peer_colors
+            .values()
+            .map(|c| c.claimed_lamport)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Deterministically enforces a strict 1-to-1 bijection (`peer_id -> unique color_idx`)
+    /// across self, all connected peers, and all message authors in the replicated log.
+    /// Returns `true` iff any peer's effective `color_idx` changed.
+    fn normalize_peer_colors(&mut self) -> bool {
+        let prev_map: BTreeMap<String, u32> = self
+            .peer_colors
+            .iter()
+            .map(|(k, v)| (k.clone(), v.color_idx))
+            .collect();
+
+        // Ensure self, all connected peers, and all log authors exist in the registry
+        self.peer_colors
+            .entry(self.peer_id.clone())
+            .or_insert_with(|| PeerColorClaim {
+                peer_id: self.peer_id.clone(),
+                color_idx: u32::MAX,
+                claimed_lamport: 0,
+            });
+        for pid in self.peers.keys() {
+            if self.peer_colors.len() >= MAX_COLOR_SYNC_CLAIMS {
+                break;
+            }
+            self.peer_colors
+                .entry(pid.clone())
+                .or_insert_with(|| PeerColorClaim {
+                    peer_id: pid.clone(),
+                    color_idx: u32::MAX,
+                    claimed_lamport: 0,
+                });
+        }
+        for msg in self.log.ordered() {
+            if self.peer_colors.len() >= MAX_COLOR_SYNC_CLAIMS {
+                break;
+            }
+            if !msg.author.trim().is_empty() {
+                self.peer_colors
+                    .entry(msg.author.clone())
+                    .or_insert_with(|| PeerColorClaim {
+                        peer_id: msg.author.clone(),
+                        color_idx: u32::MAX,
+                        claimed_lamport: 0,
+                    });
+            }
+        }
+
+        // Canonical strict total order: committed claims (lamport >= 1) first by (lamport, peer_id),
+        // then tentative claims (lamport == 0) by peer_id.
+        let mut ordered: Vec<PeerColorClaim> = self.peer_colors.values().cloned().collect();
+        ordered.sort_by(|a, b| {
+            (a.claimed_lamport == 0, a.claimed_lamport, a.peer_id.as_str()).cmp(&(
+                b.claimed_lamport == 0,
+                b.claimed_lamport,
+                b.peer_id.as_str(),
+            ))
+        });
+
+        let mut used: BTreeSet<u32> = BTreeSet::new();
+        let mut next_free: u32 = 0;
+        for claim in &mut ordered {
+            if claim.color_idx != u32::MAX && !used.contains(&claim.color_idx) {
+                used.insert(claim.color_idx);
+            } else {
+                while used.contains(&next_free) {
+                    next_free = next_free.saturating_add(1);
+                }
+                claim.color_idx = next_free;
+                used.insert(next_free);
+                next_free = next_free.saturating_add(1);
+            }
+        }
+
+        self.peer_colors.clear();
+        for claim in ordered {
+            self.peer_colors.insert(claim.peer_id.clone(), claim);
+        }
+
+        if prev_map.len() != self.peer_colors.len() {
+            return true;
+        }
+        self.peer_colors
+            .iter()
+            .any(|(k, v)| prev_map.get(k) != Some(&v.color_idx))
+    }
+
+    pub fn peer_colors_map(&self) -> BTreeMap<String, u32> {
+        self.peer_colors
+            .iter()
+            .map(|(k, v)| (k.clone(), v.color_idx))
+            .collect()
+    }
+
+    pub fn color_for_peer(&self, peer_id: &str) -> u32 {
+        self.peer_colors
+            .get(peer_id)
+            .map(|c| c.color_idx)
+            .unwrap_or(0)
+    }
+
+    fn build_color_sync_frame(&self, ttl: u32) -> WireFrame {
+        let claims: Vec<PeerColorClaim> = self
+            .peer_colors
+            .values()
+            .take(MAX_COLOR_SYNC_CLAIMS)
+            .cloned()
+            .collect();
+        WireFrame::ColorSync {
+            origin: self.peer_id.clone(),
+            ttl,
+            claims,
+        }
+    }
+
+    fn broadcast_color_sync(
+        &mut self,
+        actions: &mut Vec<MeshAction>,
+        exclude_peer: Option<&str>,
+        origin: Option<&str>,
+        ttl: u32,
+    ) {
+        let targets: Vec<String> = self
+            .peers
+            .keys()
+            .filter(|pid| {
+                exclude_peer != Some(pid.as_str()) && origin != Some(pid.as_str())
+            })
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let frame = WireFrame::ColorSync {
+            origin: origin.unwrap_or(&self.peer_id).to_owned(),
+            ttl,
+            claims: self
+                .peer_colors
+                .values()
+                .take(MAX_COLOR_SYNC_CLAIMS)
+                .cloned()
+                .collect(),
+        };
+        let plaintext = frame.to_json_string();
+        for pid in targets {
+            self.emit_wire_plaintext(actions, &pid, &plaintext);
+        }
+    }
+
+    /// Commits this node's own room color claim if still tentative (`claimed_lamport == 0`),
+    /// normalizes for zero duplicates, and gossips to connected peers.
+    pub fn commit_self_color(&mut self) -> Vec<MeshAction> {
+        let mut actions = Vec::new();
+        let is_tentative = self
+            .peer_colors
+            .get(&self.peer_id)
+            .map(|c| c.claimed_lamport == 0)
+            .unwrap_or(true);
+        if is_tentative {
+            let next_l = self.max_committed_color_lamport().saturating_add(1).max(1);
+            let existing_idx = self
+                .peer_colors
+                .get(&self.peer_id)
+                .map(|c| c.color_idx)
+                .unwrap_or(u32::MAX);
+            self.peer_colors.insert(
+                self.peer_id.clone(),
+                PeerColorClaim {
+                    peer_id: self.peer_id.clone(),
+                    color_idx: existing_idx,
+                    claimed_lamport: next_l,
+                },
+            );
+            let changed = self.normalize_peer_colors();
+            if changed {
+                actions.push(MeshAction::PeerColors {
+                    colors: self.peer_colors_map(),
+                });
+            }
+            let ttl = self.config.gossip_ttl;
+            self.broadcast_color_sync(&mut actions, None, None, ttl);
+        }
+        actions
+    }
+
+    fn handle_color_sync(
+        &mut self,
+        from_peer: &str,
+        origin: String,
+        ttl: u32,
+        incoming_claims: Vec<PeerColorClaim>,
+        actions: &mut Vec<MeshAction>,
+    ) {
+        let mut claims_upgraded = false;
+        for claim in incoming_claims.into_iter().take(MAX_COLOR_SYNC_CLAIMS) {
+            if claim.peer_id.trim().is_empty() {
+                continue;
+            }
+            match self.peer_colors.get(&claim.peer_id) {
+                Some(existing) => {
+                    if Self::incoming_color_claim_wins(existing, &claim) {
+                        self.peer_colors.insert(claim.peer_id.clone(), claim);
+                        claims_upgraded = true;
+                    }
+                }
+                None => {
+                    if self.peer_colors.len() < MAX_COLOR_SYNC_CLAIMS {
+                        self.peer_colors.insert(claim.peer_id.clone(), claim);
+                        claims_upgraded = true;
+                    }
+                }
+            }
+        }
+
+        // If self is still tentative and we are now talking to peers, commit self cleanly
+        // right after the highest committed Lamport so earlier room members keep their colors.
+        let mut self_just_committed = false;
+        let self_is_tentative = self
+            .peer_colors
+            .get(&self.peer_id)
+            .map(|c| c.claimed_lamport == 0)
+            .unwrap_or(true);
+        if self_is_tentative && !self.peers.is_empty() {
+            let next_l = self.max_committed_color_lamport().saturating_add(1).max(1);
+            // Reset color_idx to u32::MAX so normalize_peer_colors picks the lowest unused slot
+            // without colliding with existing committed peers.
+            self.peer_colors.insert(
+                self.peer_id.clone(),
+                PeerColorClaim {
+                    peer_id: self.peer_id.clone(),
+                    color_idx: u32::MAX,
+                    claimed_lamport: next_l,
+                },
+            );
+            self_just_committed = true;
+        }
+
+        let colors_changed = self.normalize_peer_colors();
+        if colors_changed || self_just_committed {
+            actions.push(MeshAction::PeerColors {
+                colors: self.peer_colors_map(),
+            });
+        }
+
+        if self_just_committed {
+            // Broadcast our newly committed claim to ALL peers (including `from_peer`)
+            let gossip_ttl = self.config.gossip_ttl;
+            self.broadcast_color_sync(actions, None, None, gossip_ttl);
+        } else if (claims_upgraded || colors_changed) && ttl > 0 {
+            self.broadcast_color_sync(actions, Some(from_peer), Some(&origin), ttl - 1);
         }
     }
 
@@ -894,6 +1207,9 @@ impl MeshNode {
                 self.emit_wire_plaintext(&mut actions, &pid, &plaintext);
             }
         }
+
+        let mut color_actions = self.commit_self_color();
+        actions.append(&mut color_actions);
 
         actions.push(MeshAction::Telemetry {
             event: if msg.msg_type == MSG_TYPE_DELETE {
@@ -1119,6 +1435,13 @@ impl MeshNode {
         self.emit_wire(&mut actions, &peer_id, &hello);
 
         self.send_sync_inv_to(&peer_id, &mut actions);
+        if self.normalize_peer_colors() {
+            actions.push(MeshAction::PeerColors {
+                colors: self.peer_colors_map(),
+            });
+        }
+        let color_sync = self.build_color_sync_frame(self.config.gossip_ttl);
+        self.emit_wire(&mut actions, &peer_id, &color_sync);
 
         actions.push(MeshAction::Telemetry {
             event: "peer_connected".to_owned(),
@@ -1155,6 +1478,11 @@ impl MeshNode {
         let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
         for pid in peer_ids {
             self.emit_wire(&mut actions, &pid, &frame);
+        }
+
+        if self.in_voice {
+            let mut color_actions = self.commit_self_color();
+            actions.append(&mut color_actions);
         }
 
         let detail = if !self.in_voice {
@@ -1817,15 +2145,50 @@ impl MeshNode {
         actions
     }
 
-    /// Sends fresh encrypted anti-entropy `sync-inv` frames to all connected peers.
+    /// Sends fresh encrypted anti-entropy `sync-inv` and `color-sync` frames to all connected peers.
     pub fn request_sync_all(&mut self) -> Vec<MeshAction> {
+        self.request_sync_all_at(0)
+    }
+
+    /// Full anti-entropy reconciliation across all connected peers: chat log (`sync-inv`),
+    /// canonical peer color registry (`color-sync`), and active media sync states (`media-sync`).
+    pub fn request_sync_all_at(&mut self, now_ms: u64) -> Vec<MeshAction> {
         let mut actions = Vec::new();
         let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+        if peer_ids.is_empty() {
+            return actions;
+        }
+        let color_sync_json = self
+            .build_color_sync_frame(self.config.gossip_ttl)
+            .to_json_string();
+        let media_snapshots: Vec<String> = if now_ms > 0 && !self.media_states.is_empty() {
+            self.media_states
+                .values()
+                .map(|st| {
+                    let mut proj = st.clone();
+                    proj.position_ms = st.projected_position_ms(now_ms);
+                    proj.anchor_local_ms = now_ms;
+                    WireFrame::MediaSync {
+                        origin: self.peer_id.clone(),
+                        ttl: 0,
+                        state: proj,
+                    }
+                    .to_json_string()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         for pid in peer_ids {
             if let Some(p) = self.peers.get_mut(&pid) {
                 p.we_sent_inv = true;
             }
             self.send_sync_inv_to(&pid, &mut actions);
+            self.emit_wire_plaintext(&mut actions, &pid, &color_sync_json);
+            for ms_json in &media_snapshots {
+                self.emit_wire_plaintext(&mut actions, &pid, ms_json);
+            }
         }
         actions
     }
@@ -1880,7 +2243,7 @@ impl MeshNode {
         }
 
         if run_sync {
-            let sync_actions = self.request_sync_all();
+            let sync_actions = self.request_sync_all_at(now_ms);
             actions.extend(sync_actions);
         }
 
@@ -2225,6 +2588,13 @@ impl MeshNode {
             WireFrame::MediaSync { origin, ttl, state } => {
                 self.handle_media_sync(from_peer, origin, ttl, state, now_ms, &mut actions);
             }
+            WireFrame::ColorSync {
+                origin,
+                ttl,
+                claims,
+            } => {
+                self.handle_color_sync(from_peer, origin, ttl, claims, &mut actions);
+            }
         }
 
         Ok(actions)
@@ -2502,6 +2872,16 @@ impl MeshNode {
             ),
         });
 
+        // Reconcile canonical peer colors immediately upon handshake so every peer converges
+        // to the exact same duplicate-free color mapping.
+        if self.normalize_peer_colors() {
+            actions.push(MeshAction::PeerColors {
+                colors: self.peer_colors_map(),
+            });
+        }
+        let color_sync = self.build_color_sync_frame(self.config.gossip_ttl);
+        self.emit_wire(actions, &effective_peer, &color_sync);
+
         // Reconcile active room media sync states (videos, GIFs, Watch Together) with the peer
         // immediately upon handshake, projected to `now_ms` so late joiners land in lockstep.
         if !self.media_states.is_empty() {
@@ -2628,6 +3008,11 @@ impl MeshNode {
             total_count: self.log.len(),
             lamport: self.log.lamport(),
         });
+        if self.normalize_peer_colors() {
+            actions.push(MeshAction::PeerColors {
+                colors: self.peer_colors_map(),
+            });
+        }
 
         if ttl <= 1 || path.iter().any(|p| p == &self.peer_id) {
             return Ok(());
@@ -2819,6 +3204,11 @@ impl MeshNode {
             total_count: self.log.len(),
             lamport: self.log.lamport(),
         });
+        if self.normalize_peer_colors() {
+            actions.push(MeshAction::PeerColors {
+                colors: self.peer_colors_map(),
+            });
+        }
 
         actions.push(MeshAction::Telemetry {
             event: "sync_batch_received".to_owned(),
@@ -3219,9 +3609,17 @@ impl MeshNode {
             write_json_string(&mut out, &r.via_peer_id);
             out.push('}');
         }
+        out.push_str("],\"peerColors\":{");
+        for (i, (pid, claim)) in self.peer_colors.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_string(&mut out, pid);
+            let _ = write!(out, ":{}", claim.color_idx);
+        }
         let _ = write!(
             out,
-            "],\"stats\":{{\"framesSent\":{},\"framesReceived\":{},\"e2eeFramesEncrypted\":{},\"e2eeFramesDecrypted\":{},\"e2eeAuthFailures\":{},\"relaySignalsEncrypted\":{},\"gossipForwards\":{},\"gossipDuplicatesDropped\":{},\"syncInvSent\":{},\"syncInvReceived\":{},\"syncBatchesSent\":{},\"syncBatchesReceived\":{},\"autoMeshIntrosSent\":{},\"autoMeshOffersCreated\":{},\"relaySignalsForwarded\":{},\"voicePacketsSent\":{},\"voicePacketsReceived\":{}}}}}",
+            "}},\"stats\":{{\"framesSent\":{},\"framesReceived\":{},\"e2eeFramesEncrypted\":{},\"e2eeFramesDecrypted\":{},\"e2eeAuthFailures\":{},\"relaySignalsEncrypted\":{},\"gossipForwards\":{},\"gossipDuplicatesDropped\":{},\"syncInvSent\":{},\"syncInvReceived\":{},\"syncBatchesSent\":{},\"syncBatchesReceived\":{},\"autoMeshIntrosSent\":{},\"autoMeshOffersCreated\":{},\"relaySignalsForwarded\":{},\"voicePacketsSent\":{},\"voicePacketsReceived\":{}}}}}",
             self.stats.frames_sent,
             self.stats.frames_received,
             self.stats.e2ee_frames_encrypted,
@@ -3312,13 +3710,15 @@ impl MeshNode {
             .stats
             .e2ee_frames_encrypted
             .saturating_add(sent_peer_count as u64);
-        Ok(vec![MeshAction::Telemetry {
+        let mut actions = self.commit_self_color();
+        actions.push(MeshAction::Telemetry {
             event: "publish".to_owned(),
             detail: format!(
                 "Sealed & gossiped {} (L={}) to {} peer(s) [off-thread bulk worker]",
                 msg_id, lamport, sent_peer_count
             ),
-        }])
+        });
+        Ok(actions)
     }
 
     /// Validates peer connectivity and anti-replay window before dispatching a large encrypted
@@ -3380,6 +3780,7 @@ impl MeshNode {
                 self.stats.gossip_duplicates_dropped.saturating_add(1);
             return Ok((false, Vec::new(), Vec::new(), 0));
         }
+        let _ = self.normalize_peer_colors();
 
         if ttl <= 1 || path.iter().any(|p| p == &self.peer_id) {
             return Ok((true, Vec::new(), Vec::new(), 0));

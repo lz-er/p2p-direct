@@ -270,6 +270,7 @@ impl SimNetwork {
                 | MeshAction::AutoMeshAddIce { .. }
                 | MeshAction::LogUpdated { .. }
                 | MeshAction::MediaSync { .. }
+                | MeshAction::PeerColors { .. }
                 | MeshAction::Telemetry { .. } => {}
             }
         }

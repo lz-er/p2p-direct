@@ -1947,5 +1947,148 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
     Ok(())
 }
 
+#[test]
+fn peer_color_sync_converges_without_duplicates_across_multihop_and_partitions() -> TestResult {
+    use p2p_direct::mesh::MeshAction;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    let mesh_key = [0x99u8; 32];
+    let cfg = MeshConfig {
+        auto_mesh_enabled: false, // test pure multi-hop gossip convergence without auto-mesh shortcuts
+        ..Default::default()
+    };
+
+    let make_node = |id: &str, name: &str, sk_byte: u8| -> MeshNode {
+        MeshNode::new(
+            id.to_owned(),
+            name.to_owned(),
+            "ColorRoom".to_owned(),
+            [sk_byte; 32],
+            mesh_key,
+            &[sk_byte; 32],
+            cfg.clone(),
+        )
+    };
+
+    // Helper to drain all queued WireFrame actions across a map of nodes
+    let drain_network = |nodes: &mut BTreeMap<String, MeshNode>,
+                         initial: Vec<(String, Vec<MeshAction>)>|
+     -> TestResult {
+        let mut q: VecDeque<(String, String, String)> = VecDeque::new();
+        for (from, acts) in initial {
+            for act in acts {
+                if let MeshAction::SendWire { peer_id, frame } = act {
+                    q.push_back((from.clone(), peer_id, frame));
+                }
+            }
+        }
+        let mut hops = 0usize;
+        while let Some((from, to, frame)) = q.pop_front() {
+            hops += 1;
+            assert!(hops < 500, "ColorSync gossip failed to terminate (loop?)");
+            if let Some(target) = nodes.get_mut(&to) {
+                let next_acts = target.on_wire_message(&from, &frame, 10_000)?;
+                for act in next_acts {
+                    if let MeshAction::SendWire { peer_id, frame } = act {
+                        q.push_back((to.clone(), peer_id, frame));
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // 1. Creator "z-alice" commits color 0, then joiner "a-bob" (lexicographically smaller!) joins:
+    //    "z-alice" MUST keep color 0, and "a-bob" MUST get color 1!
+    let mut nodes: BTreeMap<String, MeshNode> = BTreeMap::new();
+    let mut alice = make_node("z-alice", "Alice", 0x11);
+    let _ = alice.commit_self_color();
+    assert_eq!(alice.color_for_peer("z-alice"), 0);
+
+    let bob = make_node("a-bob", "Bob", 0x22);
+    let carol = make_node("m-carol", "Carol", 0x33);
+    let dave = make_node("b-dave", "Dave", 0x44);
+    let pk_a = alice.public_key();
+    let pk_b = bob.public_key();
+    let pk_c = carol.public_key();
+    let pk_d = dave.public_key();
+    nodes.insert("z-alice".into(), alice);
+    nodes.insert("a-bob".into(), bob);
+    nodes.insert("m-carol".into(), carol);
+    nodes.insert("b-dave".into(), dave);
+
+    // Connect linear 4-hop chain: z-alice <-> a-bob <-> m-carol <-> b-dave
+    let connect_pair = |nodes: &mut BTreeMap<String, MeshNode>,
+                        u: &str,
+                        u_name: &str,
+                        u_pk: [u8; 32],
+                        v: &str,
+                        v_name: &str,
+                        v_pk: [u8; 32]|
+     -> TestResult {
+        let a1 = nodes
+            .get_mut(u)
+            .ok_or("missing u")?
+            .on_peer_connected(v.into(), v_name.into(), v_pk, false, None)?;
+        let a2 = nodes
+            .get_mut(v)
+            .ok_or("missing v")?
+            .on_peer_connected(u.into(), u_name.into(), u_pk, false, None)?;
+        drain_network(nodes, vec![(u.into(), a1), (v.into(), a2)])
+    };
+
+    connect_pair(&mut nodes, "z-alice", "Alice", pk_a, "a-bob", "Bob", pk_b)?;
+    assert_eq!(nodes["z-alice"].color_for_peer("z-alice"), 0);
+    assert_eq!(nodes["a-bob"].color_for_peer("z-alice"), 0);
+    assert_eq!(nodes["z-alice"].color_for_peer("a-bob"), 1);
+    assert_eq!(nodes["a-bob"].color_for_peer("a-bob"), 1);
+
+    connect_pair(&mut nodes, "a-bob", "Bob", pk_b, "m-carol", "Carol", pk_c)?;
+    connect_pair(&mut nodes, "m-carol", "Carol", pk_c, "b-dave", "Dave", pk_d)?;
+
+    // ALL 4 peers across the 4-node chain MUST agree bit-for-bit on ALL 4 unique colors!
+    let expected = nodes["z-alice"].peer_colors_map();
+    assert_eq!(expected.len(), 4);
+    assert_eq!(expected["z-alice"], 0);
+    let unique_colors: BTreeSet<u32> = expected.values().copied().collect();
+    assert_eq!(unique_colors.len(), 4, "Duplicate peer colors detected: {expected:?}");
+    for (pid, node) in &nodes {
+        assert_eq!(
+            node.peer_colors_map(),
+            expected,
+            "Node {pid} diverged on peer colors"
+        );
+    }
+
+    // Verify status_json exposes peerColors cleanly
+    let status_val = parse_json(&nodes["b-dave"].status_json())?;
+    let pc_obj = status_val
+        .get("peerColors")
+        .ok_or("status_json missing peerColors")?;
+    assert_eq!(pc_obj.get_u64("z-alice"), Some(0));
+    assert_eq!(pc_obj.get_u64("a-bob"), Some(1));
+
+    // 2. Partitioned simultaneous creators (both committed color=0, lamport=1 while disconnected)
+    //    MUST resolve collision identically with zero duplicates once connected!
+    let mut part_nodes: BTreeMap<String, MeshNode> = BTreeMap::new();
+    let mut p1 = make_node("p-111", "P1", 0x55);
+    let mut p2 = make_node("p-999", "P2", 0x66);
+    let _ = p1.commit_self_color();
+    let _ = p2.commit_self_color();
+    assert_eq!(p1.color_for_peer("p-111"), 0);
+    assert_eq!(p2.color_for_peer("p-999"), 0);
+    let pk1 = p1.public_key();
+    let pk2 = p2.public_key();
+    part_nodes.insert("p-111".into(), p1);
+    part_nodes.insert("p-999".into(), p2);
+    connect_pair(&mut part_nodes, "p-111", "P1", pk1, "p-999", "P2", pk2)?;
+    assert_eq!(part_nodes["p-111"].peer_colors_map(), part_nodes["p-999"].peer_colors_map());
+    assert_eq!(part_nodes["p-111"].color_for_peer("p-111"), 0);
+    assert_eq!(part_nodes["p-111"].color_for_peer("p-999"), 1);
+
+    Ok(())
+}
+
+
 
 

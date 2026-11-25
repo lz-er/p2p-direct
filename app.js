@@ -577,12 +577,23 @@ const STRUCTURED_PRESETS = {
   },
 };
 
-const METRO_TILE_THEMES = [
-  "tile-coral",
+// 12 curated WCAG-checked Flat Metro peer hues in canonical index order (0..11).
+// Indices >= 12 dynamically generate unique golden-angle HSL fills via .tile-custom CSS vars.
+const PEER_COLOR_THEMES = [
+  "tile-mint",
   "tile-cobalt",
+  "tile-coral",
   "tile-ochre",
   "tile-cyan",
+  "tile-magenta",
+  "tile-violet",
+  "tile-tangerine",
+  "tile-lime",
+  "tile-teal",
+  "tile-indigo",
+  "tile-crimson",
 ];
+const ALL_PEER_TILE_CLASSES = [...PEER_COLOR_THEMES, "tile-custom", "is-dark-ink"];
 
 const VOICE_EQ_WEIGHTS = [0.32, 0.54, 0.76, 0.92, 1.0, 1.0, 0.92, 0.76, 0.54, 0.32];
 const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
@@ -743,14 +754,91 @@ function avatarInitials(name) {
   return single.slice(0, 2).toUpperCase();
 }
 
-function peerTileTheme(seed, isSelf = false) {
-  if (isSelf) return "tile-mint";
+function fallbackPeerColorIndex(seed) {
   const str = String(seed || "peer");
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
   }
-  return METRO_TILE_THEMES[Math.abs(hash) % METRO_TILE_THEMES.length];
+  return Math.abs(hash) % PEER_COLOR_THEMES.length;
+}
+
+function _hslRelativeLuminance(hDeg, sPct, lPct) {
+  const h = (((hDeg % 360) + 360) % 360) / 360;
+  const s = Math.max(0, Math.min(1, sPct / 100));
+  const l = Math.max(0, Math.min(1, lPct / 100));
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const hue2rgb = (t) => {
+    let tt = t;
+    if (tt < 0) tt += 1;
+    if (tt > 1) tt -= 1;
+    if (tt < 1 / 6) return p + (q - p) * 6 * tt;
+    if (tt < 1 / 2) return q;
+    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6;
+    return p;
+  };
+  const lin = (c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+  const r = lin(hue2rgb(h + 1 / 3));
+  const g = lin(hue2rgb(h));
+  const b = lin(hue2rgb(h - 1 / 3));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function colorSpecForIndex(rawIdx) {
+  const idx = Number.isInteger(rawIdx) && rawIdx >= 0 ? rawIdx : 0;
+  if (idx < PEER_COLOR_THEMES.length) {
+    return {
+      idx,
+      className: PEER_COLOR_THEMES[idx],
+      extraClass: "",
+      styleAttr: "",
+      bg: null,
+      bgMuted: null,
+      fg: null,
+    };
+  }
+  // Golden-angle stepping guarantees unlimited distinct hues with zero collisions for 13+ peers
+  const overflow = idx - PEER_COLOR_THEMES.length;
+  const hue = Math.round(((overflow * 137.50776405003785) + 27) % 360);
+  const sat = overflow % 2 === 0 ? 84 : 74;
+  const light = overflow % 3 === 0 ? 52 : overflow % 3 === 1 ? 42 : 60;
+  const bg = `hsl(${hue}, ${sat}%, ${light}%)`;
+  const bgMuted = `hsl(${hue}, ${Math.max(26, sat - 44)}%, ${Math.max(28, light - 10)}%)`;
+  const lum = _hslRelativeLuminance(hue, sat, light);
+  const isDarkInk = lum > 0.36;
+  const fg = isDarkInk ? "#0e0f12" : "#ffffff";
+  return {
+    idx,
+    className: "tile-custom",
+    extraClass: isDarkInk ? " is-dark-ink" : "",
+    styleAttr: `--tile-bg:${bg};--tile-bg-muted:${bgMuted};--tile-fg:${fg}`,
+    bg,
+    bgMuted,
+    fg,
+  };
+}
+
+function applyPeerColorToElement(el, spec) {
+  if (!el || !spec) return;
+  for (const cls of ALL_PEER_TILE_CLASSES) {
+    el.classList.remove(cls);
+  }
+  el.classList.add(spec.className);
+  if (spec.extraClass) {
+    for (const extra of spec.extraClass.trim().split(/\s+/)) {
+      if (extra) el.classList.add(extra);
+    }
+  }
+  if (spec.bg) {
+    el.style.setProperty("--tile-bg", spec.bg);
+    el.style.setProperty("--tile-bg-muted", spec.bgMuted);
+    el.style.setProperty("--tile-fg", spec.fg);
+  } else {
+    el.style.removeProperty("--tile-bg");
+    el.style.removeProperty("--tile-bg-muted");
+    el.style.removeProperty("--tile-fg");
+  }
 }
 
 function formatByteSize(bytes) {
@@ -1352,6 +1440,14 @@ class P2PDirectApp {
 
     // Negotiated voice codec capability per peer ("opus48" | "adpcm16")
     this.peerVoiceCodec = new Map();
+
+    // Canonical duplicate-free peer color registry synced across all peers via Safe Rust WASM
+    this.peerColors = new Map(); // peerId -> colorIdx (u32)
+
+    // Tracks explicit local changes for live same-browser multi-tab sync
+    this._userCustomizedName = false;
+    this._userCustomizedTheme = false;
+    this._userCustomizedAudio = false;
 
     // Real-time multi-peer voice channel state
     this.voice = {
@@ -2052,6 +2148,7 @@ class P2PDirectApp {
         this.el["author-name-input"].value = this.status.authorName;
         return;
       }
+      this._userCustomizedName = true;
       saveSessionAuthorName(next);
       const res = this.wasm.call({ cmd: "set_profile", authorName: next });
       this.status = res.status;
@@ -2061,6 +2158,7 @@ class P2PDirectApp {
       this.renderVoicePanel(true);
       this.renderTopology();
       this.broadcastMeshBeacon(false);
+      this.broadcastTabState({ authorName: next });
       this.announceRoomHello(false);
       this.showToast(`Updated display name to ${next}`);
     });
@@ -2075,13 +2173,16 @@ class P2PDirectApp {
     });
 
     this.el["btn-sync-now"].addEventListener("click", () => {
-      const res = this.wasm.call({ cmd: "request_sync" });
+      const res = this.wasm.call({ cmd: "request_sync", nowMs: Date.now() });
       this.status = res.status;
       this.executeActions(res.actions);
       this.broadcastMeshBeacon(true);
+      if (this.activeRoom && this.roomRendezvous) {
+        this.announceRoomHello(true);
+      }
       this.addTelemetry(
         "sync_inv",
-        `Triggered E2EE anti-entropy sync across ${this.directPeers.size} peer(s)`
+        `Triggered full E2EE sync (log + colors + media) across ${this.directPeers.size} peer(s)`
       );
       this.renderAll();
     });
@@ -2614,8 +2715,12 @@ class P2PDirectApp {
     await this.handleUrlHashFragment();
     this.renderAll();
 
-    // Discover any other live tabs open in this browser
+    // Discover any other live tabs open in this browser and sync live tab preferences
     this.broadcastMeshBeacon(true);
+    this.postBroadcast({
+      type: "tab-state-hello",
+      fromPeerId: this.status.peerId,
+    });
 
     window.__p2pDirect = this;
   }
@@ -3046,10 +3151,10 @@ class P2PDirectApp {
   initTheme() {
     const current =
       document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
-    this.applyTheme(current, /* persist = */ false);
+    this.applyTheme(current, /* persist = */ false, /* broadcast = */ false);
   }
 
-  applyTheme(theme, persist = true) {
+  applyTheme(theme, persist = true, broadcast = false) {
     const isDark = theme === "dark";
     const root = document.documentElement;
     root.classList.add("theme-switching");
@@ -3072,6 +3177,10 @@ class P2PDirectApp {
         // ignore storage restrictions
       }
     }
+    if (broadcast) {
+      this._userCustomizedTheme = true;
+      this.broadcastTabState({ theme: isDark ? "dark" : "light" });
+    }
     if (this.status) {
       this.renderTopology();
     }
@@ -3079,7 +3188,7 @@ class P2PDirectApp {
 
   toggleTheme() {
     const current = document.documentElement.getAttribute("data-theme");
-    this.applyTheme(current === "dark" ? "light" : "dark", true);
+    this.applyTheme(current === "dark" ? "light" : "dark", true, true);
   }
 
   async addPendingImageFiles(files) {
@@ -4973,7 +5082,7 @@ class P2PDirectApp {
         const pingRes = this.wasm.call({ cmd: "keepalive_ping", nowMs: now });
         this.status = pingRes.status;
         this.executeActions(pingRes.actions);
-        const syncRes = this.wasm.call({ cmd: "request_sync" });
+        const syncRes = this.wasm.call({ cmd: "request_sync", nowMs: now });
         this.status = syncRes.status;
         this.executeActions(syncRes.actions);
         this.renderAll();
@@ -5056,6 +5165,81 @@ class P2PDirectApp {
     }
   }
 
+  broadcastTabState(patch, toPeerId = undefined) {
+    if (!this.bc || !this.status || !patch) return;
+    this.postBroadcast({
+      type: "tab-state-sync",
+      fromPeerId: this.status.peerId,
+      toPeerId,
+      patch,
+    });
+  }
+
+  applyIncomingTabState(patch) {
+    if (!patch || typeof patch !== "object" || !this.status) return;
+
+    if (patch.theme === "dark" || patch.theme === "light") {
+      const currentTheme =
+        document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+      if (currentTheme !== patch.theme) {
+        this._userCustomizedTheme = true;
+        this.applyTheme(patch.theme, /* persist = */ true, /* broadcast = */ false);
+      }
+    }
+
+    if (typeof patch.authorName === "string") {
+      const next = patch.authorName.trim().slice(0, 32);
+      if (next && next !== this.status.authorName) {
+        this._userCustomizedName = true;
+        if (this.el["author-name-input"]) {
+          this.el["author-name-input"].value = next;
+        }
+        saveSessionAuthorName(next);
+        try {
+          const res = this.wasm.call({ cmd: "set_profile", authorName: next });
+          this.status = res.status;
+          this.profile.authorName = next;
+          this.executeActions(res.actions);
+          this.renderHeader();
+          this.renderVoicePanel(true);
+          this.renderTopology();
+          this.announceRoomHello(false);
+        } catch {
+          // ignore if engine not ready
+        }
+      }
+    }
+
+    if (patch.audioSettings && typeof patch.audioSettings === "object") {
+      const merged = saveSessionAudioSettings({
+        ...this.audioSettings,
+        ...patch.audioSettings,
+      });
+      if (JSON.stringify(merged) !== JSON.stringify(this.audioSettings)) {
+        this.audioSettings = merged;
+        this._userCustomizedAudio = true;
+        this.syncAudioSettingsUI();
+        this.applyLiveAudioDspParams(true);
+        this.applyMicTrackConstraints();
+        this.updateVoiceCodecMeta();
+      }
+    }
+
+    if (patch.savedRoomsChanged) {
+      this.savedRooms = loadSavedRooms();
+      this.lastJoinedRoom = loadLastJoinedRoom();
+      if (this.activeRoom) {
+        const match = this.savedRooms.find((r) => r.topic === this.activeRoom.topic);
+        if (match && match.name && match.name !== this.activeRoom.name) {
+          this.activeRoom.name = match.name;
+          this.profile.room = match.name;
+        }
+      }
+      this.renderRoomCard();
+      this.renderSavedRooms();
+    }
+  }
+
   broadcastMeshBeacon(requestReply) {
     if (!this.bc || !this.status) return;
     this.postBroadcast({
@@ -5082,6 +5266,29 @@ class P2PDirectApp {
     }
 
     switch (msg.type) {
+      case "tab-state-hello": {
+        const replyPatch = {};
+        if (this._userCustomizedTheme) {
+          replyPatch.theme =
+            document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+        }
+        if (this._userCustomizedName && this.status.authorName) {
+          replyPatch.authorName = this.status.authorName;
+        }
+        if (this._userCustomizedAudio && this.audioSettings) {
+          replyPatch.audioSettings = this.audioSettings;
+        }
+        if (Object.keys(replyPatch).length > 0) {
+          this.broadcastTabState(replyPatch, msg.fromPeerId);
+        }
+        break;
+      }
+
+      case "tab-state-sync": {
+        this.applyIncomingTabState(msg.patch);
+        break;
+      }
+
       case "mesh-beacon": {
         if (msg.peerId && msg.vcodec) {
           this.recordPeerVoiceCodec(msg.peerId, msg.vcodec);
@@ -6078,6 +6285,15 @@ class P2PDirectApp {
       entropy: randomBase64Url(16),
     });
     this.status = encoded.status;
+    if (!joined) {
+      try {
+        const colorRes = this.wasm.call({ cmd: "commit_peer_color" });
+        this.status = colorRes.status;
+        this.executeActions(colorRes.actions);
+      } catch {
+        // ignore
+      }
+    }
     const savedMatch = this.savedRooms.find((r) => r.topic === encoded.roomTopic);
     const displayName = (savedMatch && savedMatch.name) || encoded.room;
     this.activeRoom = {
@@ -6100,6 +6316,7 @@ class P2PDirectApp {
     }
 
     this.startRoomRendezvous(encoded.roomTopic, relay);
+    this.broadcastMeshBeacon(true);
     this.renderAll();
 
     this.addTelemetry(
@@ -6191,6 +6408,7 @@ class P2PDirectApp {
     if (saved) {
       this.lastJoinedRoom = saved;
       this.savedRooms = loadSavedRooms();
+      this.broadcastTabState({ savedRoomsChanged: true });
     }
   }
 
@@ -6208,6 +6426,7 @@ class P2PDirectApp {
         this.editingSavedRoomTopic = null;
       }
       this.renderSavedRooms();
+      this.broadcastTabState({ savedRoomsChanged: true });
       this.showToast(`Removed "${name || "Shared Room"}" from saved rooms`);
     } else {
       this.saveRoomBookmark(this.activeRoom);
@@ -6228,6 +6447,7 @@ class P2PDirectApp {
       lastJoinedAt: entry.lastJoinedAt || now,
     });
     this.renderSavedRooms();
+    this.broadcastTabState({ savedRoomsChanged: true });
     this.showToast(`Saved "${entry.name || "Shared Room"}" locally`);
   }
 
@@ -6239,6 +6459,7 @@ class P2PDirectApp {
       this.editingSavedRoomTopic = null;
     }
     this.renderSavedRooms();
+    this.broadcastTabState({ savedRoomsChanged: true });
     if (prev) {
       this.showToast(`Removed "${prev.name}" from saved rooms`);
     }
@@ -6260,6 +6481,7 @@ class P2PDirectApp {
     }
     this.editingSavedRoomTopic = null;
     this.renderRoomCard();
+    this.broadcastTabState({ savedRoomsChanged: true });
     this.showToast(`Renamed room to "${trimmed}"`);
   }
 
@@ -6267,6 +6489,7 @@ class P2PDirectApp {
     clearLastJoinedRoom();
     this.lastJoinedRoom = null;
     this.renderSavedRooms();
+    this.broadcastTabState({ savedRoomsChanged: true });
     this.showToast("Cleared last joined room");
   }
 
@@ -8573,6 +8796,7 @@ class P2PDirectApp {
   applyAudioPreset(presetName) {
     const preset = AUDIO_PRESETS[presetName];
     if (!preset) return;
+    this._userCustomizedAudio = true;
     this.audioSettings = saveSessionAudioSettings({
       ...this.audioSettings,
       ...preset,
@@ -8581,12 +8805,14 @@ class P2PDirectApp {
     this.applyLiveAudioDspParams(true);
     this.applyMicTrackConstraints();
     this.updateVoiceCodecMeta();
+    this.broadcastTabState({ audioSettings: this.audioSettings });
     this.showToast(
       `Audio profile: ${presetName === "raw" ? "Raw / Music" : presetName[0].toUpperCase() + presetName.slice(1)}`
     );
   }
 
   resetAudioSettings() {
+    this._userCustomizedAudio = true;
     this.audioSettings = saveSessionAudioSettings({
       ...DEFAULT_AUDIO_SETTINGS,
       deviceId: this.audioSettings.deviceId || "",
@@ -8596,6 +8822,7 @@ class P2PDirectApp {
     this.applyLiveAudioDspParams(true);
     this.applyMicTrackConstraints();
     this.updateVoiceCodecMeta();
+    this.broadcastTabState({ audioSettings: this.audioSettings });
     this.showToast("Audio settings reset to defaults");
   }
 
@@ -8618,9 +8845,11 @@ class P2PDirectApp {
     if (!keepPreset) {
       next.preset = this.detectMatchingAudioPreset(next);
     }
+    this._userCustomizedAudio = true;
     this.audioSettings = saveSessionAudioSettings(next);
     this.syncAudioSettingsUI();
     this.applyLiveAudioDspParams(rewireGraph);
+    this.broadcastTabState({ audioSettings: this.audioSettings });
     if (prevPreset !== this.audioSettings.preset && (prevPreset === "raw" || this.audioSettings.preset === "raw")) {
       this.updateVoiceCodecMeta();
     }
@@ -11215,6 +11444,14 @@ class P2PDirectApp {
           }
           break;
         }
+        case "peer_colors": {
+          if (act.colors && typeof act.colors === "object") {
+            if (this._syncPeerColorsFromMap(act.colors)) {
+              this._refreshPeerColorDom();
+            }
+          }
+          break;
+        }
         case "telemetry": {
           this.addTelemetry(act.event, act.detail);
           break;
@@ -11455,9 +11692,104 @@ class P2PDirectApp {
     }
   }
 
+  /* ================= Synced Peer Color Registry ================= */
+
+  _syncPeerColorsFromMap(colorsObj) {
+    if (!colorsObj || typeof colorsObj !== "object") return false;
+    const entries = Object.entries(colorsObj);
+    let changed = entries.length !== this.peerColors.size;
+    if (!changed) {
+      for (const [pid, idx] of entries) {
+        if (this.peerColors.get(pid) !== idx) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed) return false;
+    this.peerColors.clear();
+    for (const [pid, idx] of entries) {
+      if (typeof idx === "number" && Number.isInteger(idx) && idx >= 0) {
+        this.peerColors.set(pid, idx);
+      }
+    }
+    return true;
+  }
+
+  _syncPeerColorsFromStatus() {
+    if (!this.status || !this.status.peerColors) return false;
+    return this._syncPeerColorsFromMap(this.status.peerColors);
+  }
+
+  getPeerColorIndex(peerId) {
+    if (peerId && this.peerColors.has(peerId)) {
+      return this.peerColors.get(peerId);
+    }
+    if (
+      peerId &&
+      this.status &&
+      this.status.peerColors &&
+      typeof this.status.peerColors[peerId] === "number"
+    ) {
+      return this.status.peerColors[peerId];
+    }
+    return fallbackPeerColorIndex(peerId);
+  }
+
+  getPeerColorSpec(peerId) {
+    return colorSpecForIndex(this.getPeerColorIndex(peerId));
+  }
+
+  _refreshPeerColorDom() {
+    if (!this.status) return;
+    // 1. Update top-bar NAME tag to match self's synced room color (default Mint in Lobby)
+    const nameTag = document.querySelector(".name-hero-tag");
+    if (nameTag) {
+      const inSession = Boolean(this.activeRoom || (this.status.peers && this.status.peers.length > 0));
+      const selfSpec = inSession
+        ? this.getPeerColorSpec(this.status.peerId)
+        : colorSpecForIndex(0);
+      applyPeerColorToElement(nameTag, selfSpec);
+    }
+
+    // 2. Update all existing chat message stripes in place (never rebuilds video/GIF DOM nodes)
+    const logFeed = this.el["log-feed"];
+    if (logFeed) {
+      for (const stripe of logFeed.querySelectorAll(".msg-stripe[data-msg-author]")) {
+        const authorId = stripe.getAttribute("data-msg-author");
+        if (authorId) {
+          applyPeerColorToElement(stripe, this.getPeerColorSpec(authorId));
+        }
+      }
+    }
+
+    // 3. Update active voice tiles in place without losing slider focus or interrupting audio
+    const voiceList = this.el["voice-participant-list"];
+    if (voiceList) {
+      for (const card of voiceList.querySelectorAll(".voice-card[data-voice-row]")) {
+        const rowKey = card.getAttribute("data-voice-row");
+        if (!rowKey) continue;
+        const pid = rowKey === "self" ? this.status.peerId : rowKey;
+        applyPeerColorToElement(card, this.getPeerColorSpec(pid));
+      }
+    }
+
+    // 4. Update Advanced Peer List color swatches in place
+    const peerList = this.el["peer-list"];
+    if (peerList) {
+      for (const swatch of peerList.querySelectorAll(".peer-color-swatch[data-peer-color-id]")) {
+        const pid = swatch.getAttribute("data-peer-color-id");
+        if (pid) {
+          applyPeerColorToElement(swatch, this.getPeerColorSpec(pid));
+        }
+      }
+    }
+  }
+
   /* ================= Rendering ================= */
 
   renderAll() {
+    const colorsChanged = this._syncPeerColorsFromStatus();
     this.syncLayoutAttributes();
     this.renderHeader();
     this.renderRoomCard();
@@ -11469,6 +11801,9 @@ class P2PDirectApp {
     this.renderStats();
     this.renderTypeFilterOptions();
     this.renderLog();
+    if (colorsChanged) {
+      this._refreshPeerColorDom();
+    }
   }
 
   /**
@@ -11476,9 +11811,13 @@ class P2PDirectApp {
    * rebuilds so incoming/outgoing media paints in ~1-3 ms without perturbing live audio.
    */
   renderMessageUpdate() {
+    const colorsChanged = this._syncPeerColorsFromStatus();
     this.renderStats();
     this.renderTypeFilterOptions();
     this.renderLog();
+    if (colorsChanged) {
+      this._refreshPeerColorDom();
+    }
   }
 
   buildBotCliCommand() {
@@ -11562,6 +11901,15 @@ class P2PDirectApp {
 
   renderHeader() {
     if (!this.status) return;
+    this._syncPeerColorsFromStatus();
+    const nameTag = document.querySelector(".name-hero-tag");
+    if (nameTag) {
+      const inSession = Boolean(this.activeRoom || (this.status.peers && this.status.peers.length > 0));
+      applyPeerColorToElement(
+        nameTag,
+        inSession ? this.getPeerColorSpec(this.status.peerId) : colorSpecForIndex(0)
+      );
+    }
     this.el["peer-id-display"].textContent = this.status.peerId;
     this.el["lamport-display"].textContent = String(this.status.lamport);
     this.el["peer-count-display"].textContent = String(this.status.peers.length);
@@ -11679,11 +12027,13 @@ class P2PDirectApp {
       return;
     }
 
+    const selfColorSpec = this.getPeerColorSpec(this.status.peerId);
     const rosterKey = JSON.stringify({
       inVoice: this.voice.inVoice,
       order: ordered,
       selfId: this.status.peerId,
       selfName: this.status.authorName,
+      selfColor: selfColorSpec.idx,
       muted: this.voice.muted,
       listenOnly: this.voice.listenOnly,
       deafened: this.voice.deafened,
@@ -11698,6 +12048,7 @@ class P2PDirectApp {
             p ? p.voiceMuted : false,
             mx ? mx.muted : false,
             Boolean(p && p.isBot),
+            this.getPeerColorIndex(id),
           ];
         }),
     });
@@ -11718,7 +12069,8 @@ class P2PDirectApp {
       const enteringClass = prevRendered.has(key) ? "" : " is-entering";
 
       if (key === "self") {
-        const selfTheme = peerTileTheme(this.status.peerId, true);
+        const selfTheme = `${selfColorSpec.className}${selfColorSpec.extraClass}`;
+        const selfStyle = selfColorSpec.styleAttr ? ` style="${selfColorSpec.styleAttr}"` : "";
         const selfInitials = escapeHtml(avatarInitials(this.status.authorName));
         const selfMuted = this.voice.muted || this.voice.listenOnly;
         const selfStateText = this.voice.listenOnly
@@ -11734,7 +12086,7 @@ class P2PDirectApp {
         const deafenLabel = this.voice.deafened ? "Undeafen audio" : "Deafen audio";
 
         items.push(`
-          <li class="voice-card is-self ${selfTheme}${selfMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="self">
+          <li class="voice-card is-self ${selfTheme}${selfMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="self"${selfStyle}>
             <div class="voice-tile-top">
               <span class="tile-mono">${selfInitials}</span>
               <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="self">${selfStateText}</span></span>
@@ -11781,7 +12133,9 @@ class P2PDirectApp {
 
       const p = peerMap.get(key);
       if (!p) continue;
-      const peerTheme = peerTileTheme(p.peerId, false);
+      const peerColorSpec = this.getPeerColorSpec(p.peerId);
+      const peerTheme = `${peerColorSpec.className}${peerColorSpec.extraClass}`;
+      const peerStyle = peerColorSpec.styleAttr ? ` style="${peerColorSpec.styleAttr}"` : "";
       const initials = escapeHtml(avatarInitials(p.authorName));
       const botPill = p.isBot ? '<span class="voice-bot-pill">BOT</span>' : "";
 
@@ -11797,7 +12151,7 @@ class P2PDirectApp {
             : "Live";
 
         items.push(`
-          <li class="voice-card ${peerTheme}${peerColorMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
+          <li class="voice-card ${peerTheme}${peerColorMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
             <div class="voice-tile-top">
               <span class="tile-mono">${initials}</span>
               <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span></span>
@@ -11832,7 +12186,7 @@ class P2PDirectApp {
       } else {
         const previewStateText = p.voiceMuted ? "Muted" : "In Voice";
         items.push(`
-          <li class="voice-card is-channel-preview ${peerTheme}${p.voiceMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
+          <li class="voice-card is-channel-preview ${peerTheme}${p.voiceMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
             <div class="voice-tile-top">
               <span class="tile-mono">${initials}</span>
               <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${previewStateText}</span></span>
@@ -12398,6 +12752,9 @@ class P2PDirectApp {
       const tech = this._getPeerTechInfo(p.peerId);
       const transportCls = isRelayed ? "transport-relay" : "transport-direct";
       const selectedCls = this.topo.selectedId === p.peerId ? " is-selected" : "";
+      const peerColorSpec = this.getPeerColorSpec(p.peerId);
+      const swatchStyle = peerColorSpec.styleAttr ? ` style="${peerColorSpec.styleAttr}"` : "";
+      const colorSwatch = `<span class="peer-color-swatch ${peerColorSpec.className}" data-peer-color-id="${escapeHtml(p.peerId)}"${swatchStyle} aria-hidden="true"></span>`;
       const originBadge = isRelayed
         ? `<span class="badge relay" title="${escapeHtml(tech.detailLabel)}">e2ee relay</span>`
         : `<span class="badge direct" title="${escapeHtml(tech.detailLabel)}">${escapeHtml(tech.shortLabel.toLowerCase())}</span>`;
@@ -12409,7 +12766,7 @@ class P2PDirectApp {
       parts.push(`
         <li class="peer-item ${transportCls}${selectedCls}" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
-            <div class="peer-name">${escapeHtml(p.authorName)} ${botBadge} ${originBadge} ${voiceBadge}</div>
+            <div class="peer-name">${colorSwatch}${escapeHtml(p.authorName)} ${botBadge} ${originBadge} ${voiceBadge}</div>
             <div class="peer-id">${escapeHtml(p.peerId)} · code ${escapeHtml(p.safetyCode || "—")}${rttLabel}</div>
           </div>
           <button type="button" class="btn btn-sm btn-danger" data-disconnect="${escapeHtml(p.peerId)}">Drop</button>
@@ -13361,7 +13718,8 @@ class P2PDirectApp {
   }
 
   buildLogEntryElement(m, isSelf, isNew) {
-    const stripeTheme = peerTileTheme(m.author, isSelf);
+    const stripeColor = this.getPeerColorSpec(m.author);
+    const stripeStyle = stripeColor.styleAttr ? ` style="${stripeColor.styleAttr}"` : "";
     const isBotMsg = m.type === "bot" && m.payload && typeof m.payload === "object";
     const isChat =
       m.type === "chat" &&
@@ -13400,7 +13758,7 @@ class P2PDirectApp {
     article.dataset.msgId = m.id;
     article.dataset.rev = String(m.updatedLamport || 0);
     article.innerHTML = `
-      <div class="msg-stripe ${stripeTheme}" aria-hidden="true"></div>
+      <div class="msg-stripe ${stripeColor.className}" data-msg-author="${escapeHtml(m.author)}"${stripeStyle} aria-hidden="true"></div>
       <div class="log-entry-main">
         <div class="log-entry-head">
           <div class="log-author-group">

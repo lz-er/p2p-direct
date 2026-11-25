@@ -448,7 +448,17 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
         }
         "request_sync" => {
             let node = require_node(state)?;
-            let actions = node.request_sync_all();
+            let now_ms = val.get_u64("nowMs").unwrap_or(0);
+            let actions = node.request_sync_all_at(now_ms);
+            let actions_json = actions_to_json_array(&actions);
+            let status = node.status_json();
+            Ok(format!(
+                "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
+            ))
+        }
+        "commit_peer_color" => {
+            let node = require_node(state)?;
+            let actions = node.commit_self_color();
             let actions_json = actions_to_json_array(&actions);
             let status = node.status_json();
             Ok(format!(

@@ -705,6 +705,16 @@ pub fn write_msg_wire_json_borrowed(
     out
 }
 
+pub const MAX_COLOR_SYNC_CLAIMS: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerColorClaim {
+    pub peer_id: String,
+    pub color_idx: u32,
+    /// `0` = tentative (pre-room / unresolved); `>= 1` = committed room Lamport order.
+    pub claimed_lamport: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireFrame {
     Hello {
@@ -791,6 +801,11 @@ pub enum WireFrame {
         ttl: u32,
         state: MediaSyncState,
     },
+    ColorSync {
+        origin: String,
+        ttl: u32,
+        claims: Vec<PeerColorClaim>,
+    },
 }
 
 impl WireFrame {
@@ -808,6 +823,7 @@ impl WireFrame {
                 sealed_ciphertext, ..
             } => sealed_ciphertext.len().div_ceil(3) * 4 + 320,
             Self::MediaSync { state, .. } => 384 + state.queue.len() * 192,
+            Self::ColorSync { claims, .. } => 96 + claims.len().saturating_mul(48),
             _ => 256,
         };
         let mut out = String::with_capacity(cap);
@@ -1014,6 +1030,24 @@ impl WireFrame {
                 let _ = write!(out, ",\"ttl\":{ttl},\"state\":");
                 state.write_json(&mut out, state.anchor_local_ms);
                 out.push('}');
+            }
+            Self::ColorSync {
+                origin,
+                ttl,
+                claims,
+            } => {
+                out.push_str("{\"kind\":\"color-sync\",\"origin\":");
+                write_json_string(&mut out, origin);
+                let _ = write!(out, ",\"ttl\":{ttl},\"claims\":[");
+                for (i, c) in claims.iter().take(MAX_COLOR_SYNC_CLAIMS).enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str("{\"p\":");
+                    write_json_string(&mut out, &c.peer_id);
+                    let _ = write!(out, ",\"c\":{},\"l\":{}}}", c.color_idx, c.claimed_lamport);
+                }
+                out.push_str("]}");
             }
         }
         out
@@ -1229,6 +1263,38 @@ impl WireFrame {
                     .ok_or_else(|| "media-sync frame missing 'state' object".to_owned())?;
                 let state = MediaSyncState::from_json_value(state_val, 0, 0)?;
                 Ok(Self::MediaSync { origin, ttl, state })
+            }
+            "color-sync" => {
+                let origin = req_str(&val, "origin")?;
+                let ttl = val
+                    .get_u64("ttl")
+                    .unwrap_or(u64::from(DEFAULT_GOSSIP_TTL))
+                    .min(u64::from(u32::MAX)) as u32;
+                let mut claims = Vec::new();
+                if let Some(arr) = val.get("claims").and_then(JsonValue::as_array) {
+                    for item in arr.iter().take(MAX_COLOR_SYNC_CLAIMS) {
+                        if let Some(pid) = item.get_str("p")
+                            && !pid.trim().is_empty()
+                        {
+                            let color_idx = item
+                                .get_u64("c")
+                                .unwrap_or(0)
+                                .min(u64::from(u32::MAX))
+                                as u32;
+                            let claimed_lamport = item.get_u64("l").unwrap_or(0);
+                            claims.push(PeerColorClaim {
+                                peer_id: pid.to_owned(),
+                                color_idx,
+                                claimed_lamport,
+                            });
+                        }
+                    }
+                }
+                Ok(Self::ColorSync {
+                    origin,
+                    ttl,
+                    claims,
+                })
             }
             other => Err(format!("unknown wire frame kind '{other}'")),
         }
