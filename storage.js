@@ -173,6 +173,7 @@ export function createDefaultProfile(slot) {
     x25519Secret: randomBase64Url(32),
     meshKey: randomBase64Url(32),
     passphraseMode: false,
+    knownPeers: [],
     snapshot: { version: 2, e2ee: "chacha20-poly1305", lamport: 0, records: [] },
     updatedAt: Date.now(),
   };
@@ -188,7 +189,35 @@ function ensureCryptoFields(record) {
   if (typeof record.passphraseMode !== "boolean") {
     record.passphraseMode = false;
   }
+  if (!Array.isArray(record.knownPeers)) {
+    record.knownPeers = [];
+  }
   return record;
+}
+
+export function upsertKnownPeer(profile, peerInfo) {
+  if (!profile || !peerInfo || !peerInfo.peerId || peerInfo.peerId === profile.peerId) {
+    return;
+  }
+  if (!Array.isArray(profile.knownPeers)) {
+    profile.knownPeers = [];
+  }
+  const existingIdx = profile.knownPeers.findIndex((p) => p.peerId === peerInfo.peerId);
+  const entry = {
+    peerId: peerInfo.peerId,
+    authorName: peerInfo.authorName || "Peer",
+    pubKey: peerInfo.pubKey || "",
+    lastSeenAt: Date.now(),
+  };
+  if (existingIdx >= 0) {
+    profile.knownPeers[existingIdx] = { ...profile.knownPeers[existingIdx], ...entry };
+  } else {
+    profile.knownPeers.unshift(entry);
+  }
+  profile.knownPeers.sort((a, b) => (b.lastSeenAt || 0) - (a.lastSeenAt || 0));
+  if (profile.knownPeers.length > 24) {
+    profile.knownPeers.length = 24;
+  }
 }
 
 export async function loadProfileState(slot) {

@@ -239,6 +239,12 @@ pub enum WireFrame {
         sealed_nonce: [u8; NONCE_LEN],
         sealed_ciphertext: Vec<u8>,
     },
+    Ping {
+        ts: u64,
+    },
+    Pong {
+        ts: u64,
+    },
 }
 
 impl WireFrame {
@@ -387,6 +393,12 @@ impl WireFrame {
                 out.push_str(",\"sc\":");
                 write_json_string(&mut out, &base64url_encode(sealed_ciphertext));
                 out.push('}');
+            }
+            Self::Ping { ts } => {
+                let _ = write!(out, "{{\"kind\":\"ping\",\"t\":{ts}}}");
+            }
+            Self::Pong { ts } => {
+                let _ = write!(out, "{{\"kind\":\"pong\",\"t\":{ts}}}");
             }
         }
         out
@@ -539,6 +551,12 @@ impl WireFrame {
                     sealed_ciphertext,
                 })
             }
+            "ping" => Ok(Self::Ping {
+                ts: val.get_u64("t").unwrap_or(0),
+            }),
+            "pong" => Ok(Self::Pong {
+                ts: val.get_u64("t").unwrap_or(0),
+            }),
             other => Err(format!("unknown wire frame kind '{other}'")),
         }
     }

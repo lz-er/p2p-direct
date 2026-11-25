@@ -283,6 +283,8 @@ pub struct ConnectedPeer {
     pub via_auto_mesh: bool,
     pub introduced_by: Option<String>,
     pub remote_peers: Vec<PeerSummary>,
+    pub last_pong_ms: u64,
+    pub rtt_ms: Option<u64>,
     crypto: PeerCryptoState,
     known_ids: HashSet<String>,
     pending_inv: Option<PendingInventory>,
@@ -430,7 +432,11 @@ impl MeshNode {
     }
 
     /// Updates the 256-bit mesh key, re-sealing local log records and re-keying active links.
+    /// Returns immediately as a no-op if the key and passphrase mode are already active so live E2EE links are preserved.
     pub fn set_mesh_key(&mut self, new_mesh_key: [u8; KEY_LEN], passphrase_mode: bool) -> Result<(), String> {
+        if self.mesh_key == new_mesh_key && self.passphrase_mode == passphrase_mode {
+            return Ok(());
+        }
         self.mesh_key = new_mesh_key;
         self.log_key = derive_log_key(&new_mesh_key);
         self.key_fp = key_fingerprint(&new_mesh_key);
@@ -677,6 +683,8 @@ impl MeshNode {
                 via_auto_mesh,
                 introduced_by: resolved_intro,
                 remote_peers: Vec::new(),
+                last_pong_ms: 0,
+                rtt_ms: None,
                 crypto: PeerCryptoState {
                     pub_key: peer_pub_key,
                     tx_key,
@@ -758,6 +766,17 @@ impl MeshNode {
                 p.we_sent_inv = true;
             }
             self.send_sync_inv_to(&pid, &mut actions);
+        }
+        actions
+    }
+
+    /// Sends encrypted keepalive `Ping` frames across all direct peers to keep background connections warm.
+    pub fn send_keepalive_pings(&mut self, now_ms: u64) -> Vec<MeshAction> {
+        let mut actions = Vec::new();
+        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+        let frame = WireFrame::Ping { ts: now_ms };
+        for pid in peer_ids {
+            self.emit_wire(&mut actions, &pid, &frame);
         }
         actions
     }
@@ -1056,6 +1075,18 @@ impl MeshNode {
                     now_ms,
                     &mut actions,
                 )?;
+            }
+            WireFrame::Ping { ts } => {
+                let pong = WireFrame::Pong { ts };
+                self.emit_wire(&mut actions, from_peer, &pong);
+            }
+            WireFrame::Pong { ts } => {
+                if let Some(peer) = self.peers.get_mut(from_peer) {
+                    peer.last_pong_ms = now_ms;
+                    if now_ms >= ts && ts > 0 {
+                        peer.rtt_ms = Some(now_ms - ts);
+                    }
+                }
             }
         }
 
@@ -1768,9 +1799,17 @@ impl MeshNode {
             }
             let _ = write!(
                 out,
-                ",\"knownCount\":{},\"remotePeers\":[",
-                peer.known_ids.len()
+                ",\"knownCount\":{},\"lastPongMs\":{},\"rttMs\":",
+                peer.known_ids.len(),
+                peer.last_pong_ms
             );
+            match peer.rtt_ms {
+                Some(r) => {
+                    let _ = write!(out, "{r}");
+                }
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"remotePeers\":[");
             for (j, rp) in peer.remote_peers.iter().enumerate() {
                 if j > 0 {
                     out.push(',');

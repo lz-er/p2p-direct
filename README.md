@@ -23,6 +23,10 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
 - **Anti-Entropy Backfill & Loop-Free Multi-Hop Gossip**:
   - Multi-part `sync-inv`, `sync-req`, and count/byte-bounded chunked `sync-batch` backfill deliver all missing historical and new records to joining or reconnecting peers.
   - Loop-free multi-hop gossip and transitive backfill propagation guarded by seen-ID deduplication, path tracking, and TTL bounds.
+- **Frictionless Joining, Tab-Reopen Rejoining & Background Keepalive**:
+  - Unified **Connect & Join** box auto-detects pasted `P2P1:`, `#offer=`, and `#answer=` links (with 1-click clipboard paste and Web Share support); opening an `#answer=` link in a new tab automatically delivers the reply to the original inviter tab via `BroadcastChannel`.
+  - Reopening a closed or reloaded tab restores the saved `peerId`, X25519 identity, mesh key, encrypted log, and `knownPeers` — auto-rejoining open tabs on the same browser with zero clicks, or offering a 1-click **Create Rejoin Link** for peers on other devices (cleanly superseding stale sockets).
+  - An inline Blob Web Worker sends encrypted `Ping`/`Pong` keepalive frames every 4s (unthrottled in hidden tabs) paired with liveness-aware disconnect timers and foreground resume sync so background tabs stay connected.
 
 ## Architecture
 

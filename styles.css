@@ -300,6 +300,89 @@ select {
   line-height: 1.35;
 }
 
+.quick-banner {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid #cddcff;
+  background: var(--accent-action-bg);
+  color: #1e3a8a;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.quick-banner.rejoin {
+  border-color: #f6d5a3;
+  background: var(--accent-warn-bg);
+  color: var(--accent-warn);
+}
+
+.quick-banner-title {
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.quick-banner-sub {
+  font-size: 11.5px;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.connect-hero-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.connect-hero-row .btn-primary {
+  flex: 1;
+}
+
+.handshake-card {
+  margin-bottom: 12px;
+  padding: 11px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid #b7dfd8;
+  background: #f5fbf9;
+}
+
+.handshake-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.handshake-step-pill {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-live-ink);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.smart-paste-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.smart-paste-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.smart-paste-actions .btn-accent {
+  flex: 1;
+}
+
 /* Segmented Tabs */
 .tabs {
   display: grid;

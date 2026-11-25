@@ -4,6 +4,7 @@ import {
   loadProfileState,
   randomBase64Url,
   saveProfileState,
+  upsertKnownPeer,
 } from "./storage.js";
 
 const ICE_CONFIG = {
@@ -12,6 +13,10 @@ const ICE_CONFIG = {
     { urls: "stun:stun1.l.google.com:19302" },
   ],
 };
+
+const BROADCAST_CHANNEL_NAME = "p2p-direct-signal-v1";
+const KEEPALIVE_INTERVAL_MS = 4000;
+const DISCONNECT_GRACE_MS = 6000;
 
 const STRUCTURED_PRESETS = {
   event: {
@@ -71,7 +76,7 @@ function basePageUrl() {
   return `${window.location.origin}${window.location.pathname}${window.location.search}`;
 }
 
-function waitForIceGathering(pc, maxWaitMs = 2000) {
+function waitForIceGathering(pc, maxWaitMs = 1400) {
   if (pc.iceGatheringState === "complete") {
     return Promise.resolve();
   }
@@ -96,7 +101,7 @@ function waitForIceGathering(pc, maxWaitMs = 2000) {
       if (!ev.candidate) {
         finish();
       } else if (!candidateTimer) {
-        candidateTimer = setTimeout(finish, 900);
+        candidateTimer = setTimeout(finish, 600);
       }
     };
     const hardTimer = setTimeout(finish, maxWaitMs);
@@ -115,17 +120,30 @@ class P2PDirectApp {
     this.telemetry = [];
     this.saveTimer = null;
     this.toastTimer = null;
+    this.rejoinDismissed = false;
 
     // Out-of-band manual signaling state
     this.pendingOffers = new Map();
     this.pendingAnswers = new Map();
     this.latestOffer = null;
     this.latestAnswer = null;
+    this.activeHandshake = null; // { kind: "offer"|"answer", code, url, inviteId }
 
     // Live WebRTC transport maps
     this.directPeers = new Map();
     this.relayPeers = new Map();
     this.earlyRelayIce = new Map();
+
+    // Same-browser BroadcastChannel auto-rejoin & 1-click local discovery
+    this.bc = null;
+    this.discoveredLocalMeshes = new Map(); // peerId -> beacon
+    this.localDialing = new Map(); // peerId -> { pc, dc, remoteDescSet, sdpSent, localIceQueue, pendingIce, startedAt }
+    this.earlyLocalIce = new Map(); // peerId -> Array<candidate>
+
+    // Background-resilient Web Worker keepalive
+    this.keepaliveWorker = null;
+    this.keepaliveFallbackTimer = null;
+    this.keepaliveTickCount = 0;
 
     this.el = {};
   }
@@ -145,25 +163,28 @@ class P2PDirectApp {
       "btn-apply-passphrase",
       "btn-clear-passphrase",
       "e2ee-bar-hint",
-      "tab-btn-invite",
-      "tab-btn-join",
-      "tab-pane-invite",
-      "tab-pane-join",
+      "local-mesh-banner",
+      "local-mesh-fp",
+      "local-mesh-desc",
+      "btn-join-local-mesh",
+      "rejoin-banner",
+      "rejoin-fp",
+      "rejoin-desc",
+      "btn-create-rejoin",
+      "btn-dismiss-rejoin",
       "btn-create-invite",
-      "btn-copy-offer-code",
-      "btn-copy-offer-url",
-      "offer-code-output",
-      "offer-size-meta",
-      "answer-code-input",
-      "btn-accept-answer",
-      "invite-notice",
-      "offer-code-input",
-      "btn-create-answer",
-      "answer-code-output",
-      "answer-size-meta",
-      "btn-copy-answer-code",
-      "btn-copy-answer-url",
-      "join-notice",
+      "handshake-card",
+      "handshake-step-pill",
+      "handshake-size-meta",
+      "handshake-instruction",
+      "btn-copy-handshake-url",
+      "btn-copy-handshake-code",
+      "btn-share-handshake",
+      "handshake-code-output",
+      "smart-signal-input",
+      "btn-paste-clipboard",
+      "btn-smart-connect",
+      "connect-notice",
       "btn-sync-now",
       "topology-svg",
       "profile-slot-label",
@@ -198,9 +219,6 @@ class P2PDirectApp {
   }
 
   bindEvents() {
-    this.el["tab-btn-invite"].addEventListener("click", () => this.switchConnectTab("invite"));
-    this.el["tab-btn-join"].addEventListener("click", () => this.switchConnectTab("join"));
-
     this.el["btn-apply-passphrase"].addEventListener("click", () => this.applyPassphrase());
     this.el["btn-clear-passphrase"].addEventListener("click", () => this.clearPassphrase());
     this.el["e2ee-passphrase-input"].addEventListener("keydown", (ev) => {
@@ -210,25 +228,75 @@ class P2PDirectApp {
       }
     });
 
-    this.el["btn-create-invite"].addEventListener("click", () => this.createManualInvite());
-    this.el["btn-copy-offer-code"].addEventListener("click", () => {
-      if (this.latestOffer) this.copyText(this.latestOffer.code, "Copied P2P1: offer code");
+    this.el["btn-join-local-mesh"].addEventListener("click", () => this.joinDiscoveredLocalMesh());
+    this.el["btn-create-rejoin"].addEventListener("click", () => this.createManualInvite(true));
+    this.el["btn-dismiss-rejoin"].addEventListener("click", () => {
+      this.rejoinDismissed = true;
+      this.renderConnectBanners();
     });
-    this.el["btn-copy-offer-url"].addEventListener("click", () => {
-      if (this.latestOffer) this.copyText(this.latestOffer.url, "Copied #offer= invite link");
-    });
-    this.el["btn-accept-answer"].addEventListener("click", () =>
-      this.completeManualOffer(this.el["answer-code-input"].value)
-    );
 
-    this.el["btn-create-answer"].addEventListener("click", () =>
-      this.acceptManualOffer(this.el["offer-code-input"].value)
-    );
-    this.el["btn-copy-answer-code"].addEventListener("click", () => {
-      if (this.latestAnswer) this.copyText(this.latestAnswer.code, "Copied P2P1: reply code");
+    this.el["btn-create-invite"].addEventListener("click", () => this.createManualInvite(false));
+    this.el["btn-copy-handshake-url"].addEventListener("click", () => {
+      if (this.activeHandshake) {
+        const label =
+          this.activeHandshake.kind === "offer"
+            ? "Copied #offer= invite link"
+            : "Copied #answer= reply link";
+        this.copyText(this.activeHandshake.url, label);
+      }
     });
-    this.el["btn-copy-answer-url"].addEventListener("click", () => {
-      if (this.latestAnswer) this.copyText(this.latestAnswer.url, "Copied #answer= reply link");
+    this.el["btn-copy-handshake-code"].addEventListener("click", () => {
+      if (this.activeHandshake) {
+        const label =
+          this.activeHandshake.kind === "offer"
+            ? "Copied P2P1: invite code"
+            : "Copied P2P1: reply code";
+        this.copyText(this.activeHandshake.code, label);
+      }
+    });
+    this.el["btn-share-handshake"].addEventListener("click", async () => {
+      if (!this.activeHandshake || typeof navigator.share !== "function") return;
+      try {
+        await navigator.share({
+          title:
+            this.activeHandshake.kind === "offer"
+              ? "Join my E2EE p2p-direct mesh"
+              : "p2p-direct E2EE reply link",
+          url: this.activeHandshake.url,
+        });
+      } catch {
+        // user canceled share sheet
+      }
+    });
+
+    this.el["btn-smart-connect"].addEventListener("click", () =>
+      this.handleSmartSignal(this.el["smart-signal-input"].value)
+    );
+    this.el["btn-paste-clipboard"].addEventListener("click", async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text || !text.trim()) {
+          this.showNotice("connect-notice", "warn", "Clipboard is empty.");
+          return;
+        }
+        this.el["smart-signal-input"].value = text.trim();
+        await this.handleSmartSignal(text.trim());
+      } catch {
+        this.showNotice(
+          "connect-notice",
+          "warn",
+          "Browser blocked direct clipboard read — paste into the box with Ctrl+V / Cmd+V."
+        );
+        this.el["smart-signal-input"].focus();
+      }
+    });
+    this.el["smart-signal-input"].addEventListener("paste", () => {
+      setTimeout(() => {
+        const val = this.el["smart-signal-input"].value.trim();
+        if (val.includes("P2P1:") || val.includes("#offer=") || val.includes("#answer=")) {
+          this.handleSmartSignal(val);
+        }
+      }, 0);
     });
 
     this.el["author-name-input"].addEventListener("change", () => {
@@ -243,6 +311,7 @@ class P2PDirectApp {
       this.schedulePersist();
       this.renderHeader();
       this.renderTopology();
+      this.broadcastMeshBeacon(false);
       this.showToast(`Updated display name to ${next}`);
     });
 
@@ -260,7 +329,11 @@ class P2PDirectApp {
       const res = this.wasm.call({ cmd: "request_sync" });
       this.status = res.status;
       this.executeActions(res.actions);
-      this.addTelemetry("sync_inv", `Triggered E2EE anti-entropy sync across ${this.directPeers.size} peer(s)`);
+      this.broadcastMeshBeacon(true);
+      this.addTelemetry(
+        "sync_inv",
+        `Triggered E2EE anti-entropy sync across ${this.directPeers.size} peer(s)`
+      );
       this.renderAll();
     });
 
@@ -319,12 +392,33 @@ class P2PDirectApp {
     this.el["log-type-filter"].addEventListener("change", () => this.renderLog());
 
     window.addEventListener("hashchange", () => this.handleUrlHashFragment());
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && this.wasm) {
+        this.onForegroundResume();
+      }
+    });
+
     const teardownAll = () => {
       this.flushPersist();
+      if (this.keepaliveWorker) {
+        try {
+          this.keepaliveWorker.terminate();
+        } catch {
+          // ignore
+        }
+      }
       for (const p of this.directPeers.values()) {
         try {
           p.dc.close();
           p.pc.close();
+        } catch {
+          // ignore
+        }
+      }
+      if (this.bc) {
+        try {
+          this.bc.close();
         } catch {
           // ignore
         }
@@ -359,7 +453,10 @@ class P2PDirectApp {
     this.status = initRes.status;
 
     const snap = this.profile.snapshot;
-    const hasRecords = snap && ((Array.isArray(snap.records) && snap.records.length > 0) || (Array.isArray(snap.messages) && snap.messages.length > 0));
+    const hasRecords =
+      snap &&
+      ((Array.isArray(snap.records) && snap.records.length > 0) ||
+        (Array.isArray(snap.messages) && snap.messages.length > 0));
     if (hasRecords) {
       try {
         const imp = this.wasm.call({ cmd: "import_snapshot", snapshot: snap });
@@ -382,21 +479,502 @@ class P2PDirectApp {
     this.el["auto-mesh-toggle"].checked = this.status.autoMeshEnabled;
     this.el["auto-mesh-badge"].textContent = this.status.autoMeshEnabled ? "ON" : "OFF";
 
+    this.setupBroadcastChannel();
+    this.startKeepaliveWorker();
     this.renderAll();
 
+    // Handle any #offer= or #answer= fragment present in the initial URL
     await this.handleUrlHashFragment();
 
-    setInterval(() => {
-      if (!this.wasm) return;
-      const runSync = this.directPeers.size > 0;
-      const res = this.wasm.call({ cmd: "tick", nowMs: Date.now(), runSync });
-      this.status = res.status;
-      this.executeActions(res.actions);
-      this.renderStats();
-    }, 15_000);
+    // Broadcast presence so reopened tabs on the same browser auto-rejoin immediately
+    this.broadcastMeshBeacon(true);
 
     window.__p2pDirect = this;
   }
+
+  /* ================= Background-Resilient Web Worker Keepalive ================= */
+
+  startKeepaliveWorker() {
+    const onTick = () => {
+      if (!this.wasm) return;
+      this.keepaliveTickCount += 1;
+      const now = Date.now();
+
+      if (this.directPeers.size > 0) {
+        try {
+          const pingRes = this.wasm.call({ cmd: "keepalive_ping", nowMs: now });
+          this.status = pingRes.status;
+          this.executeActions(pingRes.actions);
+        } catch {
+          // ignore
+        }
+      }
+
+      // Every 4th worker tick (~16s), run anti-entropy sync & stale handshake cleanup
+      if (this.keepaliveTickCount % 4 === 0) {
+        try {
+          const tickRes = this.wasm.call({
+            cmd: "tick",
+            nowMs: now,
+            runSync: this.directPeers.size > 0,
+          });
+          this.status = tickRes.status;
+          this.executeActions(tickRes.actions);
+          this.cleanupStaleLocalDialing(now);
+          this.renderStats();
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    try {
+      const workerCode = `setInterval(() => postMessage("tick"), ${KEEPALIVE_INTERVAL_MS});`;
+      const blob = new Blob([workerCode], { type: "application/javascript" });
+      const url = URL.createObjectURL(blob);
+      const worker = new Worker(url);
+      worker.onmessage = onTick;
+      worker.onerror = () => {
+        try {
+          worker.terminate();
+        } catch {
+          // ignore
+        }
+        this.keepaliveWorker = null;
+        if (!this.keepaliveFallbackTimer) {
+          this.keepaliveFallbackTimer = setInterval(onTick, KEEPALIVE_INTERVAL_MS);
+        }
+      };
+      this.keepaliveWorker = worker;
+      URL.revokeObjectURL(url);
+      this.addTelemetry("keepalive", "Started background Web Worker E2EE keepalive (4s interval)");
+    } catch {
+      this.keepaliveFallbackTimer = setInterval(onTick, KEEPALIVE_INTERVAL_MS);
+    }
+  }
+
+  onForegroundResume() {
+    const now = Date.now();
+    if (this.directPeers.size > 0) {
+      try {
+        const pingRes = this.wasm.call({ cmd: "keepalive_ping", nowMs: now });
+        this.status = pingRes.status;
+        this.executeActions(pingRes.actions);
+        const syncRes = this.wasm.call({ cmd: "request_sync" });
+        this.status = syncRes.status;
+        this.executeActions(syncRes.actions);
+        this.renderAll();
+      } catch {
+        // ignore
+      }
+    } else {
+      this.broadcastMeshBeacon(true);
+    }
+  }
+
+  cleanupStaleLocalDialing(now) {
+    for (const [pid, entry] of this.localDialing.entries()) {
+      if (now - entry.startedAt > 15_000) {
+        try {
+          entry.pc.close();
+        } catch {
+          // ignore
+        }
+        this.localDialing.delete(pid);
+      }
+    }
+  }
+
+  /* ================= Same-Browser BroadcastChannel Rejoin & Handoff ================= */
+
+  setupBroadcastChannel() {
+    if (typeof BroadcastChannel === "undefined") return;
+    try {
+      this.bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+      this.bc.onmessage = (ev) => {
+        if (!ev.data || !this.status) return;
+        this.handleBroadcastMessage(ev.data);
+      };
+    } catch {
+      this.bc = null;
+    }
+  }
+
+  postBroadcast(msg) {
+    if (!this.bc) return;
+    try {
+      this.bc.postMessage(msg);
+    } catch {
+      // ignore closed channel
+    }
+  }
+
+  broadcastMeshBeacon(requestReply) {
+    if (!this.bc || !this.status) return;
+    this.postBroadcast({
+      type: "mesh-beacon",
+      peerId: this.status.peerId,
+      authorName: this.status.authorName,
+      pubKey: this.status.e2ee.publicKey,
+      keyFingerprint: this.status.e2ee.keyFingerprint,
+      passphraseMode: Boolean(this.status.e2ee.passphraseMode),
+      peerCount: this.directPeers.size,
+      logCount: this.logMessages.length,
+      requestReply: Boolean(requestReply),
+    });
+  }
+
+  async handleBroadcastMessage(msg) {
+    if (!this.status || msg.peerId === this.status.peerId || msg.fromPeerId === this.status.peerId) {
+      return;
+    }
+    if (msg.toPeerId && msg.toPeerId !== this.status.peerId) {
+      return;
+    }
+
+    switch (msg.type) {
+      case "mesh-beacon": {
+        const myFp = this.status.e2ee.keyFingerprint;
+        if (msg.requestReply) {
+          this.broadcastMeshBeacon(false);
+        }
+        if (msg.keyFingerprint === myFp) {
+          // Same E2EE mesh key! Auto-rejoin directly over WebRTC DataChannel with zero clicks!
+          this.discoveredLocalMeshes.delete(msg.peerId);
+          const existing = this.directPeers.get(msg.peerId);
+          const isHealthy = existing && existing.dc && existing.dc.readyState === "open";
+          if (!isHealthy && !this.localDialing.has(msg.peerId)) {
+            if (this.status.peerId < msg.peerId) {
+              this.startLocalAutoRejoinOffer(msg.peerId, msg.authorName, msg.pubKey);
+            }
+          }
+        } else if (!msg.passphraseMode && this.directPeers.size === 0 && this.logMessages.length === 0) {
+          // Brand-new tab sees an active local mesh -> offer 1-click Join button
+          this.discoveredLocalMeshes.set(msg.peerId, msg);
+          this.renderConnectBanners();
+        }
+        break;
+      }
+
+      case "local-offer": {
+        if (msg.keyFingerprint !== this.status.e2ee.keyFingerprint) return;
+        await this.acceptLocalAutoRejoinOffer(msg);
+        break;
+      }
+
+      case "local-answer": {
+        if (msg.keyFingerprint !== this.status.e2ee.keyFingerprint) return;
+        await this.applyLocalAutoRejoinAnswer(msg);
+        break;
+      }
+
+      case "local-ice": {
+        if (msg.keyFingerprint !== this.status.e2ee.keyFingerprint) return;
+        await this.applyLocalAutoRejoinIce(msg.fromPeerId, msg.candidate);
+        break;
+      }
+
+      case "local-join-request": {
+        // Only respond if not in passphrase-locked mode
+        if (this.status.e2ee.passphraseMode) return;
+        await this.handleLocalJoinRequest(msg.fromPeerId);
+        break;
+      }
+
+      case "local-join-offer": {
+        await this.handleLocalJoinOffer(msg.fromPeerId, msg.code);
+        break;
+      }
+
+      case "deliver-answer": {
+        // Cross-tab #answer= handoff (e.g., user clicked an #answer= link that opened in a new tab!)
+        const hasPending =
+          (msg.inviteId && this.pendingOffers.has(msg.inviteId)) ||
+          (!msg.inviteId && this.pendingOffers.size === 1);
+        if (hasPending) {
+          const ok = await this.completeManualOffer(msg.code);
+          if (ok) {
+            this.postBroadcast({
+              type: "answer-accepted",
+              inviteId: msg.inviteId || "",
+              fromPeerId: this.status.peerId,
+              peerName: this.status.authorName,
+              toPeerId: msg.fromPeerId || undefined,
+            });
+          }
+        }
+        break;
+      }
+
+      case "answer-accepted": {
+        this.showNotice(
+          "connect-notice",
+          "success",
+          `Reply delivered to ${msg.peerName || "your main mesh tab"}! Direct E2EE connection is opening — you can switch back or close this tab.`
+        );
+        this.showToast("Reply delivered automatically to your main tab");
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  async startLocalAutoRejoinOffer(targetPeerId, targetName, targetPubKey) {
+    if (this.localDialing.has(targetPeerId)) return;
+    try {
+      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
+      const early = this.earlyLocalIce.get(targetPeerId) || [];
+      this.earlyLocalIce.delete(targetPeerId);
+      const entry = {
+        pc,
+        dc,
+        remoteDescSet: false,
+        sdpSent: false,
+        localIceQueue: [],
+        pendingIce: early,
+        startedAt: Date.now(),
+      };
+      this.localDialing.set(targetPeerId, entry);
+      this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, false, null, true);
+
+      const sendIce = (candJson) => {
+        this.postBroadcast({
+          type: "local-ice",
+          fromPeerId: this.status.peerId,
+          toPeerId: targetPeerId,
+          keyFingerprint: this.status.e2ee.keyFingerprint,
+          candidate: candJson,
+        });
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        const candJson = ev.candidate.toJSON();
+        if (!entry.sdpSent) {
+          entry.localIceQueue.push(candJson);
+          return;
+        }
+        sendIce(candJson);
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      this.postBroadcast({
+        type: "local-offer",
+        fromPeerId: this.status.peerId,
+        fromName: this.status.authorName,
+        fromPubKey: this.status.e2ee.publicKey,
+        toPeerId: targetPeerId,
+        keyFingerprint: this.status.e2ee.keyFingerprint,
+        sdp: offer.sdp,
+      });
+
+      entry.sdpSent = true;
+      while (entry.localIceQueue.length > 0) {
+        sendIce(entry.localIceQueue.shift());
+      }
+      this.addTelemetry("rejoin", `Auto-rejoining ${targetName} (${targetPeerId}) over E2EE WebRTC`);
+    } catch {
+      this.localDialing.delete(targetPeerId);
+    }
+  }
+
+  async acceptLocalAutoRejoinOffer(msg) {
+    const prev = this.localDialing.get(msg.fromPeerId);
+    if (prev) {
+      try {
+        prev.pc.close();
+      } catch {
+        // ignore
+      }
+      this.localDialing.delete(msg.fromPeerId);
+    }
+    try {
+      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const early = this.earlyLocalIce.get(msg.fromPeerId) || [];
+      this.earlyLocalIce.delete(msg.fromPeerId);
+      const entry = {
+        pc,
+        dc: null,
+        remoteDescSet: false,
+        sdpSent: false,
+        localIceQueue: [],
+        pendingIce: early,
+        startedAt: Date.now(),
+      };
+      this.localDialing.set(msg.fromPeerId, entry);
+
+      pc.ondatachannel = (ev) => {
+        entry.dc = ev.channel;
+        this.attachDataChannel(
+          pc,
+          ev.channel,
+          msg.fromPeerId,
+          msg.fromName,
+          msg.fromPubKey,
+          false,
+          null,
+          true
+        );
+      };
+
+      const sendIce = (candJson) => {
+        this.postBroadcast({
+          type: "local-ice",
+          fromPeerId: this.status.peerId,
+          toPeerId: msg.fromPeerId,
+          keyFingerprint: this.status.e2ee.keyFingerprint,
+          candidate: candJson,
+        });
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        const candJson = ev.candidate.toJSON();
+        if (!entry.sdpSent) {
+          entry.localIceQueue.push(candJson);
+          return;
+        }
+        sendIce(candJson);
+      };
+
+      await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+      entry.remoteDescSet = true;
+      await this.flushPendingIce(entry);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      this.postBroadcast({
+        type: "local-answer",
+        fromPeerId: this.status.peerId,
+        fromName: this.status.authorName,
+        fromPubKey: this.status.e2ee.publicKey,
+        toPeerId: msg.fromPeerId,
+        keyFingerprint: this.status.e2ee.keyFingerprint,
+        sdp: answer.sdp,
+      });
+
+      entry.sdpSent = true;
+      while (entry.localIceQueue.length > 0) {
+        sendIce(entry.localIceQueue.shift());
+      }
+    } catch {
+      this.localDialing.delete(msg.fromPeerId);
+    }
+  }
+
+  async applyLocalAutoRejoinAnswer(msg) {
+    const entry = this.localDialing.get(msg.fromPeerId);
+    if (!entry) return;
+    try {
+      if (entry.pc.signalingState === "have-local-offer") {
+        await entry.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        entry.remoteDescSet = true;
+        await this.flushPendingIce(entry);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async applyLocalAutoRejoinIce(fromPeerId, candidate) {
+    const entry = this.localDialing.get(fromPeerId);
+    if (!entry) {
+      const direct = this.directPeers.get(fromPeerId);
+      if (direct && direct.pc) {
+        try {
+          await direct.pc.addIceCandidate(candidate);
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      const list = this.earlyLocalIce.get(fromPeerId) || [];
+      list.push(candidate);
+      this.earlyLocalIce.set(fromPeerId, list);
+      return;
+    }
+    if (!entry.remoteDescSet) {
+      entry.pendingIce.push(candidate);
+      return;
+    }
+    try {
+      await entry.pc.addIceCandidate(candidate);
+    } catch {
+      // ignore
+    }
+  }
+
+  joinDiscoveredLocalMesh() {
+    const target = this.discoveredLocalMeshes.values().next().value;
+    if (!target) return;
+    this.el["btn-join-local-mesh"].disabled = true;
+    this.showNotice(
+      "connect-notice",
+      "info",
+      `Connecting directly (E2EE) to ${target.authorName}…`
+    );
+    this.postBroadcast({
+      type: "local-join-request",
+      fromPeerId: this.status.peerId,
+      fromName: this.status.authorName,
+      toPeerId: target.peerId,
+    });
+    setTimeout(() => {
+      this.el["btn-join-local-mesh"].disabled = false;
+    }, 3000);
+  }
+
+  async handleLocalJoinRequest(requesterPeerId) {
+    try {
+      const inviteId = randomId("inv");
+      const pc = new RTCPeerConnection(ICE_CONFIG);
+      const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
+      this.pendingOffers.set(inviteId, { inviteId, pc, dc, code: "", url: "" });
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc, 1000);
+
+      const encoded = this.wasm.call({
+        cmd: "encode_signal",
+        kind: "offer",
+        inviteId,
+        sdp: pc.localDescription.sdp,
+        baseUrl: basePageUrl(),
+        entropy: randomBase64Url(16),
+      });
+      this.postBroadcast({
+        type: "local-join-offer",
+        fromPeerId: this.status.peerId,
+        toPeerId: requesterPeerId,
+        code: encoded.code,
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  async handleLocalJoinOffer(fromPeerId, code) {
+    const answerResult = await this.acceptManualOffer(code, /* silentUi = */ true);
+    if (answerResult) {
+      this.discoveredLocalMeshes.clear();
+      this.postBroadcast({
+        type: "deliver-answer",
+        inviteId: answerResult.inviteId,
+        code: answerResult.code,
+        fromPeerId: this.status.peerId,
+        toPeerId: fromPeerId,
+      });
+    }
+  }
+
+  /* ================= Passphrase & E2EE Key Controls ================= */
 
   applyPassphrase() {
     const pass = this.el["e2ee-passphrase-input"].value;
@@ -413,11 +991,13 @@ class P2PDirectApp {
       this.status = res.status;
       this.profile.meshKey = res.meshKey;
       this.profile.passphraseMode = true;
+      this.discoveredLocalMeshes.clear();
       this.flushPersist();
       this.renderAll();
+      this.broadcastMeshBeacon(true);
       this.addTelemetry(
         "e2ee",
-        `Derived 256-bit key via PBKDF2-HMAC-SHA256 (${this.status.e2ee.keyFingerprint}); P2P1 codes are now passphrase-encrypted`
+        `Derived 256-bit key via PBKDF2-HMAC-SHA256 (${this.status.e2ee.keyFingerprint}); P2P1 codes are passphrase-encrypted`
       );
       this.showToast(`Passphrase E2EE active · FP ${this.status.e2ee.keyFingerprint}`);
     } catch (err) {
@@ -439,21 +1019,12 @@ class P2PDirectApp {
     this.profile.passphraseMode = false;
     this.flushPersist();
     this.renderAll();
+    this.broadcastMeshBeacon(true);
     this.addTelemetry(
       "e2ee",
       `Switched to automatic 256-bit mesh key (${this.status.e2ee.keyFingerprint})`
     );
     this.showToast(`Auto 256-bit E2EE active · FP ${this.status.e2ee.keyFingerprint}`);
-  }
-
-  switchConnectTab(tab) {
-    const isInvite = tab === "invite";
-    this.el["tab-btn-invite"].classList.toggle("active", isInvite);
-    this.el["tab-btn-invite"].setAttribute("aria-selected", String(isInvite));
-    this.el["tab-pane-invite"].classList.toggle("active", isInvite);
-    this.el["tab-btn-join"].classList.toggle("active", !isInvite);
-    this.el["tab-btn-join"].setAttribute("aria-selected", String(!isInvite));
-    this.el["tab-pane-join"].classList.toggle("active", !isInvite);
   }
 
   switchComposerMode(mode) {
@@ -484,7 +1055,7 @@ class P2PDirectApp {
     el.textContent = text;
     el.classList.add("visible");
     if (this.toastTimer) clearTimeout(this.toastTimer);
-    this.toastTimer = setTimeout(() => el.classList.remove("visible"), 2600);
+    this.toastTimer = setTimeout(() => el.classList.remove("visible"), 2800);
   }
 
   async copyText(text, toastMsg) {
@@ -563,7 +1134,10 @@ class P2PDirectApp {
     this.status = res.status;
     this.logMessages = res.log;
     this.flushPersist();
-    this.addTelemetry("storage", "Cleared local encrypted log; click Sync Now to backfill from peers");
+    this.addTelemetry(
+      "storage",
+      "Cleared local encrypted log; click Sync Now to backfill from peers"
+    );
     this.renderAll();
     this.showToast("Local log cleared (surviving peers still hold encrypted history)");
   }
@@ -592,55 +1166,121 @@ class P2PDirectApp {
     this.showToast(`Exported ${this.logMessages.length} decrypted log entries`);
   }
 
+  showHandshakeCard(kind, code, url, sizeMeta, instruction, inviteId) {
+    this.activeHandshake = { kind, code, url, inviteId };
+    this.el["handshake-card"].classList.remove("hidden");
+    this.el["handshake-step-pill"].textContent =
+      kind === "offer" ? "Step 1 · Share Invite Link" : "Step 2 · Send Reply Link Back";
+    this.el["handshake-size-meta"].textContent = sizeMeta;
+    this.el["handshake-instruction"].textContent = instruction;
+    this.el["btn-copy-handshake-url"].textContent =
+      kind === "offer" ? "Copy #offer Link" : "Copy #answer Link";
+    this.el["handshake-code-output"].value = code;
+    this.el["btn-share-handshake"].classList.toggle("hidden", typeof navigator.share !== "function");
+  }
+
+  hideHandshakeCard() {
+    this.activeHandshake = null;
+    this.el["handshake-card"].classList.add("hidden");
+  }
+
+  /* ================= URL Fragments & Smart Auto-Detect Signal Handler ================= */
+
   async handleUrlHashFragment() {
     const hash = window.location.hash;
     if (!hash || hash.length < 4) return;
     try {
       const frag = this.wasm.call({ cmd: "extract_fragment", hash });
       if (!frag.found) return;
-      if (frag.kind === "offer") {
-        this.switchConnectTab("join");
-        this.el["offer-code-input"].value = frag.code;
-        await this.acceptManualOffer(frag.code);
-      } else if (frag.kind === "answer") {
-        this.switchConnectTab("invite");
-        this.el["answer-code-input"].value = frag.code;
-        if (this.pendingOffers.size > 0) {
-          await this.completeManualOffer(frag.code);
-        } else {
-          this.showNotice(
-            "invite-notice",
-            "warn",
-            "Detected #answer= fragment in URL. Paste it into the inviter tab that generated the matching offer."
-          );
-        }
+
+      // Clear consumed hash so refreshing or reopening this tab never re-processes a stale invite
+      try {
+        history.replaceState(null, "", basePageUrl());
+      } catch {
+        // ignore restricted history API
       }
+
+      await this.handleSmartSignal(frag.code, /* fromHash = */ true);
     } catch (err) {
       this.addTelemetry("error", `Fragment parse failed: ${err.message}`);
     }
   }
 
+  async handleSmartSignal(rawInput, fromHash = false) {
+    const trimmed = (rawInput || "").trim();
+    if (!trimmed) {
+      this.showNotice(
+        "connect-notice",
+        "warn",
+        "Paste any P2P1: code or #offer= / #answer= link first."
+      );
+      return;
+    }
+
+    let decoded;
+    try {
+      const passInput = this.el["e2ee-passphrase-input"].value;
+      decoded = this.wasm.call({
+        cmd: "decode_signal",
+        input: trimmed,
+        passphrase: passInput || undefined,
+      });
+    } catch (err) {
+      this.showNotice("connect-notice", "error", err.message);
+      return;
+    }
+
+    const sig = decoded.signal;
+    if (sig.kind === "offer") {
+      await this.acceptManualOffer(trimmed);
+    } else if (sig.kind === "answer") {
+      const hasLocalPending =
+        (sig.inviteId && this.pendingOffers.has(sig.inviteId)) ||
+        this.pendingOffers.size === 1 ||
+        (this.latestOffer && this.pendingOffers.has(this.latestOffer.inviteId));
+      if (hasLocalPending) {
+        await this.completeManualOffer(trimmed);
+      } else if (this.bc) {
+        // Forward #answer= link automatically to the original inviter tab in this browser!
+        this.postBroadcast({
+          type: "deliver-answer",
+          inviteId: sig.inviteId || "",
+          code: trimmed,
+          fromPeerId: this.status.peerId,
+        });
+        this.showNotice(
+          "connect-notice",
+          "info",
+          fromHash
+            ? "Forwarding reply link to your original inviter tab…"
+            : "No pending invite in this tab — forwarded reply to open tabs in this browser."
+        );
+      } else {
+        this.showNotice(
+          "connect-notice",
+          "warn",
+          "No matching pending invite in this tab. Paste this reply into the tab that generated the invite."
+        );
+      }
+    }
+  }
+
   /* ================= Manual Out-of-Band E2EE P2P1 Handshake ================= */
 
-  async createManualInvite() {
+  async createManualInvite(isRejoin = false) {
     this.el["btn-create-invite"].disabled = true;
-    this.showNotice("invite-notice", "info", "Gathering WebRTC ICE candidates…");
+    this.latestOffer = null;
+    this.showNotice("connect-notice", "info", "Gathering WebRTC ICE candidates…");
     try {
       const inviteId = randomId("inv");
       const pc = new RTCPeerConnection(ICE_CONFIG);
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
-      const pending = {
-        inviteId,
-        pc,
-        dc,
-        code: "",
-        url: "",
-      };
+      const pending = { inviteId, pc, dc, code: "", url: "" };
       this.pendingOffers.set(inviteId, pending);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await waitForIceGathering(pc, 1800);
+      await waitForIceGathering(pc, 1400);
 
       const encoded = this.wasm.call({
         cmd: "encode_signal",
@@ -655,36 +1295,39 @@ class P2PDirectApp {
       pending.url = encoded.url;
       this.latestOffer = pending;
 
-      this.el["offer-code-output"].value = encoded.code;
-      this.el["offer-size-meta"].textContent = `${encoded.rawBytes}B SDP → ${encoded.codeChars} chars${encoded.encrypted ? " · AEAD" : ""}`;
-      this.el["btn-copy-offer-code"].disabled = false;
-      this.el["btn-copy-offer-url"].disabled = false;
-      this.showNotice(
-        "invite-notice",
-        "success",
-        encoded.encrypted
-          ? `Passphrase-encrypted invite ready (${inviteId}). Peer must enter the same passphrase to decrypt.`
-          : `E2EE invite ready (${inviteId}, FP ${this.status.e2ee.keyFingerprint}). Share the P2P1: code or #offer= link.`
-      );
+      const sizeMeta = `${encoded.rawBytes}B → ${encoded.codeChars} chars${encoded.encrypted ? " · AEAD" : ""}`;
+      const instruction = encoded.encrypted
+        ? "Send this passphrase-encrypted link to your peer. When they send back their #answer= link, simply open or paste it below."
+        : isRejoin
+          ? `Send this rejoin link to any surviving peer in your mesh (FP ${this.status.e2ee.keyFingerprint}). Open or paste their #answer= reply to reconnect and backfill.`
+          : `Send this #offer= link to your peer (FP ${this.status.e2ee.keyFingerprint}). When they return an #answer= link, click it or paste it below.`;
+
+      this.showHandshakeCard("offer", encoded.code, encoded.url, sizeMeta, instruction, inviteId);
+      this.el["connect-notice"].classList.add("hidden");
       this.addTelemetry(
         "signal",
-        `Generated ${encoded.encrypted ? "passphrase-encrypted " : ""}P2P1 offer ${inviteId} (${encoded.codeChars} chars)`
+        `Generated ${isRejoin ? "rejoin " : ""}${encoded.encrypted ? "passphrase-encrypted " : ""}P2P1 offer ${inviteId} (${encoded.codeChars} chars)`
       );
     } catch (err) {
-      this.showNotice("invite-notice", "error", `Failed to create invite: ${err.message}`);
+      this.showNotice("connect-notice", "error", `Failed to create invite: ${err.message}`);
     } finally {
       this.el["btn-create-invite"].disabled = false;
     }
   }
 
-  async acceptManualOffer(rawInput) {
+  async acceptManualOffer(rawInput, silentUi = false) {
     const trimmed = (rawInput || "").trim();
     if (!trimmed) {
-      this.showNotice("join-notice", "warn", "Paste a P2P1: invite code or #offer= link first.");
-      return;
+      if (!silentUi) {
+        this.showNotice("connect-notice", "warn", "Paste a P2P1: invite code or #offer= link first.");
+      }
+      return null;
     }
-    this.el["btn-create-answer"].disabled = true;
-    this.showNotice("join-notice", "info", "Decoding P2P1 offer and gathering ICE candidates…");
+    this.el["btn-smart-connect"].disabled = true;
+    this.latestAnswer = null;
+    if (!silentUi) {
+      this.showNotice("connect-notice", "info", "Decoding P2P1 offer and gathering ICE candidates…");
+    }
     try {
       const passInput = this.el["e2ee-passphrase-input"].value;
       const decoded = this.wasm.call({
@@ -700,8 +1343,8 @@ class P2PDirectApp {
         throw new Error("Cannot connect a node to itself (open a second tab or device).");
       }
 
-      // Adopt inviter's 256-bit mesh key automatically if embedded in out-of-band #offer= fragment
-      if (sig.meshKey && !sig.encrypted) {
+      // Adopt inviter's 256-bit mesh key only when different from our current key
+      if (sig.meshKey && !sig.encrypted && sig.meshKey !== this.profile.meshKey) {
         const keyRes = this.wasm.call({
           cmd: "set_mesh_key",
           meshKey: sig.meshKey,
@@ -732,13 +1375,22 @@ class P2PDirectApp {
 
       const pc = new RTCPeerConnection(ICE_CONFIG);
       pc.ondatachannel = (ev) => {
-        this.attachDataChannel(pc, ev.channel, sig.peerId, sig.authorName, sig.pubKey, false, null);
+        this.attachDataChannel(
+          pc,
+          ev.channel,
+          sig.peerId,
+          sig.authorName,
+          sig.pubKey,
+          false,
+          null,
+          true
+        );
       };
 
       await pc.setRemoteDescription({ type: "offer", sdp: sig.sdp });
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await waitForIceGathering(pc, 1800);
+      await waitForIceGathering(pc, 1400);
 
       const encoded = this.wasm.call({
         cmd: "encode_signal",
@@ -749,33 +1401,47 @@ class P2PDirectApp {
         entropy: randomBase64Url(16),
       });
 
-      this.pendingAnswers.set(sig.peerId, { pc, code: encoded.code, url: encoded.url });
-      this.latestAnswer = { code: encoded.code, url: encoded.url, peerId: sig.peerId };
+      const result = {
+        code: encoded.code,
+        url: encoded.url,
+        peerId: sig.peerId,
+        inviteId: sig.inviteId || "",
+      };
+      this.pendingAnswers.set(sig.peerId, { pc, ...result });
+      this.latestAnswer = result;
 
-      this.el["answer-code-output"].value = encoded.code;
-      this.el["answer-size-meta"].textContent = `${encoded.rawBytes}B SDP → ${encoded.codeChars} chars${encoded.encrypted ? " · AEAD" : ""}`;
-      this.el["btn-copy-answer-code"].disabled = false;
-      this.el["btn-copy-answer-url"].disabled = false;
-      this.showNotice(
-        "join-notice",
-        "success",
-        `E2EE reply ready for ${sig.authorName} (${sig.peerId}, FP ${this.status.e2ee.keyFingerprint}). Send reply back to connect.`
-      );
+      if (!silentUi) {
+        const sizeMeta = `${encoded.rawBytes}B → ${encoded.codeChars} chars${encoded.encrypted ? " · AEAD" : ""}`;
+        this.showHandshakeCard(
+          "answer",
+          encoded.code,
+          encoded.url,
+          sizeMeta,
+          `Send this #answer= reply link back to ${sig.authorName}. Connection opens automatically once they open or paste it!`,
+          sig.inviteId || ""
+        );
+        this.el["smart-signal-input"].value = "";
+        this.el["connect-notice"].classList.add("hidden");
+      }
       this.addTelemetry("signal", `Created E2EE P2P1 reply for ${sig.authorName} (${sig.peerId})`);
+      return result;
     } catch (err) {
-      this.showNotice("join-notice", "error", `Could not accept invite: ${err.message}`);
+      if (!silentUi) {
+        this.showNotice("connect-notice", "error", `Could not accept invite: ${err.message}`);
+      }
+      return null;
     } finally {
-      this.el["btn-create-answer"].disabled = false;
+      this.el["btn-smart-connect"].disabled = false;
     }
   }
 
   async completeManualOffer(rawInput) {
     const trimmed = (rawInput || "").trim();
     if (!trimmed) {
-      this.showNotice("invite-notice", "warn", "Paste the peer's P2P1: answer code or #answer= link first.");
-      return;
+      this.showNotice("connect-notice", "warn", "Paste the peer's P2P1: reply code or #answer= link first.");
+      return false;
     }
-    this.el["btn-accept-answer"].disabled = true;
+    this.el["btn-smart-connect"].disabled = true;
     try {
       const passInput = this.el["e2ee-passphrase-input"].value;
       const decoded = this.wasm.call({
@@ -796,90 +1462,142 @@ class P2PDirectApp {
         pending = this.latestOffer;
       }
       if (!pending) {
-        throw new Error("No matching pending invite found. Click Generate Invite first.");
+        throw new Error("No matching pending invite found. Click Invite Peer first.");
       }
 
       this.pendingOffers.delete(pending.inviteId);
-      this.attachDataChannel(pending.pc, pending.dc, sig.peerId, sig.authorName, sig.pubKey, false, null);
+      if (this.latestOffer && this.latestOffer.inviteId === pending.inviteId) {
+        this.latestOffer = null;
+      }
+      this.attachDataChannel(
+        pending.pc,
+        pending.dc,
+        sig.peerId,
+        sig.authorName,
+        sig.pubKey,
+        false,
+        null,
+        true
+      );
       await pending.pc.setRemoteDescription({ type: "answer", sdp: sig.sdp });
 
-      this.el["answer-code-input"].value = "";
+      this.el["smart-signal-input"].value = "";
       this.showNotice(
-        "invite-notice",
+        "connect-notice",
         "info",
-        `Applying X25519 reply from ${sig.authorName} (${sig.peerId}) — opening E2EE DataChannel…`
+        `Opening direct E2EE WebRTC channel with ${sig.authorName} (${sig.peerId})…`
       );
       this.addTelemetry("signal", `Applied P2P1 answer from ${sig.authorName} (${sig.peerId})`);
+      return true;
     } catch (err) {
-      this.showNotice("invite-notice", "error", `Failed to complete connection: ${err.message}`);
+      this.showNotice("connect-notice", "error", `Failed to complete connection: ${err.message}`);
+      return false;
     } finally {
-      this.el["btn-accept-answer"].disabled = false;
+      this.el["btn-smart-connect"].disabled = false;
     }
   }
 
   /* ================= Direct E2EE DataChannel & Relayed Auto-Mesh ================= */
 
-  attachDataChannel(pc, dc, peerId, authorName, peerPubKey, viaAutoMesh, introducedBy) {
+  attachDataChannel(
+    pc,
+    dc,
+    peerId,
+    authorName,
+    peerPubKey,
+    viaAutoMesh,
+    introducedBy,
+    replaceExisting = false
+  ) {
     let closed = false;
+    let disconnectTimer = null;
+
+    const clearDisconnectTimer = () => {
+      if (disconnectTimer) {
+        clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+      }
+    };
+
+    const peerEntry = {
+      peerId,
+      authorName: authorName || "Peer",
+      peerPubKey,
+      pc,
+      dc,
+      viaAutoMesh,
+      introducedBy,
+      lastActivityMs: Date.now(),
+      superseded: false,
+    };
 
     const handleOpen = () => {
-      if (closed) return;
+      if (closed || peerEntry.superseded) return;
       const existing = this.directPeers.get(peerId);
-      if (existing && existing.dc && existing.dc.readyState === "open" && existing.dc !== dc) {
+      if (existing && existing.dc !== dc) {
+        if (!replaceExisting && existing.dc && existing.dc.readyState === "open") {
+          const recentlyActive = Date.now() - (existing.lastActivityMs || 0) < 12_000;
+          if (recentlyActive) {
+            try {
+              dc.close();
+              pc.close();
+            } catch {
+              // ignore
+            }
+            return;
+          }
+        }
+        // Cleanly supersede stale/rejoining connection without emitting spurious disconnect!
+        existing.superseded = true;
         try {
-          dc.close();
-          pc.close();
+          existing.dc.onclose = null;
+          existing.dc.onerror = null;
+          existing.pc.onconnectionstatechange = null;
+          existing.pc.oniceconnectionstatechange = null;
+          existing.dc.close();
+          existing.pc.close();
         } catch {
           // ignore
         }
-        return;
       }
 
+      peerEntry.lastActivityMs = Date.now();
       this.relayPeers.delete(peerId);
       this.earlyRelayIce.delete(peerId);
+      this.localDialing.delete(peerId);
+      this.earlyLocalIce.delete(peerId);
       this.pendingAnswers.delete(peerId);
-      this.directPeers.set(peerId, {
-        peerId,
-        authorName: authorName || "Peer",
-        peerPubKey,
-        pc,
-        dc,
-        viaAutoMesh,
-        introducedBy,
-      });
+      this.discoveredLocalMeshes.delete(peerId);
+      this.directPeers.set(peerId, peerEntry);
+
+      upsertKnownPeer(this.profile, { peerId, authorName: peerEntry.authorName, pubKey: peerPubKey });
+      this.schedulePersist();
 
       const res = this.wasm.call({
         cmd: "peer_connected",
         peerId,
-        authorName: authorName || "Peer",
+        authorName: peerEntry.authorName,
         peerPubKey,
         viaAutoMesh,
         introducedBy,
       });
       this.status = res.status;
       this.executeActions(res.actions);
-      this.renderAll();
 
       if (!viaAutoMesh) {
+        this.hideHandshakeCard();
         this.showNotice(
-          "invite-notice",
+          "connect-notice",
           "success",
-          `Direct E2EE WebRTC channel open with ${authorName} (${peerId}).`
+          `Direct E2EE WebRTC channel open with ${peerEntry.authorName} (${peerId}).`
         );
       }
+      this.renderAll();
       this.showToast(
         viaAutoMesh
-          ? `Auto-meshed directly (E2EE) with ${authorName || peerId}`
-          : `Connected (E2EE) to ${authorName || peerId}`
+          ? `Auto-meshed directly (E2EE) with ${peerEntry.authorName}`
+          : `Connected (E2EE) to ${peerEntry.authorName}`
       );
-    };
-
-    let disconnectTimer = null;
-    const clearDisconnectTimer = () => {
-      if (disconnectTimer) {
-        clearTimeout(disconnectTimer);
-        disconnectTimer = null;
-      }
     };
 
     const handleClose = () => {
@@ -891,6 +1609,9 @@ class P2PDirectApp {
         pc.close();
       } catch {
         // ignore
+      }
+      if (peerEntry.superseded) {
+        return;
       }
       const current = this.directPeers.get(peerId);
       if (current && current.dc === dc) {
@@ -904,9 +1625,14 @@ class P2PDirectApp {
       if (rel && rel.pc === pc) {
         this.relayPeers.delete(peerId);
       }
+      const loc = this.localDialing.get(peerId);
+      if (loc && loc.pc === pc) {
+        this.localDialing.delete(peerId);
+      }
     };
 
     const evaluateConnectionState = () => {
+      if (closed || peerEntry.superseded) return;
       const cs = pc.connectionState;
       const ics = pc.iceConnectionState;
       if (cs === "failed" || cs === "closed" || ics === "failed" || ics === "closed") {
@@ -914,14 +1640,23 @@ class P2PDirectApp {
       } else if (cs === "disconnected" || ics === "disconnected") {
         if (!disconnectTimer) {
           disconnectTimer = setTimeout(() => {
-            if (
-              pc.connectionState !== "connected" &&
-              pc.iceConnectionState !== "connected" &&
-              pc.iceConnectionState !== "completed"
-            ) {
-              handleClose();
+            disconnectTimer = null;
+            if (closed || peerEntry.superseded) return;
+            const healthyState =
+              pc.connectionState === "connected" ||
+              pc.iceConnectionState === "connected" ||
+              pc.iceConnectionState === "completed";
+            const recentEncryptedTraffic =
+              Date.now() - peerEntry.lastActivityMs < DISCONNECT_GRACE_MS - 500;
+            if (healthyState || recentEncryptedTraffic) {
+              // Background keepalive ping/pong is still flowing — stay connected!
+              if (!healthyState) {
+                evaluateConnectionState();
+              }
+              return;
             }
-          }, 2500);
+            handleClose();
+          }, DISCONNECT_GRACE_MS);
         }
       } else if (cs === "connected" || ics === "connected" || ics === "completed") {
         clearDisconnectTimer();
@@ -929,7 +1664,8 @@ class P2PDirectApp {
     };
 
     dc.onmessage = (ev) => {
-      if (typeof ev.data !== "string") return;
+      if (typeof ev.data !== "string" || peerEntry.superseded) return;
+      peerEntry.lastActivityMs = Date.now();
       try {
         const res = this.wasm.call({
           cmd: "wire_message",
@@ -938,6 +1674,17 @@ class P2PDirectApp {
           nowMs: Date.now(),
         });
         this.status = res.status;
+        // Keep knownPeers name fresh after hello arrives
+        const liveInfo = this.status.peers.find((p) => p.peerId === peerId);
+        if (liveInfo && liveInfo.authorName && liveInfo.authorName !== peerEntry.authorName) {
+          peerEntry.authorName = liveInfo.authorName;
+          upsertKnownPeer(this.profile, {
+            peerId,
+            authorName: liveInfo.authorName,
+            pubKey: peerPubKey,
+          });
+          this.schedulePersist();
+        }
         this.executeActions(res.actions);
         this.renderAll();
       } catch (err) {
@@ -961,6 +1708,7 @@ class P2PDirectApp {
   disconnectPeer(peerId) {
     const entry = this.directPeers.get(peerId);
     if (!entry) return;
+    entry.superseded = true;
     this.directPeers.delete(peerId);
     try {
       entry.dc.close();
@@ -1001,7 +1749,13 @@ class P2PDirectApp {
           break;
         }
         case "auto_mesh_accept_offer": {
-          this.acceptRelayedOffer(act.fromPeerId, act.fromName, act.fromPubKey, act.viaPeerId, act.sdp);
+          this.acceptRelayedOffer(
+            act.fromPeerId,
+            act.fromName,
+            act.fromPubKey,
+            act.viaPeerId,
+            act.sdp
+          );
           break;
         }
         case "auto_mesh_apply_answer": {
@@ -1065,7 +1819,7 @@ class P2PDirectApp {
         pendingIce: early,
       };
       this.relayPeers.set(targetPeerId, entry);
-      this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, true, viaPeerId);
+      this.attachDataChannel(pc, dc, targetPeerId, targetName, targetPubKey, true, viaPeerId, false);
 
       pc.onicecandidate = (ev) => {
         if (!ev.candidate) return;
@@ -1133,7 +1887,16 @@ class P2PDirectApp {
 
       pc.ondatachannel = (ev) => {
         entry.dc = ev.channel;
-        this.attachDataChannel(pc, ev.channel, fromPeerId, fromName, fromPubKey, true, viaPeerId);
+        this.attachDataChannel(
+          pc,
+          ev.channel,
+          fromPeerId,
+          fromName,
+          fromPubKey,
+          true,
+          viaPeerId,
+          false
+        );
       };
 
       pc.onicecandidate = (ev) => {
@@ -1231,6 +1994,7 @@ class P2PDirectApp {
 
   renderAll() {
     this.renderHeader();
+    this.renderConnectBanners();
     this.renderPeers();
     this.renderTopology();
     this.renderStats();
@@ -1247,17 +2011,59 @@ class P2PDirectApp {
     this.el["next-lamport-preview"].textContent = `next lamport: ${this.status.lamport + 1}`;
 
     if (this.status.e2ee) {
-      this.el["key-fp-display"].textContent = this.status.e2ee.keyFingerprint.slice(0, 9);
+      const shortFp = this.status.e2ee.keyFingerprint.slice(0, 9);
+      this.el["key-fp-display"].textContent = shortFp;
       this.el["key-fp-display"].parentElement.title =
         `E2EE ${this.status.e2ee.cipher} · Full Key Fingerprint: ${this.status.e2ee.keyFingerprint}`;
       this.el["e2ee-mode-label"].textContent = this.status.e2ee.passphraseMode
-        ? `Passphrase-Locked · ${this.status.e2ee.keyFingerprint.slice(0, 9)}`
-        : `Auto 256-bit Key · ${this.status.e2ee.keyFingerprint.slice(0, 9)}`;
+        ? `Passphrase · ${shortFp}`
+        : `Auto 256-bit · ${shortFp}`;
     }
 
     const isOnline = this.status.peers.length > 0;
     this.el["mesh-status-chip"].classList.toggle("live", isOnline);
     this.el["mesh-status-dot"].classList.toggle("online", isOnline);
+  }
+
+  renderConnectBanners() {
+    if (!this.status) return;
+
+    // 1. Local browser active mesh quick-join banner
+    const localTarget =
+      this.directPeers.size === 0 && this.logMessages.length === 0
+        ? this.discoveredLocalMeshes.values().next().value
+        : null;
+    if (localTarget) {
+      this.el["local-mesh-banner"].classList.remove("hidden");
+      this.el["local-mesh-fp"].textContent = `FP ${localTarget.keyFingerprint.slice(0, 9)}`;
+      this.el["local-mesh-desc"].textContent =
+        `${localTarget.authorName} is open in another tab (${localTarget.logCount} log entries). Connect directly over E2EE WebRTC with 1 click.`;
+      this.el["btn-join-local-mesh"].textContent = `Join ${localTarget.authorName}'s Mesh`;
+    } else {
+      this.el["local-mesh-banner"].classList.add("hidden");
+    }
+
+    // 2. Rejoin previous mesh banner (for cross-device tab reopen when disconnected)
+    const known = this.profile?.knownPeers || [];
+    const showRejoin =
+      !this.rejoinDismissed &&
+      this.directPeers.size === 0 &&
+      known.length > 0 &&
+      !localTarget &&
+      !this.activeHandshake;
+    if (showRejoin) {
+      const names = known
+        .slice(0, 3)
+        .map((p) => p.authorName || p.peerId)
+        .join(", ");
+      const extra = known.length > 3 ? ` +${known.length - 3} more` : "";
+      this.el["rejoin-banner"].classList.remove("hidden");
+      this.el["rejoin-fp"].textContent = `FP ${this.status.e2ee.keyFingerprint.slice(0, 9)}`;
+      this.el["rejoin-desc"].textContent =
+        `Previously meshed with ${names}${extra}. Open tabs on this browser rejoin automatically; for peers on another device, share a Rejoin Link or paste their invite.`;
+    } else {
+      this.el["rejoin-banner"].classList.add("hidden");
+    }
   }
 
   renderStats() {
@@ -1276,7 +2082,7 @@ class P2PDirectApp {
 
     if (direct.length === 0 && pending.length === 0) {
       list.innerHTML =
-        '<li class="empty-state">No direct peers yet. Create an invite or open an <code>#offer=</code> link to join a mesh.</li>';
+        '<li class="empty-state">No direct peers yet. Click Invite Peer or paste a <code>P2P1:</code> / <code>#offer=</code> link above.</li>';
       return;
     }
 
@@ -1284,12 +2090,13 @@ class P2PDirectApp {
     for (const p of direct) {
       const originBadge = p.viaAutoMesh
         ? `<span class="badge auto" title="Auto-introduced via ${escapeHtml(p.introducedBy || "mesh")}">auto-mesh</span>`
-        : '<span class="badge">manual</span>';
+        : '<span class="badge">direct</span>';
+      const rttLabel = typeof p.rttMs === "number" ? ` · ${p.rttMs}ms` : "";
       parts.push(`
         <li class="peer-item" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
             <div class="peer-name">${escapeHtml(p.authorName)} ${originBadge}</div>
-            <div class="peer-id">${escapeHtml(p.peerId)} · safety ${escapeHtml(p.safetyCode || "—")} · synced ${p.knownCount}</div>
+            <div class="peer-id">${escapeHtml(p.peerId)} · safety ${escapeHtml(p.safetyCode || "—")}${rttLabel} · synced ${p.knownCount}</div>
           </div>
           <button type="button" class="btn btn-sm btn-danger" data-disconnect="${escapeHtml(p.peerId)}">Drop</button>
         </li>
@@ -1417,9 +2224,14 @@ class P2PDirectApp {
     box.innerHTML = this.telemetry
       .map((item) => {
         let cls = "telemetry-entry";
-        if (item.event.startsWith("auto_mesh") || item.event === "peer_connected" || item.event === "e2ee") {
+        if (
+          item.event.startsWith("auto_mesh") ||
+          item.event === "peer_connected" ||
+          item.event === "e2ee" ||
+          item.event === "rejoin"
+        ) {
           cls += " event-auto";
-        } else if (item.event.startsWith("sync") || item.event === "hello") {
+        } else if (item.event.startsWith("sync") || item.event === "hello" || item.event === "keepalive") {
           cls += " event-sync";
         } else if (item.event === "error") {
           cls += " event-err";

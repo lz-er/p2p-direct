@@ -732,3 +732,90 @@ fn sim_local_wipe_and_one_sided_sync_recovery() -> TestResult {
     sim.assert_all_converged(12)?;
     Ok(())
 }
+
+#[test]
+fn sim_keepalive_ping_pong_and_rapid_rejoin_same_peer_id() -> TestResult {
+    let mut sim = SimNetwork::new(5_000);
+    sim.add_node("peer-a", "Alice", MeshConfig::default());
+    sim.add_node("peer-b", "Bob", MeshConfig::default());
+    sim.add_node("peer-c", "Carol", MeshConfig::default());
+
+    sim.connect("peer-a", "peer-b", false, None)?;
+    sim.connect("peer-a", "peer-c", false, None)?;
+    sim.drain()?;
+
+    // 1. Encrypted keepalive ping/pong keeps links warm and measures RTT
+    let ping_acts = sim.node_mut("peer-a")?.send_keepalive_pings(1_700_000_000_000);
+    sim.process_actions("peer-a", ping_acts)?;
+    sim.drain()?;
+    let status_a = parse_json(&sim.node("peer-a")?.status_json())?;
+    let peers_arr = status_a
+        .get("peers")
+        .and_then(JsonValue::as_array)
+        .ok_or("missing peers")?;
+    for p in peers_arr {
+        assert!(
+            p.get_u64("lastPongMs").unwrap_or(0) > 0,
+            "expected encrypted pong response from peer"
+        );
+    }
+
+    // 2. Calling set_mesh_key with the SAME key must be a no-op and NOT break live peer-a <-> peer-c link!
+    sim.node_mut("peer-a")?.set_mesh_key(SIM_MESH_KEY, false)?;
+    sim.publish("peer-a", "chat", parse_json(r#"{"text":"after-noop-set-key"}"#)?, None)?;
+    sim.drain()?;
+    sim.assert_all_converged(1)?;
+
+    // 3. Simulate Bob closing his tab and reopening with the SAME peerId & persisted encrypted snapshot,
+    //    even while Alice still has Bob's old connection entry before timeout!
+    let bob_snap = parse_json(&sim.node_mut("peer-b")?.export_persistence())?;
+    let bob_sk = sha256(b"sim-x25519-secret-peer-b");
+    let bob_pk = sim.node("peer-b")?.public_key();
+    let alice_pk = sim.node("peer-a")?.public_key();
+
+    // Alice publishes a message while Bob is offline
+    sim.disconnect("peer-b", "peer-c")?;
+    sim.nodes.remove("peer-b");
+    sim.publish("peer-a", "chat", parse_json(r#"{"text":"missed-while-tab-closed"}"#)?, None)?;
+    sim.drain()?;
+
+    // Bob reopens tab from persisted encrypted snapshot (same peerId, same keys)
+    let mut bob_reopened = MeshNode::new(
+        "peer-b".to_owned(),
+        "Bob".to_owned(),
+        "sim-room".to_owned(),
+        bob_sk,
+        SIM_MESH_KEY,
+        b"reopened-tab-entropy",
+        MeshConfig::default(),
+    );
+    let restored = bob_reopened.import_persistence(&bob_snap)?;
+    assert_eq!(restored, 1);
+    sim.nodes.insert("peer-b".to_owned(), bob_reopened);
+
+    // Reconnect directly onto Alice WITHOUT calling on_peer_disconnected on Alice first (supersedes stale link!)
+    let acts_a = sim.node_mut("peer-a")?.on_peer_connected(
+        "peer-b".to_owned(),
+        "Bob".to_owned(),
+        bob_pk,
+        false,
+        None,
+    )?;
+    let acts_b = sim.node_mut("peer-b")?.on_peer_connected(
+        "peer-a".to_owned(),
+        "Alice".to_owned(),
+        alice_pk,
+        false,
+        None,
+    )?;
+    sim.process_actions("peer-a", acts_a)?;
+    sim.process_actions("peer-b", acts_b)?;
+    sim.drain()?;
+
+    // Bob catches up on missed messages AND auto-meshes back to Carol!
+    sim.assert_all_converged(2)?;
+    assert!(sim.node("peer-b")?.is_connected_to("peer-c"));
+    assert_eq!(sim.node("peer-a")?.stats().e2ee_auth_failures, 0);
+    assert_eq!(sim.node("peer-b")?.stats().e2ee_auth_failures, 0);
+    Ok(())
+}

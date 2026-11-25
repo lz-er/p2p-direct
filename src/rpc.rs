@@ -297,6 +297,16 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                 "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
             ))
         }
+        "keepalive_ping" => {
+            let node = require_node(state)?;
+            let now_ms = val.get_u64("nowMs").unwrap_or(0);
+            let actions = node.send_keepalive_pings(now_ms);
+            let actions_json = actions_to_json_array(&actions);
+            let status = node.status_json();
+            Ok(format!(
+                "{{\"ok\":true,\"actions\":{actions_json},\"status\":{status}}}"
+            ))
+        }
         "send_relay_signal" => {
             let node = require_node(state)?;
             let to_peer_id = val

@@ -66,7 +66,7 @@
         <aside class="rail">
           <section class="panel" aria-labelledby="connect-panel-title">
             <div class="panel-header">
-              <h2 class="panel-title" id="connect-panel-title">Out-of-Band WebRTC Handshake</h2>
+              <h2 class="panel-title" id="connect-panel-title">Connect &amp; Join Mesh</h2>
               <span class="panel-meta">P2P1 · E2EE</span>
             </div>
             <div class="panel-body">
@@ -80,7 +80,7 @@
                     id="e2ee-passphrase-input"
                     class="text-input"
                     type="password"
-                    placeholder="Optional shared passphrase (encrypts P2P1 codes too)…"
+                    placeholder="Optional shared passphrase (encrypts P2P1 codes)…"
                     autocomplete="off"
                   />
                   <button type="button" id="btn-apply-passphrase" class="btn btn-sm btn-primary">
@@ -91,119 +91,96 @@
                   </button>
                 </div>
                 <p class="e2ee-bar-hint" id="e2ee-bar-hint">
-                  Every wire frame, relayed SDP/ICE signal, and IndexedDB log record is sealed with
-                  X25519 + ChaCha20-Poly1305 AEAD.
+                  X25519 + ChaCha20-Poly1305 AEAD on every wire frame, relay signal, and IndexedDB record.
                 </p>
               </div>
 
-              <div class="tabs" role="tablist">
-                <button
-                  type="button"
-                  id="tab-btn-invite"
-                  class="tab-btn active"
-                  role="tab"
-                  aria-selected="true"
-                >
-                  Create Invite (#offer)
-                </button>
-                <button
-                  type="button"
-                  id="tab-btn-join"
-                  class="tab-btn"
-                  role="tab"
-                  aria-selected="false"
-                >
-                  Join / Reply (#answer)
+              <!-- 1-click local tab discovery banner -->
+              <div id="local-mesh-banner" class="quick-banner hidden">
+                <div class="quick-banner-title">
+                  <span>Active Mesh Detected in This Browser</span>
+                  <span class="panel-meta" id="local-mesh-fp"></span>
+                </div>
+                <p class="quick-banner-sub" id="local-mesh-desc"></p>
+                <div class="btn-row" style="margin-top: 0">
+                  <button type="button" id="btn-join-local-mesh" class="btn btn-sm btn-accent">
+                    Join in 1 Click
+                  </button>
+                </div>
+              </div>
+
+              <!-- Rejoin banner when reopening a closed tab -->
+              <div id="rejoin-banner" class="quick-banner rejoin hidden">
+                <div class="quick-banner-title">
+                  <span>Rejoin Previous Mesh</span>
+                  <span class="panel-meta" id="rejoin-fp"></span>
+                </div>
+                <p class="quick-banner-sub" id="rejoin-desc"></p>
+                <div class="btn-row" style="margin-top: 0">
+                  <button type="button" id="btn-create-rejoin" class="btn btn-sm btn-primary">
+                    Create Rejoin Link
+                  </button>
+                  <button type="button" id="btn-dismiss-rejoin" class="btn btn-sm">
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+
+              <!-- Primary 1-click invite button -->
+              <div class="connect-hero-row">
+                <button type="button" id="btn-create-invite" class="btn btn-primary">
+                  Invite Peer (Create #offer Link)
                 </button>
               </div>
 
-              <!-- Tab 1: Host / Create Invite -->
-              <div id="tab-pane-invite" class="tab-pane active" role="tabpanel">
-                <p class="step-hint">
-                  1. Generate a deflate-compressed <code>P2P1:</code> offer code or
-                  <code>#offer=</code> URL and share it out-of-band.
-                </p>
-                <div class="btn-row" style="margin-top: 0; margin-bottom: 10px">
-                  <button type="button" id="btn-create-invite" class="btn btn-primary">
-                    Generate Invite
-                  </button>
-                  <button type="button" id="btn-copy-offer-code" class="btn" disabled>
-                    Copy Code
-                  </button>
-                  <button type="button" id="btn-copy-offer-url" class="btn" disabled>
+              <!-- Active outgoing offer or reply card (auto-opens when needed, auto-closes when connected) -->
+              <div id="handshake-card" class="handshake-card hidden">
+                <div class="handshake-card-head">
+                  <span class="handshake-step-pill" id="handshake-step-pill">Step 1 · Share Invite</span>
+                  <span class="panel-meta" id="handshake-size-meta"></span>
+                </div>
+                <p class="step-hint" id="handshake-instruction" style="margin-bottom: 8px"></p>
+                <div class="btn-row" style="margin-top: 0; margin-bottom: 8px">
+                  <button type="button" id="btn-copy-handshake-url" class="btn btn-primary btn-sm">
                     Copy Link
                   </button>
+                  <button type="button" id="btn-copy-handshake-code" class="btn btn-sm">
+                    Copy Code
+                  </button>
+                  <button type="button" id="btn-share-handshake" class="btn btn-sm hidden">
+                    Share…
+                  </button>
                 </div>
-
-                <label class="step-label" for="offer-code-output">
-                  <span>Outgoing Invite Code</span>
-                  <span class="panel-meta" id="offer-size-meta"></span>
-                </label>
                 <textarea
-                  id="offer-code-output"
+                  id="handshake-code-output"
                   class="code-box"
                   rows="2"
                   readonly
-                  placeholder="Click Generate Invite to produce a P2P1: offer code…"
                 ></textarea>
-
-                <hr class="divider" />
-
-                <label class="step-label" for="answer-code-input">
-                  <span>2. Paste Peer Reply (<code>P2P1:</code> or <code>#answer=</code> URL)</span>
-                </label>
-                <textarea
-                  id="answer-code-input"
-                  class="code-box"
-                  rows="2"
-                  placeholder="Paste peer's P2P1: answer code or #answer= link here…"
-                ></textarea>
-                <div class="btn-row">
-                  <button type="button" id="btn-accept-answer" class="btn btn-accent">
-                    Complete Direct Connection
-                  </button>
-                </div>
-                <div id="invite-notice" class="inline-notice hidden"></div>
               </div>
 
-              <!-- Tab 2: Joiner / Accept Invite -->
-              <div id="tab-pane-join" class="tab-pane" role="tabpanel">
-                <label class="step-label" for="offer-code-input">
-                  <span>1. Paste Invite (<code>P2P1:</code> or <code>#offer=</code> URL)</span>
+              <!-- Unified Smart Auto-Detect Paste Input -->
+              <div class="smart-paste-wrap">
+                <label class="step-label" for="smart-signal-input">
+                  <span>Paste Invite or Reply (auto-detects <code>#offer=</code> / <code>#answer=</code> / <code>P2P1:</code>)</span>
                 </label>
                 <textarea
-                  id="offer-code-input"
+                  id="smart-signal-input"
                   class="code-box"
                   rows="2"
-                  placeholder="Paste an invite P2P1: code or #offer= URL…"
+                  placeholder="Paste any P2P1: code or #offer= / #answer= link — connects automatically…"
                 ></textarea>
-                <div class="btn-row" style="margin-bottom: 10px">
-                  <button type="button" id="btn-create-answer" class="btn btn-primary">
-                    Accept &amp; Generate Reply
+                <div class="smart-paste-actions">
+                  <button type="button" id="btn-paste-clipboard" class="btn btn-sm">
+                    Paste Clipboard
+                  </button>
+                  <button type="button" id="btn-smart-connect" class="btn btn-accent btn-sm">
+                    Connect / Apply
                   </button>
                 </div>
-
-                <label class="step-label" for="answer-code-output">
-                  <span>2. Send Reply Back to Inviter</span>
-                  <span class="panel-meta" id="answer-size-meta"></span>
-                </label>
-                <textarea
-                  id="answer-code-output"
-                  class="code-box"
-                  rows="2"
-                  readonly
-                  placeholder="Generated P2P1: reply code will appear here…"
-                ></textarea>
-                <div class="btn-row">
-                  <button type="button" id="btn-copy-answer-code" class="btn" disabled>
-                    Copy Code
-                  </button>
-                  <button type="button" id="btn-copy-answer-url" class="btn" disabled>
-                    Copy Link
-                  </button>
-                </div>
-                <div id="join-notice" class="inline-notice hidden"></div>
               </div>
+
+              <div id="connect-notice" class="inline-notice hidden"></div>
             </div>
           </section>
 
