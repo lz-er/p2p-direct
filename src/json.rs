@@ -153,8 +153,33 @@ impl JsonValue {
         self.get(key)?.as_bool()
     }
 
+    pub fn estimated_json_len(&self) -> usize {
+        match self {
+            Self::Null | Self::Bool(_) => 5,
+            Self::Number(_) => 16,
+            Self::String(s) => s.len().saturating_add(4),
+            Self::Array(items) => {
+                let mut total = 2usize;
+                for item in items {
+                    total = total.saturating_add(item.estimated_json_len()).saturating_add(1);
+                }
+                total
+            }
+            Self::Object(map) => {
+                let mut total = 2usize;
+                for (k, v) in map {
+                    total = total
+                        .saturating_add(k.len())
+                        .saturating_add(v.estimated_json_len())
+                        .saturating_add(4);
+                }
+                total
+            }
+        }
+    }
+
     pub fn to_json_string(&self) -> String {
-        let mut out = String::new();
+        let mut out = String::with_capacity(self.estimated_json_len());
         write_json_value(&mut out, self);
         out
     }
@@ -168,6 +193,30 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
     };
     parser.skip_ws();
     let value = parser.parse_value()?;
+    parser.skip_ws();
+    if parser.pos != parser.bytes.len() {
+        return Err(format!(
+            "unexpected trailing characters at byte {}",
+            parser.pos
+        ));
+    }
+    Ok(value)
+}
+
+/// Parses a top-level JSON object while skipping (validating syntax without allocating) any
+/// top-level field named `skip_key` (e.g. skipping multi-MB `"payload"` when only reading
+/// metadata headers during off-thread bulk decryption).
+pub fn parse_json_object_skipping_field(
+    input: &str,
+    skip_key: &str,
+) -> Result<JsonValue, String> {
+    let mut parser = Parser {
+        bytes: input.as_bytes(),
+        pos: 0,
+        depth: 0,
+    };
+    parser.skip_ws();
+    let value = parser.parse_object_with_skip(Some(skip_key))?;
     parser.skip_ws();
     if parser.pos != parser.bytes.len() {
         return Err(format!(
@@ -346,7 +395,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_object(&mut self) -> Result<JsonValue, String> {
-        self.pos += 1; // consume '{'
+        self.parse_object_with_skip(None)
+    }
+
+    fn parse_object_with_skip(&mut self, skip_key: Option<&str>) -> Result<JsonValue, String> {
+        if self.next_byte() != Some(b'{') {
+            return Err(format!("expected '{{' at byte {}", self.pos));
+        }
         self.depth += 1;
         let mut map = BTreeMap::new();
         self.skip_ws();
@@ -367,8 +422,12 @@ impl<'a> Parser<'a> {
                 self.depth -= 1;
                 return Err(format!("expected ':' after key at byte {}", self.pos));
             }
-            let val = self.parse_value()?;
-            map.insert(key, val);
+            if skip_key == Some(key.as_str()) {
+                self.skip_value()?;
+            } else {
+                let val = self.parse_value()?;
+                map.insert(key, val);
+            }
             self.skip_ws();
             match self.next_byte() {
                 Some(b',') => continue,
@@ -384,19 +443,162 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn skip_value(&mut self) -> Result<(), String> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err("JSON nesting depth exceeded".to_owned());
+        }
+        self.skip_ws();
+        let b = self
+            .peek()
+            .ok_or_else(|| "unexpected end of JSON input".to_owned())?;
+        match b {
+            b'n' => {
+                let _ = self.parse_literal(b"null", JsonValue::Null)?;
+                Ok(())
+            }
+            b't' => {
+                let _ = self.parse_literal(b"true", JsonValue::Bool(true))?;
+                Ok(())
+            }
+            b'f' => {
+                let _ = self.parse_literal(b"false", JsonValue::Bool(false))?;
+                Ok(())
+            }
+            b'"' => self.skip_string(),
+            b'[' => {
+                self.pos += 1;
+                self.depth += 1;
+                self.skip_ws();
+                if self.peek() == Some(b']') {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(());
+                }
+                loop {
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.next_byte() {
+                        Some(b',') => continue,
+                        Some(b']') => {
+                            self.depth -= 1;
+                            return Ok(());
+                        }
+                        _ => {
+                            self.depth -= 1;
+                            return Err(format!("expected ',' or ']' at byte {}", self.pos));
+                        }
+                    }
+                }
+            }
+            b'{' => {
+                self.pos += 1;
+                self.depth += 1;
+                self.skip_ws();
+                if self.peek() == Some(b'}') {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(());
+                }
+                loop {
+                    self.skip_ws();
+                    if self.peek() != Some(b'"') {
+                        self.depth -= 1;
+                        return Err(format!("expected string key at byte {}", self.pos));
+                    }
+                    self.skip_string()?;
+                    self.skip_ws();
+                    if self.next_byte() != Some(b':') {
+                        self.depth -= 1;
+                        return Err(format!("expected ':' after key at byte {}", self.pos));
+                    }
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.next_byte() {
+                        Some(b',') => continue,
+                        Some(b'}') => {
+                            self.depth -= 1;
+                            return Ok(());
+                        }
+                        _ => {
+                            self.depth -= 1;
+                            return Err(format!("expected ',' or '}}' at byte {}", self.pos));
+                        }
+                    }
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let _ = self.parse_number()?;
+                Ok(())
+            }
+            other => Err(format!(
+                "unexpected byte 0x{other:02x} at position {}",
+                self.pos
+            )),
+        }
+    }
+
+    #[inline(always)]
+    fn scan_plain_ascii_run(&mut self) {
+        let mut advance = 0usize;
+        for &b in &self.bytes[self.pos..] {
+            if (0x20..0x80).contains(&b) && b != b'"' && b != b'\\' {
+                advance += 1;
+            } else {
+                break;
+            }
+        }
+        self.pos += advance;
+    }
+
+    fn skip_string(&mut self) -> Result<(), String> {
+        if self.next_byte() != Some(b'"') {
+            return Err(format!("expected '\"' at byte {}", self.pos));
+        }
+        loop {
+            self.scan_plain_ascii_run();
+            let b = self
+                .next_byte()
+                .ok_or_else(|| "unterminated JSON string".to_owned())?;
+            match b {
+                b'"' => return Ok(()),
+                b'\\' => {
+                    let esc = self
+                        .next_byte()
+                        .ok_or_else(|| "unterminated escape sequence".to_owned())?;
+                    if esc == b'u' {
+                        let _ = self.parse_hex4()?;
+                    }
+                }
+                c if c < 0x20 => {
+                    return Err(format!(
+                        "unescaped control character 0x{c:02x} in string"
+                    ));
+                }
+                first => {
+                    let start = self.pos - 1;
+                    let width = utf8_width(first)
+                        .ok_or_else(|| format!("invalid UTF-8 lead byte 0x{first:02x}"))?;
+                    let end = start.saturating_add(width);
+                    let slice = self
+                        .bytes
+                        .get(start..end)
+                        .ok_or_else(|| "truncated UTF-8 sequence in string".to_owned())?;
+                    if std::str::from_utf8(slice).is_err() {
+                        return Err("invalid UTF-8 bytes in string".to_owned());
+                    }
+                    self.pos = end;
+                }
+            }
+        }
+    }
+
     fn parse_string(&mut self) -> Result<String, String> {
         if self.next_byte() != Some(b'"') {
             return Err(format!("expected '\"' at byte {}", self.pos));
         }
         // Fast path: scan contiguous plain ASCII bytes (e.g., multi-MB base64 GIFs / ciphertexts)
         let fast_start = self.pos;
-        while let Some(&b) = self.bytes.get(self.pos) {
-            if (0x20..0x80).contains(&b) && b != b'"' && b != b'\\' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
+        self.scan_plain_ascii_run();
         if self.peek() == Some(b'"') {
             let slice = &self.bytes[fast_start..self.pos];
             self.pos += 1;
@@ -414,13 +616,7 @@ impl<'a> Parser<'a> {
 
         loop {
             let span_start = self.pos;
-            while let Some(&b) = self.bytes.get(self.pos) {
-                if (0x20..0x80).contains(&b) && b != b'"' && b != b'\\' {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
+            self.scan_plain_ascii_run();
             if self.pos > span_start {
                 let span = std::str::from_utf8(&self.bytes[span_start..self.pos])
                     .map_err(|_| "invalid UTF-8 bytes in string".to_owned())?;

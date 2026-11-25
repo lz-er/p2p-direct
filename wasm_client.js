@@ -25,6 +25,8 @@ const OP_COMMIT_BULK_RX = 18;
 const OP_STREAM_EXEC_COMMIT_RX = 19;
 const OP_WORKER_SEAL_FORWARD = 20;
 const OP_STREAM_EXEC_WORKER_SEAL_FORWARD = 21;
+const OP_GET_COUNTERS = 22;
+const OP_SHA256 = 23;
 
 const STATUS_OK = 1;
 const EXPECTED_BUF_CAP = 262144;
@@ -60,38 +62,59 @@ let hdrOff = 0;
 let inPtr = 0;
 let outPtr = 0;
 let bufCap = EXPECTED_BUF_CAP;
+let cachedBuf = null;
+let cachedHdr = null;
+let cachedIn = null;
+let cachedOut = null;
 
-function hdrView() {
-  return new Uint32Array(mem.buffer, hdrOff, 12);
+function ensureViews() {
+  const buf = mem.buffer;
+  if (buf !== cachedBuf) {
+    cachedBuf = buf;
+    cachedHdr = new Uint32Array(buf, hdrOff, 12);
+    cachedIn = new Uint8Array(buf, inPtr, bufCap);
+    cachedOut = new Uint8Array(buf, outPtr, bufCap);
+  }
 }
 
 function invoke(op, argLen) {
-  const h = hdrView();
-  h[4] = op;
-  h[5] = argLen;
-  h[8] = 0;
+  ensureViews();
+  cachedHdr[4] = op;
+  cachedHdr[5] = argLen;
+  cachedHdr[8] = 0;
   mainFn();
-  return hdrView();
+  ensureViews();
+  return cachedHdr;
 }
 
 function execFramed(directOp, streamOp, headerObj, tailBytes) {
   const hdrBytes = te.encode(JSON.stringify(headerObj));
-  const totalLen = 4 + hdrBytes.length + tailBytes.length;
-  const payload = new Uint8Array(totalLen);
-  new DataView(payload.buffer).setUint32(0, hdrBytes.length, true);
-  payload.set(hdrBytes, 4);
-  payload.set(tailBytes, 4 + hdrBytes.length);
+  const prefixLen = 4 + hdrBytes.length;
+  const totalLen = prefixLen + tailBytes.length;
+  const prefix = new Uint8Array(prefixLen);
+  prefix[0] = hdrBytes.length & 0xff;
+  prefix[1] = (hdrBytes.length >>> 8) & 0xff;
+  prefix[2] = (hdrBytes.length >>> 16) & 0xff;
+  prefix[3] = (hdrBytes.length >>> 24) & 0xff;
+  prefix.set(hdrBytes, 4);
 
   let h;
   if (totalLen <= bufCap) {
-    new Uint8Array(mem.buffer, inPtr, totalLen).set(payload);
+    ensureViews();
+    cachedIn.set(prefix, 0);
+    cachedIn.set(tailBytes, prefixLen);
     h = invoke(directOp, totalLen);
   } else {
+    ensureViews();
+    cachedIn.set(prefix, 0);
+    h = invoke(OP_STREAM_APPEND, prefixLen);
+    if (h[8] !== STATUS_OK) throw new Error("worker stream append failed");
     let offset = 0;
-    while (offset < totalLen) {
-      const end = Math.min(offset + bufCap, totalLen);
-      const slice = payload.subarray(offset, end);
-      new Uint8Array(mem.buffer, inPtr, slice.length).set(slice);
+    while (offset < tailBytes.length) {
+      const end = Math.min(offset + bufCap, tailBytes.length);
+      const slice = tailBytes.subarray(offset, end);
+      ensureViews();
+      cachedIn.set(slice, 0);
       h = invoke(OP_STREAM_APPEND, slice.length);
       if (h[8] !== STATUS_OK) throw new Error("worker stream append failed");
       offset = end;
@@ -101,21 +124,19 @@ function execFramed(directOp, streamOp, headerObj, tailBytes) {
 
   const totalOut = h[6];
   const firstChunk = h[7];
-  let outBytes;
   if (totalOut <= firstChunk) {
-    outBytes = new Uint8Array(mem.buffer, outPtr, totalOut).slice();
-  } else {
-    outBytes = new Uint8Array(totalOut);
-    outBytes.set(new Uint8Array(mem.buffer, outPtr, firstChunk), 0);
-    let pos = firstChunk;
-    while (pos < totalOut) {
-      h = invoke(OP_READ_OUT_CHUNK, pos);
-      const got = h[7];
-      if (!got) break;
-      const rem = Math.min(got, totalOut - pos);
-      outBytes.set(new Uint8Array(mem.buffer, outPtr, rem), pos);
-      pos += rem;
-    }
+    return cachedOut.slice(0, totalOut);
+  }
+  const outBytes = new Uint8Array(totalOut);
+  outBytes.set(cachedOut.subarray(0, firstChunk), 0);
+  let pos = firstChunk;
+  while (pos < totalOut) {
+    h = invoke(OP_READ_OUT_CHUNK, pos);
+    const got = h[7];
+    if (!got) break;
+    const rem = Math.min(got, totalOut - pos);
+    outBytes.set(cachedOut.subarray(0, rem), pos);
+    pos += rem;
   }
   return outBytes;
 }
@@ -150,6 +171,8 @@ self.onmessage = async (ev) => {
       inPtr = u32[idx + 9];
       outPtr = u32[idx + 10];
       bufCap = u32[idx + 11];
+      cachedBuf = null;
+      ensureViews();
       self.postMessage({ type: "ready" });
     } catch (err) {
       self.postMessage({ type: "init_error", error: err.message || String(err) });
@@ -163,8 +186,7 @@ self.onmessage = async (ev) => {
     if (msg.type === "seal_bulk") {
       const msgJsonBytes = te.encode(JSON.stringify(msg.fullMessage));
       const out = execFramed(OP_WORKER_SEAL_BULK, OP_STREAM_EXEC_WORKER_SEAL, msg.header, msgJsonBytes);
-      const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
-      const jlen = dv.getUint32(0, true);
+      const jlen = (out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24)) >>> 0;
       const parsed = JSON.parse(td.decode(out.subarray(4, 4 + jlen)));
       if (!parsed.ok) throw new Error(parsed.error || "worker_seal_bulk failed");
       const sealedCt = out.slice(4 + jlen);
@@ -178,8 +200,7 @@ self.onmessage = async (ev) => {
     if (msg.type === "open_bulk") {
       const frameBytes = te.encode(msg.frameStr);
       const out = execFramed(OP_WORKER_OPEN_BULK, OP_STREAM_EXEC_WORKER_OPEN, msg.header, frameBytes);
-      const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
-      const mlen = dv.getUint32(0, true);
+      const mlen = (out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24)) >>> 0;
       const metaResp = JSON.parse(td.decode(out.subarray(4, 4 + mlen)));
       if (!metaResp.ok) throw new Error(metaResp.error || "worker_open_bulk failed");
       if (metaResp.kind !== "msg") {
@@ -187,7 +208,11 @@ self.onmessage = async (ev) => {
         return;
       }
       const jlenOff = 4 + mlen;
-      const jlen = dv.getUint32(jlenOff, true);
+      const jlen =
+        (out[jlenOff] |
+          (out[jlenOff + 1] << 8) |
+          (out[jlenOff + 2] << 16) |
+          (out[jlenOff + 3] << 24)) >>> 0;
       const msgJsonStr = td.decode(out.subarray(jlenOff + 4, jlenOff + 4 + jlen));
       const sealedCt = out.slice(jlenOff + 4 + jlen);
       self.postMessage(
@@ -228,11 +253,19 @@ export class SafeRustWasmMesh {
     this.inPtr = inPtr;
     this.outPtr = outPtr;
     this.bufCap = bufCap;
+    this._cachedMemBuf = null;
+    this._hdrU32 = null;
+    this._inU8 = null;
+    this._outU8 = null;
+    this._outDv = null;
+    this._peerIdBytesCache = new Map();
+    this._rxPeerIdCache = [];
     this._bulkWorker = null;
     this._bulkWorkerReady = null;
     this._bulkWorkerFailed = false;
     this._bulkJobSeq = 0;
     this._bulkJobs = new Map();
+    this._ensureViews();
   }
 
   static async loadFromUrl(url = "./p2p_mesh.wasm") {
@@ -300,17 +333,58 @@ export class SafeRustWasmMesh {
     return new SafeRustWasmMesh(instance, headerIdx * 4, inPtr, outPtr, bufCap, wasmModule);
   }
 
-  _headerView() {
-    return new Uint32Array(this.memory.buffer, this.headerByteOffset, 12);
+  _ensureViews() {
+    const buf = this.memory.buffer;
+    if (buf !== this._cachedMemBuf) {
+      this._cachedMemBuf = buf;
+      this._hdrU32 = new Uint32Array(buf, this.headerByteOffset, 12);
+      this._inU8 = new Uint8Array(buf, this.inPtr, this.bufCap);
+      this._outU8 = new Uint8Array(buf, this.outPtr, this.bufCap);
+      this._outDv = new DataView(buf, this.outPtr, this.bufCap);
+    }
+  }
+
+  _encodePeerIdCached(peerId) {
+    let cached = this._peerIdBytesCache.get(peerId);
+    if (cached) return cached;
+    cached = textEncoder.encode(peerId);
+    if (this._peerIdBytesCache.size >= 64) {
+      this._peerIdBytesCache.clear();
+    }
+    this._peerIdBytesCache.set(peerId, cached);
+    return cached;
+  }
+
+  _decodePeerIdCached(outBytes, offset, len) {
+    const cache = this._rxPeerIdCache;
+    for (let c = 0; c < cache.length; c++) {
+      const entry = cache[c];
+      const eb = entry.bytes;
+      if (eb.length !== len) continue;
+      let match = true;
+      for (let j = 0; j < len; j++) {
+        if (eb[j] !== outBytes[offset + j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return entry.str;
+    }
+    const copy = outBytes.slice(offset, offset + len);
+    const str = textDecoder.decode(copy);
+    if (cache.length >= 32) cache.shift();
+    cache.push({ bytes: copy, str });
+    return str;
   }
 
   _invoke(op, argLen) {
-    const hdr = this._headerView();
-    hdr[4] = op;
-    hdr[5] = argLen;
-    hdr[8] = 0;
+    this._ensureViews();
+    this._hdrU32[4] = op;
+    this._hdrU32[5] = argLen;
+    this._hdrU32[8] = 0;
     this.mainFn();
-    return this._headerView();
+    this._ensureViews();
+    return this._hdrU32;
   }
 
   call(requestObj) {
@@ -319,14 +393,16 @@ export class SafeRustWasmMesh {
     let hdr;
 
     if (bytes.length <= this.bufCap) {
-      new Uint8Array(this.memory.buffer, this.inPtr, bytes.length).set(bytes);
+      this._ensureViews();
+      this._inU8.set(bytes, 0);
       hdr = this._invoke(OP_CALL, bytes.length);
     } else {
       let offset = 0;
       while (offset < bytes.length) {
         const end = Math.min(offset + this.bufCap, bytes.length);
         const slice = bytes.subarray(offset, end);
-        new Uint8Array(this.memory.buffer, this.inPtr, slice.length).set(slice);
+        this._ensureViews();
+        this._inU8.set(slice, 0);
         hdr = this._invoke(OP_STREAM_APPEND, slice.length);
         if (hdr[8] !== STATUS_OK) {
           throw new Error("WASM bridge stream append failed");
@@ -342,13 +418,14 @@ export class SafeRustWasmMesh {
   _readJsonResponse(hdr) {
     const totalOutLen = hdr[6];
     const firstChunkLen = hdr[7];
-    let outBytes;
+    let respText;
 
     if (totalOutLen <= firstChunkLen) {
-      outBytes = new Uint8Array(this.memory.buffer, this.outPtr, totalOutLen).slice();
+      // Zero-copy decode directly from WASM shared output window
+      respText = textDecoder.decode(this._outU8.subarray(0, totalOutLen));
     } else {
-      outBytes = new Uint8Array(totalOutLen);
-      outBytes.set(new Uint8Array(this.memory.buffer, this.outPtr, firstChunkLen), 0);
+      const outBytes = new Uint8Array(totalOutLen);
+      outBytes.set(this._outU8.subarray(0, firstChunkLen), 0);
       let readOffset = firstChunkLen;
       while (readOffset < totalOutLen) {
         hdr = this._invoke(OP_READ_OUT_CHUNK, readOffset);
@@ -357,12 +434,12 @@ export class SafeRustWasmMesh {
           break;
         }
         const remaining = Math.min(got, totalOutLen - readOffset);
-        outBytes.set(new Uint8Array(this.memory.buffer, this.outPtr, remaining), readOffset);
+        outBytes.set(this._outU8.subarray(0, remaining), readOffset);
         readOffset += remaining;
       }
+      respText = textDecoder.decode(outBytes);
     }
 
-    const respText = textDecoder.decode(outBytes);
     const parsed = JSON.parse(respText);
     if (!parsed.ok) {
       throw new Error(parsed.error || "Unknown WASM RPC error");
@@ -371,11 +448,58 @@ export class SafeRustWasmMesh {
   }
 
   /**
+   * Pure zero-JSON binary fast-path for reading live packet/E2EE/log counters in < 1 us.
+   */
+  getCounters() {
+    const hdr = this._invoke(OP_GET_COUNTERS, 0);
+    const outLen = hdr[7];
+    if (hdr[8] !== STATUS_OK || outLen < 88) {
+      return null;
+    }
+    const dv = this._outDv;
+    const readU64 = (off) => dv.getUint32(off, true) + dv.getUint32(off + 4, true) * 0x100000000;
+    return {
+      voicePacketsSent: readU64(0),
+      voicePacketsReceived: readU64(8),
+      framesSent: readU64(16),
+      framesReceived: readU64(24),
+      e2eeFramesEncrypted: readU64(32),
+      e2eeFramesDecrypted: readU64(40),
+      e2eeAuthFailures: readU64(48),
+      gossipForwards: readU64(56),
+      gossipDuplicatesDropped: readU64(64),
+      logCount: readU64(72),
+      lamport: readU64(80),
+    };
+  }
+
+  /**
+   * Computes FIPS 180-4 SHA-256 directly in safe Rust WASM (works identically even on non-HTTPS LAN).
+   */
+  sha256(inputBytesOrStr) {
+    const bytes =
+      inputBytesOrStr instanceof Uint8Array
+        ? inputBytesOrStr
+        : textEncoder.encode(String(inputBytesOrStr || ""));
+    if (bytes.length > this.bufCap) {
+      throw new Error("sha256 input exceeds bridge buffer capacity");
+    }
+    this._ensureViews();
+    this._inU8.set(bytes, 0);
+    const hdr = this._invoke(OP_SHA256, bytes.length);
+    if (hdr[8] !== STATUS_OK || hdr[7] !== 32) {
+      throw new Error("WASM sha256 failed");
+    }
+    return this._outU8.slice(0, 32);
+  }
+
+  /**
    * Binary fast-path for `wire_message`: streams raw UTF-8 frame bytes directly into WASM
    * without outer JSON.stringify escaping or double JSON parsing (eliminates stalls on large GIFs/videos).
    */
   wireMessage(fromPeer, frameStr, nowMs = Date.now()) {
-    const pidBytes = textEncoder.encode(String(fromPeer || ""));
+    const pidStr = String(fromPeer || "");
+    const pidBytes = this._encodePeerIdCached(pidStr);
     if (pidBytes.length > 65535) {
       return this.call({ cmd: "wire_message", fromPeer, frame: frameStr, nowMs });
     }
@@ -383,23 +507,43 @@ export class SafeRustWasmMesh {
     const headerLen = 2 + pidBytes.length + 8;
     const totalLen = headerLen + frameBytes.length;
 
-    const header = new Uint8Array(headerLen);
-    header[0] = pidBytes.length & 0xff;
-    header[1] = (pidBytes.length >> 8) & 0xff;
-    header.set(pidBytes, 2);
     const tsVal = Math.max(0, Math.floor(Number(nowMs) || 0));
-    const dv = new DataView(header.buffer);
-    dv.setUint32(2 + pidBytes.length, tsVal >>> 0, true);
-    dv.setUint32(2 + pidBytes.length + 4, Math.floor(tsVal / 0x100000000) >>> 0, true);
+    const tsLo = tsVal >>> 0;
+    const tsHi = Math.floor(tsVal / 0x100000000) >>> 0;
 
     let hdr;
     if (totalLen <= this.bufCap) {
-      const dst = new Uint8Array(this.memory.buffer, this.inPtr, totalLen);
-      dst.set(header, 0);
-      dst.set(frameBytes, headerLen);
+      this._ensureViews();
+      const inBuf = this._inU8;
+      inBuf[0] = pidBytes.length & 0xff;
+      inBuf[1] = (pidBytes.length >> 8) & 0xff;
+      inBuf.set(pidBytes, 2);
+      const tOff = 2 + pidBytes.length;
+      inBuf[tOff] = tsLo & 0xff;
+      inBuf[tOff + 1] = (tsLo >>> 8) & 0xff;
+      inBuf[tOff + 2] = (tsLo >>> 16) & 0xff;
+      inBuf[tOff + 3] = (tsLo >>> 24) & 0xff;
+      inBuf[tOff + 4] = tsHi & 0xff;
+      inBuf[tOff + 5] = (tsHi >>> 8) & 0xff;
+      inBuf[tOff + 6] = (tsHi >>> 16) & 0xff;
+      inBuf[tOff + 7] = (tsHi >>> 24) & 0xff;
+      inBuf.set(frameBytes, headerLen);
       hdr = this._invoke(OP_WIRE_MESSAGE, totalLen);
     } else {
-      new Uint8Array(this.memory.buffer, this.inPtr, headerLen).set(header);
+      this._ensureViews();
+      const inBuf = this._inU8;
+      inBuf[0] = pidBytes.length & 0xff;
+      inBuf[1] = (pidBytes.length >> 8) & 0xff;
+      inBuf.set(pidBytes, 2);
+      const tOff = 2 + pidBytes.length;
+      inBuf[tOff] = tsLo & 0xff;
+      inBuf[tOff + 1] = (tsLo >>> 8) & 0xff;
+      inBuf[tOff + 2] = (tsLo >>> 16) & 0xff;
+      inBuf[tOff + 3] = (tsLo >>> 24) & 0xff;
+      inBuf[tOff + 4] = tsHi & 0xff;
+      inBuf[tOff + 5] = (tsHi >>> 8) & 0xff;
+      inBuf[tOff + 6] = (tsHi >>> 16) & 0xff;
+      inBuf[tOff + 7] = (tsHi >>> 24) & 0xff;
       hdr = this._invoke(OP_STREAM_APPEND, headerLen);
       if (hdr[8] !== STATUS_OK) {
         throw new Error("WASM bridge wire header stream append failed");
@@ -408,7 +552,8 @@ export class SafeRustWasmMesh {
       while (offset < frameBytes.length) {
         const end = Math.min(offset + this.bufCap, frameBytes.length);
         const slice = frameBytes.subarray(offset, end);
-        new Uint8Array(this.memory.buffer, this.inPtr, slice.length).set(slice);
+        this._ensureViews();
+        this._inU8.set(slice, 0);
         hdr = this._invoke(OP_STREAM_APPEND, slice.length);
         if (hdr[8] !== STATUS_OK) {
           throw new Error("WASM bridge wire frame stream append failed");
@@ -434,7 +579,8 @@ export class SafeRustWasmMesh {
       int16Array.byteLength
     );
     const byteLen = Math.min(rawView.byteLength, this.bufCap);
-    new Uint8Array(this.memory.buffer, this.inPtr, byteLen).set(rawView.subarray(0, byteLen));
+    this._ensureViews();
+    this._inU8.set(byteLen === rawView.byteLength ? rawView : rawView.subarray(0, byteLen), 0);
 
     const hdr = this._invoke(OP_VOICE_ENCODE_SEAL, byteLen);
     const outLen = hdr[7];
@@ -442,21 +588,20 @@ export class SafeRustWasmMesh {
       return { rms: 0, packets: [] };
     }
 
-    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
-    const outBytes = new Uint8Array(this.memory.buffer, this.outPtr, outLen);
-    const rms = dv.getUint16(0, true);
-    const peerCount = dv.getUint16(2, true);
+    const outBytes = this._outU8;
+    const rms = outBytes[0] | (outBytes[1] << 8);
+    const peerCount = outBytes[2] | (outBytes[3] << 8);
     const packets = [];
     let offset = 4;
 
     for (let i = 0; i < peerCount; i++) {
       if (offset + 2 > outLen) break;
-      const pidLen = dv.getUint16(offset, true);
+      const pidLen = outBytes[offset] | (outBytes[offset + 1] << 8);
       offset += 2;
       if (offset + pidLen + 2 > outLen) break;
-      const peerId = textDecoder.decode(outBytes.subarray(offset, offset + pidLen));
+      const peerId = this._decodePeerIdCached(outBytes, offset, pidLen);
       offset += pidLen;
-      const pktLen = dv.getUint16(offset, true);
+      const pktLen = outBytes[offset] | (outBytes[offset + 1] << 8);
       offset += 2;
       if (offset + pktLen > outLen) break;
       const data = outBytes.slice(offset, offset + pktLen);
@@ -474,12 +619,13 @@ export class SafeRustWasmMesh {
     if (!peerId || !packetUint8 || packetUint8.byteLength === 0) {
       return null;
     }
-    const pidBytes = textEncoder.encode(peerId);
+    const pidBytes = this._encodePeerIdCached(peerId);
     const totalIn = 2 + pidBytes.length + packetUint8.byteLength;
     if (totalIn > this.bufCap || pidBytes.length > 65535) {
       return null;
     }
-    const inBuf = new Uint8Array(this.memory.buffer, this.inPtr, totalIn);
+    this._ensureViews();
+    const inBuf = this._inU8;
     inBuf[0] = pidBytes.length & 0xff;
     inBuf[1] = (pidBytes.length >> 8) & 0xff;
     inBuf.set(pidBytes, 2);
@@ -491,14 +637,14 @@ export class SafeRustWasmMesh {
       return null;
     }
 
-    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
-    const rms = dv.getUint16(0, true);
-    const sampleCount = dv.getUint16(2, true);
+    const outBytes = this._outU8;
+    const rms = outBytes[0] | (outBytes[1] << 8);
+    const sampleCount = outBytes[2] | (outBytes[3] << 8);
     const byteCount = sampleCount * 2;
     if (sampleCount === 0 || 4 + byteCount > outLen) {
       return { rms, pcm: new Int16Array(0) };
     }
-    const pcmBytes = new Uint8Array(this.memory.buffer, this.outPtr + 4, byteCount).slice();
+    const pcmBytes = outBytes.slice(4, 4 + byteCount);
     return { rms, pcm: new Int16Array(pcmBytes.buffer) };
   }
 
@@ -511,8 +657,10 @@ export class SafeRustWasmMesh {
       return [];
     }
     const byteLen = Math.min(rawPayloadUint8.byteLength, this.bufCap);
-    new Uint8Array(this.memory.buffer, this.inPtr, byteLen).set(
-      rawPayloadUint8.subarray(0, byteLen)
+    this._ensureViews();
+    this._inU8.set(
+      byteLen === rawPayloadUint8.byteLength ? rawPayloadUint8 : rawPayloadUint8.subarray(0, byteLen),
+      0
     );
 
     const hdr = this._invoke(OP_VOICE_SEAL_RAW, byteLen);
@@ -521,20 +669,19 @@ export class SafeRustWasmMesh {
       return [];
     }
 
-    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
-    const outBytes = new Uint8Array(this.memory.buffer, this.outPtr, outLen);
-    const peerCount = dv.getUint16(0, true);
+    const outBytes = this._outU8;
+    const peerCount = outBytes[0] | (outBytes[1] << 8);
     const packets = [];
     let offset = 2;
 
     for (let i = 0; i < peerCount; i++) {
       if (offset + 2 > outLen) break;
-      const pidLen = dv.getUint16(offset, true);
+      const pidLen = outBytes[offset] | (outBytes[offset + 1] << 8);
       offset += 2;
       if (offset + pidLen + 2 > outLen) break;
-      const peerId = textDecoder.decode(outBytes.subarray(offset, offset + pidLen));
+      const peerId = this._decodePeerIdCached(outBytes, offset, pidLen);
       offset += pidLen;
-      const pktLen = dv.getUint16(offset, true);
+      const pktLen = outBytes[offset] | (outBytes[offset + 1] << 8);
       offset += 2;
       if (offset + pktLen > outLen) break;
       const data = outBytes.slice(offset, offset + pktLen);
@@ -552,12 +699,13 @@ export class SafeRustWasmMesh {
     if (!peerId || !packetUint8 || packetUint8.byteLength === 0) {
       return null;
     }
-    const pidBytes = textEncoder.encode(peerId);
+    const pidBytes = this._encodePeerIdCached(peerId);
     const totalIn = 2 + pidBytes.length + packetUint8.byteLength;
     if (totalIn > this.bufCap || pidBytes.length > 65535) {
       return null;
     }
-    const inBuf = new Uint8Array(this.memory.buffer, this.inPtr, totalIn);
+    this._ensureViews();
+    const inBuf = this._inU8;
     inBuf[0] = pidBytes.length & 0xff;
     inBuf[1] = (pidBytes.length >> 8) & 0xff;
     inBuf.set(pidBytes, 2);
@@ -568,7 +716,7 @@ export class SafeRustWasmMesh {
     if (hdr[8] !== STATUS_OK || outLen === 0) {
       return null;
     }
-    return new Uint8Array(this.memory.buffer, this.outPtr, outLen).slice();
+    return this._outU8.slice(0, outLen);
   }
 
   /**
@@ -589,12 +737,13 @@ export class SafeRustWasmMesh {
     const maxSampleBytes = Math.max(0, this.bufCap - 4);
     const sampleByteLen = Math.min(rawView.byteLength, maxSampleBytes) & ~3;
     const totalIn = 4 + sampleByteLen;
-    const inBuf = new Uint8Array(this.memory.buffer, this.inPtr, totalIn);
+    this._ensureViews();
+    const inBuf = this._inU8;
     inBuf[0] = Math.max(0, Math.min(100, Math.round(gatePct)));
     inBuf[1] = (needV1 ? 1 : 0) | (returnProcessed48k ? 2 : 0);
     inBuf[2] = 0;
     inBuf[3] = 0;
-    inBuf.set(rawView.subarray(0, sampleByteLen), 4);
+    inBuf.set(sampleByteLen === rawView.byteLength ? rawView : rawView.subarray(0, sampleByteLen), 4);
 
     const hdr = this._invoke(OP_VOICE_PROCESS_CAPTURE_48K, totalIn);
     const outLen = hdr[7];
@@ -602,15 +751,14 @@ export class SafeRustWasmMesh {
       return { rawRms: 0, activeRms: 0, gated: true, isFadeOutTail: false, processed48k: null, v1Packets: [] };
     }
 
-    const dv = new DataView(this.memory.buffer, this.outPtr, outLen);
-    const outBytes = new Uint8Array(this.memory.buffer, this.outPtr, outLen);
-    const rawRms = dv.getUint16(0, true);
-    const activeRms = dv.getUint16(2, true);
+    const outBytes = this._outU8;
+    const rawRms = outBytes[0] | (outBytes[1] << 8);
+    const activeRms = outBytes[2] | (outBytes[3] << 8);
     const outFlags = outBytes[4];
     const gated = (outFlags & 1) !== 0;
     const isFadeOutTail = (outFlags & 2) !== 0;
-    const sampleCount = dv.getUint16(6, true);
-    const v1PeerCount = dv.getUint16(8, true);
+    const sampleCount = outBytes[6] | (outBytes[7] << 8);
+    const v1PeerCount = outBytes[8] | (outBytes[9] << 8);
 
     let offset = 12;
     let processed48k = null;
@@ -624,12 +772,12 @@ export class SafeRustWasmMesh {
     const v1Packets = [];
     for (let i = 0; i < v1PeerCount; i++) {
       if (offset + 2 > outLen) break;
-      const pidLen = dv.getUint16(offset, true);
+      const pidLen = outBytes[offset] | (outBytes[offset + 1] << 8);
       offset += 2;
       if (offset + pidLen + 2 > outLen) break;
-      const peerId = textDecoder.decode(outBytes.subarray(offset, offset + pidLen));
+      const peerId = this._decodePeerIdCached(outBytes, offset, pidLen);
       offset += pidLen;
-      const pktLen = dv.getUint16(offset, true);
+      const pktLen = outBytes[offset] | (outBytes[offset + 1] << 8);
       offset += 2;
       if (offset + pktLen > outLen) break;
       const data = outBytes.slice(offset, offset + pktLen);
@@ -790,20 +938,29 @@ export class SafeRustWasmMesh {
   _execFramedJson(directOp, streamOp, headerObj, tailUint8) {
     const hdrBytes = textEncoder.encode(JSON.stringify(headerObj));
     const tail = tailUint8 instanceof Uint8Array ? tailUint8 : new Uint8Array(tailUint8 || 0);
-    const totalLen = 4 + hdrBytes.length + tail.length;
-    const prefix = new Uint8Array(4 + hdrBytes.length);
-    new DataView(prefix.buffer).setUint32(0, hdrBytes.length, true);
-    prefix.set(hdrBytes, 4);
+    const prefixLen = 4 + hdrBytes.length;
+    const totalLen = prefixLen + tail.length;
 
     let hdr;
     if (totalLen <= this.bufCap) {
-      const dst = new Uint8Array(this.memory.buffer, this.inPtr, totalLen);
-      dst.set(prefix, 0);
-      dst.set(tail, prefix.length);
+      this._ensureViews();
+      const inBuf = this._inU8;
+      inBuf[0] = hdrBytes.length & 0xff;
+      inBuf[1] = (hdrBytes.length >>> 8) & 0xff;
+      inBuf[2] = (hdrBytes.length >>> 16) & 0xff;
+      inBuf[3] = (hdrBytes.length >>> 24) & 0xff;
+      inBuf.set(hdrBytes, 4);
+      inBuf.set(tail, prefixLen);
       hdr = this._invoke(directOp, totalLen);
     } else {
-      new Uint8Array(this.memory.buffer, this.inPtr, prefix.length).set(prefix);
-      hdr = this._invoke(OP_STREAM_APPEND, prefix.length);
+      this._ensureViews();
+      const inBuf = this._inU8;
+      inBuf[0] = hdrBytes.length & 0xff;
+      inBuf[1] = (hdrBytes.length >>> 8) & 0xff;
+      inBuf[2] = (hdrBytes.length >>> 16) & 0xff;
+      inBuf[3] = (hdrBytes.length >>> 24) & 0xff;
+      inBuf.set(hdrBytes, 4);
+      hdr = this._invoke(OP_STREAM_APPEND, prefixLen);
       if (hdr[8] !== STATUS_OK) {
         throw new Error("WASM bridge framed header append failed");
       }
@@ -811,7 +968,8 @@ export class SafeRustWasmMesh {
       while (offset < tail.length) {
         const end = Math.min(offset + this.bufCap, tail.length);
         const slice = tail.subarray(offset, end);
-        new Uint8Array(this.memory.buffer, this.inPtr, slice.length).set(slice);
+        this._ensureViews();
+        this._inU8.set(slice, 0);
         hdr = this._invoke(OP_STREAM_APPEND, slice.length);
         if (hdr[8] !== STATUS_OK) {
           throw new Error("WASM bridge framed tail append failed");

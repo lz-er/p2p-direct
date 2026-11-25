@@ -9,14 +9,15 @@ use p2p_direct::codec::{
     encode_signal_code, extract_fragment_code,
 };
 use p2p_direct::crypto::{
-    SafeCsprng, aead_open, aead_seal, derive_invite_wrap_key, derive_log_key,
-    derive_mesh_key_from_passphrase, derive_voice_link_keys, hkdf_extract, key_fingerprint,
-    pair_safety_code, sha256, x25519, x25519_public_key, x25519_shared_secret,
+    SafeCsprng, aead_open, aead_open_into, aead_seal, aead_seal_into, derive_all_link_keys,
+    derive_invite_wrap_key, derive_link_keys, derive_log_key, derive_mesh_key_from_passphrase,
+    derive_voice_link_keys, hkdf_extract, key_fingerprint, pair_safety_code, sha256, x25519,
+    x25519_public_key, x25519_shared_secret,
 };
 use p2p_direct::deflate::{
     base64url_decode, base64url_encode, deflate_raw, inflate_auto, inflate_raw,
 };
-use p2p_direct::json::{JsonValue, parse_json};
+use p2p_direct::json::{JsonValue, parse_json, parse_json_object_skipping_field};
 use p2p_direct::log::{LogMessage, ReplicatedLog, SealedLogRecord};
 use p2p_direct::mesh::{MeshConfig, MeshNode};
 use p2p_direct::protocol::{
@@ -1549,4 +1550,223 @@ fn off_thread_bulk_worker_roundtrip_interops_with_standard_mesh() -> TestResult 
     assert!(dispatch_rpc(&mut a, r#"{"cmd":"get_state"}"#).contains("R0lGODlhAQABAAAAACw="));
     Ok(())
 }
+
+#[test]
+fn fused_aead_matches_boundaries_and_rejects_tampering() -> TestResult {
+    let key = [0x42u8; 32];
+    let nonce = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC];
+    let aad_lens = [0usize, 1, 15, 16, 17, 63, 64, 65];
+    let pt_lens = [0usize, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129, 255, 4097];
+
+    let mut sealed_buf = Vec::new();
+    let mut opened_buf = Vec::new();
+
+    for &aad_len in &aad_lens {
+        let aad: Vec<u8> = (0..aad_len).map(|i| (i.wrapping_mul(37) ^ 0x5A) as u8).collect();
+        for &pt_len in &pt_lens {
+            let pt: Vec<u8> = (0..pt_len).map(|i| (i.wrapping_mul(131) ^ 0xA5) as u8).collect();
+            sealed_buf.clear();
+            aead_seal_into(&key, &nonce, &aad, &pt, &mut sealed_buf);
+            assert_eq!(sealed_buf.len(), pt_len + 16);
+
+            let sealed_alloc = aead_seal(&key, &nonce, &aad, &pt);
+            assert_eq!(sealed_buf, sealed_alloc);
+
+            opened_buf.clear();
+            aead_open_into(&key, &nonce, &aad, &sealed_buf, &mut opened_buf)?;
+            assert_eq!(opened_buf, pt);
+            assert_eq!(aead_open(&key, &nonce, &aad, &sealed_buf)?, pt);
+
+            // Flip one bit in tag or ciphertext and verify strict rejection without mutating `opened_buf`
+            let mut tampered = sealed_buf.clone();
+            tampered[0] ^= 0x01;
+            let pre_len = opened_buf.len();
+            assert!(aead_open_into(&key, &nonce, &aad, &tampered, &mut opened_buf).is_err());
+            assert_eq!(opened_buf.len(), pre_len);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn derive_all_link_keys_matches_individual_derivations() -> TestResult {
+    let mesh_key = [0x99u8; 32];
+    let sk_a = [0x12u8; 32];
+    let sk_b = [0x34u8; 32];
+    let pk_a = x25519_public_key(&sk_a);
+    let pk_b = x25519_public_key(&sk_b);
+
+    let (wire_a, voice_a) = derive_all_link_keys(&sk_a, &pk_b, &mesh_key, "alice", "bob")?;
+    let wire_a_sep = derive_link_keys(&sk_a, &pk_b, &mesh_key, "alice", "bob")?;
+    let voice_a_sep = derive_voice_link_keys(&sk_a, &pk_b, &mesh_key, "alice", "bob")?;
+
+    assert_eq!(wire_a, wire_a_sep);
+    assert_eq!(voice_a, voice_a_sep);
+
+    let (wire_b, voice_b) = derive_all_link_keys(&sk_b, &pk_a, &mesh_key, "bob", "alice")?;
+    assert_eq!(wire_a.0, wire_b.1);
+    assert_eq!(wire_a.1, wire_b.0);
+    assert_eq!(voice_a.0, voice_b.1);
+    assert_eq!(voice_a.1, voice_b.0);
+    Ok(())
+}
+
+#[test]
+fn zero_copy_wire_parsers_and_skipping_parser_cover_fast_and_fallback_paths() -> TestResult {
+    let mut rng = SafeCsprng::from_seed(b"zero-copy-parser-test");
+    let mesh_key = [0x33u8; 32];
+    let log_key = derive_log_key(&mesh_key);
+
+    let msg = LogMessage {
+        id: "m-zc-1".to_owned(),
+        msg_type: "chat".to_owned(),
+        lamport: 7,
+        ts: 123_456,
+        author: "alice".to_owned(),
+        author_name: "Alice".to_owned(),
+        payload: parse_json(r#"{"text":"hello","nested":{"arr":[1,2,"a\"b"],"k":"v"}}"#)?,
+    };
+    let rec = SealedLogRecord::seal(&msg, &log_key, &mut rng);
+
+    // 1. Compact Msg wire frame exercises zero-copy fast path
+    let wire_frame = WireFrame::Msg {
+        origin: "alice".to_owned(),
+        ttl: 5,
+        path: vec!["alice".to_owned(), "bob".to_owned()],
+        record: rec.clone(),
+    };
+    let compact_msg_json = wire_frame.to_json_string();
+    let parsed_fast = WireFrame::parse_json(&compact_msg_json)?;
+    assert_eq!(parsed_fast, wire_frame);
+
+    // 2. Pretty/whitespace + escaped Msg wire frame exercises full JSON parser fallback
+    let pretty_msg_json = format!(
+        "{{ \"kind\" : \"msg\" , \"origin\" : \"alice\" , \"ttl\" : 5 , \"path\" : [ \"alice\" , \"bob\" ] , \"record\" : {{ \"id\" : \"m-zc-1\" , \"lamport\" : 7 , \"ts\" : 123456 , \"n\" : \"{}\" , \"c\" : \"{}\" }} }}",
+        base64url_encode(&rec.nonce),
+        base64url_encode(&rec.ciphertext)
+    );
+    let parsed_fallback = WireFrame::parse_json(&pretty_msg_json)?;
+    assert_eq!(parsed_fallback, wire_frame);
+
+    // 3. Compact and whitespace EncryptedWireEnvelope (fast path + fallback)
+    let env = EncryptedWireEnvelope {
+        version: 1,
+        seq: 42,
+        nonce: [0x5Au8; 12],
+        ciphertext: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03],
+    };
+    let compact_env = env.to_json_string();
+    let env_fast = EncryptedWireEnvelope::parse_json(&compact_env)?;
+    assert_eq!(env_fast.version, env.version);
+    assert_eq!(env_fast.seq, env.seq);
+    assert_eq!(env_fast.nonce, env.nonce);
+    assert_eq!(env_fast.ciphertext, env.ciphertext);
+
+    let pretty_env = format!(
+        "{{ \"kind\": \"e2ee\", \"v\": 1, \"s\": 42, \"n\": \"{}\", \"c\": \"{}\" }}",
+        base64url_encode(&env.nonce),
+        base64url_encode(&env.ciphertext)
+    );
+    let env_fallback = EncryptedWireEnvelope::parse_json(&pretty_env)?;
+    assert_eq!(env_fallback.seq, env.seq);
+    assert_eq!(env_fallback.nonce, env.nonce);
+    assert_eq!(env_fallback.ciphertext, env.ciphertext);
+
+    // 4. parse_json_object_skipping_field skips arbitrarily large/nested payload cleanly
+    let msg_json = msg.to_json_string();
+    let skipped = parse_json_object_skipping_field(&msg_json, "payload")?;
+    assert_eq!(skipped.get_str("id"), Some("m-zc-1"));
+    assert_eq!(skipped.get_str("type"), Some("chat"));
+    assert_eq!(skipped.get_u64("lamport"), Some(7));
+    assert_eq!(skipped.get_u64("ts"), Some(123_456));
+    assert_eq!(skipped.get_str("author"), Some("alice"));
+    assert_eq!(skipped.get_str("authorName"), Some("Alice"));
+    assert!(skipped.get("payload").is_none());
+    Ok(())
+}
+
+#[test]
+fn mesh_binary_counters_and_48k_dsp_fast_path_consistency() -> TestResult {
+    let mut node = MeshNode::new(
+        "p-cnt".to_owned(),
+        "Counter".to_owned(),
+        "Room".to_owned(),
+        [0x21u8; 32],
+        [0x43u8; 32],
+        &[0x65u8; 32],
+        MeshConfig::default(),
+    );
+    let _ = node.publish_local(
+        "chat".to_owned(),
+        parse_json(r#"{"text":"hi"}"#)?,
+        1000,
+        Some("m1".to_owned()),
+    )?;
+    let mut raw = Vec::new();
+    node.write_counters_binary(&mut raw);
+    assert_eq!(raw.len(), 88);
+    let read_u64 = |idx: usize| -> u64 {
+        u64::from_le_bytes([
+            raw[idx * 8],
+            raw[idx * 8 + 1],
+            raw[idx * 8 + 2],
+            raw[idx * 8 + 3],
+            raw[idx * 8 + 4],
+            raw[idx * 8 + 5],
+            raw[idx * 8 + 6],
+            raw[idx * 8 + 7],
+        ])
+    };
+    let st = node.stats();
+    assert_eq!(read_u64(0), st.voice_packets_sent);
+    assert_eq!(read_u64(1), st.voice_packets_received);
+    assert_eq!(read_u64(2), st.frames_sent);
+    assert_eq!(read_u64(3), st.frames_received);
+    assert_eq!(read_u64(4), st.e2ee_frames_encrypted);
+    assert_eq!(read_u64(5), st.e2ee_frames_decrypted);
+    assert_eq!(read_u64(6), st.e2ee_auth_failures);
+    assert_eq!(read_u64(7), st.gossip_forwards);
+    assert_eq!(read_u64(8), st.gossip_duplicates_dropped);
+    assert_eq!(read_u64(9), node.log().len() as u64);
+    assert_eq!(read_u64(10), node.log().lamport());
+
+    // Verify VoiceCaptureDsp48k normal (<= 0.85 fast path), clipping (> 0.85 limiter),
+    // and fade-out tail produce clean, bounded outputs with accurate downsampled lengths.
+    let mut dsp = VoiceCaptureDsp48k::new();
+    let quiet: Vec<f32> = (0..960)
+        .map(|i| 0.25 * (2.0 * std::f32::consts::PI * 440.0 * (i as f32) / 48_000.0).sin())
+        .collect();
+    let r1 = dsp.process_frame(&quiet, 2, false, true);
+    assert!(!r1.gated);
+    assert_eq!(r1.processed_48k.len(), 960);
+    assert_eq!(r1.downsampled_16k.len(), 320);
+
+    let loud: Vec<f32> = (0..960)
+        .map(|i| 1.8 * (2.0 * std::f32::consts::PI * 440.0 * (i as f32) / 48_000.0).sin())
+        .collect();
+    let r2 = dsp.process_frame(&loud, 2, false, true);
+    assert!(!r2.gated);
+    assert!(r2.processed_48k.iter().all(|&s| s.abs() < 1.0));
+    assert_eq!(r2.downsampled_16k.len(), 320);
+
+    // Silence drains 14 hold frames then emits a single fade-out tail frame, then gates
+    let silence = vec![0.0f32; 960];
+    let mut saw_tail = false;
+    let mut saw_gated = false;
+    for _ in 0..20 {
+        let r = dsp.process_frame(&silence, 5, false, false);
+        if r.is_fade_out_tail {
+            saw_tail = true;
+            assert!(!r.gated);
+            assert_eq!(r.active_rms, 0);
+        } else if r.gated {
+            saw_gated = true;
+            assert!(r.processed_48k.is_empty());
+            break;
+        }
+    }
+    assert!(saw_tail && saw_gated);
+    Ok(())
+}
+
 

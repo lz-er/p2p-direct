@@ -12,8 +12,8 @@ import {
   computePeerTag,
   decodeRelayDataChunk,
   decodeRelayVoiceBundle,
-  encodeRelayDataChunks,
   encodeRelayVoiceBundle,
+  encodeSingleRelayDataChunk,
   resolveRelayUrls,
 } from "../mqtt_relay.js";
 
@@ -744,7 +744,8 @@ export class P2PBot extends EventEmitter {
     if (this.roomMyTag && this.roomMyTag.topic === topic && this.roomMyTag.peerId === peerId) {
       return this.roomMyTag;
     }
-    const tag = await computePeerTag(topic, peerId);
+    const shaFallback = this.wasm ? (b) => this.wasm.sha256(b) : null;
+    const tag = await computePeerTag(topic, peerId, shaFallback);
     this.roomMyTag = { topic, peerId, bytes: tag.bytes, hex: tag.hex };
     return this.roomMyTag;
   }
@@ -753,7 +754,8 @@ export class P2PBot extends EventEmitter {
     if (!this.activeRoom || !peerId || peerId === this.status?.peerId) return null;
     let info = this.roomKnownPeers.get(peerId);
     if (!info) {
-      const tag = await computePeerTag(this.activeRoom.topic, peerId);
+      const shaFallback = this.wasm ? (b) => this.wasm.sha256(b) : null;
+      const tag = await computePeerTag(this.activeRoom.topic, peerId, shaFallback);
       info = {
         peerId,
         name: name || "Peer",
@@ -1000,15 +1002,19 @@ export class P2PBot extends EventEmitter {
       send(frameStr) {
         if (this.readyState !== "open" || !bot.roomRendezvous || !bot.activeRoom) return;
         const msgId = (bot.relayDataMsgSeq = (bot.relayDataMsgSeq + 1) >>> 0) || 1;
-        const chunks = encodeRelayDataChunks(
-          myTag.bytes,
-          peerInfo.tagBytes,
-          msgId,
-          String(frameStr),
-          RELAY_DATA_CHUNK_SIZE
-        );
+        const payloadBytes = Buffer.from(String(frameStr), "utf8");
+        const total = Math.max(1, Math.ceil(payloadBytes.length / RELAY_DATA_CHUNK_SIZE));
         const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
-        for (const chunkPkt of chunks) {
+        for (let idx = 0; idx < total; idx++) {
+          const chunkPkt = encodeSingleRelayDataChunk(
+            myTag.bytes,
+            peerInfo.tagBytes,
+            msgId,
+            idx,
+            total,
+            payloadBytes,
+            RELAY_DATA_CHUNK_SIZE
+          );
           bot.roomRendezvous.publishBinary(chunkPkt, {
             preferredUrls,
             maxBrokers: 2,
@@ -1118,11 +1124,11 @@ export class P2PBot extends EventEmitter {
 
   _handleIncomingRelayBinary(bytes, brokerUrl) {
     if (!this.activeRoom || !this.roomMyTag || !bytes || bytes.length < 2) return;
-    const myHex = this.roomMyTag.hex;
+    const myTagBytes = this.roomMyTag.bytes;
 
     if (bytes[0] === 0x44 && bytes[1] === 0x46) {
-      const decoded = decodeRelayDataChunk(bytes);
-      if (!decoded || decoded.toHex !== myHex || decoded.fromHex === myHex) return;
+      const decoded = decodeRelayDataChunk(bytes, myTagBytes, myTagBytes);
+      if (!decoded) return;
       const dedupeKey = `${decoded.fromHex}:${decoded.msgId}:${decoded.idx}`;
       if (this.seenRelayChunkKeys.has(dedupeKey)) return;
       this.seenRelayChunkKeys.set(dedupeKey, Date.now());
@@ -1197,8 +1203,8 @@ export class P2PBot extends EventEmitter {
     }
 
     if (bytes[0] === 0x56 && bytes[1] === 0x42) {
-      const bundle = decodeRelayVoiceBundle(bytes);
-      if (!bundle || bundle.toHex !== myHex || bundle.fromHex === myHex) return;
+      const bundle = decodeRelayVoiceBundle(bytes, myTagBytes, myTagBytes);
+      if (!bundle) return;
       if (this.seenVoiceBundleSeq.get(bundle.fromHex) === bundle.seq) return;
       this.seenVoiceBundleSeq.set(bundle.fromHex, bundle.seq);
 

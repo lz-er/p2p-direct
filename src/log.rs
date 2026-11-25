@@ -53,7 +53,14 @@ impl LogMessage {
     }
 
     pub fn to_json_string(&self) -> String {
-        let mut out = String::with_capacity(192);
+        let cap = self
+            .payload
+            .estimated_json_len()
+            .saturating_add(self.id.len())
+            .saturating_add(self.author.len())
+            .saturating_add(self.author_name.len())
+            .saturating_add(128);
+        let mut out = String::with_capacity(cap);
         self.write_json(&mut out);
         out
     }
@@ -157,15 +164,22 @@ pub struct SealedLogRecord {
 }
 
 impl SealedLogRecord {
-    fn aad_bytes(id: &str, lamport: u64, ts: u64) -> Vec<u8> {
-        format!("p2p-log-v1|{id}|{lamport}|{ts}").into_bytes()
+    pub fn build_aad(id: &str, lamport: u64, ts: u64) -> crate::crypto::AadBuf {
+        let mut aad = crate::crypto::AadBuf::new();
+        aad.push_bytes(b"p2p-log-v1|");
+        aad.push_bytes(id.as_bytes());
+        aad.push_bytes(b"|");
+        aad.push_u64_dec(lamport);
+        aad.push_bytes(b"|");
+        aad.push_u64_dec(ts);
+        aad
     }
 
     pub fn seal(msg: &LogMessage, log_key: &[u8; KEY_LEN], rng: &mut SafeCsprng) -> Self {
         let nonce = rng.next_nonce();
-        let aad = Self::aad_bytes(&msg.id, msg.lamport, msg.ts);
+        let aad = Self::build_aad(&msg.id, msg.lamport, msg.ts);
         let plaintext = msg.to_json_string();
-        let ciphertext = aead_seal(log_key, &nonce, &aad, plaintext.as_bytes());
+        let ciphertext = aead_seal(log_key, &nonce, aad.as_slice(), plaintext.as_bytes());
         Self {
             id: msg.id.clone(),
             lamport: msg.lamport,
@@ -176,8 +190,8 @@ impl SealedLogRecord {
     }
 
     pub fn open(&self, log_key: &[u8; KEY_LEN]) -> Result<LogMessage, String> {
-        let aad = Self::aad_bytes(&self.id, self.lamport, self.ts);
-        let plain_bytes = aead_open(log_key, &self.nonce, &aad, &self.ciphertext)?;
+        let aad = Self::build_aad(&self.id, self.lamport, self.ts);
+        let plain_bytes = aead_open(log_key, &self.nonce, aad.as_slice(), &self.ciphertext)?;
         let plain_str = std::str::from_utf8(&plain_bytes)
             .map_err(|_| "decrypted log record is not valid UTF-8".to_owned())?;
         let val = parse_json(plain_str)?;
@@ -188,14 +202,32 @@ impl SealedLogRecord {
         Ok(msg)
     }
 
-    pub fn write_json(&self, out: &mut String) {
+    pub fn write_parts_json(
+        out: &mut String,
+        id: &str,
+        lamport: u64,
+        ts: u64,
+        nonce: &[u8; NONCE_LEN],
+        ciphertext: &[u8],
+    ) {
         out.push_str("{\"id\":");
-        write_json_string(out, &self.id);
-        let _ = write!(out, ",\"lamport\":{},\"ts\":{},\"n\":\"", self.lamport, self.ts);
-        base64url_encode_into(&self.nonce, out);
+        write_json_string(out, id);
+        let _ = write!(out, ",\"lamport\":{lamport},\"ts\":{ts},\"n\":\"");
+        base64url_encode_into(nonce, out);
         out.push_str("\",\"c\":\"");
-        base64url_encode_into(&self.ciphertext, out);
+        base64url_encode_into(ciphertext, out);
         out.push_str("\"}");
+    }
+
+    pub fn write_json(&self, out: &mut String) {
+        Self::write_parts_json(
+            out,
+            &self.id,
+            self.lamport,
+            self.ts,
+            &self.nonce,
+            &self.ciphertext,
+        );
     }
 
     pub fn to_json_string(&self) -> String {

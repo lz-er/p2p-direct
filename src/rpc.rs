@@ -8,11 +8,15 @@ use crate::crypto::{
     aead_open, aead_seal, derive_invite_wrap_key, derive_mesh_key_from_passphrase, parse_fixed_12,
     parse_fixed_32,
 };
-use crate::deflate::{base64url_decode, base64url_encode};
-use crate::json::{JsonValue, parse_json, write_json_string};
+use crate::deflate::{base64url_decode, base64url_encode, base64url_encode_into};
+use crate::json::{
+    JsonValue, parse_json, parse_json_object_skipping_field, write_json_string,
+};
 use crate::log::{LogMessage, SealedLogRecord, is_internal_log_type};
 use crate::mesh::{BulkPeerKeyTarget, MeshConfig, MeshNode, actions_to_json_array};
-use crate::protocol::{EncryptedWireEnvelope, RelaySignalType, WireFrame};
+use crate::protocol::{
+    EncryptedWireEnvelope, RelaySignalType, WireFrame, write_msg_wire_json_borrowed,
+};
 
 pub fn dispatch_rpc(state: &mut Option<MeshNode>, req_json: &str) -> String {
     match dispatch_inner(state, req_json) {
@@ -895,28 +899,22 @@ fn worker_seal_bulk_inner(in_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let gossip_ttl = hdr.get_u64("gossipTtl").unwrap_or(16) as u32;
     let targets = parse_targets_from_json(&hdr)?;
 
-    let log_aad = format!(
-        "p2p-log-v1|{}|{}|{}",
-        meta_msg.id, meta_msg.lamport, meta_msg.ts
-    );
-    let sealed_ct = aead_seal(&log_key, &log_nonce, log_aad.as_bytes(), msg_json_bytes);
+    let log_aad = SealedLogRecord::build_aad(&meta_msg.id, meta_msg.lamport, meta_msg.ts);
+    let sealed_ct = aead_seal(&log_key, &log_nonce, log_aad.as_slice(), msg_json_bytes);
 
     let mut wire_frames: Vec<(String, String)> = Vec::with_capacity(targets.len());
     if !targets.is_empty() {
-        let record = SealedLogRecord {
-            id: meta_msg.id.clone(),
-            lamport: meta_msg.lamport,
-            ts: meta_msg.ts,
-            nonce: log_nonce,
-            ciphertext: sealed_ct.clone(),
-        };
-        let wire = WireFrame::Msg {
-            origin: meta_msg.author.clone(),
-            ttl: gossip_ttl,
-            path: vec![meta_msg.author.clone()],
-            record,
-        };
-        let wire_plaintext = wire.to_json_string();
+        let path = [meta_msg.author.clone()];
+        let wire_plaintext = write_msg_wire_json_borrowed(
+            &meta_msg.author,
+            gossip_ttl,
+            &path,
+            &meta_msg.id,
+            meta_msg.lamport,
+            meta_msg.ts,
+            &log_nonce,
+            &sealed_ct,
+        );
         for t in targets {
             let env = EncryptedWireEnvelope::seal(
                 &t.tx_key,
@@ -1002,11 +1000,11 @@ fn worker_open_bulk_inner(in_bytes: &[u8]) -> Result<Vec<u8>, String> {
         return Ok(frame_json_and_tail("{\"ok\":true,\"kind\":\"fallback\"}", &[]));
     };
 
-    let aad = format!("p2p-log-v1|{}|{}|{}", record.id, record.lamport, record.ts);
-    let plain_bytes = aead_open(&log_key, &record.nonce, aad.as_bytes(), &record.ciphertext)?;
+    let aad = SealedLogRecord::build_aad(&record.id, record.lamport, record.ts);
+    let plain_bytes = aead_open(&log_key, &record.nonce, aad.as_slice(), &record.ciphertext)?;
     let plain_str = std::str::from_utf8(&plain_bytes)
         .map_err(|_| "decrypted log record is not valid UTF-8".to_owned())?;
-    let msg_val = parse_json(plain_str)?;
+    let msg_val = parse_json_object_skipping_field(plain_str, "payload")?;
     let meta_msg = parse_meta_msg_from_json(&msg_val)?;
     if meta_msg.id != record.id || meta_msg.lamport != record.lamport || meta_msg.ts != record.ts {
         return Err("sealed log record metadata mismatch with authenticated plaintext".to_owned());
@@ -1025,9 +1023,9 @@ fn worker_open_bulk_inner(in_bytes: &[u8]) -> Result<Vec<u8>, String> {
         }
         write_json_string(&mut meta_json, hop);
     }
-    meta_json.push_str("],\"sealedNonce\":");
-    write_json_string(&mut meta_json, &base64url_encode(&record.nonce));
-    meta_json.push_str(",\"meta\":");
+    meta_json.push_str("],\"sealedNonce\":\"");
+    base64url_encode_into(&record.nonce, &mut meta_json);
+    meta_json.push_str("\",\"meta\":");
     meta_json.push_str(&meta_msg.to_meta_json_string());
     meta_json.push('}');
 
@@ -1059,8 +1057,7 @@ fn worker_seal_forward_inner(in_bytes: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "worker_seal_forward missing 'selfPeerId'".to_owned())?;
     let origin = hdr
         .get_str("origin")
-        .ok_or_else(|| "worker_seal_forward missing 'origin'".to_owned())?
-        .to_owned();
+        .ok_or_else(|| "worker_seal_forward missing 'origin'".to_owned())?;
     let ttl = hdr.get_u64("ttl").unwrap_or(1) as u32;
     let mut path = Vec::new();
     if let Some(arr) = hdr.get("path").and_then(JsonValue::as_array) {
@@ -1075,8 +1072,7 @@ fn worker_seal_forward_inner(in_bytes: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "worker_seal_forward missing 'recordMeta'".to_owned())?;
     let id = rec_meta
         .get_str("id")
-        .ok_or_else(|| "recordMeta missing 'id'".to_owned())?
-        .to_owned();
+        .ok_or_else(|| "recordMeta missing 'id'".to_owned())?;
     let lamport = rec_meta
         .get_u64("lamport")
         .ok_or_else(|| "recordMeta missing 'lamport'".to_owned())?;
@@ -1093,19 +1089,8 @@ fn worker_seal_forward_inner(in_bytes: &[u8]) -> Result<String, String> {
     )?;
     let targets = parse_targets_from_json(&hdr)?;
 
-    let wire = WireFrame::Msg {
-        origin,
-        ttl,
-        path,
-        record: SealedLogRecord {
-            id,
-            lamport,
-            ts,
-            nonce,
-            ciphertext: sealed_ct.to_vec(),
-        },
-    };
-    let wire_plaintext = wire.to_json_string();
+    let wire_plaintext =
+        write_msg_wire_json_borrowed(origin, ttl, &path, id, lamport, ts, &nonce, sealed_ct);
     let mut out = String::with_capacity(targets.len().saturating_mul(wire_plaintext.len() + 256) + 64);
     out.push_str("{\"ok\":true,\"wireFrames\":[");
     for (i, t) in targets.iter().enumerate() {

@@ -1,9 +1,10 @@
 use std::fmt::Write as _;
 
 use crate::crypto::{
-    KEY_LEN, NONCE_LEN, aead_open, aead_seal, parse_fixed_12, parse_fixed_32,
+    AadBuf, KEY_LEN, NONCE_LEN, aead_open, aead_open_into, aead_seal, aead_seal_into,
+    parse_fixed_12, parse_fixed_32,
 };
-use crate::deflate::{base64url_decode, base64url_encode, base64url_encode_into};
+use crate::deflate::{base64url_decode, base64url_encode_into};
 use crate::json::{JsonValue, parse_json, write_json_string, write_json_value};
 use crate::log::SealedLogRecord;
 
@@ -12,6 +13,320 @@ pub const DEFAULT_RELAY_TTL: u32 = 8;
 pub const DEFAULT_INV_CHUNK_IDS: usize = 200;
 pub const DEFAULT_BATCH_MAX_MSGS: usize = 16;
 pub const DEFAULT_BATCH_MAX_BYTES: usize = 11_000;
+
+fn build_directional_aad(prefix: &[u8], sender_id: &str, receiver_id: &str, seq: u64) -> AadBuf {
+    let mut aad = AadBuf::new();
+    aad.push_bytes(prefix);
+    aad.push_bytes(sender_id.as_bytes());
+    aad.push_bytes(b"->");
+    aad.push_bytes(receiver_id.as_bytes());
+    aad.push_bytes(b"|");
+    aad.push_u64_dec(seq);
+    aad
+}
+
+#[inline(always)]
+fn zc_skip_ws(bytes: &[u8], pos: &mut usize) {
+    while let Some(&b) = bytes.get(*pos) {
+        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+#[inline(always)]
+fn zc_read_plain_str<'a>(raw: &'a str, bytes: &[u8], pos: &mut usize) -> Option<&'a str> {
+    if bytes.get(*pos) != Some(&b'"') {
+        return None;
+    }
+    *pos += 1;
+    let start = *pos;
+    let mut advance = 0usize;
+    for &b in &bytes[start..] {
+        if (0x20..0x80).contains(&b) && b != b'"' && b != b'\\' {
+            advance += 1;
+        } else {
+            break;
+        }
+    }
+    *pos += advance;
+    if bytes.get(*pos) != Some(&b'"') {
+        return None;
+    }
+    let s = &raw[start..*pos];
+    *pos += 1;
+    Some(s)
+}
+
+#[inline(always)]
+fn zc_read_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let start = *pos;
+    let mut val = 0u64;
+    while let Some(&b) = bytes.get(*pos) {
+        if b.is_ascii_digit() {
+            val = val.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    if *pos == start { None } else { Some(val) }
+}
+
+/// Zero-copy fast scanner for standard compact `{"kind":"e2ee","v":...,"s":...,"n":"...","c":"..."}`
+/// JSON objects. Borrows `"n"` and `"c"` directly from `raw` so multi-MB GIF envelopes never
+/// allocate a redundant 2+ MB `String` copy inside a `BTreeMap` before Base64 decoding.
+/// Returns `None` if input uses escapes or unexpected syntax (caller falls back to `parse_json`).
+fn parse_e2ee_envelope_zero_copy(raw: &str) -> Option<Result<EncryptedWireEnvelope, String>> {
+    let bytes = raw.as_bytes();
+    let mut pos = 0usize;
+
+    zc_skip_ws(bytes, &mut pos);
+    if bytes.get(pos) != Some(&b'{') {
+        return None;
+    }
+    pos += 1;
+
+    let mut kind: Option<&str> = None;
+    let mut version: Option<u64> = None;
+    let mut seq: Option<u64> = None;
+    let mut nonce_b64: Option<&str> = None;
+    let mut ct_b64: Option<&str> = None;
+
+    zc_skip_ws(bytes, &mut pos);
+    if bytes.get(pos) == Some(&b'}') {
+        return None;
+    }
+    loop {
+        zc_skip_ws(bytes, &mut pos);
+        let key = zc_read_plain_str(raw, bytes, &mut pos)?;
+        zc_skip_ws(bytes, &mut pos);
+        if bytes.get(pos) != Some(&b':') {
+            return None;
+        }
+        pos += 1;
+        zc_skip_ws(bytes, &mut pos);
+        match key {
+            "kind" => kind = Some(zc_read_plain_str(raw, bytes, &mut pos)?),
+            "v" => version = Some(zc_read_u64(bytes, &mut pos)?),
+            "s" => seq = Some(zc_read_u64(bytes, &mut pos)?),
+            "n" => nonce_b64 = Some(zc_read_plain_str(raw, bytes, &mut pos)?),
+            "c" => ct_b64 = Some(zc_read_plain_str(raw, bytes, &mut pos)?),
+            _ => return None,
+        }
+        zc_skip_ws(bytes, &mut pos);
+        match bytes.get(pos) {
+            Some(&b',') => {
+                pos += 1;
+                continue;
+            }
+            Some(&b'}') => {
+                pos += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    zc_skip_ws(bytes, &mut pos);
+    if pos != bytes.len() {
+        return None;
+    }
+
+    let kind_str = kind?;
+    if kind_str != "e2ee" {
+        return Some(Err(format!(
+            "rejected unencrypted wire frame kind '{kind_str}' (E2EE required)"
+        )));
+    }
+    let v = version?;
+    let s = seq?;
+    let n_str = nonce_b64?;
+    let c_str = ct_b64?;
+    let nonce = match base64url_decode(n_str).and_then(|b| parse_fixed_12(&b, "wire nonce")) {
+        Ok(n) => n,
+        Err(e) => return Some(Err(e)),
+    };
+    let ciphertext = match base64url_decode(c_str) {
+        Ok(c) => c,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(EncryptedWireEnvelope {
+        version: v,
+        seq: s,
+        nonce,
+        ciphertext,
+    }))
+}
+
+/// Zero-copy fast scanner for `WireFrame::Msg` so multi-MB encrypted log records decode
+/// directly from borrowed `"c"` slices without allocating a 2 MB temporary `String`.
+fn parse_msg_wire_zero_copy(raw: &str) -> Option<Result<WireFrame, String>> {
+    let bytes = raw.as_bytes();
+    let mut pos = 0usize;
+    zc_skip_ws(bytes, &mut pos);
+    if bytes.get(pos) != Some(&b'{') {
+        return None;
+    }
+    pos += 1;
+
+    let mut kind: Option<&str> = None;
+    let mut origin: Option<&str> = None;
+    let mut ttl: Option<u64> = None;
+    let mut path: Option<Vec<String>> = None;
+    let mut rec_id: Option<&str> = None;
+    let mut rec_lamport: Option<u64> = None;
+    let mut rec_ts: Option<u64> = None;
+    let mut rec_nonce_b64: Option<&str> = None;
+    let mut rec_ct_b64: Option<&str> = None;
+
+    zc_skip_ws(bytes, &mut pos);
+    if bytes.get(pos) == Some(&b'}') {
+        return None;
+    }
+    loop {
+        zc_skip_ws(bytes, &mut pos);
+        let key = zc_read_plain_str(raw, bytes, &mut pos)?;
+        zc_skip_ws(bytes, &mut pos);
+        if bytes.get(pos) != Some(&b':') {
+            return None;
+        }
+        pos += 1;
+        zc_skip_ws(bytes, &mut pos);
+        match key {
+            "kind" => {
+                let k = zc_read_plain_str(raw, bytes, &mut pos)?;
+                if k != "msg" {
+                    return None;
+                }
+                kind = Some(k);
+            }
+            "origin" => origin = Some(zc_read_plain_str(raw, bytes, &mut pos)?),
+            "ttl" => ttl = Some(zc_read_u64(bytes, &mut pos)?),
+            "path" => {
+                if bytes.get(pos) != Some(&b'[') {
+                    return None;
+                }
+                pos += 1;
+                let mut arr = Vec::new();
+                zc_skip_ws(bytes, &mut pos);
+                if bytes.get(pos) == Some(&b']') {
+                    pos += 1;
+                } else {
+                    loop {
+                        zc_skip_ws(bytes, &mut pos);
+                        let item = zc_read_plain_str(raw, bytes, &mut pos)?;
+                        arr.push(item.to_owned());
+                        zc_skip_ws(bytes, &mut pos);
+                        match bytes.get(pos) {
+                            Some(&b',') => {
+                                pos += 1;
+                                continue;
+                            }
+                            Some(&b']') => {
+                                pos += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                path = Some(arr);
+            }
+            "record" => {
+                if bytes.get(pos) != Some(&b'{') {
+                    return None;
+                }
+                pos += 1;
+                zc_skip_ws(bytes, &mut pos);
+                if bytes.get(pos) == Some(&b'}') {
+                    return None;
+                }
+                loop {
+                    zc_skip_ws(bytes, &mut pos);
+                    let rkey = zc_read_plain_str(raw, bytes, &mut pos)?;
+                    zc_skip_ws(bytes, &mut pos);
+                    if bytes.get(pos) != Some(&b':') {
+                        return None;
+                    }
+                    pos += 1;
+                    zc_skip_ws(bytes, &mut pos);
+                    match rkey {
+                        "id" => rec_id = Some(zc_read_plain_str(raw, bytes, &mut pos)?),
+                        "lamport" => rec_lamport = Some(zc_read_u64(bytes, &mut pos)?),
+                        "ts" => rec_ts = Some(zc_read_u64(bytes, &mut pos)?),
+                        "n" => rec_nonce_b64 = Some(zc_read_plain_str(raw, bytes, &mut pos)?),
+                        "c" => rec_ct_b64 = Some(zc_read_plain_str(raw, bytes, &mut pos)?),
+                        _ => return None,
+                    }
+                    zc_skip_ws(bytes, &mut pos);
+                    match bytes.get(pos) {
+                        Some(&b',') => {
+                            pos += 1;
+                            continue;
+                        }
+                        Some(&b'}') => {
+                            pos += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
+        zc_skip_ws(bytes, &mut pos);
+        match bytes.get(pos) {
+            Some(&b',') => {
+                pos += 1;
+                continue;
+            }
+            Some(&b'}') => {
+                pos += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    zc_skip_ws(bytes, &mut pos);
+    if pos != bytes.len() || kind != Some("msg") {
+        return None;
+    }
+
+    let origin_str = origin?;
+    let id_str = rec_id?;
+    if id_str.trim().is_empty() {
+        return Some(Err("sealed record 'id' must not be empty".to_owned()));
+    }
+    let lamport = rec_lamport?;
+    let ts = rec_ts?;
+    let nonce = match base64url_decode(rec_nonce_b64?)
+        .and_then(|b| parse_fixed_12(&b, "sealed record nonce"))
+    {
+        Ok(n) => n,
+        Err(e) => return Some(Err(e)),
+    };
+    let ciphertext = match base64url_decode(rec_ct_b64?) {
+        Ok(c) => c,
+        Err(e) => return Some(Err(e)),
+    };
+    let ttl_u32 = ttl
+        .unwrap_or(u64::from(DEFAULT_GOSSIP_TTL))
+        .min(u64::from(u32::MAX)) as u32;
+    Some(Ok(WireFrame::Msg {
+        origin: origin_str.to_owned(),
+        ttl: ttl_u32,
+        path: path.unwrap_or_default(),
+        record: SealedLogRecord {
+            id: id_str.to_owned(),
+            lamport,
+            ts,
+            nonce,
+            ciphertext,
+        },
+    }))
+}
 
 /// Outer ChaCha20-Poly1305 AEAD envelope wrapping EVERY frame sent over WebRTC DataChannels.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +338,8 @@ pub struct EncryptedWireEnvelope {
 }
 
 impl EncryptedWireEnvelope {
-    fn aad_bytes(sender_id: &str, receiver_id: &str, seq: u64) -> Vec<u8> {
-        format!("p2p-wire-v1|{sender_id}->{receiver_id}|{seq}").into_bytes()
+    fn build_aad(sender_id: &str, receiver_id: &str, seq: u64) -> AadBuf {
+        build_directional_aad(b"p2p-wire-v1|", sender_id, receiver_id, seq)
     }
 
     pub fn seal(
@@ -35,8 +350,8 @@ impl EncryptedWireEnvelope {
         receiver_id: &str,
         plaintext_frame: &str,
     ) -> Self {
-        let aad = Self::aad_bytes(sender_id, receiver_id, seq);
-        let ciphertext = aead_seal(tx_key, &nonce, &aad, plaintext_frame.as_bytes());
+        let aad = Self::build_aad(sender_id, receiver_id, seq);
+        let ciphertext = aead_seal(tx_key, &nonce, aad.as_slice(), plaintext_frame.as_bytes());
         Self {
             version: 1,
             seq,
@@ -54,8 +369,8 @@ impl EncryptedWireEnvelope {
         if self.version != 1 {
             return Err(format!("unsupported e2ee envelope version {}", self.version));
         }
-        let aad = Self::aad_bytes(sender_id, receiver_id, self.seq);
-        let plain = aead_open(rx_key, &self.nonce, &aad, &self.ciphertext)?;
+        let aad = Self::build_aad(sender_id, receiver_id, self.seq);
+        let plain = aead_open(rx_key, &self.nonce, aad.as_slice(), &self.ciphertext)?;
         String::from_utf8(plain)
             .map_err(|_| "decrypted wire frame is not valid UTF-8".to_owned())
     }
@@ -75,6 +390,9 @@ impl EncryptedWireEnvelope {
     }
 
     pub fn parse_json(raw: &str) -> Result<Self, String> {
+        if let Some(fast) = parse_e2ee_envelope_zero_copy(raw) {
+            return fast;
+        }
         let val = parse_json(raw)?;
         let kind = val
             .get_str("kind")
@@ -191,12 +509,23 @@ pub const VOICE_PACKET_MAGIC: [u8; 2] = *b"V1";
 pub const VOICE_V2_PACKET_MAGIC: [u8; 2] = *b"V2";
 pub const VOICE_PACKET_HEADER_LEN: usize = 2 + 8 + NONCE_LEN;
 
-fn voice_aad_bytes(sender_id: &str, receiver_id: &str, seq: u64) -> Vec<u8> {
-    format!("p2p-voice-v1|{sender_id}->{receiver_id}|{seq}").into_bytes()
-}
-
-fn voice_v2_aad_bytes(sender_id: &str, receiver_id: &str, seq: u64) -> Vec<u8> {
-    format!("p2p-voice-v2|{sender_id}->{receiver_id}|{seq}").into_bytes()
+/// Seals a raw IMA ADPCM voice frame directly into `out` with zero intermediate heap allocations:
+/// `[b'V', b'1', seq_u64_le (8B), nonce (12B), ciphertext + 16B Poly1305 tag]`.
+pub fn seal_voice_packet_into(
+    tx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: [u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    adpcm_payload: &[u8],
+    out: &mut Vec<u8>,
+) {
+    let aad = build_directional_aad(b"p2p-voice-v1|", sender_id, receiver_id, seq);
+    out.reserve(VOICE_PACKET_HEADER_LEN + adpcm_payload.len() + 16);
+    out.extend_from_slice(&VOICE_PACKET_MAGIC);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&nonce);
+    aead_seal_into(tx_key, &nonce, aad.as_slice(), adpcm_payload, out);
 }
 
 /// Seals a raw IMA ADPCM voice frame into a compact binary ChaCha20-Poly1305 packet:
@@ -209,14 +538,29 @@ pub fn seal_voice_packet(
     receiver_id: &str,
     adpcm_payload: &[u8],
 ) -> Vec<u8> {
-    let aad = voice_aad_bytes(sender_id, receiver_id, seq);
-    let ciphertext = aead_seal(tx_key, &nonce, &aad, adpcm_payload);
-    let mut out = Vec::with_capacity(VOICE_PACKET_HEADER_LEN + ciphertext.len());
-    out.extend_from_slice(&VOICE_PACKET_MAGIC);
+    let mut out = Vec::with_capacity(VOICE_PACKET_HEADER_LEN + adpcm_payload.len() + 16);
+    seal_voice_packet_into(tx_key, seq, nonce, sender_id, receiver_id, adpcm_payload, &mut out);
+    out
+}
+
+/// Seals an opaque high-definition codec payload (e.g. 48 kHz Opus) directly into `out`
+/// with zero intermediate heap allocations:
+/// `[b'V', b'2', seq_u64_le (8B), nonce (12B), ciphertext + 16B Poly1305 tag]`.
+pub fn seal_voice_v2_packet_into(
+    tx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: [u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    raw_payload: &[u8],
+    out: &mut Vec<u8>,
+) {
+    let aad = build_directional_aad(b"p2p-voice-v2|", sender_id, receiver_id, seq);
+    out.reserve(VOICE_PACKET_HEADER_LEN + raw_payload.len() + 16);
+    out.extend_from_slice(&VOICE_V2_PACKET_MAGIC);
     out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    out
+    aead_seal_into(tx_key, &nonce, aad.as_slice(), raw_payload, out);
 }
 
 /// Seals an opaque high-definition codec payload (e.g. 48 kHz Opus) into a binary `V2`
@@ -230,13 +574,8 @@ pub fn seal_voice_v2_packet(
     receiver_id: &str,
     raw_payload: &[u8],
 ) -> Vec<u8> {
-    let aad = voice_v2_aad_bytes(sender_id, receiver_id, seq);
-    let ciphertext = aead_seal(tx_key, &nonce, &aad, raw_payload);
-    let mut out = Vec::with_capacity(VOICE_PACKET_HEADER_LEN + ciphertext.len());
-    out.extend_from_slice(&VOICE_V2_PACKET_MAGIC);
-    out.extend_from_slice(&seq.to_le_bytes());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
+    let mut out = Vec::with_capacity(VOICE_PACKET_HEADER_LEN + raw_payload.len() + 16);
+    seal_voice_v2_packet_into(tx_key, seq, nonce, sender_id, receiver_id, raw_payload, &mut out);
     out
 }
 
@@ -280,6 +619,20 @@ pub fn parse_voice_v2_packet_header(
     parse_voice_header_with_magic(packet, &VOICE_V2_PACKET_MAGIC, "V2")
 }
 
+/// Authenticates and decrypts the ADPCM payload of a parsed `V1` E2EE voice packet into `out`.
+pub fn open_voice_packet_ciphertext_into(
+    rx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: &[u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    ciphertext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let aad = build_directional_aad(b"p2p-voice-v1|", sender_id, receiver_id, seq);
+    aead_open_into(rx_key, nonce, aad.as_slice(), ciphertext, out)
+}
+
 /// Authenticates and decrypts the ADPCM payload of a parsed `V1` E2EE voice packet.
 pub fn open_voice_packet_ciphertext(
     rx_key: &[u8; KEY_LEN],
@@ -289,8 +642,22 @@ pub fn open_voice_packet_ciphertext(
     receiver_id: &str,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let aad = voice_aad_bytes(sender_id, receiver_id, seq);
-    aead_open(rx_key, nonce, &aad, ciphertext)
+    let aad = build_directional_aad(b"p2p-voice-v1|", sender_id, receiver_id, seq);
+    aead_open(rx_key, nonce, aad.as_slice(), ciphertext)
+}
+
+/// Authenticates and decrypts the raw codec payload of a parsed `V2` E2EE voice packet into `out`.
+pub fn open_voice_v2_packet_ciphertext_into(
+    rx_key: &[u8; KEY_LEN],
+    seq: u64,
+    nonce: &[u8; NONCE_LEN],
+    sender_id: &str,
+    receiver_id: &str,
+    ciphertext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let aad = build_directional_aad(b"p2p-voice-v2|", sender_id, receiver_id, seq);
+    aead_open_into(rx_key, nonce, aad.as_slice(), ciphertext, out)
 }
 
 /// Authenticates and decrypts the raw codec payload of a parsed `V2` E2EE voice packet.
@@ -302,8 +669,39 @@ pub fn open_voice_v2_packet_ciphertext(
     receiver_id: &str,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let aad = voice_v2_aad_bytes(sender_id, receiver_id, seq);
-    aead_open(rx_key, nonce, &aad, ciphertext)
+    let aad = build_directional_aad(b"p2p-voice-v2|", sender_id, receiver_id, seq);
+    aead_open(rx_key, nonce, aad.as_slice(), ciphertext)
+}
+
+/// Serializes a `WireFrame::Msg` directly from borrowed ciphertext bytes (zero multi-MB clone!).
+#[allow(clippy::too_many_arguments)]
+pub fn write_msg_wire_json_borrowed(
+    origin: &str,
+    ttl: u32,
+    path: &[String],
+    rec_id: &str,
+    rec_lamport: u64,
+    rec_ts: u64,
+    rec_nonce: &[u8; NONCE_LEN],
+    rec_ciphertext: &[u8],
+) -> String {
+    let cap = rec_ciphertext.len().div_ceil(3) * 4 + 256;
+    let mut out = String::with_capacity(cap);
+    out.push_str("{\"kind\":\"msg\",\"origin\":");
+    write_json_string(&mut out, origin);
+    let _ = write!(out, ",\"ttl\":{ttl},\"path\":");
+    write_string_array(&mut out, path);
+    out.push_str(",\"record\":");
+    SealedLogRecord::write_parts_json(
+        &mut out,
+        rec_id,
+        rec_lamport,
+        rec_ts,
+        rec_nonce,
+        rec_ciphertext,
+    );
+    out.push('}');
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -390,7 +788,21 @@ pub enum WireFrame {
 
 impl WireFrame {
     pub fn to_json_string(&self) -> String {
-        let mut out = String::with_capacity(256);
+        let cap = match self {
+            Self::Msg { record, .. } => record.ciphertext.len().div_ceil(3) * 4 + 256,
+            Self::SyncBatch { records, .. } => {
+                let bytes: usize = records
+                    .iter()
+                    .map(|r| r.ciphertext.len().div_ceil(3) * 4 + 128)
+                    .sum();
+                bytes.saturating_add(160)
+            }
+            Self::RelaySignal {
+                sealed_ciphertext, ..
+            } => sealed_ciphertext.len().div_ceil(3) * 4 + 320,
+            _ => 256,
+        };
+        let mut out = String::with_capacity(cap);
         match self {
             Self::Hello {
                 peer_id,
@@ -410,11 +822,11 @@ impl WireFrame {
                 write_json_string(&mut out, author_name);
                 out.push_str(",\"room\":");
                 write_json_string(&mut out, room);
-                out.push_str(",\"pubKey\":");
-                write_json_string(&mut out, &base64url_encode(pub_key));
+                out.push_str(",\"pubKey\":\"");
+                base64url_encode_into(pub_key, &mut out);
                 let _ = write!(
                     out,
-                    ",\"lamport\":{lamport},\"logCount\":{log_count},\"inVoice\":{in_voice},\"voiceMuted\":{voice_muted},\"isBot\":{is_bot},\"peers\":["
+                    "\",\"lamport\":{lamport},\"logCount\":{log_count},\"inVoice\":{in_voice},\"voiceMuted\":{voice_muted},\"isBot\":{is_bot},\"peers\":["
                 );
                 for (i, p) in peers.iter().enumerate() {
                     if i > 0 {
@@ -424,9 +836,9 @@ impl WireFrame {
                     write_json_string(&mut out, &p.peer_id);
                     out.push_str(",\"authorName\":");
                     write_json_string(&mut out, &p.author_name);
-                    out.push_str(",\"pubKey\":");
-                    write_json_string(&mut out, &base64url_encode(&p.pub_key));
-                    let _ = write!(out, ",\"isBot\":{}}}", p.is_bot);
+                    out.push_str(",\"pubKey\":\"");
+                    base64url_encode_into(&p.pub_key, &mut out);
+                    let _ = write!(out, "\",\"isBot\":{}}}", p.is_bot);
                 }
                 out.push_str("]}");
             }
@@ -506,9 +918,9 @@ impl WireFrame {
                 write_json_string(&mut out, peer_id);
                 out.push_str(",\"authorName\":");
                 write_json_string(&mut out, author_name);
-                out.push_str(",\"pubKey\":");
-                write_json_string(&mut out, &base64url_encode(pub_key));
-                let _ = write!(out, ",\"isBot\":{is_bot}}}");
+                out.push_str(",\"pubKey\":\"");
+                base64url_encode_into(pub_key, &mut out);
+                let _ = write!(out, "\",\"isBot\":{is_bot}}}");
             }
             Self::RelaySignal {
                 from,
@@ -525,19 +937,19 @@ impl WireFrame {
                 write_json_string(&mut out, from);
                 out.push_str(",\"fromName\":");
                 write_json_string(&mut out, from_name);
-                out.push_str(",\"fromPubKey\":");
-                write_json_string(&mut out, &base64url_encode(from_pub_key));
-                out.push_str(",\"to\":");
+                out.push_str(",\"fromPubKey\":\"");
+                base64url_encode_into(from_pub_key, &mut out);
+                out.push_str("\",\"to\":");
                 write_json_string(&mut out, to);
                 out.push_str(",\"via\":");
                 write_json_string(&mut out, via);
                 out.push_str(",\"hops\":");
                 write_string_array(&mut out, hops);
-                let _ = write!(out, ",\"ttl\":{ttl},\"sn\":");
-                write_json_string(&mut out, &base64url_encode(sealed_nonce));
-                out.push_str(",\"sc\":");
-                write_json_string(&mut out, &base64url_encode(sealed_ciphertext));
-                out.push('}');
+                let _ = write!(out, ",\"ttl\":{ttl},\"sn\":\"");
+                base64url_encode_into(sealed_nonce, &mut out);
+                out.push_str("\",\"sc\":\"");
+                base64url_encode_into(sealed_ciphertext, &mut out);
+                out.push_str("\"}");
             }
             Self::Ping { ts } => {
                 let _ = write!(out, "{{\"kind\":\"ping\",\"t\":{ts}}}");
@@ -589,6 +1001,9 @@ impl WireFrame {
     }
 
     pub fn parse_json(raw: &str) -> Result<Self, String> {
+        if let Some(fast) = parse_msg_wire_zero_copy(raw) {
+            return fast;
+        }
         let val = parse_json(raw)?;
         let kind = val
             .get_str("kind")

@@ -7,6 +7,7 @@ import {
   decodeRelayVoiceBundle,
   encodeRelayDataChunks,
   encodeRelayVoiceBundle,
+  encodeSingleRelayDataChunk,
   resolveRelayUrls,
 } from "./mqtt_relay.js";
 import {
@@ -18,6 +19,9 @@ import {
   saveSessionAudioSettings,
   saveSessionAuthorName,
 } from "./storage.js";
+
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder();
 
 const BASE_STUN_SERVERS = [
   { urls: "stun:stun.cloudflare.com:3478" },
@@ -149,12 +153,18 @@ class P2PVoiceCaptureProcessor extends AudioWorkletProcessor {
     const len = ch.length;
 
     if (this.isDirect) {
-      for (let i = 0; i < len; i++) {
-        this.frame[this.frameIdx++] = ch[i];
+      let srcOff = 0;
+      while (srcOff < len) {
+        const space = this.frameSize - this.frameIdx;
+        const take = len - srcOff < space ? len - srcOff : space;
+        this.frame.set(srcOff === 0 && take === len ? ch : ch.subarray(srcOff, srcOff + take), this.frameIdx);
+        this.frameIdx += take;
+        srcOff += take;
         if (this.frameIdx >= this.frameSize) {
-          const out = new Float32Array(this.frame);
-          this.port.postMessage(out, [out.buffer]);
+          const out = this.frame;
+          this.frame = new Float32Array(this.frameSize);
           this.frameIdx = 0;
+          this.port.postMessage(out, [out.buffer]);
         }
       }
       return true;
@@ -359,21 +369,23 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
         this.rsPhase = 0;
       }
       const step = inRate / sampleRate;
-      const getS = (idx) => {
-        if (idx >= 0) return idx < n ? samples[idx] : samples[n - 1];
-        if (idx === -1) return this.rsPrev2;
-        if (idx === -2) return this.rsPrev1;
-        return this.rsPrev0;
-      };
+      const p0 = this.rsPrev0;
+      const p1 = this.rsPrev1;
+      const p2 = this.rsPrev2;
+      const lastS = samples[n - 1];
       let pos = this.rsPhase - 2;
       const limit = Math.max(0, n - 2);
       while (pos < limit) {
         const idx = Math.floor(pos);
         const t = pos - idx;
-        const y0 = getS(idx - 1);
-        const y1 = getS(idx);
-        const y2 = getS(idx + 1);
-        const y3 = getS(idx + 2);
+        const i0 = idx - 1;
+        const i1 = idx;
+        const i2 = idx + 1;
+        const i3 = idx + 2;
+        const y0 = i0 >= 0 ? (i0 < n ? samples[i0] : lastS) : i0 === -1 ? p2 : i0 === -2 ? p1 : p0;
+        const y1 = i1 >= 0 ? (i1 < n ? samples[i1] : lastS) : i1 === -1 ? p2 : i1 === -2 ? p1 : p0;
+        const y2 = i2 >= 0 ? (i2 < n ? samples[i2] : lastS) : i2 === -1 ? p2 : i2 === -2 ? p1 : p0;
+        const y3 = i3 >= 0 ? (i3 < n ? samples[i3] : lastS) : i3 === -1 ? p2 : i3 === -2 ? p1 : p0;
         const a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
         const a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
         const a2 = -0.5 * y0 + 0.5 * y2;
@@ -619,16 +631,6 @@ function formatBotRichText(raw) {
   return html
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-}
-
-function computePcmRms(int16Pcm) {
-  if (!int16Pcm || int16Pcm.length === 0) return 0;
-  let sumSq = 0;
-  for (let i = 0; i < int16Pcm.length; i++) {
-    const s = int16Pcm[i];
-    sumSq += s * s;
-  }
-  return Math.round(Math.sqrt(sumSq / int16Pcm.length));
 }
 
 function computeFloat32RmsI16Scale(float32Pcm) {
@@ -1243,6 +1245,7 @@ class P2PDirectApp {
       statsTimer: null,
       svgInitialized: false,
       particlePool: [],
+      boundTick: (ts) => this._topologyTick(ts),
     };
 
     // Step-by-step Connect Wizard state
@@ -1323,6 +1326,7 @@ class P2PDirectApp {
       opusEncoderBitrate: 0,
       opusTxSampleCounter: 0,
       opusPendingMeta: [],
+      opusTxBuf: new Uint8Array(2048),
       workletsLoaded: false,
       workletsLoadingPromise: null,
       audioCtx: null,
@@ -1351,6 +1355,8 @@ class P2PDirectApp {
       meterTicks: 0,
       lastRosterKey: "",
       renderedKeys: new Set(),
+      cardCache: new Map(),
+      lastCounterSig: "",
     };
 
     this.iceConfig = ICE_CONFIG;
@@ -2667,7 +2673,7 @@ class P2PDirectApp {
       }
       if (this.topo.particles.length > 0 && !this.topo.rafId) {
         this.topo.lastFrameMs = performance.now();
-        this.topo.rafId = requestAnimationFrame((ts) => this._topologyTick(ts));
+        this.topo.rafId = requestAnimationFrame(this.topo.boundTick);
       }
     } else {
       if (this.topo.statsTimer) {
@@ -4535,7 +4541,8 @@ class P2PDirectApp {
     if (this.roomMyTag && this.roomMyTag.topic === topic && this.roomMyTag.peerId === peerId) {
       return this.roomMyTag;
     }
-    const tag = await computePeerTag(topic, peerId);
+    const shaFn = this.wasm ? (b) => this.wasm.sha256(b) : null;
+    const tag = await computePeerTag(topic, peerId, shaFn);
     this.roomMyTag = { topic, peerId, bytes: tag.bytes, hex: tag.hex };
     return this.roomMyTag;
   }
@@ -4544,7 +4551,8 @@ class P2PDirectApp {
     if (!this.activeRoom || !peerId || peerId === this.status?.peerId) return null;
     let info = this.roomKnownPeers.get(peerId);
     if (!info) {
-      const tag = await computePeerTag(this.activeRoom.topic, peerId);
+      const shaFn = this.wasm ? (b) => this.wasm.sha256(b) : null;
+      const tag = await computePeerTag(this.activeRoom.topic, peerId, shaFn);
       info = {
         peerId,
         name: name || "Peer",
@@ -5049,7 +5057,7 @@ class P2PDirectApp {
     };
 
     // Low-priority bulk relay queue for GIFs, images, videos & large frames (> 16 KB)
-    // Yields to voice bundles, uses smaller 12 KB chunks during voice, and steers onto a secondary broker
+    // Yields to voice bundles, lazily slices 12-14 KB DF chunks on demand, and steers onto a secondary broker
     const bulkDfQueue = [];
     let bulkPumpTimer = null;
     let bulkQueuedBytes = 0;
@@ -5075,7 +5083,19 @@ class P2PDirectApp {
       const tickMs = voiceBusy ? RELAY_BULK_TICK_VOICE_MS : RELAY_BULK_TICK_IDLE_MS;
       let sentThisTick = 0;
       while (bulkDfQueue.length > 0 && sentThisTick < maxPerTick) {
-        const nextPkt = bulkDfQueue[0];
+        const head = bulkDfQueue[0];
+        // Reuse cached packet if previous tick backed off on socket water-mark
+        const nextPkt =
+          head.cachedPkt ||
+          encodeSingleRelayDataChunk(
+            myTag.bytes,
+            peerInfo.tagBytes,
+            head.msgId,
+            head.payloadBytes,
+            head.idx,
+            head.total,
+            head.chunkSize
+          );
         const sent = app.roomRendezvous.publishBinary(nextPkt, {
           preferredUrls,
           maxBrokers: 1,
@@ -5084,11 +5104,16 @@ class P2PDirectApp {
           avoidPrimaryVoiceBroker: voiceBusy,
         });
         if (sent === 0) {
+          head.cachedPkt = nextPkt;
           // Secondary relay socket briefly above 8 KB cap — retry next tick without dropping chunks
           bulkPumpTimer = setTimeout(pumpBulkDfQueue, voiceBusy ? 45 : 30);
           return;
         }
-        bulkDfQueue.shift();
+        head.cachedPkt = null;
+        head.idx += 1;
+        if (head.idx >= head.total) {
+          bulkDfQueue.shift();
+        }
         bulkQueuedBytes = Math.max(0, bulkQueuedBytes - nextPkt.byteLength);
         virtualBulkDc.bufferedAmount = bulkQueuedBytes;
         app.recordTopologyPacket(peerId, "tx", "bulk", nextPkt.byteLength);
@@ -5112,20 +5137,20 @@ class P2PDirectApp {
       send(frameStr) {
         if (this.readyState !== "open" || !app.roomRendezvous || !app.activeRoom) return;
         const msgId = (app.relayDataMsgSeq = (app.relayDataMsgSeq + 1) >>> 0) || 1;
-        const chunkBytes = app.isVoiceChannelBusy()
+        const chunkSize = app.isVoiceChannelBusy()
           ? RELAY_BULK_CHUNK_SIZE_VOICE
           : RELAY_DATA_CHUNK_SIZE;
-        const chunks = encodeRelayDataChunks(
-          myTag.bytes,
-          peerInfo.tagBytes,
+        const payloadBytes = TEXT_ENCODER.encode(String(frameStr));
+        const total = Math.max(1, Math.ceil(payloadBytes.length / chunkSize));
+        bulkDfQueue.push({
           msgId,
-          String(frameStr),
-          chunkBytes
-        );
-        for (const chunkPkt of chunks) {
-          bulkDfQueue.push(chunkPkt);
-          bulkQueuedBytes += chunkPkt.byteLength;
-        }
+          payloadBytes,
+          chunkSize,
+          idx: 0,
+          total,
+          cachedPkt: null,
+        });
+        bulkQueuedBytes += payloadBytes.length + total * 26;
         this.bufferedAmount = bulkQueuedBytes;
         pumpBulkDfQueue();
       },
@@ -5372,12 +5397,12 @@ class P2PDirectApp {
 
   handleIncomingRelayBinary(bytes, brokerUrl) {
     if (!this.activeRoom || !this.roomMyTag || !bytes || bytes.length < 2) return;
-    const myHex = this.roomMyTag.hex;
+    const myTagBytes = this.roomMyTag.bytes;
 
     if (bytes[0] === 0x44 && bytes[1] === 0x46) {
-      // "DF" E2EE Data Frame / Chunk
-      const decoded = decodeRelayDataChunk(bytes);
-      if (!decoded || decoded.toHex !== myHex || decoded.fromHex === myHex) return;
+      // "DF" E2EE Data Frame / Chunk (filters non-matching & echo packets in 8 byte compares before hex alloc)
+      const decoded = decodeRelayDataChunk(bytes, myTagBytes, myTagBytes);
+      if (!decoded) return;
 
       const dedupeKey = `${decoded.fromHex}:${decoded.msgId}:${decoded.idx}`;
       if (this.seenRelayChunkKeys.has(dedupeKey)) return;
@@ -5393,7 +5418,7 @@ class P2PDirectApp {
 
       let fullFrameStr = null;
       if (decoded.total === 1) {
-        fullFrameStr = new TextDecoder().decode(decoded.chunkBytes);
+        fullFrameStr = TEXT_DECODER.decode(decoded.chunkBytes);
       } else {
         const asmKey = `${decoded.fromHex}:${decoded.msgId}`;
         let asm = this.relayChunkAssemblies.get(asmKey);
@@ -5423,7 +5448,7 @@ class P2PDirectApp {
             merged.set(part, offset);
             offset += part.length;
           }
-          fullFrameStr = new TextDecoder().decode(merged);
+          fullFrameStr = TEXT_DECODER.decode(merged);
         }
       }
 
@@ -5461,8 +5486,8 @@ class P2PDirectApp {
     if (bytes[0] === 0x56 && bytes[1] === 0x42) {
       // "VB" E2EE Voice Bundle (striped across multiple low-RTT brokers; reordered & deduped per peer)
       if (!this.voice.inVoice) return;
-      const bundle = decodeRelayVoiceBundle(bytes);
-      if (!bundle || bundle.toHex !== myHex || bundle.fromHex === myHex) return;
+      const bundle = decodeRelayVoiceBundle(bytes, myTagBytes, myTagBytes);
+      if (!bundle) return;
 
       const senderPeerId = this.roomTagToPeerId.get(bundle.fromHex);
       if (!senderPeerId) return;
@@ -7314,19 +7339,29 @@ class P2PDirectApp {
     const rms = meta ? meta.rms : this.voice.localRms;
     const tsSamples = meta ? meta.tsSamples : 0;
 
-    const payload = new Uint8Array(VOICE_V2_HEADER_BYTES + chunk.byteLength);
-    payload[0] = VOICE_V2_CODEC_OPUS48;
-    payload[1] = Math.round(VOICE_HD_SAMPLE_RATE / 1000);
-    const dv = new DataView(payload.buffer, payload.byteOffset, VOICE_V2_HEADER_BYTES);
-    dv.setUint16(2, Math.min(65535, rms), true);
-    dv.setUint32(4, tsSamples >>> 0, true);
+    const totalLen = VOICE_V2_HEADER_BYTES + chunk.byteLength;
+    let buf = this.voice.opusTxBuf;
+    if (!buf || buf.length < totalLen) {
+      buf = new Uint8Array(Math.max(2048, totalLen));
+      this.voice.opusTxBuf = buf;
+    }
+    const clampedRms = Math.min(65535, rms) | 0;
+    const tsU32 = tsSamples >>> 0;
+    buf[0] = VOICE_V2_CODEC_OPUS48;
+    buf[1] = 48;
+    buf[2] = clampedRms & 0xff;
+    buf[3] = (clampedRms >>> 8) & 0xff;
+    buf[4] = tsU32 & 0xff;
+    buf[5] = (tsU32 >>> 8) & 0xff;
+    buf[6] = (tsU32 >>> 16) & 0xff;
+    buf[7] = (tsU32 >>> 24) & 0xff;
     try {
-      chunk.copyTo(payload.subarray(VOICE_V2_HEADER_BYTES));
+      chunk.copyTo(buf.subarray(VOICE_V2_HEADER_BYTES, totalLen));
     } catch {
       return;
     }
 
-    const packets = this.wasm.sealVoiceRaw(payload);
+    const packets = this.wasm.sealVoiceRaw(buf.subarray(0, totalLen));
     for (const { peerId, data } of packets) {
       if (this.getPeerVoiceCodec(peerId) !== "opus48") continue;
       const vdc = this.voiceChannels.get(peerId);
@@ -7364,9 +7399,12 @@ class P2PDirectApp {
             const float32 = extractFloat32FromAudioData(audioData);
             const rate = audioData.sampleRate || VOICE_HD_SAMPLE_RATE;
             liveMixer.decodedFrames += 1;
-            const decRms = computeFloat32RmsI16Scale(float32);
-            if (decRms > 0) {
-              liveMixer.rms = decRms;
+            // V2 header already supplies exact Rust-computed RMS; only scan PCM on main thread as fallback
+            if (liveMixer.rms === 0) {
+              const decRms = computeFloat32RmsI16Scale(float32);
+              if (decRms > 0) {
+                liveMixer.rms = decRms;
+              }
             }
             const direct = this.directPeers.get(peerId);
             const isRelayed = direct?.transport === "relay";
@@ -8040,27 +8078,56 @@ class P2PDirectApp {
   }
 
   _applySpeakerVisualizer(rowKey, level, defaultStateLabel, tickPhase) {
-    const list = this.el["voice-participant-list"];
-    const selector = rowKey === "self" ? "self" : CSS.escape(rowKey);
-    const card = list.querySelector(`[data-voice-row="${selector}"]`);
-    if (!card) return;
-    const speaking = level > 0.09;
-    card.style.setProperty("--voice-level", level.toFixed(3));
-    card.classList.toggle("is-speaking", speaking);
-
-    const stateEl = card.querySelector("[data-voice-state]");
-    if (stateEl) {
-      stateEl.textContent = speaking ? "Speaking" : defaultStateLabel;
+    let entry = this.voice.cardCache.get(rowKey);
+    if (!entry || !entry.card.isConnected) {
+      const list = this.el["voice-participant-list"];
+      const selector = rowKey === "self" ? "self" : CSS.escape(rowKey);
+      const card = list.querySelector(`[data-voice-row="${selector}"]`);
+      if (!card) return;
+      const bars = Array.from(card.querySelectorAll(".voice-eq-bar"));
+      entry = {
+        card,
+        stateEl: card.querySelector("[data-voice-state]"),
+        bars,
+        lastSpeaking: null,
+        lastLevelStr: "",
+        lastStateText: "",
+        lastBarH: new Int16Array(bars.length),
+      };
+      this.voice.cardCache.set(rowKey, entry);
     }
 
-    const bars = card.querySelectorAll(".voice-eq-bar");
+    const speaking = level > 0.09;
+    const levelStr = level <= 0.001 ? "0" : level.toFixed(3);
+    if (entry.lastLevelStr !== levelStr) {
+      entry.lastLevelStr = levelStr;
+      entry.card.style.setProperty("--voice-level", levelStr);
+    }
+    if (entry.lastSpeaking !== speaking) {
+      entry.lastSpeaking = speaking;
+      entry.card.classList.toggle("is-speaking", speaking);
+    }
+
+    const nextStateText = speaking ? "Speaking" : defaultStateLabel;
+    if (entry.stateEl && entry.lastStateText !== nextStateText) {
+      entry.lastStateText = nextStateText;
+      entry.stateEl.textContent = nextStateText;
+    }
+
+    const bars = entry.bars;
+    const lastH = entry.lastBarH;
+    const silent = level <= 0.04;
     for (let i = 0; i < bars.length; i++) {
-      if (level <= 0.04) {
-        bars[i].style.height = "4px";
+      let h;
+      if (silent) {
+        h = 4;
       } else {
         const w = VOICE_EQ_WEIGHTS[i] || 0.5;
         const wobble = 0.72 + 0.28 * Math.sin(tickPhase * 0.9 + i * 1.15);
-        const h = Math.max(4, Math.min(30, Math.round(4 + level * 26 * w * wobble)));
+        h = Math.max(4, Math.min(30, Math.round(4 + level * 26 * w * wobble)));
+      }
+      if (lastH[i] !== h) {
+        lastH[i] = h;
         bars[i].style.height = `${h}px`;
       }
     }
@@ -8091,39 +8158,56 @@ class P2PDirectApp {
     this._applySpeakerVisualizer("self", this.voice.localSmoothLevel, selfDefault, phase);
 
     // Remote speaker smoothing & live visualizer update
-    const peersInVoice = (this.status?.peers || []).filter((p) => p.inVoice);
-    for (const p of peersInVoice) {
-      const mixer = this.voice.peerMixers.get(p.peerId);
-      const localMuted = Boolean(mixer && mixer.muted);
-      const peerSilenced = this.voice.deafened || localMuted || Boolean(p.voiceMuted);
-      const fresh = !peerSilenced && mixer && now - mixer.lastAudioAt < 340;
-      const target = fresh ? rmsToLevel(mixer.rms) : 0;
-      if (mixer) {
-        mixer.smoothLevel = peerSilenced
-          ? 0
-          : target > (mixer.smoothLevel || 0)
-            ? (mixer.smoothLevel || 0) * 0.4 + target * 0.6
-            : (mixer.smoothLevel || 0) * 0.72 + target * 0.28;
-        if (mixer.smoothLevel < 0.015) mixer.smoothLevel = 0;
+    const peers = this.status?.peers;
+    if (peers) {
+      for (let i = 0; i < peers.length; i++) {
+        const p = peers[i];
+        if (!p.inVoice) continue;
+        const mixer = this.voice.peerMixers.get(p.peerId);
+        const localMuted = Boolean(mixer && mixer.muted);
+        const peerSilenced = this.voice.deafened || localMuted || Boolean(p.voiceMuted);
+        const fresh = !peerSilenced && mixer && now - mixer.lastAudioAt < 340;
+        const target = fresh ? rmsToLevel(mixer.rms) : 0;
+        if (mixer) {
+          mixer.smoothLevel = peerSilenced
+            ? 0
+            : target > (mixer.smoothLevel || 0)
+              ? (mixer.smoothLevel || 0) * 0.4 + target * 0.6
+              : (mixer.smoothLevel || 0) * 0.72 + target * 0.28;
+          if (mixer.smoothLevel < 0.015) mixer.smoothLevel = 0;
+        }
+        const level = peerSilenced ? 0 : mixer ? mixer.smoothLevel : 0;
+        const defaultState = this.voice.deafened
+          ? "Deafened"
+          : p.voiceMuted || localMuted
+            ? "Muted"
+            : "Live";
+        this._applySpeakerVisualizer(p.peerId, level, defaultState, phase + p.peerId.charCodeAt(2));
       }
-      const level = peerSilenced ? 0 : mixer ? mixer.smoothLevel : 0;
-      const defaultState = this.voice.deafened
-        ? "Deafened"
-        : p.voiceMuted || localMuted
-          ? "Muted"
-          : "Live";
-      this._applySpeakerVisualizer(p.peerId, level, defaultState, phase + p.peerId.charCodeAt(2));
     }
 
-    // Refresh packet counters every ~4th visualizer frame (~280ms) using lightweight get_status (never serializes chat/GIF log)
+    // Refresh packet counters every ~4th visualizer frame (~280ms) via zero-JSON binary OP_GET_COUNTERS (~1.7 us)
     if (this.voice.meterTicks % 4 === 0) {
       try {
-        const st = this.wasm.call({ cmd: "get_status" }).status;
-        this.status = st;
-        this.renderStats();
-        if (st?.stats) {
-          this.el["voice-packet-stats"].textContent =
-            `TX ${st.stats.voicePacketsSent} / RX ${st.stats.voicePacketsReceived}`;
+        const cnt = this.wasm.getCounters();
+        if (cnt && this.status?.stats) {
+          const s = this.status.stats;
+          s.voicePacketsSent = cnt.voicePacketsSent;
+          s.voicePacketsReceived = cnt.voicePacketsReceived;
+          s.framesSent = cnt.framesSent;
+          s.framesReceived = cnt.framesReceived;
+          s.e2eeFramesEncrypted = cnt.e2eeFramesEncrypted;
+          s.e2eeFramesDecrypted = cnt.e2eeFramesDecrypted;
+          s.e2eeAuthFailures = cnt.e2eeAuthFailures;
+          s.gossipForwards = cnt.gossipForwards;
+          s.gossipDuplicatesDropped = cnt.gossipDuplicatesDropped;
+          const sig = `${cnt.voicePacketsSent}:${cnt.voicePacketsReceived}:${cnt.e2eeFramesEncrypted}:${cnt.e2eeFramesDecrypted}`;
+          if (sig !== this.voice.lastCounterSig) {
+            this.voice.lastCounterSig = sig;
+            this.renderStats();
+            this.el["voice-packet-stats"].textContent =
+              `TX ${cnt.voicePacketsSent} / RX ${cnt.voicePacketsReceived}`;
+          }
         }
       } catch {
         // ignore
@@ -8796,9 +8880,16 @@ class P2PDirectApp {
       if (typeof head === "string") {
         pkt = q.shift();
       } else {
-        // Lazy on-demand 16 KB chunk slicing (zero upfront multi-MB burst allocation)
-        const d = head.frameStr.slice(head.i * DC_CHUNK_SIZE, (head.i + 1) * DC_CHUNK_SIZE);
-        pkt = JSON.stringify({ kind: "dc_chunk", id: head.id, i: head.i, n: head.total, d });
+        // Lazy on-demand 16 KB chunk slicing (zero upfront multi-MB burst allocation;
+        // interior e2ee ciphertext chunks are pure base64url ASCII so skip JSON.stringify escaping)
+        const start = head.i * DC_CHUNK_SIZE;
+        const end = Math.min(head.frameStr.length, start + DC_CHUNK_SIZE);
+        const d = head.frameStr.slice(start, end);
+        if (head.pureB64Start > 0 && start >= head.pureB64Start && end <= head.pureB64End) {
+          pkt = `{"kind":"dc_chunk","id":${head.id},"i":${head.i},"n":${head.total},"d":"${d}"}`;
+        } else {
+          pkt = JSON.stringify({ kind: "dc_chunk", id: head.id, i: head.i, n: head.total, d });
+        }
         head.i += 1;
         if (head.i >= head.total) {
           q.shift();
@@ -8984,7 +9075,16 @@ class P2PDirectApp {
       const bq = peer.bulkSendQueue || (peer.bulkSendQueue = []);
       const id = (this.dcChunkSeq = (this.dcChunkSeq + 1) >>> 0) || 1;
       const total = Math.ceil(frameStr.length / DC_CHUNK_SIZE);
-      bq.push({ id, frameStr, i: 0, total });
+      let pureB64Start = 0;
+      let pureB64End = 0;
+      if (frameStr.startsWith('{"kind":"e2ee",') && frameStr.endsWith('"}')) {
+        const cPos = frameStr.indexOf(',"c":"', 20);
+        if (cPos > 0 && cPos < 160) {
+          pureB64Start = cPos + 6;
+          pureB64End = frameStr.length - 2;
+        }
+      }
+      bq.push({ id, frameStr, i: 0, total, pureB64Start, pureB64End });
       this._pumpBulkDirectSendQueue(peer);
       return;
     }
@@ -9509,6 +9609,7 @@ class P2PDirectApp {
     if (totalInVoice === 0) {
       this.voice.lastRosterKey = "";
       this.voice.renderedKeys.clear();
+      this.voice.cardCache.clear();
       this.el["voice-participant-list"].innerHTML = "";
       return;
     }
@@ -9689,6 +9790,21 @@ class P2PDirectApp {
     this.voice.renderedKeys = new Set(ordered);
     const listEl = this.el["voice-participant-list"];
     listEl.innerHTML = items.join("");
+    this.voice.cardCache.clear();
+    for (const card of listEl.querySelectorAll("[data-voice-row]")) {
+      const rowKey = card.getAttribute("data-voice-row");
+      if (!rowKey) continue;
+      const bars = Array.from(card.querySelectorAll(".voice-eq-bar"));
+      this.voice.cardCache.set(rowKey, {
+        card,
+        stateEl: card.querySelector("[data-voice-state]"),
+        bars,
+        lastSpeaking: false,
+        lastLevelStr: "",
+        lastStateText: "",
+        lastBarH: new Int16Array(bars.length),
+      });
+    }
 
     if (this.voice.inVoice) {
       const selfMuteBtn = listEl.querySelector("#btn-voice-mute");
@@ -9964,7 +10080,7 @@ class P2PDirectApp {
 
     if (!this.topo.rafId) {
       this.topo.lastFrameMs = now;
-      this.topo.rafId = requestAnimationFrame((ts) => this._topologyTick(ts));
+      this.topo.rafId = requestAnimationFrame(this.topo.boundTick);
     }
   }
 
@@ -9993,6 +10109,9 @@ class P2PDirectApp {
       rect.setAttribute("stroke", "#0e0f12");
       rect.setAttribute("stroke-width", "1.2");
       rect.style.pointerEvents = "none";
+      rect._vis = false;
+      rect._sz = 0;
+      rect._fill = "";
       particleLayer.appendChild(rect);
       this.topo.particlePool.push(rect);
     }
@@ -10003,54 +10122,77 @@ class P2PDirectApp {
     this.topo.rafId = null;
     if (!this.isTopologyVisible()) {
       for (const rect of this.topo.particlePool) {
-        rect.setAttribute("visibility", "hidden");
+        if (rect._vis) {
+          rect._vis = false;
+          rect.setAttribute("visibility", "hidden");
+        }
       }
       return;
     }
     const dt = Math.min(80, Math.max(0, ts - (this.topo.lastFrameMs || ts)));
     this.topo.lastFrameMs = ts;
 
-    const alive = [];
-    for (const p of this.topo.particles) {
+    // Compact live particles in-place (zero per-frame array allocation at 60 fps)
+    const particles = this.topo.particles;
+    let aliveCount = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
       p.t += dt / p.durationMs;
       if (p.t < 1) {
-        alive.push(p);
+        if (aliveCount !== i) {
+          particles[aliveCount] = p;
+        }
+        aliveCount++;
       }
     }
-    this.topo.particles = alive;
+    particles.length = aliveCount;
 
     const pool = this.topo.particlePool;
     for (let i = 0; i < pool.length; i++) {
       const rect = pool[i];
-      if (i >= alive.length) {
-        if (rect.getAttribute("visibility") !== "hidden") {
+      if (i >= aliveCount) {
+        if (rect._vis) {
+          rect._vis = false;
           rect.setAttribute("visibility", "hidden");
         }
         continue;
       }
-      const p = alive[i];
+      const p = particles[i];
       const a = this.topo.positions.get(p.fromId);
       const b = this.topo.positions.get(p.toId);
       if (!a || !b) {
-        rect.setAttribute("visibility", "hidden");
+        if (rect._vis) {
+          rect._vis = false;
+          rect.setAttribute("visibility", "hidden");
+        }
         continue;
       }
       const x = a.x + (b.x - a.x) * p.t;
       const y = a.y + (b.y - a.y) * p.t;
       const sz = p.kind === "voice" ? 6 : 7;
-      const half = sz / 2;
-      rect.setAttribute("x", (-half).toFixed(1));
-      rect.setAttribute("y", (-half).toFixed(1));
-      rect.setAttribute("width", String(sz));
-      rect.setAttribute("height", String(sz));
-      rect.setAttribute("fill", p.color);
+      if (rect._sz !== sz) {
+        rect._sz = sz;
+        const half = (-sz / 2).toFixed(1);
+        const szStr = String(sz);
+        rect.setAttribute("x", half);
+        rect.setAttribute("y", half);
+        rect.setAttribute("width", szStr);
+        rect.setAttribute("height", szStr);
+      }
+      if (rect._fill !== p.color) {
+        rect._fill = p.color;
+        rect.setAttribute("fill", p.color);
+      }
       rect.setAttribute(
         "transform",
         p.kind === "voice"
           ? `translate(${x.toFixed(1)},${y.toFixed(1)}) rotate(45)`
           : `translate(${x.toFixed(1)},${y.toFixed(1)})`
       );
-      rect.setAttribute("visibility", "visible");
+      if (!rect._vis) {
+        rect._vis = true;
+        rect.setAttribute("visibility", "visible");
+      }
     }
 
     // Refresh live packet rate inside inspector at ~3 Hz while traffic is active
@@ -10059,8 +10201,8 @@ class P2PDirectApp {
       this.renderTopologyInspector();
     }
 
-    if (alive.length > 0) {
-      this.topo.rafId = requestAnimationFrame((nextTs) => this._topologyTick(nextTs));
+    if (aliveCount > 0) {
+      this.topo.rafId = requestAnimationFrame(this.topo.boundTick);
     }
   }
 

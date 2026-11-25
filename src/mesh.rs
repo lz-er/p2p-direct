@@ -2,15 +2,18 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::audio::{
-    CaptureDspResult, VoiceCaptureDsp48k, compute_rms_i16, decode_ima_adpcm, encode_ima_adpcm,
+    CaptureDspResult, VoiceCaptureDsp48k, compute_rms_i16, decode_ima_adpcm,
+    decode_ima_adpcm_into, encode_ima_adpcm, encode_ima_adpcm_into,
 };
 use crate::crypto::{
-    KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, derive_invite_wrap_key,
-    derive_link_keys, derive_log_key, derive_mesh_key_from_passphrase, derive_relay_signal_key,
-    derive_room_signal_key, derive_room_topic, derive_voice_link_keys, key_fingerprint,
+    KEY_LEN, NONCE_LEN, SafeCsprng, aead_open, aead_seal, derive_all_link_keys,
+    derive_invite_wrap_key, derive_log_key, derive_mesh_key_from_passphrase,
+    derive_relay_signal_key, derive_room_signal_key, derive_room_topic, key_fingerprint,
     pair_safety_code, parse_fixed_12, x25519_public_key,
 };
-use crate::deflate::{base64url_decode, base64url_encode, deflate_raw, inflate_auto};
+use crate::deflate::{
+    base64url_decode, base64url_encode, base64url_encode_into, deflate_raw, inflate_auto,
+};
 use crate::json::{JsonValue, write_json_string, write_json_value};
 use crate::log::{
     LogMessage, MSG_TYPE_DELETE, ReplicatedLog, SealedLogRecord, is_internal_log_type,
@@ -18,9 +21,11 @@ use crate::log::{
 use crate::protocol::{
     DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_MSGS, DEFAULT_GOSSIP_TTL, DEFAULT_INV_CHUNK_IDS,
     DEFAULT_RELAY_TTL, EncryptedWireEnvelope, PeerSummary, RelaySignalBody, RelaySignalType,
-    WireFrame, chunk_inv_ids, chunk_sealed_records, open_voice_packet_ciphertext,
-    open_voice_v2_packet_ciphertext, parse_voice_packet_header, parse_voice_v2_packet_header,
-    seal_voice_packet, seal_voice_v2_packet,
+    VOICE_PACKET_HEADER_LEN, WireFrame, chunk_inv_ids, chunk_sealed_records,
+    open_voice_packet_ciphertext, open_voice_packet_ciphertext_into,
+    open_voice_v2_packet_ciphertext, open_voice_v2_packet_ciphertext_into,
+    parse_voice_packet_header, parse_voice_v2_packet_header, seal_voice_packet,
+    seal_voice_packet_into, seal_voice_v2_packet, seal_voice_v2_packet_into,
 };
 
 #[derive(Debug, Clone)]
@@ -245,7 +250,15 @@ impl MeshAction {
 }
 
 pub fn actions_to_json_array(actions: &[MeshAction]) -> String {
-    let mut out = String::with_capacity(actions.len().saturating_mul(160) + 8);
+    let cap: usize = actions
+        .iter()
+        .map(|a| match a {
+            MeshAction::SendWire { frame, .. } => frame.len().saturating_add(96),
+            _ => 160,
+        })
+        .sum::<usize>()
+        .saturating_add(8);
+    let mut out = String::with_capacity(cap);
     out.push('[');
     for (i, act) in actions.iter().enumerate() {
         if i > 0 {
@@ -647,14 +660,7 @@ impl MeshNode {
 
         // Re-derive per-peer directional wire and voice keys under the new mesh key
         for (pid, peer) in self.peers.iter_mut() {
-            let (tx_key, rx_key) = derive_link_keys(
-                &self.x25519_secret,
-                &peer.crypto.pub_key,
-                &self.mesh_key,
-                &self.peer_id,
-                pid,
-            )?;
-            let (voice_tx_key, voice_rx_key) = derive_voice_link_keys(
+            let ((tx_key, rx_key), (voice_tx_key, voice_rx_key)) = derive_all_link_keys(
                 &self.x25519_secret,
                 &peer.crypto.pub_key,
                 &self.mesh_key,
@@ -980,14 +986,7 @@ impl MeshNode {
             return Ok(actions);
         }
 
-        let (tx_key, rx_key) = derive_link_keys(
-            &self.x25519_secret,
-            &peer_pub_key,
-            &self.mesh_key,
-            &self.peer_id,
-            &peer_id,
-        )?;
-        let (voice_tx_key, voice_rx_key) = derive_voice_link_keys(
+        let ((tx_key, rx_key), (voice_tx_key, voice_rx_key)) = derive_all_link_keys(
             &self.x25519_secret,
             &peer_pub_key,
             &self.mesh_key,
@@ -1331,6 +1330,362 @@ impl MeshNode {
         }
         self.stats.voice_packets_received = self.stats.voice_packets_received.saturating_add(1);
         Ok(plain)
+    }
+
+    /// Zero-allocation binary bridge fast-path for `OP_VOICE_ENCODE_SEAL`:
+    /// encodes 16 kHz PCM with IMA ADPCM and writes `[rms:u16][peerCount:u16][[pidLen][pid][pktLen][V1 pkt]...]`
+    /// directly into `out` reusing `adpcm_scratch`.
+    pub fn seal_voice_pcm_wire(
+        &mut self,
+        pcm: &[i16],
+        adpcm_scratch: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+        max_out: usize,
+    ) {
+        out.clear();
+        let rms = compute_rms_i16(pcm);
+        out.extend_from_slice(&rms.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // patched below
+
+        if !self.in_voice || self.voice_muted || pcm.is_empty() {
+            return;
+        }
+        let has_voice_peer = self.peers.values().any(|p| p.in_voice);
+        if !has_voice_peer {
+            return;
+        }
+
+        encode_ima_adpcm_into(pcm, adpcm_scratch);
+        let pkt_len = VOICE_PACKET_HEADER_LEN + adpcm_scratch.len() + 16;
+        if pkt_len > usize::from(u16::MAX) {
+            return;
+        }
+
+        let mut fit_count: u16 = 0;
+        let self_peer_id = &self.peer_id;
+        for (pid, peer) in self.peers.iter_mut() {
+            if !peer.in_voice {
+                continue;
+            }
+            let pid_bytes = pid.as_bytes();
+            if pid_bytes.len() > usize::from(u16::MAX) {
+                continue;
+            }
+            let needed = out.len().saturating_add(4 + pid_bytes.len() + pkt_len);
+            if needed > max_out {
+                break;
+            }
+            let (seq, nonce) = peer.crypto.next_voice_tx_seq_and_nonce();
+            out.extend_from_slice(&(pid_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(pid_bytes);
+            out.extend_from_slice(&(pkt_len as u16).to_le_bytes());
+            seal_voice_packet_into(
+                &peer.crypto.voice_tx_key,
+                seq,
+                nonce,
+                self_peer_id,
+                pid,
+                adpcm_scratch,
+                out,
+            );
+            self.stats.voice_packets_sent = self.stats.voice_packets_sent.saturating_add(1);
+            fit_count = fit_count.saturating_add(1);
+        }
+        out[2..4].copy_from_slice(&fit_count.to_le_bytes());
+    }
+
+    /// Zero-allocation binary bridge fast-path for `OP_VOICE_OPEN_DECODE`:
+    /// writes `[rms:u16][sampleCount:u16][i16 LE samples...]` directly into `out`.
+    pub fn open_voice_packet_wire(
+        &mut self,
+        from_peer: &str,
+        packet: &[u8],
+        adpcm_scratch: &mut Vec<u8>,
+        pcm_scratch: &mut Vec<i16>,
+        out: &mut Vec<u8>,
+        max_out: usize,
+    ) -> Result<(), String> {
+        out.clear();
+        if !self.in_voice {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            return Ok(());
+        }
+
+        let (seq, nonce, ct) = match parse_voice_packet_header(packet) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+
+        let (voice_rx_key, replay_ok) = match self.peers.get(from_peer) {
+            Some(peer) => (
+                peer.crypto.voice_rx_key,
+                peer.crypto.voice_replay_window.would_accept(seq),
+            ),
+            None => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(format!(
+                    "received voice packet from unconnected peer '{from_peer}'"
+                ));
+            }
+        };
+
+        if !replay_ok {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(format!(
+                "rejected replayed or out-of-window voice sequence {seq} from {from_peer}"
+            ));
+        }
+
+        adpcm_scratch.clear();
+        if let Err(err) = open_voice_packet_ciphertext_into(
+            &voice_rx_key,
+            seq,
+            &nonce,
+            from_peer,
+            &self.peer_id,
+            ct,
+            adpcm_scratch,
+        ) {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(err);
+        }
+
+        if let Some(peer) = self.peers.get_mut(from_peer) {
+            peer.crypto.voice_replay_window.accept(seq);
+        }
+
+        decode_ima_adpcm_into(adpcm_scratch, pcm_scratch)?;
+        let rms = compute_rms_i16(pcm_scratch);
+        self.stats.voice_packets_received = self.stats.voice_packets_received.saturating_add(1);
+
+        let max_samples = (max_out.saturating_sub(4)) / 2;
+        let count = pcm_scratch.len().min(max_samples).min(usize::from(u16::MAX));
+        out.reserve(4 + count * 2);
+        out.extend_from_slice(&rms.to_le_bytes());
+        out.extend_from_slice(&(count as u16).to_le_bytes());
+        for &sample in &pcm_scratch[..count] {
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Zero-allocation binary bridge fast-path for `OP_VOICE_SEAL_RAW`:
+    /// writes `[peerCount:u16][[pidLen:u16][pid][pktLen:u16][V2 pkt]...]` directly into `out`.
+    pub fn seal_voice_raw_wire(&mut self, raw_payload: &[u8], out: &mut Vec<u8>, max_out: usize) {
+        out.clear();
+        out.extend_from_slice(&0u16.to_le_bytes()); // patched below
+
+        if !self.in_voice || self.voice_muted || raw_payload.is_empty() {
+            return;
+        }
+        let pkt_len = VOICE_PACKET_HEADER_LEN + raw_payload.len() + 16;
+        if pkt_len > usize::from(u16::MAX) {
+            return;
+        }
+
+        let mut fit_count: u16 = 0;
+        let self_peer_id = &self.peer_id;
+        for (pid, peer) in self.peers.iter_mut() {
+            if !peer.in_voice {
+                continue;
+            }
+            let pid_bytes = pid.as_bytes();
+            if pid_bytes.len() > usize::from(u16::MAX) {
+                continue;
+            }
+            let needed = out.len().saturating_add(4 + pid_bytes.len() + pkt_len);
+            if needed > max_out {
+                break;
+            }
+            let (seq, nonce) = peer.crypto.next_voice_tx_seq_and_nonce();
+            out.extend_from_slice(&(pid_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(pid_bytes);
+            out.extend_from_slice(&(pkt_len as u16).to_le_bytes());
+            seal_voice_v2_packet_into(
+                &peer.crypto.voice_tx_key,
+                seq,
+                nonce,
+                self_peer_id,
+                pid,
+                raw_payload,
+                out,
+            );
+            self.stats.voice_packets_sent = self.stats.voice_packets_sent.saturating_add(1);
+            fit_count = fit_count.saturating_add(1);
+        }
+        out[0..2].copy_from_slice(&fit_count.to_le_bytes());
+    }
+
+    /// Zero-allocation binary bridge fast-path for `OP_VOICE_OPEN_RAW`:
+    /// writes decrypted V2 codec payload bytes directly into `out`.
+    pub fn open_voice_v2_packet_into(
+        &mut self,
+        from_peer: &str,
+        packet: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        out.clear();
+        if !self.in_voice {
+            return Ok(());
+        }
+        let (seq, nonce, ct) = match parse_voice_v2_packet_header(packet) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+        let (voice_rx_key, replay_ok) = match self.peers.get(from_peer) {
+            Some(peer) => (
+                peer.crypto.voice_rx_key,
+                peer.crypto.voice_replay_window.would_accept(seq),
+            ),
+            None => {
+                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                return Err(format!(
+                    "received V2 voice packet from unconnected peer '{from_peer}'"
+                ));
+            }
+        };
+        if !replay_ok {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(format!(
+                "rejected replayed or out-of-window V2 voice sequence {seq} from {from_peer}"
+            ));
+        }
+        if let Err(err) = open_voice_v2_packet_ciphertext_into(
+            &voice_rx_key,
+            seq,
+            &nonce,
+            from_peer,
+            &self.peer_id,
+            ct,
+            out,
+        ) {
+            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            return Err(err);
+        }
+        if let Some(peer) = self.peers.get_mut(from_peer) {
+            peer.crypto.voice_replay_window.accept(seq);
+        }
+        self.stats.voice_packets_received = self.stats.voice_packets_received.saturating_add(1);
+        Ok(())
+    }
+
+    /// Zero-allocation binary bridge fast-path for `OP_VOICE_PROCESS_CAPTURE_48K`:
+    /// runs the full 48 kHz Rust DSP chain and writes the binary response (12-byte header +
+    /// optional processed 48 kHz f32 samples + optional V1 ADPCM E2EE packets) directly into `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_voice_capture_48k_wire(
+        &mut self,
+        samples_48k: &[f32],
+        gate_pct: u8,
+        need_v1: bool,
+        return_48k: bool,
+        adpcm_scratch: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+        max_out: usize,
+    ) {
+        out.clear();
+        let muted = !self.in_voice || self.voice_muted;
+        let meta = self
+            .voice_dsp_48k
+            .process_frame_in_place(samples_48k, gate_pct, muted, need_v1);
+        let out_flags: u8 = u8::from(meta.gated) | (u8::from(meta.is_fade_out_tail) << 1);
+
+        let processed = self.voice_dsp_48k.processed_48k();
+        let emit_samples = if return_48k && !meta.gated {
+            processed
+                .len()
+                .min((max_out.saturating_sub(12)) / 4)
+                .min(usize::from(u16::MAX))
+        } else {
+            0
+        };
+
+        out.reserve(12 + emit_samples * 4);
+        out.extend_from_slice(&meta.raw_rms.to_le_bytes());
+        out.extend_from_slice(&meta.active_rms.to_le_bytes());
+        out.push(out_flags);
+        out.push(0);
+        out.extend_from_slice(&(emit_samples as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // fit_v1 patched below at [8..10]
+        out.extend_from_slice(&[0u8, 0u8]);
+        for &s in &processed[..emit_samples] {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+
+        if !need_v1 || meta.gated || muted {
+            return;
+        }
+        let downsampled = self.voice_dsp_48k.downsampled_16k();
+        if downsampled.is_empty() || !self.peers.values().any(|p| p.in_voice) {
+            return;
+        }
+
+        encode_ima_adpcm_into(downsampled, adpcm_scratch);
+        let pkt_len = VOICE_PACKET_HEADER_LEN + adpcm_scratch.len() + 16;
+        if pkt_len > usize::from(u16::MAX) {
+            return;
+        }
+
+        let mut fit_v1: u16 = 0;
+        let self_peer_id = &self.peer_id;
+        for (pid, peer) in self.peers.iter_mut() {
+            if !peer.in_voice {
+                continue;
+            }
+            let pid_bytes = pid.as_bytes();
+            if pid_bytes.len() > usize::from(u16::MAX) {
+                continue;
+            }
+            let needed = out.len().saturating_add(4 + pid_bytes.len() + pkt_len);
+            if needed > max_out {
+                break;
+            }
+            let (seq, nonce) = peer.crypto.next_voice_tx_seq_and_nonce();
+            out.extend_from_slice(&(pid_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(pid_bytes);
+            out.extend_from_slice(&(pkt_len as u16).to_le_bytes());
+            seal_voice_packet_into(
+                &peer.crypto.voice_tx_key,
+                seq,
+                nonce,
+                self_peer_id,
+                pid,
+                adpcm_scratch,
+                out,
+            );
+            self.stats.voice_packets_sent = self.stats.voice_packets_sent.saturating_add(1);
+            fit_v1 = fit_v1.saturating_add(1);
+        }
+        out[8..10].copy_from_slice(&fit_v1.to_le_bytes());
+    }
+
+    /// Writes a compact 88-byte binary counter snapshot (`11 × u64 LE`) directly into `out`
+    /// so periodic UI stats polling avoids JSON serialization and parsing completely.
+    pub fn write_counters_binary(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(88);
+        let fields: [u64; 11] = [
+            self.stats.voice_packets_sent,
+            self.stats.voice_packets_received,
+            self.stats.frames_sent,
+            self.stats.frames_received,
+            self.stats.e2ee_frames_encrypted,
+            self.stats.e2ee_frames_decrypted,
+            self.stats.e2ee_auth_failures,
+            self.stats.gossip_forwards,
+            self.stats.gossip_duplicates_dropped,
+            self.log.len() as u64,
+            self.log.lamport(),
+        ];
+        for v in fields {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
     }
 
     /// Called when a direct WebRTC DataChannel closes or errors.
@@ -2568,11 +2923,11 @@ impl MeshNode {
         write_json_string(&mut out, &self.key_fp);
         out.push_str(",\"roomTopic\":");
         write_json_string(&mut out, &self.room_topic);
-        out.push_str(",\"publicKey\":");
-        write_json_string(&mut out, &base64url_encode(&self.x25519_public));
+        out.push_str(",\"publicKey\":\"");
+        base64url_encode_into(&self.x25519_public, &mut out);
         let _ = write!(
             out,
-            ",\"passphraseMode\":{}}},\"voice\":{{\"inVoice\":{},\"muted\":{}}},\"lamport\":{},\"logCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
+            "\",\"passphraseMode\":{}}},\"voice\":{{\"inVoice\":{},\"muted\":{}}},\"lamport\":{},\"logCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
             self.passphrase_mode,
             self.in_voice,
             self.voice_muted,
@@ -2590,11 +2945,11 @@ impl MeshNode {
             write_json_string(&mut out, &peer.author_name);
             out.push_str(",\"safetyCode\":");
             write_json_string(&mut out, &peer.crypto.safety_code);
-            out.push_str(",\"publicKey\":");
-            write_json_string(&mut out, &base64url_encode(&peer.crypto.pub_key));
+            out.push_str(",\"publicKey\":\"");
+            base64url_encode_into(&peer.crypto.pub_key, &mut out);
             let _ = write!(
                 out,
-                ",\"isBot\":{},\"viaAutoMesh\":{},\"introducedBy\":",
+                "\",\"isBot\":{},\"viaAutoMesh\":{},\"introducedBy\":",
                 peer.is_bot,
                 peer.via_auto_mesh
             );
