@@ -1,11 +1,9 @@
 import { SafeRustWasmMesh } from "./wasm_client.js";
 import { MultiRelayRendezvous, resolveRelayUrls } from "./mqtt_relay.js";
 import {
-  acquireProfileSlot,
-  loadProfileState,
+  createEphemeralProfile,
+  purgeLegacyClientStorage,
   randomBase64Url,
-  saveProfileState,
-  upsertKnownPeer,
 } from "./storage.js";
 
 const ICE_CONFIG = {
@@ -95,7 +93,7 @@ const AVATAR_PALETTE = [
   "#047857",
 ];
 
-const VOICE_EQ_WEIGHTS = [0.36, 0.66, 0.92, 1.0, 0.88, 0.62, 0.34];
+const VOICE_EQ_WEIGHTS = [0.28, 0.52, 0.78, 0.94, 1.0, 0.94, 0.78, 0.52, 0.28];
 const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 const URL_REGEX = /https?:\/\/[^\s<>"']+/gi;
 const MAX_IMAGES_PER_MESSAGE = 3;
@@ -365,9 +363,7 @@ class P2PDirectApp {
     this.composerMode = "chat";
     this.pendingImages = [];
     this.telemetry = [];
-    this.saveTimer = null;
     this.toastTimer = null;
-    this.rejoinDismissed = false;
 
     // Step-by-step Connect Wizard state
     this.wizard = {
@@ -394,7 +390,7 @@ class P2PDirectApp {
     this.relayPeers = new Map();
     this.earlyRelayIce = new Map();
 
-    // Same-browser BroadcastChannel auto-rejoin & 1-click local discovery
+    // Same-browser BroadcastChannel 1-click local discovery & tab handoff
     this.bc = null;
     this.discoveredLocalMeshes = new Map();
     this.localDialing = new Map();
@@ -415,7 +411,7 @@ class P2PDirectApp {
     this.keepaliveFallbackTimer = null;
     this.keepaliveTickCount = 0;
 
-    // Real-time multi-peer voice chat state
+    // Real-time multi-peer voice channel state
     this.voice = {
       inVoice: false,
       muted: false,
@@ -428,12 +424,14 @@ class P2PDirectApp {
       silentGain: null,
       masterGain: null,
       peerMixers: new Map(), // peerId -> { gainNode, volume, muted, nextPlayTime, rms, smoothLevel, lastAudioAt, packetsReceived }
+      joinOrder: [], // ordered participant keys (peerId or "self") so cards never jump when joining
       localRms: 0,
       localSmoothLevel: 0,
       localSpeakingAt: 0,
       meterTimer: null,
       meterTicks: 0,
       lastRosterKey: "",
+      renderedKeys: new Set(),
     };
 
     this.el = {};
@@ -461,11 +459,6 @@ class P2PDirectApp {
       "local-mesh-fp",
       "local-mesh-desc",
       "btn-join-local-mesh",
-      "rejoin-banner",
-      "rejoin-fp",
-      "rejoin-desc",
-      "btn-create-rejoin",
-      "btn-dismiss-rejoin",
       "room-link-card",
       "room-link-setup",
       "room-name-input",
@@ -539,16 +532,14 @@ class P2PDirectApp {
       "voice-status-badge",
       "voice-idle-controls",
       "voice-active-controls",
-      "voice-idle-view",
-      "voice-idle-desc",
-      "voice-waiting-peers",
+      "voice-empty-state",
       "btn-voice-join",
       "btn-voice-listen",
-      "voice-active-view",
       "btn-voice-mute",
       "btn-voice-deafen",
       "btn-voice-leave",
       "voice-participant-list",
+      "voice-footer",
       "voice-codec-meta",
       "voice-packet-stats",
       "voice-notice",
@@ -640,13 +631,8 @@ class P2PDirectApp {
     );
     this.el["btn-room-leave"].addEventListener("click", () => this.leaveLongLivedRoom());
 
-    // Quick local join & cross-device rejoin banners
+    // Quick local tab discovery banner
     this.el["btn-join-local-mesh"].addEventListener("click", () => this.joinDiscoveredLocalMesh());
-    this.el["btn-create-rejoin"].addEventListener("click", () => this.createManualInvite(true));
-    this.el["btn-dismiss-rejoin"].addEventListener("click", () => {
-      this.rejoinDismissed = true;
-      this.renderConnectBanners();
-    });
 
     // Step-by-Step Connect Wizard controls
     this.el["btn-wizard-start-host"].addEventListener("click", () => this.createManualInvite(false));
@@ -737,7 +723,7 @@ class P2PDirectApp {
       if (!this.latestAnswer || typeof navigator.share !== "function") return;
       try {
         await navigator.share({
-          title: "p2p-direct E2EE reply link",
+          title: "p2p-direct reply link",
           url: this.latestAnswer.url,
         });
         this.markJoinReplyShared();
@@ -747,7 +733,7 @@ class P2PDirectApp {
     });
     this.el["btn-join-done"].addEventListener("click", () => this.resetWizard());
 
-    // Real-time Multi-Peer E2EE Voice Chat controls
+    // Real-time Multi-Peer Voice Channel controls
     this.el["btn-voice-join"].addEventListener("click", () => this.joinVoiceChat({ listenOnly: false }));
     this.el["btn-voice-listen"].addEventListener("click", () => this.joinVoiceChat({ listenOnly: true }));
     this.el["btn-voice-mute"].addEventListener("click", () => this.toggleVoiceMute());
@@ -765,7 +751,6 @@ class P2PDirectApp {
       this.status = res.status;
       this.profile.authorName = next;
       this.executeActions(res.actions);
-      this.schedulePersist();
       this.renderHeader();
       this.renderVoicePanel(true);
       this.renderTopology();
@@ -780,7 +765,6 @@ class P2PDirectApp {
       this.status = res.status;
       this.profile.autoMeshEnabled = enabled;
       this.el["auto-mesh-badge"].textContent = enabled ? "ON" : "OFF";
-      this.schedulePersist();
       this.addTelemetry("config", `Relayed auto-mesh ${enabled ? "enabled" : "disabled"}`);
     });
 
@@ -962,7 +946,6 @@ class P2PDirectApp {
     });
 
     const teardownAll = () => {
-      this.flushPersist();
       if (this.voice.inVoice) {
         this.leaveVoiceChat(/* silent = */ true);
       }
@@ -1019,12 +1002,13 @@ class P2PDirectApp {
     this.initTheme();
     this.bindEvents();
 
-    const slot = await acquireProfileSlot();
-    this.el["profile-slot-label"].textContent = `profile: ${slot}`;
-    this.profile = await loadProfileState(slot);
+    // Ensure nothing is persisted permanently on the client
+    purgeLegacyClientStorage();
+    this.el["profile-slot-label"].textContent = "in-memory session";
+    this.profile = createEphemeralProfile();
 
     this.wasm = await SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm");
-    this.addTelemetry("engine", "Local encrypted engine ready");
+    this.addTelemetry("engine", "In-memory encrypted session ready");
 
     const initRes = this.wasm.call({
       cmd: "init",
@@ -1038,29 +1022,7 @@ class P2PDirectApp {
       entropy: randomBase64Url(32),
     });
     this.status = initRes.status;
-
-    const snap = this.profile.snapshot;
-    const hasRecords =
-      snap &&
-      ((Array.isArray(snap.records) && snap.records.length > 0) ||
-        (Array.isArray(snap.messages) && snap.messages.length > 0));
-    if (hasRecords) {
-      try {
-        const imp = this.wasm.call({ cmd: "import_snapshot", snapshot: snap });
-        this.status = imp.status;
-        this.logMessages = imp.log;
-        this.addTelemetry("sync", `Restored ${imp.added} encrypted message(s) from local storage`);
-      } catch (err) {
-        this.addTelemetry("error", `Stored snapshot could not be decrypted: ${err.message}`);
-        const state = this.wasm.call({ cmd: "get_state" });
-        this.status = state.status;
-        this.logMessages = state.log;
-      }
-    } else {
-      const state = this.wasm.call({ cmd: "get_state" });
-      this.status = state.status;
-      this.logMessages = state.log;
-    }
+    this.logMessages = [];
 
     this.el["author-name-input"].value = this.status.authorName;
     this.el["auto-mesh-toggle"].checked = this.status.autoMeshEnabled;
@@ -1073,17 +1035,7 @@ class P2PDirectApp {
     // Handle any #room=, #offer=, or #answer= fragment present in the initial URL
     await this.handleUrlHashFragment();
 
-    // If reopening a tab that belonged to a long-lived room, reconnect automatically
-    if (!this.activeRoom && this.profile.activeRoom) {
-      this.activateCurrentMeshAsRoom({
-        roomName: this.profile.activeRoom.name || this.status.room,
-        relay: this.profile.activeRoom.relay || null,
-        updateHash: false,
-        silent: true,
-      });
-    }
-
-    // Broadcast presence so reopened tabs on the same browser auto-rejoin immediately
+    // Discover any other live tabs open in this browser
     this.broadcastMeshBeacon(true);
 
     window.__p2pDirect = this;
@@ -1115,7 +1067,7 @@ class P2PDirectApp {
     }
     if (persist) {
       try {
-        localStorage.setItem("p2p-direct-theme", isDark ? "dark" : "light");
+        sessionStorage.setItem("p2p-direct-theme", isDark ? "dark" : "light");
       } catch {
         // ignore storage restrictions
       }
@@ -1906,7 +1858,6 @@ class P2PDirectApp {
       this.profile.meshKey = res.meshKey;
       this.profile.passphraseMode = true;
       this.discoveredLocalMeshes.clear();
-      this.flushPersist();
 
       if (this.pendingRoomCode) {
         const pendingCode = this.pendingRoomCode;
@@ -1948,7 +1899,6 @@ class P2PDirectApp {
     this.status = res.status;
     this.profile.meshKey = res.meshKey;
     this.profile.passphraseMode = false;
-    this.flushPersist();
     if (this.activeRoom) {
       this.activateCurrentMeshAsRoom({
         roomName: this.activeRoom.name,
@@ -2025,64 +1975,6 @@ class P2PDirectApp {
     this.renderTelemetry();
   }
 
-  schedulePersist() {
-    if (this.saveTimer) clearTimeout(this.saveTimer);
-    this.saveTimer = setTimeout(() => this.flushPersist(), 120);
-  }
-
-  _saveCurrentRoomSnapshotToCache(snapshot) {
-    if (!this.profile || !this.status?.e2ee?.keyFingerprint) return;
-    if (!this.profile.roomSnapshots || typeof this.profile.roomSnapshots !== "object") {
-      this.profile.roomSnapshots = {};
-    }
-    const fp = this.status.e2ee.keyFingerprint;
-    const hasData =
-      (snapshot?.records && snapshot.records.length > 0) ||
-      (this.profile.knownPeers && this.profile.knownPeers.length > 0);
-    if (!hasData) return;
-
-    this.profile.roomSnapshots[fp] = {
-      room: this.status.room || "Shared Room",
-      snapshot,
-      knownPeers: (this.profile.knownPeers || []).slice(0, 12),
-      updatedAt: Date.now(),
-    };
-    const keys = Object.keys(this.profile.roomSnapshots);
-    if (keys.length > 12) {
-      keys.sort(
-        (a, b) =>
-          (this.profile.roomSnapshots[b]?.updatedAt || 0) -
-          (this.profile.roomSnapshots[a]?.updatedAt || 0)
-      );
-      for (const staleKey of keys.slice(12)) {
-        delete this.profile.roomSnapshots[staleKey];
-      }
-    }
-  }
-
-  flushPersist() {
-    if (!this.wasm || !this.profile) return;
-    if (this.saveTimer) {
-      clearTimeout(this.saveTimer);
-      this.saveTimer = null;
-    }
-    try {
-      const exp = this.wasm.call({ cmd: "export_snapshot" });
-      this.profile.snapshot = exp.snapshot;
-      this.profile.authorName = this.status.authorName;
-      this.profile.room = this.status.room || "mesh-main";
-      this.profile.autoMeshEnabled = this.status.autoMeshEnabled;
-      this.profile.passphraseMode = Boolean(this.status.e2ee?.passphraseMode);
-      this.profile.activeRoom = this.activeRoom
-        ? { name: this.activeRoom.name, relay: this.activeRoom.relay || null }
-        : null;
-      this._saveCurrentRoomSnapshotToCache(exp.snapshot);
-      saveProfileState(this.profile);
-    } catch {
-      // ignore persistence error
-    }
-  }
-
   publishMessage(msgType, payload) {
     try {
       const res = this.wasm.call({
@@ -2095,7 +1987,6 @@ class P2PDirectApp {
       this.status = res.status;
       this.executeActions(res.actions);
       this.refreshLogFromWasm();
-      this.schedulePersist();
       this.renderAll();
     } catch (err) {
       this.showComposerError(err.message);
@@ -2112,13 +2003,12 @@ class P2PDirectApp {
     const res = this.wasm.call({ cmd: "clear_log" });
     this.status = res.status;
     this.logMessages = res.log;
-    this.flushPersist();
     this.addTelemetry(
       "storage",
-      "Cleared local encrypted log; click Sync Now to backfill from peers"
+      "Cleared local in-memory messages; click Sync Now to backfill from online peers"
     );
     this.renderAll();
-    this.showToast("Local log cleared (surviving peers still hold encrypted history)");
+    this.showToast("Cleared local view (online peers still hold active messages)");
   }
 
   exportEncryptedBackup() {
@@ -2151,6 +2041,10 @@ class P2PDirectApp {
     if (this.voice.inVoice) {
       this.leaveVoiceChat(/* silent = */ true);
     }
+    this.voice.joinOrder = [];
+    this.voice.lastRosterKey = "";
+    this.voice.renderedKeys.clear();
+
     for (const entry of this.roomDialing.values()) {
       try {
         entry.pc.close();
@@ -2258,18 +2152,10 @@ class P2PDirectApp {
       return false;
     }
 
-    // Persist current room's encrypted snapshot under its key fingerprint before switching
-    try {
-      const exp = this.wasm.call({ cmd: "export_snapshot" });
-      this._saveCurrentRoomSnapshotToCache(exp.snapshot);
-    } catch {
-      // ignore
-    }
-
     this._disconnectAllPeersForRoomSwitch();
     this.discoveredLocalMeshes.clear();
 
-    // Clear log before adopting the new room key so unrelated messages never cross rooms
+    // Clear in-memory log before adopting the new room key; live peers in the target room backfill automatically
     this.wasm.call({ cmd: "clear_log" });
     const keyRes = this.wasm.call({
       cmd: "set_mesh_key",
@@ -2284,26 +2170,7 @@ class P2PDirectApp {
     this.profile.meshKey = newMeshKey;
     this.profile.passphraseMode = Boolean(passphraseMode);
     this.profile.room = cleanRoom;
-
-    const newFp = this.status.e2ee.keyFingerprint;
-    const cached = this.profile.roomSnapshots?.[newFp];
-    if (cached && cached.snapshot && Array.isArray(cached.snapshot.records) && cached.snapshot.records.length > 0) {
-      try {
-        const imp = this.wasm.call({ cmd: "import_snapshot", snapshot: cached.snapshot });
-        this.status = imp.status;
-        this.logMessages = imp.log;
-        this.profile.knownPeers = Array.isArray(cached.knownPeers) ? cached.knownPeers.slice() : [];
-        this.addTelemetry("room", `Restored ${imp.added} encrypted message(s) for room "${cleanRoom}"`);
-      } catch {
-        this.refreshLogFromWasm();
-        this.profile.knownPeers = [];
-      }
-    } else {
-      this.refreshLogFromWasm();
-      this.profile.knownPeers = [];
-    }
-
-    this.flushPersist();
+    this.refreshLogFromWasm();
     return true;
   }
 
@@ -2429,7 +2296,6 @@ class P2PDirectApp {
       encrypted: Boolean(encoded.encrypted),
     };
     this.profile.room = encoded.room;
-    this.profile.activeRoom = { name: encoded.room, relay: relay || null };
 
     if (updateHash) {
       try {
@@ -2440,7 +2306,6 @@ class P2PDirectApp {
     }
 
     this.startRoomRendezvous(encoded.roomTopic, relay);
-    this.flushPersist();
     this.renderAll();
 
     this.addTelemetry(
@@ -2461,29 +2326,18 @@ class P2PDirectApp {
       this.roomRendezvous.stop();
       this.roomRendezvous = null;
     }
-    for (const entry of this.roomDialing.values()) {
-      try {
-        entry.pc.close();
-      } catch {
-        // ignore
-      }
-    }
-    this.roomDialing.clear();
-    this.earlyRoomIce.clear();
-    this.seenRoomSignalIds.clear();
-    this.lastHelloReplyPerPeer.clear();
     this.activeRoom = null;
     this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0 };
-    this.profile.activeRoom = null;
+    // Disconnect from the room and wipe in-memory messages so leaving leaves zero trace
+    this.switchToMeshKey(randomBase64Url(32), false, "mesh-main");
     try {
       history.replaceState(null, "", basePageUrl());
     } catch {
       // ignore
     }
-    this.flushPersist();
     this.renderAll();
-    this.addTelemetry("room", "Stopped listening on long-lived room link");
-    this.showToast("Left room invite link");
+    this.addTelemetry("room", "Left room and cleared in-memory session");
+    this.showToast("Left room — local messages cleared");
   }
 
   startRoomRendezvous(roomTopic, customRelay) {
@@ -3086,7 +2940,6 @@ class P2PDirectApp {
         this.status = keyRes.status;
         this.profile.meshKey = sig.meshKey;
         this.profile.passphraseMode = false;
-        this.flushPersist();
         this.renderHeader();
         this.addTelemetry(
           "e2ee",
@@ -3101,7 +2954,6 @@ class P2PDirectApp {
         this.status = passRes.status;
         this.profile.meshKey = passRes.meshKey;
         this.profile.passphraseMode = true;
-        this.flushPersist();
         this.renderHeader();
       }
 
@@ -3667,6 +3519,9 @@ class P2PDirectApp {
     this.voice.deafened = false;
     this.voice.listenOnly = false;
     this.voice.localRms = 0;
+    this.voice.localSmoothLevel = 0;
+    this.voice.joinOrder = this.voice.joinOrder.filter((id) => id !== "self");
+    this.voice.renderedKeys.delete("self");
     this.voice.lastRosterKey = "";
 
     if (this.wasm) {
@@ -3857,9 +3712,6 @@ class P2PDirectApp {
       this.discoveredLocalMeshes.delete(peerId);
       this.directPeers.set(peerId, peerEntry);
 
-      upsertKnownPeer(this.profile, { peerId, authorName: peerEntry.authorName, pubKey: peerPubKey });
-      this.schedulePersist();
-
       const res = this.wasm.call({
         cmd: "peer_connected",
         peerId,
@@ -3979,12 +3831,6 @@ class P2PDirectApp {
         const liveInfo = this.status.peers.find((p) => p.peerId === peerId);
         if (liveInfo && liveInfo.authorName && liveInfo.authorName !== peerEntry.authorName) {
           peerEntry.authorName = liveInfo.authorName;
-          upsertKnownPeer(this.profile, {
-            peerId,
-            authorName: liveInfo.authorName,
-            pubKey: peerPubKey,
-          });
-          this.schedulePersist();
         }
         this.executeActions(res.actions);
         this.renderAll();
@@ -4096,7 +3942,6 @@ class P2PDirectApp {
 
     if (logChanged) {
       this.refreshLogFromWasm();
-      this.schedulePersist();
     }
   }
 
@@ -4425,93 +4270,95 @@ class P2PDirectApp {
     } else {
       this.el["local-mesh-banner"].classList.add("hidden");
     }
-
-    const known = this.profile?.knownPeers || [];
-    const showRejoin =
-      !this.activeRoom &&
-      !this.rejoinDismissed &&
-      this.directPeers.size === 0 &&
-      known.length > 0 &&
-      !localTarget &&
-      this.wizard.mode === "idle";
-    if (showRejoin) {
-      const names = known
-        .slice(0, 3)
-        .map((p) => p.authorName || p.peerId)
-        .join(", ");
-      const extra = known.length > 3 ? ` +${known.length - 3} more` : "";
-      this.el["rejoin-banner"].classList.remove("hidden");
-      this.el["rejoin-fp"].textContent = `Key ${this.status.e2ee.keyFingerprint.slice(0, 9)}`;
-      this.el["rejoin-desc"].textContent =
-        `Previously connected with ${names}${extra}. Tabs in this browser reconnect automatically; for another device, create a Rejoin Invite.`;
-    } else {
-      this.el["rejoin-banner"].classList.add("hidden");
-    }
   }
 
   renderVoicePanel(forceRebuild = false) {
     if (!this.status) return;
     const peersInVoice = (this.status.peers || []).filter((p) => p.inVoice);
+    const peerMap = new Map(peersInVoice.map((p) => [p.peerId, p]));
     const totalInVoice = peersInVoice.length + (this.voice.inVoice ? 1 : 0);
 
+    // Maintain stable participant order so existing cards stay put and joining adds you cleanly
+    const activeKeys = new Set(peerMap.keys());
+    if (this.voice.inVoice) {
+      activeKeys.add("self");
+    }
+    const ordered = this.voice.joinOrder.filter((k) => activeKeys.has(k));
+    const sortedRemoteIds = Array.from(peerMap.keys()).sort();
+    for (const pid of sortedRemoteIds) {
+      if (!ordered.includes(pid)) {
+        ordered.push(pid);
+      }
+    }
+    if (this.voice.inVoice && !ordered.includes("self")) {
+      ordered.push("self");
+    }
+    this.voice.joinOrder = ordered;
+
+    this.el["voice-panel"].classList.toggle("has-participants", totalInVoice > 0);
     this.el["voice-panel"].classList.toggle("is-live", this.voice.inVoice);
 
     const badge = this.el["voice-status-badge"];
-    if (this.voice.inVoice) {
+    if (totalInVoice === 0) {
+      badge.textContent = "Empty";
+      badge.className = "badge";
+    } else if (this.voice.inVoice) {
       badge.textContent = `${totalInVoice} in call`;
       badge.className = "badge auto";
-    } else if (peersInVoice.length > 0) {
-      badge.textContent = `${peersInVoice.length} live`;
-      badge.className = "badge pending";
     } else {
-      badge.textContent = "Off";
-      badge.className = "badge";
+      badge.textContent = `${totalInVoice} in channel`;
+      badge.className = "badge auto";
     }
 
     this.el["voice-idle-controls"].classList.toggle("hidden", this.voice.inVoice);
     this.el["voice-active-controls"].classList.toggle("hidden", !this.voice.inVoice);
-    this.el["voice-idle-view"].classList.toggle("hidden", this.voice.inVoice);
-    this.el["voice-active-view"].classList.toggle("hidden", !this.voice.inVoice);
+    this.el["voice-empty-state"].classList.toggle("hidden", totalInVoice > 0);
+    this.el["voice-participant-list"].classList.toggle("hidden", totalInVoice === 0);
+    this.el["voice-footer"].classList.toggle("hidden", totalInVoice === 0);
 
-    if (!this.voice.inVoice) {
-      const waitEl = this.el["voice-waiting-peers"];
-      if (peersInVoice.length > 0) {
-        const names = peersInVoice.map((p) => p.authorName).join(", ");
-        waitEl.innerHTML = `<span class="status-dot online"></span><span>In voice now: ${escapeHtml(names)}</span>`;
-        waitEl.classList.remove("hidden");
-      } else {
-        waitEl.classList.add("hidden");
+    if (this.voice.inVoice) {
+      const muteBtn = this.el["btn-voice-mute"];
+      muteBtn.textContent = this.voice.listenOnly
+        ? "Listen Only"
+        : this.voice.muted
+          ? "Unmute Mic"
+          : "Mute Mic";
+      muteBtn.classList.toggle("is-toggled", this.voice.muted);
+
+      const deafBtn = this.el["btn-voice-deafen"];
+      deafBtn.textContent = this.voice.deafened ? "Undeafen" : "Deafen";
+      deafBtn.classList.toggle("is-toggled", this.voice.deafened);
+
+      if (this.status.stats) {
+        this.el["voice-packet-stats"].textContent =
+          `TX ${this.status.stats.voicePacketsSent} / RX ${this.status.stats.voicePacketsReceived}`;
       }
+    } else if (totalInVoice > 0) {
+      this.el["voice-packet-stats"].textContent = "Click Join Voice to talk together";
+    }
+
+    if (totalInVoice === 0) {
+      this.voice.lastRosterKey = "";
+      this.voice.renderedKeys.clear();
+      this.el["voice-participant-list"].innerHTML = "";
       return;
     }
 
-    const muteBtn = this.el["btn-voice-mute"];
-    muteBtn.textContent = this.voice.listenOnly
-      ? "Listen Only"
-      : this.voice.muted
-        ? "Unmute Mic"
-        : "Mute Mic";
-    muteBtn.classList.toggle("is-toggled", this.voice.muted);
-
-    const deafBtn = this.el["btn-voice-deafen"];
-    deafBtn.textContent = this.voice.deafened ? "Undeafen" : "Deafen";
-    deafBtn.classList.toggle("is-toggled", this.voice.deafened);
-
-    if (this.status.stats) {
-      this.el["voice-packet-stats"].textContent =
-        `TX ${this.status.stats.voicePacketsSent} / RX ${this.status.stats.voicePacketsReceived}`;
-    }
-
     const rosterKey = JSON.stringify({
+      inVoice: this.voice.inVoice,
+      order: ordered,
       selfId: this.status.peerId,
       selfName: this.status.authorName,
       muted: this.voice.muted,
       listenOnly: this.voice.listenOnly,
       deafened: this.voice.deafened,
-      peers: peersInVoice.map((p) => {
-        const mx = this.voice.peerMixers.get(p.peerId);
-        return [p.peerId, p.authorName, p.voiceMuted, mx ? mx.muted : false];
-      }),
+      peers: ordered
+        .filter((k) => k !== "self")
+        .map((id) => {
+          const p = peerMap.get(id);
+          const mx = this.voice.peerMixers.get(id);
+          return [id, p ? p.authorName : "", p ? p.voiceMuted : false, mx ? mx.muted : false];
+        }),
     });
 
     if (!forceRebuild && rosterKey === this.voice.lastRosterKey) {
@@ -4519,89 +4366,142 @@ class P2PDirectApp {
     }
     this.voice.lastRosterKey = rosterKey;
 
-    const eqBarsHtml = Array.from({ length: VOICE_EQ_WEIGHTS.length }, () => '<span class="voice-eq-bar"></span>').join("");
-    const selfBg = avatarColor(this.status.peerId);
-    const selfInitials = escapeHtml(avatarInitials(this.status.authorName));
-    const selfMuted = this.voice.muted || this.voice.listenOnly;
-    const selfStateText = this.voice.listenOnly
-      ? "Listen-only"
-      : this.voice.muted
-        ? "Muted"
-        : this.voice.deafened
-          ? "Deafened"
-          : "Live";
+    const prevRendered = this.voice.renderedKeys;
+    const eqBarsHtml = Array.from(
+      { length: VOICE_EQ_WEIGHTS.length },
+      () => '<span class="voice-eq-bar"></span>'
+    ).join("");
 
-    const items = [
-      `
-        <li class="voice-card" data-voice-row="self">
-          <div class="voice-avatar-wrap">
-            <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
-            <span class="voice-ring" aria-hidden="true"></span>
-            <div class="voice-avatar" style="background: ${selfBg}">${selfInitials}</div>
-            <span class="voice-avatar-badge${selfMuted ? " muted" : ""}" aria-hidden="true">
-              ${selfMuted ? MIC_OFF_SVG : MIC_ON_SVG}
-            </span>
-          </div>
-          <div class="voice-card-identity">
-            <span class="voice-card-name">${escapeHtml(this.status.authorName)} (you)</span>
-            <span class="voice-card-state" data-voice-state="self">${selfStateText}</span>
-          </div>
-          <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
-        </li>
-      `,
-    ];
+    const items = [];
+    for (const key of ordered) {
+      const enteringClass = prevRendered.has(key) ? "" : " is-entering";
 
-    for (const p of peersInVoice) {
-      const mixer = this.voice.peerMixers.get(p.peerId);
-      const localMuted = mixer ? mixer.muted : false;
-      const volPct = mixer ? Math.round(mixer.volume * 100) : 100;
+      if (key === "self") {
+        const selfBg = avatarColor(this.status.peerId);
+        const selfInitials = escapeHtml(avatarInitials(this.status.authorName));
+        const selfMuted = this.voice.muted || this.voice.listenOnly;
+        const selfStateText = this.voice.listenOnly
+          ? "Listen-only"
+          : this.voice.muted
+            ? "Muted"
+            : this.voice.deafened
+              ? "Deafened"
+              : "Live";
+
+        items.push(`
+          <li class="voice-card is-self${enteringClass}" data-voice-row="self">
+            <div class="voice-avatar-wrap">
+              <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
+              <span class="voice-ring" aria-hidden="true"></span>
+              <div class="voice-avatar" style="background: ${selfBg}">${selfInitials}</div>
+              <span class="voice-avatar-badge${selfMuted ? " muted" : ""}" aria-hidden="true">
+                ${selfMuted ? MIC_OFF_SVG : MIC_ON_SVG}
+              </span>
+            </div>
+            <div class="voice-card-identity">
+              <div class="voice-card-name-row">
+                <span class="voice-card-name">${escapeHtml(this.status.authorName)}</span>
+                <span class="voice-you-pill">You</span>
+              </div>
+              <div class="voice-card-state-row">
+                <span class="voice-live-dot${selfMuted ? " is-muted" : ""}" aria-hidden="true"></span>
+                <span class="voice-card-state" data-voice-state="self">${selfStateText}</span>
+              </div>
+            </div>
+            <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
+          </li>
+        `);
+        continue;
+      }
+
+      const p = peerMap.get(key);
+      if (!p) continue;
       const bg = avatarColor(p.peerId);
       const initials = escapeHtml(avatarInitials(p.authorName));
-      const peerStateText = p.voiceMuted ? "Muted" : localMuted ? "Muted for you" : "Live";
 
-      items.push(`
-        <li class="voice-card" data-voice-row="${escapeHtml(p.peerId)}">
-          <div class="voice-avatar-wrap">
-            <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
-            <span class="voice-ring" aria-hidden="true"></span>
-            <div class="voice-avatar" style="background: ${bg}">${initials}</div>
-            <span class="voice-avatar-badge${p.voiceMuted ? " muted" : ""}" aria-hidden="true">
-              ${p.voiceMuted ? MIC_OFF_SVG : MIC_ON_SVG}
-            </span>
-          </div>
-          <div class="voice-card-identity">
-            <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
-            <span class="voice-card-state" data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span>
-          </div>
-          <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
-          <div class="voice-peer-mixer">
-            <button type="button" class="btn btn-sm" data-peer-voice-mute="${escapeHtml(p.peerId)}">
-              ${localMuted ? "Unmute" : "Mute"}
-            </button>
-            <input
-              type="range"
-              class="voice-volume-slider"
-              min="0"
-              max="150"
-              value="${volPct}"
-              data-peer-voice-vol="${escapeHtml(p.peerId)}"
-              aria-label="Volume for ${escapeHtml(p.authorName)}"
-            />
-          </div>
-        </li>
-      `);
+      if (this.voice.inVoice) {
+        const mixer = this.voice.peerMixers.get(p.peerId);
+        const localMuted = mixer ? mixer.muted : false;
+        const volPct = mixer ? Math.round(mixer.volume * 100) : 100;
+        const isMutedDot = p.voiceMuted || localMuted;
+        const peerStateText = p.voiceMuted ? "Muted" : localMuted ? "Muted for you" : "Live";
+
+        items.push(`
+          <li class="voice-card${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
+            <div class="voice-avatar-wrap">
+              <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
+              <span class="voice-ring" aria-hidden="true"></span>
+              <div class="voice-avatar" style="background: ${bg}">${initials}</div>
+              <span class="voice-avatar-badge${p.voiceMuted ? " muted" : ""}" aria-hidden="true">
+                ${p.voiceMuted ? MIC_OFF_SVG : MIC_ON_SVG}
+              </span>
+            </div>
+            <div class="voice-card-identity">
+              <div class="voice-card-name-row">
+                <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
+              </div>
+              <div class="voice-card-state-row">
+                <span class="voice-live-dot${isMutedDot ? " is-muted" : ""}" aria-hidden="true"></span>
+                <span class="voice-card-state" data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span>
+              </div>
+            </div>
+            <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
+            <div class="voice-peer-mixer">
+              <button type="button" class="btn btn-sm" data-peer-voice-mute="${escapeHtml(p.peerId)}">
+                ${localMuted ? "Unmute" : "Mute"}
+              </button>
+              <input
+                type="range"
+                class="voice-volume-slider"
+                min="0"
+                max="150"
+                value="${volPct}"
+                data-peer-voice-vol="${escapeHtml(p.peerId)}"
+                aria-label="Volume for ${escapeHtml(p.authorName)}"
+              />
+            </div>
+          </li>
+        `);
+      } else {
+        const previewStateText = p.voiceMuted ? "Muted" : "In voice";
+        items.push(`
+          <li class="voice-card is-channel-preview${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}">
+            <div class="voice-avatar-wrap">
+              <span class="voice-ring voice-ring-outer" aria-hidden="true"></span>
+              <span class="voice-ring" aria-hidden="true"></span>
+              <div class="voice-avatar" style="background: ${bg}">${initials}</div>
+              <span class="voice-avatar-badge${p.voiceMuted ? " muted" : ""}" aria-hidden="true">
+                ${p.voiceMuted ? MIC_OFF_SVG : MIC_ON_SVG}
+              </span>
+            </div>
+            <div class="voice-card-identity">
+              <div class="voice-card-name-row">
+                <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
+              </div>
+              <div class="voice-card-state-row">
+                <span class="voice-live-dot${p.voiceMuted ? " is-muted" : ""}" aria-hidden="true"></span>
+                <span class="voice-card-state" data-voice-state="${escapeHtml(p.peerId)}">${previewStateText}</span>
+              </div>
+            </div>
+            <div class="voice-eq${p.voiceMuted ? "" : " is-preview"}" aria-hidden="true">${eqBarsHtml}</div>
+          </li>
+        `);
+      }
     }
 
+    this.voice.renderedKeys = new Set(ordered);
     const listEl = this.el["voice-participant-list"];
     listEl.innerHTML = items.join("");
 
-    for (const btn of listEl.querySelectorAll("[data-peer-voice-mute]")) {
-      btn.addEventListener("click", () => this.togglePeerVoiceMute(btn.dataset.peerVoiceMute));
-    }
-    for (const slider of listEl.querySelectorAll("[data-peer-voice-vol]")) {
-      slider.addEventListener("input", () =>
-        this.setPeerVoiceVolume(slider.dataset.peerVoiceVol, Number(slider.value) / 100)
-      );
+    if (this.voice.inVoice) {
+      for (const btn of listEl.querySelectorAll("[data-peer-voice-mute]")) {
+        btn.addEventListener("click", () => this.togglePeerVoiceMute(btn.dataset.peerVoiceMute));
+      }
+      for (const slider of listEl.querySelectorAll("[data-peer-voice-vol]")) {
+        slider.addEventListener("input", () =>
+          this.setPeerVoiceVolume(slider.dataset.peerVoiceVol, Number(slider.value) / 100)
+        );
+      }
     }
   }
 

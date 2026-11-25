@@ -16,7 +16,7 @@
     <script>
       (() => {
         try {
-          const saved = localStorage.getItem("p2p-direct-theme");
+          const saved = sessionStorage.getItem("p2p-direct-theme");
           const prefersDark =
             window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
           const theme = saved === "dark" || saved === "light" ? saved : prefersDark ? "dark" : "light";
@@ -103,7 +103,7 @@
       <main class="workbench">
         <!-- Main Focus Column: Prominent Voice Stage + Rich Live Chat -->
         <section class="main-column">
-          <!-- Prominent Real-Time Voice Stage -->
+          <!-- Prominent Unified Real-Time Voice Channel -->
           <section class="panel voice-stage-panel" id="voice-panel" aria-labelledby="voice-panel-title">
             <div class="panel-header voice-stage-header">
               <div class="voice-title-group">
@@ -116,26 +116,26 @@
                   </svg>
                 </span>
                 <h2 class="panel-title" id="voice-panel-title">
-                  Voice Chat
-                  <span class="badge" id="voice-status-badge">Off</span>
+                  Voice Channel
+                  <span class="badge" id="voice-status-badge">Empty</span>
                 </h2>
               </div>
 
-              <!-- Idle Action Buttons right in header on desktop -->
+              <!-- Join actions (shown when not in voice) -->
               <div id="voice-idle-controls" class="voice-header-actions">
                 <button type="button" id="btn-voice-join" class="btn btn-live">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                     <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
                   </svg>
-                  Join Voice Chat
+                  Join Voice
                 </button>
-                <button type="button" id="btn-voice-listen" class="btn btn-sm" title="Join without a microphone to hear everyone in the call">
+                <button type="button" id="btn-voice-listen" class="btn btn-sm" title="Join without a microphone to hear everyone in the channel">
                   Listen Only
                 </button>
               </div>
 
-              <!-- Active Call Controls right in header -->
+              <!-- Active Call Controls (shown when joined) -->
               <div id="voice-active-controls" class="voice-header-actions hidden">
                 <button type="button" id="btn-voice-mute" class="btn btn-sm">
                   Mute Mic
@@ -150,26 +150,20 @@
             </div>
 
             <div class="panel-body voice-stage-body">
-              <!-- Idle View: Clean Hero Strip + Live Waiting Participants Preview -->
-              <div id="voice-idle-view" class="voice-idle-stage">
-                <div class="voice-idle-copy">
-                  <div class="voice-idle-bars" aria-hidden="true">
-                    <span></span><span></span><span></span><span></span><span></span>
-                  </div>
-                  <p id="voice-idle-desc">
-                    Talk together in real time with everyone who joins voice.
-                  </p>
+              <!-- Shown only when 0 participants are currently in the voice channel -->
+              <div id="voice-empty-state" class="voice-empty-stage">
+                <div class="voice-idle-bars" aria-hidden="true">
+                  <span></span><span></span><span></span><span></span><span></span>
                 </div>
-                <div id="voice-waiting-peers" class="voice-waiting-banner hidden"></div>
+                <span class="voice-empty-label">Voice channel is empty — join to talk in real time</span>
               </div>
 
-              <!-- Active Voice Stage: Large Visual Speaker Cards with Reactive Rings & Waveforms -->
-              <div id="voice-active-view" class="hidden">
-                <ul id="voice-participant-list" class="voice-stage-grid"></ul>
-                <div class="voice-footer">
-                  <span id="voice-codec-meta">End-to-end encrypted · 16 kHz</span>
-                  <span id="voice-packet-stats">TX 0 / RX 0</span>
-                </div>
+              <!-- Always shows active voice channel participants; joining adds you right to the list -->
+              <ul id="voice-participant-list" class="voice-stage-grid hidden"></ul>
+
+              <div id="voice-footer" class="voice-footer hidden">
+                <span id="voice-codec-meta">End-to-end encrypted · 16 kHz</span>
+                <span id="voice-packet-stats"></span>
               </div>
 
               <div id="voice-notice" class="inline-notice hidden"></div>
@@ -181,7 +175,7 @@
             <div class="panel-header">
               <div class="chat-header-left">
                 <h2 class="panel-title" id="log-panel-title">Chat</h2>
-                <span class="panel-meta" id="chat-sync-meta">Persistent · Encrypted</span>
+                <span class="panel-meta" id="chat-sync-meta">In-memory · Encrypted</span>
               </div>
               <div class="btn-row" style="margin-top: 0">
                 <button type="button" id="btn-toggle-raw" class="btn btn-sm">Raw JSON</button>
@@ -191,7 +185,7 @@
                   type="button"
                   id="btn-clear-local-log"
                   class="btn btn-sm btn-danger"
-                  title="Clears only this browser's local history; syncing restores messages from connected peers"
+                  title="Clears only this tab's in-memory messages; syncing restores messages from connected peers"
                 >
                   Clear Local
                 </button>
@@ -330,23 +324,6 @@
                 <div class="btn-row" style="margin-top: 0">
                   <button type="button" id="btn-join-local-mesh" class="btn btn-sm btn-accent">
                     Join in 1 Click
-                  </button>
-                </div>
-              </div>
-
-              <!-- Rejoin banner when reopening a closed tab -->
-              <div id="rejoin-banner" class="quick-banner rejoin hidden">
-                <div class="quick-banner-title">
-                  <span>Rejoin Previous Room</span>
-                  <span class="panel-meta" id="rejoin-fp"></span>
-                </div>
-                <p class="quick-banner-sub" id="rejoin-desc"></p>
-                <div class="btn-row" style="margin-top: 0">
-                  <button type="button" id="btn-create-rejoin" class="btn btn-sm btn-primary">
-                    Create Rejoin Invite
-                  </button>
-                  <button type="button" id="btn-dismiss-rejoin" class="btn btn-sm">
-                    Dismiss
                   </button>
                 </div>
               </div>
@@ -614,7 +591,7 @@
                     </button>
                   </div>
                   <p class="e2ee-bar-hint" id="e2ee-bar-hint">
-                    All messages, images, voice audio, and local storage are end-to-end encrypted.
+                    All messages, images, and voice audio are end-to-end encrypted and stay in memory only — nothing is saved permanently.
                   </p>
                 </div>
               </details>
@@ -640,7 +617,7 @@
                     <span><i class="legend-dot live-dot"></i>Connected</span>
                     <span><i class="legend-dot warn-dot"></i>Connecting</span>
                   </div>
-                  <span id="profile-slot-label">profile: default</span>
+                  <span id="profile-slot-label">in-memory session</span>
                 </div>
               </div>
 

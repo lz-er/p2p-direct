@@ -1,18 +1,13 @@
-const DB_NAME = "p2p_direct_mesh_v2";
-const STORE_NAME = "profiles";
-const DB_VERSION = 1;
-const LS_PREFIX = "p2p_direct_profile_v2:";
+/**
+ * Ephemeral in-memory session identity helpers.
+ *
+ * Nothing is stored permanently on the client (zero IndexedDB, zero localStorage writes).
+ * Messages live strictly in active peers' memory and stay alive as long as at least one
+ * peer remains in the room; once all users leave, all messages are cleared.
+ */
 
-const DEFAULT_NAMES = [
-  "Alpha",
-  "Bravo",
-  "Charlie",
-  "Delta",
-  "Echo",
-  "Foxtrot",
-  "Golf",
-  "Hotel",
-];
+const LEGACY_DB_NAME = "p2p_direct_mesh_v2";
+const LEGACY_LS_PREFIX = "p2p_direct_profile_v2:";
 
 function randomBytes(len) {
   const arr = new Uint8Array(len);
@@ -40,254 +35,50 @@ export function randomBase64Url(bytesLen = 32) {
 }
 
 /**
- * Acquires a stable profile slot for this browser tab:
- * - Honors `?profile=<slot>` query param if explicitly provided.
- * - Reuses `sessionStorage` slot on page reloads so the same tab keeps its identity & encrypted log.
- * - Uses Web Locks (`navigator.locks`) so a single tab reopens `"default"` across browser restarts,
- *   while multiple simultaneously open tabs automatically get distinct slots (`peer-2`, `peer-3`, ...).
+ * Purges any legacy IndexedDB databases or localStorage entries left from earlier versions
+ * so zero messages, keys, or profiles persist permanently on the client.
  */
-export async function acquireProfileSlot() {
-  const params = new URLSearchParams(window.location.search);
-  const explicit = params.get("profile");
-  if (explicit && explicit.trim()) {
-    const clean = explicit.trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || "default";
-    try {
-      sessionStorage.setItem("p2p_direct_slot", clean);
-    } catch {
-      // ignore storage restrictions
-    }
-    holdSlotLock(clean);
-    return clean;
-  }
-
-  let savedSlot = null;
+export function purgeLegacyClientStorage() {
   try {
-    savedSlot = sessionStorage.getItem("p2p_direct_slot");
+    if (typeof indexedDB !== "undefined" && typeof indexedDB.deleteDatabase === "function") {
+      indexedDB.deleteDatabase(LEGACY_DB_NAME);
+    }
   } catch {
-    savedSlot = null;
+    // ignore storage restrictions
   }
 
-  const candidates = [];
-  if (savedSlot) {
-    candidates.push(savedSlot);
-  }
-  candidates.push("default");
-  for (let i = 2; i <= 16; i++) {
-    candidates.push(`peer-${i}`);
-  }
-
-  if (typeof navigator !== "undefined" && navigator.locks && typeof navigator.locks.request === "function") {
-    for (const slot of candidates) {
-      const acquired = await tryAcquireLock(slot);
-      if (acquired) {
-        try {
-          sessionStorage.setItem("p2p_direct_slot", slot);
-        } catch {
-          // ignore
+  try {
+    if (typeof localStorage !== "undefined") {
+      const toRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && (key.startsWith(LEGACY_LS_PREFIX) || key === "p2p-direct-theme")) {
+          toRemove.push(key);
         }
-        return slot;
+      }
+      for (const key of toRemove) {
+        localStorage.removeItem(key);
       }
     }
-  }
-
-  const fallback = savedSlot || "default";
-  try {
-    sessionStorage.setItem("p2p_direct_slot", fallback);
   } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-function tryAcquireLock(slot) {
-  return new Promise((resolve) => {
-    try {
-      navigator.locks
-        .request(`p2p-direct-slot:${slot}`, { ifAvailable: true }, (lock) => {
-          if (!lock) {
-            resolve(false);
-            return;
-          }
-          resolve(true);
-          return new Promise(() => {});
-        })
-        .catch(() => resolve(false));
-    } catch {
-      resolve(false);
-    }
-  });
-}
-
-function holdSlotLock(slot) {
-  if (typeof navigator !== "undefined" && navigator.locks && typeof navigator.locks.request === "function") {
-    navigator.locks
-      .request(`p2p-direct-slot:${slot}`, { ifAvailable: true }, (lock) => {
-        if (!lock) return;
-        return new Promise(() => {});
-      })
-      .catch(() => {});
+    // ignore storage restrictions
   }
 }
 
-function openDb() {
-  return new Promise((resolve, reject) => {
-    if (typeof indexedDB === "undefined") {
-      reject(new Error("IndexedDB unavailable"));
-      return;
-    }
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: "slot" });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error("IndexedDB open error"));
-  });
-}
-
-export function createDefaultProfile(slot) {
+/**
+ * Creates a fresh ephemeral in-memory session identity (never persisted to disk).
+ */
+export function createEphemeralProfile() {
   const peerId = `p-${randomHex(6)}`;
-  let index = 0;
-  if (slot.startsWith("peer-")) {
-    const parsed = Number.parseInt(slot.slice(5), 10);
-    if (Number.isFinite(parsed) && parsed >= 1) {
-      index = (parsed - 1) % DEFAULT_NAMES.length;
-    }
-  }
   const suffix = peerId.slice(2, 6).toUpperCase();
-  const baseName =
-    slot === "default"
-      ? `Node-${suffix}`
-      : slot.startsWith("peer-")
-        ? `${DEFAULT_NAMES[index]}-${suffix}`
-        : slot;
 
   return {
-    slot,
     peerId,
-    authorName: baseName,
+    authorName: `Node-${suffix}`,
     room: "mesh-main",
     autoMeshEnabled: true,
     x25519Secret: randomBase64Url(32),
     meshKey: randomBase64Url(32),
     passphraseMode: false,
-    activeRoom: null,
-    knownPeers: [],
-    roomSnapshots: {},
-    snapshot: { version: 2, e2ee: "chacha20-poly1305", lamport: 0, records: [] },
-    updatedAt: Date.now(),
   };
-}
-
-function ensureCryptoFields(record) {
-  if (!record.x25519Secret) {
-    record.x25519Secret = randomBase64Url(32);
-  }
-  if (!record.meshKey) {
-    record.meshKey = randomBase64Url(32);
-  }
-  if (typeof record.passphraseMode !== "boolean") {
-    record.passphraseMode = false;
-  }
-  if (!Array.isArray(record.knownPeers)) {
-    record.knownPeers = [];
-  }
-  if (!record.roomSnapshots || typeof record.roomSnapshots !== "object") {
-    record.roomSnapshots = {};
-  }
-  if (record.activeRoom === undefined) {
-    record.activeRoom = null;
-  }
-  return record;
-}
-
-export function upsertKnownPeer(profile, peerInfo) {
-  if (!profile || !peerInfo || !peerInfo.peerId || peerInfo.peerId === profile.peerId) {
-    return;
-  }
-  if (!Array.isArray(profile.knownPeers)) {
-    profile.knownPeers = [];
-  }
-  const existingIdx = profile.knownPeers.findIndex((p) => p.peerId === peerInfo.peerId);
-  const entry = {
-    peerId: peerInfo.peerId,
-    authorName: peerInfo.authorName || "Peer",
-    pubKey: peerInfo.pubKey || "",
-    lastSeenAt: Date.now(),
-  };
-  if (existingIdx >= 0) {
-    profile.knownPeers[existingIdx] = { ...profile.knownPeers[existingIdx], ...entry };
-  } else {
-    profile.knownPeers.unshift(entry);
-  }
-  profile.knownPeers.sort((a, b) => (b.lastSeenAt || 0) - (a.lastSeenAt || 0));
-  if (profile.knownPeers.length > 24) {
-    profile.knownPeers.length = 24;
-  }
-}
-
-export async function loadProfileState(slot) {
-  try {
-    const db = await openDb();
-    const record = await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readonly");
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.get(slot);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => reject(req.error || new Error("IndexedDB read error"));
-    });
-    db.close();
-    if (record && record.peerId) {
-      return ensureCryptoFields(record);
-    }
-  } catch {
-    // Fallback to localStorage below
-  }
-
-  try {
-    const raw = localStorage.getItem(`${LS_PREFIX}${slot}`);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.peerId) {
-        return ensureCryptoFields(parsed);
-      }
-    }
-  } catch {
-    // ignore corrupt localStorage
-  }
-
-  const fresh = createDefaultProfile(slot);
-  await saveProfileState(fresh);
-  return fresh;
-}
-
-export async function saveProfileState(profile) {
-  const record = {
-    ...profile,
-    updatedAt: Date.now(),
-  };
-
-  try {
-    const db = await openDb();
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put(record);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error || new Error("IndexedDB write error"));
-    });
-    db.close();
-  } catch {
-    // Fallback to localStorage
-  }
-
-  try {
-    const serialized = JSON.stringify(record);
-    if (serialized.length < 1_500_000) {
-      localStorage.setItem(`${LS_PREFIX}${record.slot}`, serialized);
-    }
-  } catch {
-    // Ignore localStorage quota exceeded when IndexedDB holds the full encrypted log
-  }
 }

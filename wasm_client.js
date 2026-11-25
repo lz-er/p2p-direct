@@ -83,7 +83,7 @@ export class SafeRustWasmMesh {
       }
     }
     if (headerIdx < 0) {
-      throw new Error("Could not locate Safe Rust WASM shared-memory bridge header");
+      throw new Error("Could not locate WASM shared-memory bridge header");
     }
     const inPtr = u32[headerIdx + 9];
     const outPtr = u32[headerIdx + 10];

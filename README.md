@@ -14,27 +14,25 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
     - **ChaCha20-Poly1305** AEAD (RFC 8439, constant-time tag check)
     - **SHA-256**, **HMAC-SHA256**, **HKDF-SHA256**, **PBKDF2-HMAC-SHA256** (10,000 iterations)
   - **Per-Link E2EE Wire Envelope**: Every WebRTC DataChannel frame (`hello`, `msg`, `sync-inv`, `sync-req`, `sync-batch`, `mesh-intro`, `relay-signal`) is wrapped in an authenticated `{"kind":"e2ee",...}` ChaCha20-Poly1305 envelope using directional `X25519(sk, peer_pk) || meshKey` session keys, AAD binding `(sender, receiver, seq)`, and a 64-slot anti-replay window. Plaintext or tampered frames are rejected.
-  - **End-to-End Encrypted Replicated Log**: Each message is sealed with ChaCha20-Poly1305 under `HKDF(meshKey, "replicated-log-aead")` with AAD binding `(id, lamport, ts)`. Both wire replication and `IndexedDB` persistence store only encrypted ciphertext records (zero plaintext on disk or on the wire).
+  - **End-to-End Encrypted Replicated Log**: Each message is sealed with ChaCha20-Poly1305 under `HKDF(meshKey, "replicated-log-aead")` with AAD binding `(id, lamport, ts)`. Nothing is persisted to disk on the client — all messages live strictly in active peers' memory and are cleared completely once all users leave.
   - **Opaque Relayed Auto-Mesh Signaling**: Relayed SDP offers, answers, and ICE candidates between peers `A` and `C` are AEAD-encrypted end-to-end with `X25519(A_sk, C_pk) || meshKey` so intermediate relay peer `B` forwards only opaque ciphertext.
   - **Opaque Encrypted Long-Lived Room Rendezvous**: Long-lived `#room=P2P1:...` invite links derive an opaque 32-hex-char rendezvous topic via `HKDF(meshKey, "room-rendezvous-topic")` and ChaCha20-Poly1305 AEAD-encrypt every presence beacon, SDP offer/answer, and ICE candidate (`R1:` envelopes) under `HKDF(meshKey, "room-rendezvous-aead")` inside safe Rust WASM. Stateless public MQTT-over-WSS relays see only random topic hashes and opaque ciphertext, while all chat, images, replicated logs, and voice audio flow strictly peer-to-peer over direct WebRTC DataChannels.
   - **Optional Passphrase-Protected `P2P1:` Invites**: Enter a shared passphrase to derive the 256-bit mesh key via PBKDF2-HMAC-SHA256 and AEAD-encrypt `#room=` / `#offer=` / `#answer=` codes themselves (omitting the mesh key from invite URLs). Or use automatic 256-bit keys carried strictly inside the client-only URL `#fragment` (never sent to HTTP servers) with verifiable key fingerprints and per-peer X25519 safety codes.
 - **Long-Lived Reusable Room Links (`#room=P2P1:...`)**:
-  - Create one permanent room link and share it anywhere. Whoever opens the link first creates/hosts the mesh, and every future person who opens that same link joins automatically with zero extra steps.
-  - Survives creator departure: any remaining peer keeps the room alive and automatically backfills the entire encrypted history to new joiners.
-  - Clean room isolation with per-room encrypted `IndexedDB` snapshots so switching between rooms never leaks messages across rooms.
-- **Persistent Replicated Log, Pasted Images & Clickable Links**:
+  - Create one reusable room link and share it anywhere. Whoever opens the link first creates/hosts the room, and every future person who opens that same link joins automatically with zero extra steps.
+  - Survives creator departure: any remaining peer keeps the room alive in memory and automatically backfills the entire encrypted history to new joiners. Once all users leave, zero data remains on any client and reopening the link starts fresh.
+- **Ephemeral In-Memory Replicated Log, Pasted Images & Clickable Links**:
   - Machine-readable JSON messages with exact fields `(id, type, lamport, ts, author, authorName, payload)`, deterministically ordered by `(lamport, ts, id)`.
   - Support for pasting (`Ctrl+V` / `Cmd+V`), dragging, or attaching compressed images (with lightbox preview) and auto-detected clickable links with link preview chips, plus Light & Dark Mode.
-  - Persists locally in browser `IndexedDB` (with `localStorage` fallback and Web Locks multi-tab profile isolation) and stays alive in the network as long as at least one peer remains.
+  - **Zero permanent client storage**: zero `IndexedDB` databases and zero `localStorage` writes (legacy client storage from older versions is automatically purged on load). History stays alive across active peers in memory as long as at least one peer remains, and disappears completely once everyone leaves.
 - **Anti-Entropy Backfill & Loop-Free Multi-Hop Gossip**:
   - Multi-part `sync-inv`, `sync-req`, and count/byte-bounded chunked `sync-batch` backfill deliver all missing historical and new records to joining or reconnecting peers.
   - Loop-free multi-hop gossip and transitive backfill propagation guarded by seen-ID deduplication, path tracking, and TTL bounds.
-- **Step-by-Step 1-to-1 Manual Wizard, Tab-Reopen Rejoining & Background Keepalive**:
+- **Step-by-Step 1-to-1 Manual Wizard & Background Keepalive**:
   - Offline / relay-free 3-step guided Connect flow: **Invite a Peer** (Step 1 Copy Invite Link → Step 2 Paste Peer's Reply → Step 3 Connected) or **Join with Invite** (Step 1 Paste Invite → Step 2 Copy Reply Link → Step 3 Connected), with automatic step progression on `#offer=` / `#answer=` URL fragments and cross-tab `#answer=` delivery via `BroadcastChannel`.
-  - Reopening a closed or reloaded tab restores the saved `peerId`, X25519 identity, mesh key, encrypted log, and active room — automatically rejoining peers without manual intervention.
   - An inline Blob Web Worker sends encrypted `Ping`/`Pong` keepalive frames every 4s (unthrottled in hidden tabs) paired with liveness-aware disconnect timers and foreground resume sync so background tabs stay connected.
-- **Real-Time Multi-Peer E2EE Voice Chat**:
-  - Everyone in the mesh who joins **Voice Chat** can talk and hear each other simultaneously in full duplex, with prominent visual speaker cards, reactive speaking rings, real-time 7-bar waveforms, per-peer mute/volume controls, deafen, and listen-only mode.
+- **Real-Time Multi-Peer E2EE Voice Channel**:
+  - Unified always-visible **Voice Channel** stage that shows active voice participants immediately with avatar cards, live status indicators, and animated audio waveforms — clicking **Join Voice** (or **Listen Only**) simply adds you directly to the participant list with real-time 9-bar reactive waveforms, speaking rings, per-peer mute/volume sliders, and deafen controls.
   - Captured via an inline Blob `AudioWorkletProcessor` (with `ScriptProcessorNode` fallback) into 16 kHz mono 20 ms (`320`-sample) PCM frames, encoded inside safe Rust WASM with a stateless **IMA ADPCM** wideband codec (`src/audio.rs`), and sealed per peer into binary `V1` ChaCha20-Poly1305 AEAD packets under domain-separated directional `X25519 + meshKey` voice keys with a 64-slot anti-replay window.
   - Sent over a dedicated unordered, zero-retransmit WebRTC DataChannel (`p2p-voice`, `{ ordered: false, maxRetransmits: 0 }`) with zero SDP renegotiation and mixed simultaneously across all active remote speakers via independent Web Audio `GainNode` playout jitter buffers.
 
@@ -54,7 +52,7 @@ Zero-build, zero-dependency, serverless, **completely end-to-end encrypted** bro
 | `src/main.rs` | Safe Rust WASM shared-memory bridge + zero-JSON binary fast-path voice opcodes (`#![forbid(unsafe_code)]`, zero `unsafe`) |
 | `p2p_mesh.wasm` | Compiled release WebAssembly binary for zero-build static hosting |
 | `mqtt_relay.js` | Zero-dependency MQTT 3.1.1 over WebSocket multi-broker client for opaque encrypted room rendezvous (supports custom `?relay=ws(s)://...` override) |
-| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport (`p2p-mesh` + `p2p-voice`), Web Audio multi-speaker voice mixer, encrypted IndexedDB persistence, Long-Lived Room Links, step-by-step Connect Wizard, Dark/Light mode, image/link chat, topology SVG, and UI |
+| `index.html`, `styles.css`, `wasm_client.js`, `storage.js`, `app.js` | Zero-dependency static browser WebRTC transport (`p2p-mesh` + `p2p-voice`), Web Audio multi-speaker voice channel, ephemeral in-memory session lifecycle, Long-Lived Room Links, step-by-step Connect Wizard, Dark/Light mode, image/link chat, topology SVG, and UI |
 
 ## Running Locally
 
@@ -64,7 +62,7 @@ Any static HTTP server works (zero build step):
 python3 -m http.server 8080
 ```
 
-Open `http://localhost:8080` in two or more tabs (each simultaneously open tab automatically acquires an isolated local profile slot via Web Locks; reloading a tab restores its encrypted log).
+Open `http://localhost:8080` in two or more tabs — each tab runs a fresh in-memory session with zero permanent client storage. Share a Long-Lived Room Link (`#room=...`) to connect automatically across devices or tabs; once all participants leave, all messages are cleared.
 
 ## Running Tests & Rebuilding WebAssembly
 
