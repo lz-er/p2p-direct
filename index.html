@@ -983,25 +983,14 @@
                 </div>
               </div>
               <div class="turn-config-box" style="margin-bottom: 10px">
-                <div style="display: flex; gap: 6px; margin-bottom: 6px">
-                  <input
-                    id="turn-endpoint-input"
-                    class="room-name-input"
-                    type="url"
-                    placeholder="TURN endpoint URL (auto: https://turn.dequ.org)"
-                    autocomplete="off"
-                    aria-label="TURN credential endpoint URL"
-                  />
-                  <button type="button" id="btn-turn-apply" class="btn btn-sm btn-primary">
-                    Apply
-                  </button>
-                  <button type="button" id="btn-turn-test" class="btn btn-sm">
-                    Test ICE
+                <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+                  <p class="step-hint" id="turn-test-status" style="margin: 0">
+                    Direct P2P (STUN) preferred — automatic E2EE Relay fallback on CGNAT / isolated WiFi (zero TURN).
+                  </p>
+                  <button type="button" id="btn-turn-test" class="btn btn-sm" style="flex-shrink: 0">
+                    Test Path
                   </button>
                 </div>
-                <p class="step-hint" id="turn-test-status" style="margin: 0">
-                  Direct P2P preferred; TURN relays opaque encrypted bytes across mobile CGNAT / strict WiFi.
-                </p>
               </div>
               <div id="telemetry-log" class="telemetry-log">
                 <div class="telemetry-entry">Initializing local engine…</div>

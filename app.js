@@ -1,5 +1,14 @@
 import { SafeRustWasmMesh } from "./wasm_client.js";
-import { MultiRelayRendezvous, resolveRelayUrls } from "./mqtt_relay.js";
+import {
+  MultiRelayRendezvous,
+  RELAY_DATA_CHUNK_SIZE,
+  computePeerTag,
+  decodeRelayDataChunk,
+  decodeRelayVoiceBundle,
+  encodeRelayDataChunks,
+  encodeRelayVoiceBundle,
+  resolveRelayUrls,
+} from "./mqtt_relay.js";
 import {
   DEFAULT_AUDIO_SETTINGS,
   createEphemeralProfile,
@@ -14,6 +23,7 @@ const BASE_STUN_SERVERS = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun2.l.google.com:19302" },
 ];
 
 const ICE_CONFIG = {
@@ -21,114 +31,16 @@ const ICE_CONFIG = {
   iceCandidatePoolSize: 2,
 };
 
-const SESSION_TURN_ENDPOINT_KEY = "p2p-direct-turn-endpoint";
-
-function resolveTurnEndpointUrl(explicitUrl = null) {
-  const clean = (raw) => {
-    if (!raw || typeof raw !== "string") return null;
-    const trimmed = raw.trim();
-    if (!trimmed) return null;
-    try {
-      const parsed = new URL(trimmed);
-      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
-        return parsed.toString();
-      }
-    } catch {
-      // ignore invalid URL
-    }
-    return null;
-  };
-
-  if (explicitUrl !== null) return clean(explicitUrl);
-  if (typeof window === "undefined") return null;
-
-  try {
-    const params = new URLSearchParams(window.location.search);
-    const fromQuery = clean(params.get("turn"));
-    if (fromQuery) return fromQuery;
-  } catch {
-    // ignore
-  }
-
-  try {
-    const fromSession = clean(sessionStorage.getItem(SESSION_TURN_ENDPOINT_KEY));
-    if (fromSession) return fromSession;
-  } catch {
-    // ignore
-  }
-
-  if (typeof window.__P2P_TURN_ENDPOINT__ === "string") {
-    const fromGlobal = clean(window.__P2P_TURN_ENDPOINT__);
-    if (fromGlobal) return fromGlobal;
-  }
-
-  // Automatically discover Cloudflare Realtime TURN worker when served from *.dequ.org
-  const host = (window.location.hostname || "").toLowerCase();
-  if (host === "dequ.org" || host.endsWith(".dequ.org")) {
-    return "https://turn.dequ.org/";
-  }
-
-  return null;
-}
-
-function normalizeIceServerList(data) {
-  const raw = Array.isArray(data)
-    ? data
-    : Array.isArray(data?.iceServers)
-      ? data.iceServers
-      : data?.iceServers
-        ? [data.iceServers]
-        : [];
-  return raw.filter((s) => s && (typeof s.urls === "string" || Array.isArray(s.urls)));
-}
-
-async function fetchTurnIceServers(endpointUrl, timeoutMs = 2000) {
-  if (!endpointUrl || typeof fetch !== "function") return [];
-  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
-  try {
-    const res = await fetch(endpointUrl, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: ctrl ? ctrl.signal : undefined,
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    return normalizeIceServerList(data);
-  } catch {
-    return [];
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-async function buildIceConfig(explicitTurnEndpoint = null) {
+function buildIceConfig() {
   if (typeof window !== "undefined" && Array.isArray(window.__P2P_ICE_SERVERS__)) {
     return {
       iceServers: window.__P2P_ICE_SERVERS__,
       iceCandidatePoolSize: 2,
-      turnEndpoint: null,
-      turnLoaded: false,
     };
   }
-  const servers = BASE_STUN_SERVERS.slice();
-  const endpoint = resolveTurnEndpointUrl(explicitTurnEndpoint);
-  let turnLoaded = false;
-  if (endpoint) {
-    const fetched = await fetchTurnIceServers(endpoint, 2000);
-    if (fetched.length > 0) {
-      servers.push(...fetched);
-      turnLoaded = fetched.some((s) => {
-        const list = Array.isArray(s.urls) ? s.urls : [s.urls];
-        return list.some((u) => typeof u === "string" && /^turns?:/i.test(u));
-      });
-    }
-  }
   return {
-    iceServers: servers,
+    iceServers: BASE_STUN_SERVERS.slice(),
     iceCandidatePoolSize: 2,
-    turnEndpoint: endpoint,
-    turnLoaded,
   };
 }
 
@@ -149,6 +61,16 @@ function classifyIceCandidateType(candStr) {
 const BROADCAST_CHANNEL_NAME = "p2p-direct-signal-v1";
 const KEEPALIVE_INTERVAL_MS = 4000;
 const DISCONNECT_GRACE_MS = 6000;
+
+// Direct-first WebRTC timeouts & zero-TURN E2EE WSS Relay fallback tuning
+const DIRECT_FALLBACK_TIMEOUT_MS = 5500;
+const ANSWER_FALLBACK_TIMEOUT_MS = 6500;
+const DIRECT_HARD_TIMEOUT_MS = 14000;
+const RELAY_INACTIVITY_TIMEOUT_MS = 22000;
+const DIRECT_UPGRADE_INTERVAL_MS = 45000;
+const DIRECT_UPGRADE_MAX_ATTEMPTS = 2;
+const VOICE_RELAY_BATCH_MS = 80;
+const VOICE_RELAY_MAX_FRAMES = 4;
 
 const VOICE_SAMPLE_RATE = 16000;
 const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16kHz wideband
@@ -612,6 +534,19 @@ class P2PDirectApp {
     this.lastHelloReplyPerPeer = new Map();
     this.pendingRoomCode = null;
 
+    // Zero-TURN E2EE Relay Fallback & automatic Direct P2P upgrade state
+    this.roomMyTag = null; // { topic, peerId, bytes, hex }
+    this.roomKnownPeers = new Map(); // peerId -> { name, pk, relays, tagBytes, tagHex, lastSeenMs }
+    this.roomTagToPeerId = new Map(); // tagHex -> peerId
+    this.relayPendingOpens = new Map(); // peerId -> { startedAt, retryTimer }
+    this.earlyRelayDataFrames = new Map(); // fromHex -> [{ frame, ts }]
+    this.relayChunkAssemblies = new Map(); // key -> { total, parts, received, ts }
+    this.seenRelayChunkKeys = new Map(); // key -> ts
+    this.seenVoiceBundleSeq = new Map(); // fromHex -> lastSeq
+    this.directUpgradeState = new Map(); // peerId -> { lastAttemptAt, attempts }
+    this.relayDataMsgSeq = 1;
+    this.relayVoiceBundleSeq = 1;
+
     // Background-resilient Web Worker keepalive
     this.keepaliveWorker = null;
     this.keepaliveFallbackTimer = null;
@@ -821,8 +756,6 @@ class P2PDirectApp {
       "stat-batches",
       "stat-voice",
       "telemetry-log",
-      "turn-endpoint-input",
-      "btn-turn-apply",
       "btn-turn-test",
       "turn-test-status",
       "chat-panel",
@@ -861,17 +794,6 @@ class P2PDirectApp {
     this.el["btn-advanced-toggle"].addEventListener("click", () => this.toggleAdvancedMode());
     if (this.el["btn-pwa-install"]) {
       this.el["btn-pwa-install"].addEventListener("click", () => this.promptPwaInstall());
-    }
-    if (this.el["btn-turn-apply"]) {
-      this.el["btn-turn-apply"].addEventListener("click", () => this.applyCustomTurnEndpoint());
-    }
-    if (this.el["turn-endpoint-input"]) {
-      this.el["turn-endpoint-input"].addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter") {
-          ev.preventDefault();
-          this.applyCustomTurnEndpoint();
-        }
-      });
     }
     if (this.el["btn-turn-test"]) {
       this.el["btn-turn-test"].addEventListener("click", () => this.runIceSelfTest());
@@ -1370,6 +1292,7 @@ class P2PDirectApp {
       }
       if (this.roomRendezvous) {
         try {
+          this.notifyRelayPeersClosing();
           this.roomRendezvous.stop();
         } catch {
           // ignore
@@ -1428,18 +1351,11 @@ class P2PDirectApp {
     this.el["profile-slot-label"].textContent = "in-memory session";
     this.profile = createEphemeralProfile();
 
-    const [wasm, iceCfg] = await Promise.all([
-      SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm"),
-      buildIceConfig(),
-    ]);
-    this.wasm = wasm;
-    this.iceConfig = iceCfg;
-    this.syncTurnStatusUi(iceCfg);
+    this.wasm = await SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm");
+    this.iceConfig = buildIceConfig();
     this.addTelemetry(
       "engine",
-      iceCfg.turnLoaded
-        ? `In-memory encrypted session ready (STUN + TURN active via ${iceCfg.turnEndpoint})`
-        : "In-memory encrypted session ready (STUN-only — deploy cloudflare/turn-worker.js at turn.dequ.org for CGNAT/mobile TURN)"
+      "In-memory encrypted session ready (Direct P2P STUN + automatic E2EE Relay fallback — zero TURN)"
     );
 
     const initRes = this.wasm.call({
@@ -1474,58 +1390,12 @@ class P2PDirectApp {
     window.__p2pDirect = this;
   }
 
-  syncTurnStatusUi(iceCfg) {
-    const input = this.el["turn-endpoint-input"];
-    const hint = this.el["turn-test-status"];
-    if (input && !input.value && iceCfg?.turnEndpoint) {
-      input.value = iceCfg.turnEndpoint;
-    }
-    if (!hint) return;
-    if (iceCfg?.turnLoaded) {
-      hint.textContent = `TURN relay active via ${iceCfg.turnEndpoint} — direct P2P preferred, TURN fallback ready.`;
-    } else if (iceCfg?.turnEndpoint) {
-      hint.textContent = `STUN-only (${iceCfg.turnEndpoint} unreachable). Deploy cloudflare/turn-worker.js for mobile/CGNAT TURN.`;
-    } else {
-      hint.textContent =
-        "STUN-only ICE. Paste a TURN credential endpoint (e.g. https://turn.dequ.org) for mobile CGNAT / strict WiFi.";
-    }
-  }
-
-  async applyCustomTurnEndpoint() {
-    const raw = (this.el["turn-endpoint-input"]?.value || "").trim();
-    try {
-      if (raw) {
-        sessionStorage.setItem(SESSION_TURN_ENDPOINT_KEY, raw);
-      } else {
-        sessionStorage.removeItem(SESSION_TURN_ENDPOINT_KEY);
-      }
-    } catch {
-      // ignore restricted sessionStorage
-    }
-    const iceCfg = await buildIceConfig(raw || null);
-    this.iceConfig = iceCfg;
-    this.syncTurnStatusUi(iceCfg);
-    if (iceCfg.turnLoaded) {
-      this.addTelemetry("room", `Loaded TURN credentials from ${iceCfg.turnEndpoint}`);
-      this.showToast("TURN relay loaded — reconnecting room peers…");
-      if (this.activeRoom && this.roomRendezvous) {
-        this.announceRoomHello(true);
-      }
-    } else if (raw) {
-      this.addTelemetry("error", `No TURN iceServers returned by ${raw}`);
-      this.showToast("TURN endpoint unreachable or returned no servers");
-    } else {
-      this.showToast("Cleared custom TURN endpoint (using default)");
-    }
-  }
-
   async runIceSelfTest() {
     const hint = this.el["turn-test-status"];
     const btn = this.el["btn-turn-test"];
     if (btn) btn.disabled = true;
-    if (hint) hint.textContent = "Testing STUN / TURN ICE gathering (2.5s)…";
+    if (hint) hint.textContent = "Testing Direct STUN ICE + E2EE Relay paths (2s)…";
     const found = new Set();
-    const errs = [];
     let pc = null;
     try {
       pc = this.createPeerConnection();
@@ -1545,19 +1415,13 @@ class P2PDirectApp {
           }
           found.add(classifyIceCandidateType(ev.candidate.candidate));
         };
-        pc.onicecandidateerror = (ev) => {
-          if (ev && ev.errorCode && ev.url) {
-            const msg = `${ev.errorCode} (${ev.url})`;
-            if (!errs.includes(msg)) errs.push(msg);
-          }
-        };
         pc.onicegatheringstatechange = () => {
           if (pc.iceGatheringState === "complete") finish();
         };
         pc.createOffer()
           .then((o) => pc.setLocalDescription(o))
           .catch(() => finish());
-        const timer = setTimeout(finish, 2600);
+        const timer = setTimeout(finish, 2000);
       });
     } finally {
       if (pc) {
@@ -1571,13 +1435,13 @@ class P2PDirectApp {
     }
 
     const list = Array.from(found);
-    const hasRelay = found.has("relay");
-    const summary = `ICE Test: [${list.join(", ") || "none"}] — ${
-      hasRelay ? "TURN relay working!" : "NO TURN relay candidate"
-    }${errs.length ? ` · errors: ${errs.slice(0, 2).join("; ")}` : ""}`;
+    const relayInfo = this.roomRendezvous
+      ? `${this.roomRelayStatus.connectedCount}/${this.roomRelayStatus.totalCount} WSS relays ready`
+      : "WSS relays connect when joining a room";
+    const summary = `Path Test: ICE [${list.join(", ") || "none"}] · ${relayInfo} · zero TURN needed`;
     if (hint) hint.textContent = summary;
-    this.addTelemetry(hasRelay ? "room" : "error", summary);
-    this.showToast(hasRelay ? "ICE test passed (TURN relay active)" : "ICE test: STUN only (no TURN relay)");
+    this.addTelemetry("room", summary);
+    this.showToast("Connection path check complete");
   }
 
   /* ================= PWA Installation & Static Shell Service Worker ================= */
@@ -2083,6 +1947,7 @@ class P2PDirectApp {
         } catch {
           // ignore
         }
+        this.checkRelayPeersHealth(now);
       }
 
       // Periodically advertise encrypted room presence so future joiners discover us even in background tabs
@@ -2100,6 +1965,7 @@ class P2PDirectApp {
           this.status = tickRes.status;
           this.executeActions(tickRes.actions);
           this.cleanupStaleLocalDialing(now);
+          this.tryBackgroundDirectUpgrades(now);
           this.renderStats();
         } catch {
           // ignore
@@ -2169,18 +2035,31 @@ class P2PDirectApp {
       }
     }
     for (const [pid, entry] of this.roomDialing.entries()) {
-      if (now - entry.startedAt > 18_000) {
-        try {
-          entry.pc.close();
-        } catch {
-          // ignore
-        }
-        this.roomDialing.delete(pid);
+      if (now - entry.startedAt > DIRECT_HARD_TIMEOUT_MS + 4000) {
+        this._cleanupRoomDialingEntry(pid, entry, null);
       }
     }
     for (const [sid, ts] of this.seenRoomSignalIds.entries()) {
       if (now - ts > 60_000) {
         this.seenRoomSignalIds.delete(sid);
+      }
+    }
+    for (const [key, asm] of this.relayChunkAssemblies.entries()) {
+      if (now - asm.ts > 30_000) {
+        this.relayChunkAssemblies.delete(key);
+      }
+    }
+    for (const [key, ts] of this.seenRelayChunkKeys.entries()) {
+      if (now - ts > 60_000) {
+        this.seenRelayChunkKeys.delete(key);
+      }
+    }
+    for (const [fromHex, list] of this.earlyRelayDataFrames.entries()) {
+      const kept = list.filter((item) => now - item.ts < 15_000);
+      if (kept.length === 0) {
+        this.earlyRelayDataFrames.delete(fromHex);
+      } else {
+        this.earlyRelayDataFrames.set(fromHex, kept);
       }
     }
   }
@@ -3087,10 +2966,12 @@ class P2PDirectApp {
 
   leaveLongLivedRoom() {
     this.stopPreCallMicMonitor();
+    this.notifyRelayPeersClosing();
     if (this.roomRendezvous) {
       this.roomRendezvous.stop();
       this.roomRendezvous = null;
     }
+    this._resetRoomRelayState();
     this.activeRoom = null;
     this.pendingRoomCode = null;
     this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0 };
@@ -3108,6 +2989,139 @@ class P2PDirectApp {
     this.showToast("Left room — local messages cleared");
   }
 
+  _resetRoomRelayState() {
+    for (const entry of this.roomDialing.values()) {
+      if (entry.trickleTimer) clearTimeout(entry.trickleTimer);
+      if (entry.fallbackTimer) clearTimeout(entry.fallbackTimer);
+      if (entry.hardTimer) clearTimeout(entry.hardTimer);
+      try {
+        entry.pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.roomDialing.clear();
+    this.earlyRoomIce.clear();
+    for (const pending of this.relayPendingOpens.values()) {
+      if (pending.retryTimer) clearTimeout(pending.retryTimer);
+    }
+    this.relayPendingOpens.clear();
+    this.roomMyTag = null;
+    this.roomKnownPeers.clear();
+    this.roomTagToPeerId.clear();
+    this.earlyRelayDataFrames.clear();
+    this.relayChunkAssemblies.clear();
+    this.seenRelayChunkKeys.clear();
+    this.seenVoiceBundleSeq.clear();
+    this.directUpgradeState.clear();
+  }
+
+  async _ensureRoomMyTag() {
+    if (!this.activeRoom || !this.status) return null;
+    const topic = this.activeRoom.topic;
+    const peerId = this.status.peerId;
+    if (this.roomMyTag && this.roomMyTag.topic === topic && this.roomMyTag.peerId === peerId) {
+      return this.roomMyTag;
+    }
+    const tag = await computePeerTag(topic, peerId);
+    this.roomMyTag = { topic, peerId, bytes: tag.bytes, hex: tag.hex };
+    return this.roomMyTag;
+  }
+
+  async _registerKnownRoomPeer(peerId, name, pk, relays = null) {
+    if (!this.activeRoom || !peerId || peerId === this.status?.peerId) return null;
+    let info = this.roomKnownPeers.get(peerId);
+    if (!info) {
+      const tag = await computePeerTag(this.activeRoom.topic, peerId);
+      info = {
+        peerId,
+        name: name || "Peer",
+        pk: pk || "",
+        relays: Array.isArray(relays) ? relays.slice() : [],
+        tagBytes: tag.bytes,
+        tagHex: tag.hex,
+        lastSeenMs: Date.now(),
+      };
+      this.roomKnownPeers.set(peerId, info);
+      this.roomTagToPeerId.set(tag.hex, peerId);
+    } else {
+      if (name) info.name = name;
+      if (pk) info.pk = pk;
+      if (Array.isArray(relays) && relays.length > 0) {
+        info.relays = relays.slice();
+      }
+      info.lastSeenMs = Date.now();
+    }
+    return info;
+  }
+
+  notifyRelayPeersClosing() {
+    if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
+    for (const [pid, peer] of this.directPeers.entries()) {
+      if (peer.transport === "relay") {
+        this.sendRoomSignal({
+          t: "relay-close",
+          from: this.status.peerId,
+          to: pid,
+        });
+      }
+    }
+  }
+
+  checkRelayPeersHealth(now) {
+    for (const [pid, peer] of Array.from(this.directPeers.entries())) {
+      if (peer.transport !== "relay" || peer.superseded) continue;
+      if (now - (peer.lastActivityMs || 0) > RELAY_INACTIVITY_TIMEOUT_MS) {
+        this.addTelemetry("room", `E2EE Relay peer ${peer.authorName} timed out — removing`);
+        try {
+          peer.dc.close(true);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  tryBackgroundDirectUpgrades(now, forceNow = false) {
+    if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
+    for (const [pid, peer] of this.directPeers.entries()) {
+      if (peer.transport !== "relay" || peer.superseded) continue;
+      if (this.localDialing.has(pid)) continue;
+      const existingDial = this.roomDialing.get(pid);
+      if (existingDial) {
+        if (forceNow && (!existingDial.isUpgradeProbe || now - existingDial.startedAt > 2500)) {
+          this._cleanupRoomDialingEntry(pid, existingDial, null);
+        } else {
+          continue;
+        }
+      }
+      // Only lower peerId initiates periodic direct-upgrade probes to avoid glare
+      // (forceNow e.g. on mic permission unmasking can initiate from either side)
+      if (!forceNow && this.status.peerId > pid) continue;
+
+      const state = this.directUpgradeState.get(pid) || {
+        connectedAt: 0,
+        lastAttemptAt: 0,
+        attempts: 0,
+      };
+      if (!forceNow) {
+        if (state.attempts >= DIRECT_UPGRADE_MAX_ATTEMPTS) continue;
+        const lastMarker = Math.max(state.connectedAt || 0, state.lastAttemptAt || 0);
+        if (now - lastMarker < DIRECT_UPGRADE_INTERVAL_MS) continue;
+      } else if (state.lastAttemptAt && now - state.lastAttemptAt < 2500) {
+        continue;
+      }
+
+      const known = this.roomKnownPeers.get(pid);
+      const pk = known?.pk || peer.peerPubKey;
+      if (!pk) continue;
+      state.lastAttemptAt = now;
+      if (!forceNow) state.attempts += 1;
+      this.directUpgradeState.set(pid, state);
+      this.startRoomOffer(pid, peer.authorName || known?.name || "Peer", pk, /* isUpgradeProbe = */ true);
+    }
+  }
+
   startRoomRendezvous(roomTopic, customRelay) {
     const urls = resolveRelayUrls(customRelay);
     if (
@@ -3115,19 +3129,25 @@ class P2PDirectApp {
       this.roomRendezvous.roomTopic === roomTopic &&
       JSON.stringify(this.roomRendezvous.urls) === JSON.stringify(urls)
     ) {
+      this._ensureRoomMyTag();
       this.announceRoomHello(true);
       return;
     }
     if (this.roomRendezvous) {
+      this.notifyRelayPeersClosing();
       this.roomRendezvous.stop();
       this.roomRendezvous = null;
     }
+    this._resetRoomRelayState();
 
     this.roomRendezvous = new MultiRelayRendezvous({
       roomTopic,
       urls,
       onMessage: (sealedPayload) => {
         this.handleSealedRoomSignal(sealedPayload);
+      },
+      onBinaryMessage: (bytes, brokerUrl) => {
+        this.handleIncomingRelayBinary(bytes, brokerUrl);
       },
       onBrokerReady: (client, status) => {
         this.roomRelayStatus = status;
@@ -3141,6 +3161,7 @@ class P2PDirectApp {
         } catch {
           // ignore invalid URL formatting
         }
+        this._ensureRoomMyTag();
         this.announceRoomHello(true);
       },
       onStatusChange: (status) => {
@@ -3148,6 +3169,7 @@ class P2PDirectApp {
         this.renderRoomCard();
       },
     });
+    this._ensureRoomMyTag();
     this.roomRendezvous.start();
   }
 
@@ -3168,12 +3190,14 @@ class P2PDirectApp {
 
   announceRoomHello(requestReply) {
     if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
+    const status = this.roomRendezvous.getStatus();
     this.sendRoomSignal({
       t: "hello",
       from: this.status.peerId,
       name: this.status.authorName,
       pk: this.status.e2ee.publicKey,
       peers: Array.from(this.directPeers.keys()),
+      relays: status.connectedUrls || [],
       reply: Boolean(requestReply),
       ts: Date.now(),
     });
@@ -3209,6 +3233,9 @@ class P2PDirectApp {
     switch (msg.t) {
       case "hello": {
         if (!msg.from || !msg.pk) return;
+        await this._ensureRoomMyTag();
+        await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
+
         const existing = this.directPeers.get(msg.from);
         const remoteConnectedToUs =
           Array.isArray(msg.peers) && msg.peers.includes(this.status.peerId);
@@ -3229,13 +3256,17 @@ class P2PDirectApp {
           !this.relayPeers.has(msg.from)
         ) {
           if (this.status.peerId < msg.from) {
-            this.startRoomOffer(msg.from, msg.name || "Peer", msg.pk);
+            this.startRoomOffer(msg.from, msg.name || "Peer", msg.pk, false);
           }
         }
         break;
       }
 
       case "offer": {
+        await this._ensureRoomMyTag();
+        if (msg.from && msg.pk) {
+          await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
+        }
         await this.acceptRoomOffer(msg);
         break;
       }
@@ -3259,12 +3290,403 @@ class P2PDirectApp {
         break;
       }
 
+      case "relay-open": {
+        if (!msg.from || !msg.pk) return;
+        await this._ensureRoomMyTag();
+        await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
+        const existing = this.directPeers.get(msg.from);
+        if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
+          return;
+        }
+        const status = this.roomRendezvous?.getStatus();
+        this.sendRoomSignal({
+          t: "relay-ack",
+          from: this.status.peerId,
+          to: msg.from,
+          name: this.status.authorName,
+          pk: this.status.e2ee.publicKey,
+          relays: status?.connectedUrls || [],
+        });
+        await this.openRelayVirtualPeer(msg.from, msg.name || "Peer", msg.pk);
+        break;
+      }
+
+      case "relay-ack": {
+        if (!msg.from || !msg.pk) return;
+        await this._ensureRoomMyTag();
+        await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
+        const pending = this.relayPendingOpens.get(msg.from);
+        if (pending) {
+          if (pending.retryTimer) clearTimeout(pending.retryTimer);
+          this.relayPendingOpens.delete(msg.from);
+        }
+        const existing = this.directPeers.get(msg.from);
+        if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
+          return;
+        }
+        await this.openRelayVirtualPeer(msg.from, msg.name || "Peer", msg.pk);
+        break;
+      }
+
+      case "relay-close": {
+        const existing = this.directPeers.get(msg.from);
+        if (existing && existing.transport === "relay") {
+          try {
+            existing.dc.close(true);
+          } catch {
+            // ignore
+          }
+        }
+        break;
+      }
+
       default:
         break;
     }
   }
 
-  _waitForInitialIce(pc, entry, maxWaitMs = 950) {
+  async requestRelayFallback(targetPeerId, targetName, targetPubKey, reasonLabel = "direct ICE blocked") {
+    if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
+    const existing = this.directPeers.get(targetPeerId);
+    if (existing && existing.dc && existing.dc.readyState === "open") {
+      return;
+    }
+    if (this.relayPendingOpens.has(targetPeerId)) {
+      return;
+    }
+
+    await this._ensureRoomMyTag();
+    const known = await this._registerKnownRoomPeer(targetPeerId, targetName, targetPubKey);
+    const name = targetName || known?.name || "Peer";
+    const pk = targetPubKey || known?.pk || "";
+    if (!pk) return;
+
+    this.addTelemetry(
+      "room",
+      `Direct P2P to ${name} did not connect (${reasonLabel}) — switching to E2EE Relay fallback`
+    );
+
+    const sendOpen = () => {
+      const cur = this.directPeers.get(targetPeerId);
+      if (cur && cur.dc && cur.dc.readyState === "open") {
+        const p = this.relayPendingOpens.get(targetPeerId);
+        if (p?.retryTimer) clearTimeout(p.retryTimer);
+        this.relayPendingOpens.delete(targetPeerId);
+        return;
+      }
+      const status = this.roomRendezvous?.getStatus();
+      this.sendRoomSignal({
+        t: "relay-open",
+        from: this.status.peerId,
+        to: targetPeerId,
+        name: this.status.authorName,
+        pk: this.status.e2ee.publicKey,
+        relays: status?.connectedUrls || [],
+      });
+    };
+
+    const pending = {
+      startedAt: Date.now(),
+      retryTimer: setTimeout(() => {
+        if (this.relayPendingOpens.get(targetPeerId) !== pending) return;
+        sendOpen();
+        pending.retryTimer = setTimeout(() => {
+          if (this.relayPendingOpens.get(targetPeerId) === pending) {
+            this.relayPendingOpens.delete(targetPeerId);
+          }
+        }, 3500);
+      }, 2000),
+    };
+    this.relayPendingOpens.set(targetPeerId, pending);
+    sendOpen();
+  }
+
+  async openRelayVirtualPeer(peerId, peerName, peerPubKey) {
+    if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
+    const existing = this.directPeers.get(peerId);
+    if (existing && existing.dc && existing.dc.readyState === "open") {
+      // Never downgrade an already-open direct WebRTC channel, and avoid duplicate relay opens
+      return;
+    }
+
+    const myTag = await this._ensureRoomMyTag();
+    const peerInfo = await this._registerKnownRoomPeer(peerId, peerName, peerPubKey);
+    if (!myTag || !peerInfo) return;
+
+    const app = this;
+
+    const virtualPc = {
+      connectionState: "connected",
+      iceConnectionState: "connected",
+      onconnectionstatechange: null,
+      oniceconnectionstatechange: null,
+      close() {
+        this.connectionState = "closed";
+        this.iceConnectionState = "closed";
+      },
+    };
+
+    const virtualDc = {
+      label: "p2p-mesh",
+      transport: "relay",
+      readyState: "open",
+      bufferedAmount: 0,
+      onmessage: null,
+      onopen: null,
+      onclose: null,
+      onerror: null,
+      send(frameStr) {
+        if (this.readyState !== "open" || !app.roomRendezvous || !app.activeRoom) return;
+        const msgId = (app.relayDataMsgSeq = (app.relayDataMsgSeq + 1) >>> 0) || 1;
+        const chunks = encodeRelayDataChunks(
+          myTag.bytes,
+          peerInfo.tagBytes,
+          msgId,
+          String(frameStr),
+          RELAY_DATA_CHUNK_SIZE
+        );
+        const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
+        for (const chunkPkt of chunks) {
+          app.roomRendezvous.publishBinary(chunkPkt, {
+            preferredUrls,
+            maxBrokers: 2,
+            queueIfOffline: true,
+          });
+        }
+      },
+      close(silentRemote = false) {
+        if (this.readyState === "closed") return;
+        this.readyState = "closed";
+        const entry = app.directPeers.get(peerId);
+        const superseded = Boolean(entry && entry.dc === this && entry.superseded);
+        if (!silentRemote && !superseded && app.activeRoom && app.roomRendezvous && app.status) {
+          app.sendRoomSignal({
+            t: "relay-close",
+            from: app.status.peerId,
+            to: peerId,
+          });
+        }
+        if (typeof this.onclose === "function") {
+          const cb = this.onclose;
+          this.onclose = null;
+          cb();
+        }
+      },
+    };
+
+    const voiceQueue = [];
+    let voiceFlushTimer = null;
+    const flushVoiceQueue = () => {
+      if (voiceFlushTimer) {
+        clearTimeout(voiceFlushTimer);
+        voiceFlushTimer = null;
+      }
+      if (voiceQueue.length === 0 || !app.roomRendezvous || !app.activeRoom) {
+        voiceQueue.length = 0;
+        return;
+      }
+      const batch = voiceQueue.splice(0, VOICE_RELAY_MAX_FRAMES);
+      const seq = (app.relayVoiceBundleSeq = (app.relayVoiceBundleSeq + 1) >>> 0) || 1;
+      const bundle = encodeRelayVoiceBundle(myTag.bytes, peerInfo.tagBytes, seq, batch);
+      const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
+      app.roomRendezvous.publishBinary(bundle, {
+        preferredUrls,
+        maxBrokers: 1,
+        queueIfOffline: false,
+      });
+      if (voiceQueue.length > 0) {
+        voiceFlushTimer = setTimeout(flushVoiceQueue, VOICE_RELAY_BATCH_MS);
+      }
+    };
+
+    const virtualVoiceDc = {
+      label: "p2p-voice",
+      transport: "relay",
+      binaryType: "arraybuffer",
+      readyState: "open",
+      bufferedAmount: 0,
+      onmessage: null,
+      onopen: null,
+      onclose: null,
+      onerror: null,
+      send(packetBytes) {
+        if (this.readyState !== "open" || !packetBytes) return;
+        const copy =
+          packetBytes instanceof Uint8Array
+            ? packetBytes.slice()
+            : new Uint8Array(packetBytes).slice();
+        voiceQueue.push(copy);
+        if (voiceQueue.length >= VOICE_RELAY_MAX_FRAMES) {
+          flushVoiceQueue();
+        } else if (!voiceFlushTimer) {
+          voiceFlushTimer = setTimeout(flushVoiceQueue, VOICE_RELAY_BATCH_MS);
+        }
+      },
+      close() {
+        if (this.readyState === "closed") return;
+        this.readyState = "closed";
+        voiceQueue.length = 0;
+        if (voiceFlushTimer) {
+          clearTimeout(voiceFlushTimer);
+          voiceFlushTimer = null;
+        }
+        if (typeof this.onclose === "function") {
+          const cb = this.onclose;
+          this.onclose = null;
+          cb();
+        }
+      },
+    };
+
+    this.attachVoiceDataChannel(peerId, virtualVoiceDc);
+    this.attachDataChannel(
+      virtualPc,
+      virtualDc,
+      peerId,
+      peerInfo.name || peerName || "Peer",
+      peerInfo.pk || peerPubKey,
+      false,
+      null,
+      false
+    );
+
+    const earlyFrames = this.earlyRelayDataFrames.get(peerInfo.tagHex);
+    if (earlyFrames && earlyFrames.length > 0) {
+      this.earlyRelayDataFrames.delete(peerInfo.tagHex);
+      for (const item of earlyFrames) {
+        if (virtualDc.readyState === "open" && typeof virtualDc.onmessage === "function") {
+          virtualDc.onmessage({ data: item.frame });
+        }
+      }
+    }
+
+    this.directUpgradeState.set(peerId, { connectedAt: Date.now(), lastAttemptAt: 0, attempts: 0 });
+    this.addTelemetry(
+      "room",
+      `Connected to ${peerInfo.name} via E2EE Relay fallback (zero TURN; will auto-upgrade if Direct P2P opens)`
+    );
+  }
+
+  handleIncomingRelayBinary(bytes, brokerUrl) {
+    if (!this.activeRoom || !this.roomMyTag || !bytes || bytes.length < 2) return;
+    const myHex = this.roomMyTag.hex;
+
+    if (bytes[0] === 0x44 && bytes[1] === 0x46) {
+      // "DF" E2EE Data Frame / Chunk
+      const decoded = decodeRelayDataChunk(bytes);
+      if (!decoded || decoded.toHex !== myHex || decoded.fromHex === myHex) return;
+
+      const dedupeKey = `${decoded.fromHex}:${decoded.msgId}:${decoded.idx}`;
+      if (this.seenRelayChunkKeys.has(dedupeKey)) return;
+      this.seenRelayChunkKeys.set(dedupeKey, Date.now());
+
+      const senderPeerId = this.roomTagToPeerId.get(decoded.fromHex);
+      if (senderPeerId && brokerUrl) {
+        const known = this.roomKnownPeers.get(senderPeerId);
+        if (known && !known.relays.includes(brokerUrl)) {
+          known.relays.unshift(brokerUrl);
+        }
+      }
+
+      let fullFrameStr = null;
+      if (decoded.total === 1) {
+        fullFrameStr = new TextDecoder().decode(decoded.chunkBytes);
+      } else {
+        const asmKey = `${decoded.fromHex}:${decoded.msgId}`;
+        let asm = this.relayChunkAssemblies.get(asmKey);
+        if (!asm) {
+          asm = {
+            total: decoded.total,
+            parts: new Array(decoded.total),
+            received: 0,
+            ts: Date.now(),
+          };
+          this.relayChunkAssemblies.set(asmKey, asm);
+        }
+        if (!asm.parts[decoded.idx]) {
+          asm.parts[decoded.idx] = decoded.chunkBytes.slice();
+          asm.received += 1;
+          asm.ts = Date.now();
+        }
+        if (asm.received === asm.total) {
+          this.relayChunkAssemblies.delete(asmKey);
+          let totalBytes = 0;
+          for (const part of asm.parts) {
+            totalBytes += part.length;
+          }
+          const merged = new Uint8Array(totalBytes);
+          let offset = 0;
+          for (const part of asm.parts) {
+            merged.set(part, offset);
+            offset += part.length;
+          }
+          fullFrameStr = new TextDecoder().decode(merged);
+        }
+      }
+
+      if (fullFrameStr === null) return;
+
+      if (!senderPeerId) {
+        const early = this.earlyRelayDataFrames.get(decoded.fromHex) || [];
+        if (early.length < 12) {
+          early.push({ frame: fullFrameStr, ts: Date.now() });
+          this.earlyRelayDataFrames.set(decoded.fromHex, early);
+        }
+        return;
+      }
+
+      const peerEntry = this.directPeers.get(senderPeerId);
+      if (!peerEntry) {
+        const early = this.earlyRelayDataFrames.get(decoded.fromHex) || [];
+        if (early.length < 12) {
+          early.push({ frame: fullFrameStr, ts: Date.now() });
+          this.earlyRelayDataFrames.set(decoded.fromHex, early);
+        }
+        return;
+      }
+
+      // Accept even during the brief relay->direct handoff window so zero frames drop
+      if (peerEntry.transport === "relay" && typeof peerEntry.dc?.onmessage === "function") {
+        peerEntry.dc.onmessage({ data: fullFrameStr });
+      } else {
+        peerEntry.lastActivityMs = Date.now();
+        try {
+          const res = this.wasm.call({
+            cmd: "wire_message",
+            fromPeer: senderPeerId,
+            frame: fullFrameStr,
+            nowMs: Date.now(),
+          });
+          this.status = res.status;
+          this.executeActions(res.actions);
+          this.renderAll();
+        } catch {
+          // ignore late duplicate wire frame during direct handoff
+        }
+      }
+      return;
+    }
+
+    if (bytes[0] === 0x56 && bytes[1] === 0x42) {
+      // "VB" E2EE Voice Bundle
+      const bundle = decodeRelayVoiceBundle(bytes);
+      if (!bundle || bundle.toHex !== myHex || bundle.fromHex === myHex) return;
+      const lastSeq = this.seenVoiceBundleSeq.get(bundle.fromHex);
+      if (lastSeq === bundle.seq) return;
+      this.seenVoiceBundleSeq.set(bundle.fromHex, bundle.seq);
+
+      const senderPeerId = this.roomTagToPeerId.get(bundle.fromHex);
+      if (!senderPeerId) return;
+      const peerEntry = this.directPeers.get(senderPeerId);
+      if (!peerEntry) return;
+
+      for (const frameBytes of bundle.frames) {
+        this.handleIncomingVoicePacket(senderPeerId, frameBytes);
+      }
+    }
+  }
+
+  _waitForInitialIce(pc, entry, maxWaitMs = 900) {
     if (pc.iceGatheringState === "complete") {
       return Promise.resolve();
     }
@@ -3286,11 +3708,13 @@ class P2PDirectApp {
         }
       };
       entry.onInitialCandidate = () => {
-        // Once we have a relay candidate (or srflx + short grace), ship SDP without waiting full timeout
-        if (entry.gatheredTypes.has("relay") && entry.gatheredTypes.has("srflx")) {
-          if (!graceTimer) graceTimer = setTimeout(finish, 100);
-        } else if (entry.gatheredTypes.has("relay")) {
-          if (!graceTimer) graceTimer = setTimeout(finish, 180);
+        // Ship SDP promptly once we have srflx or direct IPv4/IPv6 host candidates
+        if (
+          entry.gatheredTypes.has("srflx") ||
+          entry.gatheredTypes.has("host(ipv4)") ||
+          entry.gatheredTypes.has("host(ipv6)")
+        ) {
+          if (!graceTimer) graceTimer = setTimeout(finish, 220);
         }
       };
       pc.addEventListener("icegatheringstatechange", onState);
@@ -3333,6 +3757,14 @@ class P2PDirectApp {
       clearTimeout(entry.trickleTimer);
       entry.trickleTimer = null;
     }
+    if (entry.fallbackTimer) {
+      clearTimeout(entry.fallbackTimer);
+      entry.fallbackTimer = null;
+    }
+    if (entry.hardTimer) {
+      clearTimeout(entry.hardTimer);
+      entry.hardTimer = null;
+    }
     if (this.roomDialing.get(peerId) === entry) {
       this.roomDialing.delete(peerId);
     }
@@ -3341,13 +3773,13 @@ class P2PDirectApp {
     } catch {
       // ignore
     }
-    if (reason) {
+    if (reason && !entry.isUpgradeProbe) {
       const types = Array.from(entry.gatheredTypes || []).join(",") || "none";
-      this.addTelemetry("error", `Room WebRTC ${reason} for ${peerId} (ICE gathered: ${types})`);
+      this.addTelemetry("room", `Direct WebRTC ${reason} for ${peerId} (ICE: ${types})`);
     }
   }
 
-  async startRoomOffer(targetPeerId, targetName, targetPubKey) {
+  async startRoomOffer(targetPeerId, targetName, targetPubKey, isUpgradeProbe = false) {
     if (this.roomDialing.has(targetPeerId) || this.localDialing.has(targetPeerId)) return;
     let entry = null;
     try {
@@ -3361,11 +3793,16 @@ class P2PDirectApp {
         pc,
         dc,
         voiceDc,
+        targetName,
+        targetPubKey,
+        isUpgradeProbe: Boolean(isUpgradeProbe),
         remoteDescSet: false,
         sdpSent: false,
         gatheredTypes: new Set(),
         trickleBuffer: [],
         trickleTimer: null,
+        fallbackTimer: null,
+        hardTimer: null,
         flushTrickle: null,
         onInitialCandidate: null,
         pendingIce: early,
@@ -3393,11 +3830,11 @@ class P2PDirectApp {
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      // Gather initial host + srflx + relay candidates into SDP so one MQTT publish carries them reliably
-      await this._waitForInitialIce(pc, entry, 950);
+      await this._waitForInitialIce(pc, entry, 900);
 
       if (this.roomDialing.get(targetPeerId) !== entry) return;
       const fullSdp = pc.localDescription?.sdp || offer.sdp;
+      const status = this.roomRendezvous?.getStatus();
 
       this.sendRoomSignal({
         t: "offer",
@@ -3405,18 +3842,37 @@ class P2PDirectApp {
         to: targetPeerId,
         name: this.status.authorName,
         pk: this.status.e2ee.publicKey,
+        relays: status?.connectedUrls || [],
         sdp: fullSdp,
       });
 
       entry.sdpSent = true;
       const gatheredList = Array.from(entry.gatheredTypes).join(",") || "none";
-      this.addTelemetry(
-        "room",
-        `Dialing ${targetName} (${targetPeerId}) — bundled ICE [${gatheredList}]`
-      );
+      if (!entry.isUpgradeProbe) {
+        this.addTelemetry(
+          "room",
+          `Dialing ${targetName} (${targetPeerId}) — direct ICE [${gatheredList}]`
+        );
+        // If direct P2P doesn't open quickly (e.g. mobile CGNAT / isolated WiFi),
+        // activate zero-TURN E2EE Relay fallback while keeping direct ICE checking in background
+        entry.fallbackTimer = setTimeout(() => {
+          if (this.roomDialing.get(targetPeerId) !== entry) return;
+          const cur = this.directPeers.get(targetPeerId);
+          if (cur && cur.transport === "direct" && cur.dc?.readyState === "open") return;
+          this.requestRelayFallback(targetPeerId, targetName, targetPubKey, "direct ICE timeout");
+        }, DIRECT_FALLBACK_TIMEOUT_MS);
+      }
+
+      entry.hardTimer = setTimeout(() => {
+        if (this.roomDialing.get(targetPeerId) !== entry) return;
+        this._cleanupRoomDialingEntry(targetPeerId, entry, null);
+      }, DIRECT_HARD_TIMEOUT_MS);
     } catch (err) {
       if (entry) {
         this._cleanupRoomDialingEntry(targetPeerId, entry, err?.message || "offer failed");
+        if (!entry.isUpgradeProbe) {
+          this.requestRelayFallback(targetPeerId, targetName, targetPubKey, "offer error");
+        }
       } else {
         this.roomDialing.delete(targetPeerId);
       }
@@ -3429,6 +3885,9 @@ class P2PDirectApp {
     if (prev) {
       this._cleanupRoomDialingEntry(msg.from, prev, null);
     }
+    const existingRelay =
+      this.directPeers.get(msg.from)?.transport === "relay" &&
+      this.directPeers.get(msg.from)?.dc?.readyState === "open";
     let entry = null;
     try {
       const pc = this.createPeerConnection();
@@ -3438,11 +3897,16 @@ class P2PDirectApp {
       entry = {
         pc,
         dc: null,
+        targetName: msg.name || "Peer",
+        targetPubKey: msg.pk,
+        isUpgradeProbe: Boolean(existingRelay),
         remoteDescSet: false,
         sdpSent: false,
         gatheredTypes: new Set(),
         trickleBuffer: [],
         trickleTimer: null,
+        fallbackTimer: null,
+        hardTimer: null,
         flushTrickle: null,
         onInitialCandidate: null,
         pendingIce: early,
@@ -3457,6 +3921,9 @@ class P2PDirectApp {
         const cs = pc.connectionState;
         if (ics === "failed" || cs === "failed" || cs === "closed") {
           this._cleanupRoomDialingEntry(msg.from, entry, `answer ICE ${ics}/${cs}`);
+          if (!entry.isUpgradeProbe) {
+            this.requestRelayFallback(msg.from, msg.name || "Peer", msg.pk, `answer ICE ${ics}`);
+          }
         }
       };
       pc.oniceconnectionstatechange = monitorAnswerIce;
@@ -3502,10 +3969,11 @@ class P2PDirectApp {
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await this._waitForInitialIce(pc, entry, 950);
+      await this._waitForInitialIce(pc, entry, 900);
 
       if (this.roomDialing.get(msg.from) !== entry) return;
       const fullSdp = pc.localDescription?.sdp || answer.sdp;
+      const status = this.roomRendezvous?.getStatus();
 
       this.sendRoomSignal({
         t: "answer",
@@ -3513,18 +3981,35 @@ class P2PDirectApp {
         to: msg.from,
         name: this.status.authorName,
         pk: this.status.e2ee.publicKey,
+        relays: status?.connectedUrls || [],
         sdp: fullSdp,
       });
 
       entry.sdpSent = true;
       const gatheredList = Array.from(entry.gatheredTypes).join(",") || "none";
-      this.addTelemetry(
-        "room",
-        `Answered ${msg.name || msg.from} — bundled ICE [${gatheredList}]`
-      );
+      if (!entry.isUpgradeProbe) {
+        this.addTelemetry(
+          "room",
+          `Answered ${msg.name || msg.from} — direct ICE [${gatheredList}]`
+        );
+        entry.fallbackTimer = setTimeout(() => {
+          if (this.roomDialing.get(msg.from) !== entry) return;
+          const cur = this.directPeers.get(msg.from);
+          if (cur && cur.dc?.readyState === "open") return;
+          this.requestRelayFallback(msg.from, msg.name || "Peer", msg.pk, "answer ICE timeout");
+        }, ANSWER_FALLBACK_TIMEOUT_MS);
+      }
+
+      entry.hardTimer = setTimeout(() => {
+        if (this.roomDialing.get(msg.from) !== entry) return;
+        this._cleanupRoomDialingEntry(msg.from, entry, null);
+      }, DIRECT_HARD_TIMEOUT_MS);
     } catch (err) {
       if (entry) {
         this._cleanupRoomDialingEntry(msg.from, entry, err?.message || "answer failed");
+        if (!entry.isUpgradeProbe) {
+          this.requestRelayFallback(msg.from, msg.name || "Peer", msg.pk, "answer error");
+        }
       } else {
         this.roomDialing.delete(msg.from);
       }
@@ -3534,6 +4019,9 @@ class P2PDirectApp {
   async applyRoomAnswer(msg) {
     const entry = this.roomDialing.get(msg.from);
     if (!entry || !msg.sdp) return;
+    if (msg.from && msg.relays) {
+      await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
+    }
     try {
       if (entry.pc.signalingState === "have-local-offer") {
         await entry.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
@@ -3550,7 +4038,7 @@ class P2PDirectApp {
     const entry = this.roomDialing.get(fromPeerId);
     if (!entry) {
       const direct = this.directPeers.get(fromPeerId);
-      if (direct && direct.pc) {
+      if (direct && direct.pc && typeof direct.pc.addIceCandidate === "function") {
         try {
           await direct.pc.addIceCandidate(candidate);
         } catch {
@@ -4489,7 +4977,26 @@ class P2PDirectApp {
     if (!voiceDc) return;
     voiceDc.binaryType = "arraybuffer";
     const prev = this.voiceChannels.get(peerId);
+    // During a background Direct P2P upgrade probe, keep the active open voice channel alive
+    // until the new WebRTC voice channel actually opens so voice never drops mid-call.
+    if (prev && prev !== voiceDc && prev.readyState === "open" && voiceDc.readyState !== "open") {
+      voiceDc.onopen = () => {
+        if (voiceDc.readyState === "open") {
+          this.attachVoiceDataChannel(peerId, voiceDc);
+        }
+      };
+      return;
+    }
     if (prev && prev !== voiceDc) {
+      // Never downgrade an open direct WebRTC voice channel to a virtual relay voice channel
+      if (voiceDc.transport === "relay" && prev.transport !== "relay" && prev.readyState === "open") {
+        try {
+          voiceDc.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
       try {
         prev.onmessage = null;
         prev.onclose = null;
@@ -4603,13 +5110,12 @@ class P2PDirectApp {
         await this.startMicCaptureGraph(ctx, micStream);
         this.refreshAudioInputDevices();
         // Granting mic permission unmasks real LAN host(ipv4) ICE candidates on same-WiFi networks
-        if (
-          this.activeRoom &&
-          this.roomRendezvous &&
-          this.directPeers.size === 0 &&
-          this.roomDialing.size === 0
-        ) {
-          this.announceRoomHello(true);
+        if (this.activeRoom && this.roomRendezvous) {
+          if (this.directPeers.size === 0 && this.roomDialing.size === 0) {
+            this.announceRoomHello(true);
+          } else {
+            this.tryBackgroundDirectUpgrades(Date.now(), true);
+          }
         }
       }
 
@@ -4838,8 +5344,10 @@ class P2PDirectApp {
       src.connect(mixer.gainNode);
 
       const now = ctx.currentTime;
-      const targetBufferSec = 0.045;
-      if (mixer.nextPlayTime < now + 0.005 || mixer.nextPlayTime > now + 0.25) {
+      const isRelayed = direct?.transport === "relay";
+      const targetBufferSec = isRelayed ? 0.11 : 0.045;
+      const maxDriftSec = isRelayed ? 0.38 : 0.25;
+      if (mixer.nextPlayTime < now + 0.005 || mixer.nextPlayTime > now + maxDriftSec) {
         mixer.nextPlayTime = now + targetBufferSec;
       }
       src.start(mixer.nextPlayTime);
@@ -5102,13 +5610,19 @@ class P2PDirectApp {
       }
     };
 
+    const transport = dc && dc.transport === "relay" ? "relay" : "direct";
+    const curVoice = this.voiceChannels.get(peerId);
+    const matchedVoice =
+      curVoice && (curVoice.transport === "relay") === (transport === "relay") ? curVoice : null;
+
     const peerEntry = {
       peerId,
       authorName: authorName || "Peer",
       peerPubKey,
       pc,
       dc,
-      voiceDc: this.voiceChannels.get(peerId) || null,
+      transport,
+      voiceDc: matchedVoice,
       viaAutoMesh,
       introducedBy,
       lastActivityMs: Date.now(),
@@ -5118,8 +5632,26 @@ class P2PDirectApp {
     const handleOpen = () => {
       if (closed || peerEntry.superseded) return;
       const existing = this.directPeers.get(peerId);
+      let upgradingFromRelay = false;
+
       if (existing && existing.dc !== dc) {
-        if (!replaceExisting && existing.dc && existing.dc.readyState === "open") {
+        // Never downgrade an already-open Direct WebRTC peer to a virtual E2EE relay channel
+        if (transport === "relay" && existing.transport === "direct" && existing.dc?.readyState === "open") {
+          try {
+            dc.close(true);
+            pc.close();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        upgradingFromRelay =
+          existing.transport === "relay" &&
+          transport === "direct" &&
+          existing.dc &&
+          existing.dc.readyState === "open";
+
+        if (!replaceExisting && !upgradingFromRelay && existing.dc && existing.dc.readyState === "open") {
           const recentlyActive = Date.now() - (existing.lastActivityMs || 0) < 12_000;
           if (recentlyActive) {
             try {
@@ -5137,7 +5669,11 @@ class P2PDirectApp {
           existing.dc.onerror = null;
           existing.pc.onconnectionstatechange = null;
           existing.pc.oniceconnectionstatechange = null;
-          existing.dc.close();
+          if (existing.transport === "relay") {
+            existing.dc.close(true);
+          } else {
+            existing.dc.close();
+          }
           existing.pc.close();
         } catch {
           // ignore
@@ -5145,18 +5681,37 @@ class P2PDirectApp {
       }
 
       peerEntry.lastActivityMs = Date.now();
-      peerEntry.voiceDc = this.voiceChannels.get(peerId) || peerEntry.voiceDc;
-      this.relayPeers.delete(peerId);
-      this.earlyRelayIce.delete(peerId);
-      this.localDialing.delete(peerId);
-      this.earlyLocalIce.delete(peerId);
-      const dialingEntry = this.roomDialing.get(peerId);
-      if (dialingEntry && dialingEntry.trickleTimer) {
-        clearTimeout(dialingEntry.trickleTimer);
-        dialingEntry.trickleTimer = null;
+      const latestVoice = this.voiceChannels.get(peerId);
+      if (latestVoice && (latestVoice.transport === "relay") === (transport === "relay")) {
+        peerEntry.voiceDc = latestVoice;
       }
-      this.roomDialing.delete(peerId);
-      this.earlyRoomIce.delete(peerId);
+
+      const pendingOpen = this.relayPendingOpens.get(peerId);
+      if (pendingOpen) {
+        if (pendingOpen.retryTimer) clearTimeout(pendingOpen.retryTimer);
+        this.relayPendingOpens.delete(peerId);
+      }
+
+      if (transport === "direct") {
+        this.relayPeers.delete(peerId);
+        this.earlyRelayIce.delete(peerId);
+        this.localDialing.delete(peerId);
+        this.earlyLocalIce.delete(peerId);
+        const dialingEntry = this.roomDialing.get(peerId);
+        if (dialingEntry) {
+          if (dialingEntry.trickleTimer) clearTimeout(dialingEntry.trickleTimer);
+          if (dialingEntry.fallbackTimer) clearTimeout(dialingEntry.fallbackTimer);
+          if (dialingEntry.hardTimer) clearTimeout(dialingEntry.hardTimer);
+          if (dialingEntry.voiceDc && dialingEntry.voiceDc.readyState === "open") {
+            this.attachVoiceDataChannel(peerId, dialingEntry.voiceDc);
+            peerEntry.voiceDc = dialingEntry.voiceDc;
+          }
+          this.roomDialing.delete(peerId);
+        }
+        this.earlyRoomIce.delete(peerId);
+        this.directUpgradeState.delete(peerId);
+      }
+
       this.pendingAnswers.delete(peerId);
       if (this.latestAnswer && this.latestAnswer.peerId === peerId) {
         this.latestAnswer = null;
@@ -5180,14 +5735,26 @@ class P2PDirectApp {
                 const lt = local?.candidateType || "?";
                 const rt = remote?.candidateType || "?";
                 const proto = local?.protocol || "";
+                const prefix = upgradingFromRelay
+                  ? `Upgraded ${peerEntry.authorName} from E2EE Relay → Direct P2P`
+                  : `WebRTC path to ${peerEntry.authorName}`;
                 this.addTelemetry(
                   "room",
-                  `WebRTC path to ${peerEntry.authorName}: ${lt} ↔ ${rt}${proto ? ` (${proto})` : ""}`
+                  `${prefix}: ${lt} ↔ ${rt}${proto ? ` (${proto})` : ""}`
                 );
               }
             }
           })
           .catch(() => {});
+      }
+
+      if (upgradingFromRelay) {
+        // Keep existing WASM X25519 + ChaCha20-Poly1305 session and monotonic counters alive
+        // for a zero-drop seamless upgrade from E2EE Relay to Direct WebRTC P2P.
+        this.renderPeers();
+        this.renderStats();
+        this.showToast(`Upgraded ${peerEntry.authorName} to Direct P2P`);
+        return;
       }
 
       const res = this.wasm.call({
@@ -5210,9 +5777,11 @@ class P2PDirectApp {
       }
       this.renderAll();
       this.showToast(
-        viaAutoMesh
-          ? `Connected directly with ${peerEntry.authorName}`
-          : `Connected to ${peerEntry.authorName}`
+        transport === "relay"
+          ? `Connected to ${peerEntry.authorName} (E2EE Relay)`
+          : viaAutoMesh
+            ? `Connected directly with ${peerEntry.authorName}`
+            : `Connected to ${peerEntry.authorName}`
       );
     };
 
@@ -5220,9 +5789,16 @@ class P2PDirectApp {
       if (closed) return;
       closed = true;
       clearDisconnectTimer();
+      const current = this.directPeers.get(peerId);
+      const isOwningPeer = Boolean(current && current.dc === dc);
       try {
         dc.close();
-        if (peerEntry.voiceDc) peerEntry.voiceDc.close();
+        if (
+          peerEntry.voiceDc &&
+          (isOwningPeer || (peerEntry.voiceDc.transport === "relay") === (transport === "relay"))
+        ) {
+          peerEntry.voiceDc.close();
+        }
         pc.close();
       } catch {
         // ignore
@@ -5230,8 +5806,7 @@ class P2PDirectApp {
       if (peerEntry.superseded) {
         return;
       }
-      const current = this.directPeers.get(peerId);
-      if (current && current.dc === dc) {
+      if (isOwningPeer) {
         this.directPeers.delete(peerId);
         if (this.voiceChannels.get(peerId) === peerEntry.voiceDc) {
           this.voiceChannels.delete(peerId);
@@ -5260,7 +5835,10 @@ class P2PDirectApp {
       }
       const rm = this.roomDialing.get(peerId);
       if (rm && rm.pc === pc) {
-        this.roomDialing.delete(peerId);
+        this._cleanupRoomDialingEntry(peerId, rm, "offer ICE failed");
+        if (!rm.isUpgradeProbe && !this.directPeers.has(peerId)) {
+          this.requestRelayFallback(peerId, authorName, peerPubKey, "offer ICE failed");
+        }
       }
     };
 
@@ -6093,9 +6671,13 @@ class P2PDirectApp {
     for (const p of direct) {
       const peerTheme = peerTileTheme(p.peerId, false);
       const botBadge = p.isBot ? '<span class="bot-tag">BOT</span>' : "";
-      const originBadge = p.viaAutoMesh
-        ? `<span class="badge auto" title="Auto-connected via ${escapeHtml(p.introducedBy || "peer")}">auto</span>`
-        : '<span class="badge">direct</span>';
+      const liveConn = this.directPeers.get(p.peerId);
+      const originBadge =
+        liveConn?.transport === "relay"
+          ? '<span class="badge auto" title="E2EE Relay fallback (zero TURN; auto-upgrades to Direct P2P)">e2ee relay</span>'
+          : p.viaAutoMesh
+            ? `<span class="badge auto" title="Auto-connected via ${escapeHtml(p.introducedBy || "peer")}">auto</span>`
+            : '<span class="badge">direct</span>';
       const voiceBadge = p.inVoice
         ? `<span class="badge auto">${p.voiceMuted ? "voice · muted" : "in voice"}</span>`
         : "";

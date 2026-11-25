@@ -147,20 +147,37 @@ function buildSubscribePacket(packetId, topic) {
   return buildPacket(0x82, [varHeader, topicBytes, qos]);
 }
 
-function buildPublishPacket(topic, payloadText) {
+function buildPublishPacket(topic, payload) {
   const topicBytes = encodeMqttString(topic);
-  const payloadBytes = textEncoder.encode(payloadText);
+  let payloadBytes;
+  if (payload instanceof Uint8Array) {
+    payloadBytes = payload;
+  } else if (ArrayBuffer.isView(payload)) {
+    payloadBytes = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+  } else {
+    payloadBytes = textEncoder.encode(String(payload));
+  }
   return buildPacket(0x30, [topicBytes, payloadBytes]);
+}
+
+function isBinaryFallbackFrame(bytes) {
+  if (!bytes || bytes.length < 2) return false;
+  // "DF" (0x44 0x46) = E2EE fallback data frame/chunk, "VB" (0x56 0x42) = E2EE fallback voice bundle
+  return (
+    (bytes[0] === 0x44 && bytes[1] === 0x46) ||
+    (bytes[0] === 0x56 && bytes[1] === 0x42)
+  );
 }
 
 const PINGREQ_PACKET = new Uint8Array([0xc0, 0x00]);
 const DISCONNECT_PACKET = new Uint8Array([0xe0, 0x00]);
 
 class MqttWsClient {
-  constructor({ url, topic, onMessage, onReady, onStateChange }) {
+  constructor({ url, topic, onMessage, onBinaryMessage, onReady, onStateChange }) {
     this.url = url;
     this.topic = topic;
     this.onMessage = onMessage;
+    this.onBinaryMessage = onBinaryMessage || null;
     this.onReady = onReady;
     this.onStateChange = onStateChange;
 
@@ -218,6 +235,28 @@ class MqttWsClient {
     this.outboundQueue.push(payloadText);
     if (this.outboundQueue.length > MAX_OUTBOUND_QUEUE) {
       this.outboundQueue.shift();
+    }
+    return false;
+  }
+
+  publishBinary(payloadBytes, queueIfOffline = false) {
+    if (this.stopped || !payloadBytes) return false;
+    if (this.ready && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if ((this.ws.bufferedAmount || 0) > 131072) {
+        return false;
+      }
+      try {
+        this.ws.send(buildPublishPacket(this.topic, payloadBytes));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    if (queueIfOffline) {
+      this.outboundQueue.push(payloadBytes);
+      if (this.outboundQueue.length > MAX_OUTBOUND_QUEUE) {
+        this.outboundQueue.shift();
+      }
     }
     return false;
   }
@@ -446,7 +485,15 @@ class MqttWsClient {
         pos += 2;
       }
       if (pos > body.length || msgTopic !== this.topic) return;
-      const payloadText = textDecoder.decode(body.subarray(pos));
+      const payloadBytes = body.subarray(pos);
+      if (payloadBytes.length === 0) return;
+      if (isBinaryFallbackFrame(payloadBytes)) {
+        if (this.onBinaryMessage) {
+          this.onBinaryMessage(payloadBytes.slice(), this.url);
+        }
+        return;
+      }
+      const payloadText = textDecoder.decode(payloadBytes);
       if (payloadText && this.onMessage) {
         this.onMessage(payloadText);
       }
@@ -455,11 +502,12 @@ class MqttWsClient {
 }
 
 export class MultiRelayRendezvous {
-  constructor({ roomTopic, urls, onMessage, onBrokerReady, onStatusChange }) {
+  constructor({ roomTopic, urls, onMessage, onBinaryMessage, onBrokerReady, onStatusChange }) {
     this.roomTopic = roomTopic;
     this.fullTopic = `${TOPIC_PREFIX}${roomTopic}`;
     this.urls = Array.isArray(urls) && urls.length > 0 ? urls : DEFAULT_MQTT_RELAYS.slice();
     this.onMessage = onMessage;
+    this.onBinaryMessage = onBinaryMessage || null;
     this.onBrokerReady = onBrokerReady;
     this.onStatusChange = onStatusChange;
 
@@ -477,6 +525,7 @@ export class MultiRelayRendezvous {
           url,
           topic: this.fullTopic,
           onMessage: (payload) => this._handleIncoming(payload),
+          onBinaryMessage: (bytes, brokerUrl) => this._handleIncomingBinary(bytes, brokerUrl),
           onReady: (client) => {
             if (!this.stopped && this.onBrokerReady) {
               this.onBrokerReady(client, this.getStatus());
@@ -512,6 +561,42 @@ export class MultiRelayRendezvous {
     let sent = 0;
     for (const c of this.clients) {
       if (c.publish(sealedPayload)) {
+        sent += 1;
+      }
+    }
+    return sent;
+  }
+
+  /**
+   * Publishes raw E2EE binary fallback payloads ("DF" data frames / "VB" voice bundles),
+   * preferring brokers that BOTH the local node and remote peer are actively connected to.
+   */
+  publishBinary(payloadBytes, { preferredUrls = null, maxBrokers = 1, queueIfOffline = false } = {}) {
+    if (this.stopped || !payloadBytes || payloadBytes.length === 0) return 0;
+    const ready = this.clients.filter(
+      (c) => c.ready && c.ws && c.ws.readyState === WebSocket.OPEN && (c.ws.bufferedAmount || 0) <= 131072
+    );
+
+    if (ready.length === 0) {
+      if (queueIfOffline && this.clients.length > 0) {
+        this.clients[0].publishBinary(payloadBytes, true);
+      }
+      return 0;
+    }
+
+    let ordered = ready;
+    if (Array.isArray(preferredUrls) && preferredUrls.length > 0) {
+      const prefSet = new Set(preferredUrls);
+      const shared = ready.filter((c) => prefSet.has(c.url));
+      if (shared.length > 0) {
+        ordered = shared;
+      }
+    }
+
+    const limit = Math.max(1, Math.min(ordered.length, maxBrokers));
+    let sent = 0;
+    for (let i = 0; i < ordered.length && sent < limit; i++) {
+      if (ordered[i].publishBinary(payloadBytes, false)) {
         sent += 1;
       }
     }
@@ -560,4 +645,149 @@ export class MultiRelayRendezvous {
       this.onMessage(payload);
     }
   }
+
+  _handleIncomingBinary(bytes, brokerUrl) {
+    if (this.stopped || !bytes || bytes.length === 0) return;
+    if (this.onBinaryMessage) {
+      this.onBinaryMessage(bytes, brokerUrl);
+    }
+  }
+}
+
+export const RELAY_DATA_CHUNK_SIZE = 14000;
+
+export function bytesToHex(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+/**
+ * Computes a deterministic, opaque 8-byte room-scoped peer routing tag so raw peer IDs
+ * never appear in plaintext on MQTT brokers when E2EE fallback transport is active.
+ */
+export async function computePeerTag(roomTopic, peerId) {
+  const input = textEncoder.encode(`${roomTopic}\0${peerId}`);
+  if (typeof globalThis.crypto !== "undefined" && globalThis.crypto?.subtle?.digest) {
+    const hash = await globalThis.crypto.subtle.digest("SHA-256", input);
+    const bytes = new Uint8Array(hash, 0, 8).slice();
+    return { bytes, hex: bytesToHex(bytes) };
+  }
+  // Fallback 64-bit FNV-1a pair if SubtleCrypto is unavailable (e.g. non-secure LAN HTTP)
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < input.length; i++) {
+    h1 ^= input[i];
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= input[i] ^ ((i * 31) & 0xff);
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  const bytes = new Uint8Array(8);
+  const dv = new DataView(bytes.buffer);
+  dv.setUint32(0, h1 >>> 0, false);
+  dv.setUint32(4, h2 >>> 0, false);
+  return { bytes, hex: bytesToHex(bytes) };
+}
+
+/**
+ * Encodes an already-E2EE `E1:` mesh frame string into one or more compact binary "DF"
+ * packets (`<= chunkSize` bytes payload each) safe for any public MQTT broker limit.
+ */
+export function encodeRelayDataChunks(
+  fromTagBytes,
+  toTagBytes,
+  msgId,
+  frameStr,
+  chunkSize = RELAY_DATA_CHUNK_SIZE
+) {
+  const payload = textEncoder.encode(frameStr);
+  const total = Math.max(1, Math.ceil(payload.length / chunkSize));
+  const packets = [];
+  for (let idx = 0; idx < total; idx++) {
+    const start = idx * chunkSize;
+    const slice = payload.subarray(start, Math.min(payload.length, start + chunkSize));
+    const pkt = new Uint8Array(26 + slice.length);
+    pkt[0] = 0x44; // 'D'
+    pkt[1] = 0x46; // 'F'
+    pkt.set(fromTagBytes, 2);
+    pkt.set(toTagBytes, 10);
+    const dv = new DataView(pkt.buffer);
+    dv.setUint32(18, msgId >>> 0, false);
+    dv.setUint16(22, idx, false);
+    dv.setUint16(24, total, false);
+    pkt.set(slice, 26);
+    packets.push(pkt);
+  }
+  return packets;
+}
+
+export function decodeRelayDataChunk(bytes) {
+  if (!bytes || bytes.length < 26 || bytes[0] !== 0x44 || bytes[1] !== 0x46) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const fromHex = bytesToHex(bytes.subarray(2, 10));
+  const toHex = bytesToHex(bytes.subarray(10, 18));
+  const msgId = dv.getUint32(18, false);
+  const idx = dv.getUint16(22, false);
+  const total = dv.getUint16(24, false);
+  if (total === 0 || idx >= total || total > 512) return null;
+  return {
+    fromHex,
+    toHex,
+    msgId,
+    idx,
+    total,
+    chunkBytes: bytes.subarray(26),
+  };
+}
+
+/**
+ * Bundles 1..16 already-E2EE `V1` binary voice packets (~20ms each) into a single
+ * compact "VB" MQTT payload so fallback voice uses ~10-12 tiny packets/sec only while speaking.
+ */
+export function encodeRelayVoiceBundle(fromTagBytes, toTagBytes, seq, frames) {
+  const count = Math.min(frames.length, 16);
+  let totalLen = 23;
+  for (let i = 0; i < count; i++) {
+    totalLen += 2 + frames[i].byteLength;
+  }
+  const pkt = new Uint8Array(totalLen);
+  pkt[0] = 0x56; // 'V'
+  pkt[1] = 0x42; // 'B'
+  pkt.set(fromTagBytes, 2);
+  pkt.set(toTagBytes, 10);
+  const dv = new DataView(pkt.buffer);
+  dv.setUint32(18, seq >>> 0, false);
+  pkt[22] = count;
+  let offset = 23;
+  for (let i = 0; i < count; i++) {
+    const f = frames[i];
+    dv.setUint16(offset, f.byteLength, false);
+    offset += 2;
+    pkt.set(f, offset);
+    offset += f.byteLength;
+  }
+  return pkt;
+}
+
+export function decodeRelayVoiceBundle(bytes) {
+  if (!bytes || bytes.length < 23 || bytes[0] !== 0x56 || bytes[1] !== 0x42) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const fromHex = bytesToHex(bytes.subarray(2, 10));
+  const toHex = bytesToHex(bytes.subarray(10, 18));
+  const seq = dv.getUint32(18, false);
+  const count = bytes[22];
+  if (count === 0 || count > 16) return null;
+  const frames = [];
+  let offset = 23;
+  for (let i = 0; i < count; i++) {
+    if (offset + 2 > bytes.length) return null;
+    const len = dv.getUint16(offset, false);
+    offset += 2;
+    if (len === 0 || offset + len > bytes.length) return null;
+    frames.push(bytes.subarray(offset, offset + len));
+    offset += len;
+  }
+  return { fromHex, toHex, seq, frames };
 }
