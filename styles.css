@@ -861,6 +861,16 @@ html[data-advanced="false"][data-in-room="true"][data-has-pinned="true"] .workbe
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
+  container-type: inline-size;
+  container-name: main-col;
+}
+
+.watch-chat-split {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .rail {
@@ -6751,28 +6761,46 @@ input[type="checkbox"].metro-switch:checked::after {
 
 .watch-embed-stage {
   width: 100%;
-  height: clamp(148px, 24vh, 270px);
+  aspect-ratio: 16 / 9;
+  height: auto;
+  min-height: 220px;
+  max-height: min(44vh, 440px);
   background: #0b0c0f;
 }
 
 .watch-panel.provider-spotify .watch-embed-stage {
+  aspect-ratio: auto;
+  min-height: 0;
   height: 112px;
+  max-height: none;
 }
 
 .watch-panel.provider-spotify.is-spotify-collection .watch-embed-stage {
+  aspect-ratio: auto;
+  min-height: 0;
   height: clamp(260px, 38vh, 352px);
+  max-height: none;
 }
 
 .watch-panel.provider-soundcloud .watch-embed-stage {
+  aspect-ratio: auto;
+  min-height: 0;
   height: 126px;
+  max-height: none;
 }
 
 .watch-panel.provider-soundcloud.is-soundcloud-playlist .watch-embed-stage {
+  aspect-ratio: auto;
+  min-height: 0;
   height: clamp(220px, 32vh, 290px);
+  max-height: none;
 }
 
 .watch-panel.provider-twitch .watch-embed-stage {
-  height: clamp(300px, 38vh, 380px);
+  aspect-ratio: 16 / 9;
+  height: auto;
+  min-height: 300px;
+  max-height: min(46vh, 460px);
 }
 
 .watch-panel.is-twitch-live .watch-scrub-row,
@@ -7072,6 +7100,8 @@ input[type="checkbox"].metro-switch:checked::after {
   color: var(--ink-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .watch-queue-section {
@@ -7211,17 +7241,31 @@ input[type="checkbox"].metro-switch:checked::after {
 
 @media (max-width: 720px) {
   .watch-embed-stage {
-    max-height: 220px;
+    min-height: 196px;
+    max-height: 42dvh;
+  }
+
+  .watch-panel.provider-spotify .watch-embed-stage {
+    min-height: 0;
+    height: 112px;
+    max-height: 112px;
+  }
+
+  .watch-panel.provider-soundcloud .watch-embed-stage {
+    min-height: 0;
+    height: 126px;
+    max-height: 126px;
   }
 
   .watch-panel.provider-spotify.is-spotify-collection .watch-embed-stage,
   .watch-panel.provider-soundcloud.is-soundcloud-playlist .watch-embed-stage {
+    min-height: 0;
     max-height: 260px;
   }
 
   .watch-panel.provider-twitch .watch-embed-stage {
-    height: clamp(220px, 34vh, 300px);
-    max-height: 300px;
+    min-height: 210px;
+    max-height: 44dvh;
   }
 
   .chat-media-link-card {
@@ -7230,6 +7274,317 @@ input[type="checkbox"].metro-switch:checked::after {
 
   .watch-vol-slider {
     max-width: none;
+  }
+}
+
+/* ================= Adaptive Side-by-Side Watch Together + Chat (Aspect-Ratio Driven) ================= */
+/* While a Watch Together video/playlist stage is expanded, compact the Voice header & tiles into a
+   sleek horizontal strip so the video theater gets maximum vertical canvas. */
+html[data-watch-stage="true"] .voice-panel .panel-header {
+  padding: 7px 14px;
+}
+
+html[data-watch-stage="true"] .voice-mosaic {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+
+html[data-watch-stage="true"] .voice-card {
+  min-height: 96px;
+  padding: 8px 12px 0;
+}
+
+html[data-watch-stage="true"] .tile-mono {
+  font-size: 20px;
+}
+
+html[data-watch-stage="true"] .join-voice-card {
+  min-height: 0;
+  grid-column: span 2;
+  flex-direction: row;
+  align-items: stretch;
+}
+
+html[data-watch-stage="true"] .join-voice-main {
+  padding: 8px 14px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+html[data-watch-stage="true"] .join-top-row {
+  width: auto;
+  flex-shrink: 0;
+}
+
+html[data-watch-stage="true"] .join-top-row .chevrons,
+html[data-watch-stage="true"] .join-tile-sub {
+  display: none;
+}
+
+html[data-watch-stage="true"] .join-plus {
+  width: 24px;
+  height: 24px;
+  font-size: 16px;
+}
+
+html[data-watch-stage="true"] .join-tile-label {
+  font-size: 13px;
+}
+
+html[data-watch-stage="true"] .join-listen-strip {
+  border-top: none;
+  border-left: 2px solid var(--rule);
+  padding: 8px 12px;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  html[data-watch-stage="true"] .join-voice-card {
+    grid-column: auto;
+  }
+}
+
+/* Landscape browser windows with enough horizontal room dock Watch Together beside Chat in theater mode. */
+@media (min-aspect-ratio: 11/10) {
+  @container main-col (min-width: 760px) {
+    .watch-chat-split.is-watch-side-eligible {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) clamp(296px, 28cqi, 430px);
+      grid-template-rows: minmax(0, 1fr);
+      align-items: stretch;
+      min-height: 360px;
+      overflow: hidden;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-panel {
+      height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      border-bottom: none;
+      border-right: 2px solid var(--rule);
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-width: thin;
+      scrollbar-color: var(--rule) var(--bg-subtle);
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-header {
+      flex-shrink: 0;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-stage-wrap {
+      flex: 1 1 0;
+      min-height: clamp(280px, 48vh, 540px);
+      display: flex;
+      flex-direction: column;
+      background: #07080b;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-panel:not(.is-minimized) .watch-embed-stage {
+      flex: 1 1 auto;
+      width: 100%;
+      height: 100%;
+      aspect-ratio: auto;
+      min-height: 0;
+      max-height: none;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-panel.provider-spotify.is-spotify-collection .watch-embed-stage iframe,
+    .watch-chat-split.is-watch-side-eligible .watch-panel.provider-soundcloud.is-soundcloud-playlist .watch-embed-stage iframe {
+      height: 100% !important;
+      min-height: 352px;
+    }
+
+    /* Pro cinema transport layout: full-width scrubber on top, controls left + local volume right */
+    .watch-chat-split.is-watch-side-eligible .watch-transport {
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 12px;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-scrub-row {
+      flex: 1 0 100%;
+      order: -1;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-transport-main {
+      flex: 1 1 auto;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-local-vol-row {
+      margin-left: auto;
+      padding-top: 0;
+      flex: 0 1 auto;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-vol-slider {
+      min-width: 76px;
+      max-width: 132px;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-playlist-bar,
+    .watch-chat-split.is-watch-side-eligible .watch-queue-section {
+      flex-shrink: 0;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel {
+      height: 100%;
+      min-height: 0;
+      flex: initial;
+      overflow: hidden;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .panel-header {
+      padding: 10px 14px;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .mobile-hide,
+    .watch-chat-split.is-watch-side-eligible .chat-panel .inline-chip:not(.inline-chip-btn) {
+      display: none;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .composer-send-btn {
+      padding: 0 14px;
+      font-size: 12px;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .composer-send-btn .chevrons {
+      display: none;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .log-feed {
+      max-height: none;
+      min-height: 0;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-media-link-card {
+      max-width: 100%;
+    }
+  }
+}
+
+/* Widescreen / Ultrawide Theater Bonus: give videos even more horizontal cinema canvas */
+@media (min-aspect-ratio: 16/10) {
+  @container main-col (min-width: 1200px) {
+    .watch-chat-split.is-watch-side-eligible {
+      grid-template-columns: minmax(0, 1fr) clamp(330px, 25cqi, 450px);
+    }
+  }
+}
+
+/* Landscape Phone / Short Wide Viewport Side-by-Side Mode */
+@media (min-aspect-ratio: 11/10) and (max-height: 520px) {
+  html[data-watch-stage="true"] .topbar {
+    height: calc(44px + env(safe-area-inset-top));
+    min-height: calc(44px + env(safe-area-inset-top));
+  }
+
+  html[data-watch-stage="true"] .simple-room-bar {
+    min-height: 36px;
+  }
+
+  html[data-watch-stage="true"] .simple-room-title {
+    padding: 4px 12px;
+    font-size: 14px;
+  }
+
+  html[data-watch-stage="true"] .voice-panel .panel-header {
+    padding: 4px 10px;
+  }
+
+  html[data-watch-stage="true"] .join-voice-main,
+  html[data-watch-stage="true"] .join-listen-strip {
+    padding: 5px 10px;
+  }
+
+  @container main-col (min-width: 560px) {
+    .watch-chat-split.is-watch-side-eligible {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(236px, 0.85fr);
+      grid-template-rows: minmax(0, 1fr);
+      align-items: stretch;
+      min-height: 210px;
+      overflow: hidden;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-panel {
+      height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      border-bottom: none;
+      border-right: 2px solid var(--rule);
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-header {
+      padding: 5px 10px;
+      flex-shrink: 0;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-stage-wrap {
+      flex: 1 1 0;
+      min-height: 144px;
+      display: flex;
+      flex-direction: column;
+      background: #07080b;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-panel:not(.is-minimized) .watch-embed-stage {
+      flex: 1 1 auto;
+      width: 100%;
+      height: 100%;
+      aspect-ratio: auto;
+      min-height: 0;
+      max-height: none;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-transport {
+      padding: 5px 10px;
+      gap: 4px 10px;
+      flex-shrink: 0;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel {
+      height: 100%;
+      min-height: 0;
+      flex: initial;
+      overflow: hidden;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .panel-header {
+      padding: 5px 10px;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .inline-chip:not(.inline-chip-btn) {
+      display: none;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .log-feed {
+      min-height: 0;
+      max-height: none;
+    }
   }
 }
 

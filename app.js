@@ -1816,6 +1816,7 @@ class P2PDirectApp {
       "btn-lightbox-replay",
       "btn-lightbox-loop",
       "lightbox-meta",
+      "watch-chat-split",
       "watch-panel",
       "watch-provider-badge",
       "watch-panel-title",
@@ -4719,6 +4720,7 @@ class P2PDirectApp {
       btn.textContent = this.mediaSync.watchMinimized ? "Expand" : "Minimize";
       btn.setAttribute("aria-expanded", String(!this.mediaSync.watchMinimized));
     }
+    this._updateWatchSplitLayoutClasses(this.mediaSync.states.get("watch") || null);
   }
 
   startWatchTogetherFromUrl(rawUrl, sourceMsgId = "") {
@@ -5156,6 +5158,38 @@ class P2PDirectApp {
     }
   }
 
+  _updateWatchSplitLayoutClasses(state) {
+    const split = this.el["watch-chat-split"];
+    if (!split) return;
+    const isActive = Boolean(state && state.active && state.provider && state.mediaId);
+    const isMinimized = Boolean(isActive && this.mediaSync.watchMinimized);
+    const isPlaylist = this._isWatchPlaylistState(state);
+    let isSideEligible = false;
+    if (isActive && !isMinimized) {
+      if (
+        state.provider === "youtube" ||
+        state.provider === "ytmusic" ||
+        state.provider === "twitch"
+      ) {
+        isSideEligible = true;
+      } else if (state.provider === "spotify") {
+        const p = parseWatchMediaUrl(state.url);
+        isSideEligible = Boolean(
+          isPlaylist ||
+            (p && (p.entityType === "playlist" || p.entityType === "album" || p.entityType === "show"))
+        );
+      } else if (state.provider === "soundcloud") {
+        isSideEligible = isPlaylist;
+      }
+    }
+    split.classList.toggle("has-watch-active", isActive);
+    split.classList.toggle("is-watch-minimized", isMinimized);
+    split.classList.toggle("is-watch-side-eligible", isSideEligible);
+    if (typeof document !== "undefined" && document.documentElement) {
+      document.documentElement.dataset.watchStage = isSideEligible ? "true" : "false";
+    }
+  }
+
   _syncWatchTogetherUi(state) {
     const panel = this.el["watch-panel"];
     if (!panel) return;
@@ -5163,6 +5197,7 @@ class P2PDirectApp {
     const isActive = Boolean(state && state.active && state.provider && state.mediaId);
     panel.classList.toggle("hidden", !isActive);
     this._syncChatWatchCardActiveStates(isActive ? state : null);
+    this._updateWatchSplitLayoutClasses(isActive ? state : null);
     if (!isActive) {
       this._renderWatchQueue([]);
       return;
