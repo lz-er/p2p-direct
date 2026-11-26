@@ -1,0 +1,453 @@
+{
+  "schema": "p2p-direct-watch-trace-v1",
+  "exportedAtMs": 1760000007076,
+  "exportedAtIso": "2025-10-09T08:53:27.076Z",
+  "appVersion": "v25",
+  "peerId": "peer-subject",
+  "maxEntries": 2000,
+  "dropped": 0,
+  "count": 15,
+  "watchState": {
+    "active": true,
+    "playing": true,
+    "provider": "soundcloud",
+    "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+    "playlistId": "https://soundcloud.com/simartist/sets/party-mix",
+    "playlistIndex": 0,
+    "trackUri": "",
+    "positionMs": 28243,
+    "projectedPosMs": 32700,
+    "rateMilli": 1000,
+    "loop": false,
+    "rev": 2,
+    "epoch": 1,
+    "actor": "peer-remote",
+    "actorName": "Remote",
+    "queueLength": 0
+  },
+  "watchNotice": {
+    "provider": "soundcloud",
+    "kind": "preview",
+    "code": "SNIP",
+    "severity": "warn",
+    "tag": "SOUNDCLOUD · 30S PREVIEW",
+    "blocksSync": false,
+    "isPreview": true,
+    "dismissed": false
+  },
+  "entries": [
+    {
+      "seq": 1,
+      "tPerf": 220,
+      "tWall": 1760000000220,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "remote",
+        "rev": 1,
+        "actor": "peer-remote",
+        "active": true,
+        "playing": true,
+        "positionMs": 43,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 2,
+      "tPerf": 220,
+      "tWall": 1760000000220,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "remote",
+        "sameMedia": false,
+        "ready": false,
+        "rev": 1,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 43,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "",
+        "ready": false,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 0
+      }
+    },
+    {
+      "seq": 3,
+      "tPerf": 245,
+      "tWall": 1760000000245,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "READY",
+      "data": null,
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 43,
+        "durationMs": 0,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 4,
+      "tPerf": 245,
+      "tWall": 1760000000245,
+      "src": "soundcloud",
+      "dir": "out",
+      "ev": "play",
+      "data": {
+        "source": "remote",
+        "isInitial": true
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 43,
+        "durationMs": 0,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 68
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "tPerf": 289,
+      "tWall": 1760000000289,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "PLAY",
+      "data": {
+        "posMs": 0,
+        "soundId": 801
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "durationMs": 0,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 68
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "tPerf": 1420,
+      "tWall": 1760000001420,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-suppressed"
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 955,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 68
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "tPerf": 2619,
+      "tWall": 1760000002619,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "remote",
+        "rev": 2,
+        "actor": "peer-remote",
+        "active": true,
+        "playing": true,
+        "positionMs": 28243,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 8,
+      "tPerf": 2619,
+      "tWall": 1760000002619,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "remote",
+        "sameMedia": true,
+        "ready": true,
+        "rev": 2,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 28243,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 2250,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 68
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "tPerf": 2619,
+      "tWall": 1760000002619,
+      "src": "soundcloud",
+      "dir": "out",
+      "ev": "seekTo",
+      "data": {
+        "ms": 28243,
+        "source": "remote",
+        "isInitial": false
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 2250,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": true,
+          "expectPlayState": false,
+          "targetPlaying": true,
+          "targetPosMs": 28243
+        }
+      }
+    },
+    {
+      "seq": 10,
+      "tPerf": 2620,
+      "tWall": 1760000002620,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-suppressed"
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 28243,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": true,
+          "expectPlayState": false,
+          "targetPlaying": true,
+          "targetPosMs": 28243
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "tPerf": 2677,
+      "tWall": 1760000002677,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "SEEK",
+      "data": {
+        "posMs": 28243
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 28243,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": true,
+          "expectPlayState": false,
+          "targetPlaying": true,
+          "targetPosMs": 28243
+        }
+      }
+    },
+    {
+      "seq": 12,
+      "tPerf": 4539,
+      "tWall": 1760000004539,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "PAUSE",
+      "data": {
+        "posMs": 30000
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 30000,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": true,
+          "expectPlayState": false,
+          "targetPlaying": true,
+          "targetPosMs": 28243
+        }
+      }
+    },
+    {
+      "seq": 13,
+      "tPerf": 4539,
+      "tWall": 1760000004539,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "FINISH",
+      "data": null,
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 30000,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": true,
+          "expectPlayState": false,
+          "targetPlaying": true,
+          "targetPosMs": 28243
+        }
+      }
+    },
+    {
+      "seq": 14,
+      "tPerf": 5020,
+      "tWall": 1760000005020,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-preview",
+        "targetMs": 30644
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 30000,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": true,
+          "expectPlayState": false,
+          "targetPlaying": true,
+          "targetPosMs": 28243
+        }
+      }
+    },
+    {
+      "seq": 15,
+      "tPerf": 6220,
+      "tWall": 1760000006220,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-preview",
+        "targetMs": 31844
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 30000,
+        "durationMs": 30000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": true,
+          "expectPlayState": false,
+          "targetPlaying": true,
+          "targetPosMs": 28243
+        }
+      }
+    }
+  ]
+}

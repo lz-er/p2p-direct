@@ -441,7 +441,10 @@ export function checkLocalOnlyPrivacy({
     const endMs = Number(win.endMs ?? Infinity);
     const action = win.action || "local-only";
 
-    for (const ev of wireEvents) {
+    for (let i = 0; i < wireEvents.length; i++) {
+      if (typeof win.startWireIndex === "number" && i < win.startWireIndex) continue;
+      if (typeof win.endWireIndex === "number" && i >= win.endWireIndex) continue;
+      const ev = wireEvents[i];
       if (!ev || ev.fromPeerId !== win.peerId) continue;
       if (ev.isKeepalive) continue;
       const t = Number(ev.tBase ?? 0);

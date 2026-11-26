@@ -1,0 +1,391 @@
+{
+  "schema": "p2p-direct-watch-trace-v1",
+  "exportedAtMs": 1760000006676,
+  "exportedAtIso": "2025-10-09T08:53:26.676Z",
+  "appVersion": "v25",
+  "peerId": "peer-subject",
+  "maxEntries": 2000,
+  "dropped": 0,
+  "count": 13,
+  "watchState": {
+    "active": true,
+    "playing": true,
+    "provider": "twitch",
+    "mediaId": "video:12345678",
+    "playlistId": "",
+    "playlistIndex": 0,
+    "trackUri": "",
+    "positionMs": 214063,
+    "projectedPosMs": 217500,
+    "rateMilli": 1000,
+    "loop": false,
+    "rev": 2,
+    "epoch": 1,
+    "actor": "peer-subject",
+    "actorName": "Subject",
+    "queueLength": 0
+  },
+  "watchNotice": null,
+  "entries": [
+    {
+      "seq": 1,
+      "tPerf": 217,
+      "tWall": 1760000000217,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "remote",
+        "rev": 1,
+        "actor": "peer-remote",
+        "active": true,
+        "playing": true,
+        "positionMs": 41,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "twitch",
+        "mediaId": "video:12345678",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 2,
+      "tPerf": 217,
+      "tWall": 1760000000217,
+      "src": "twitch",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "remote",
+        "sameMedia": false,
+        "ready": false,
+        "rev": 1,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 41,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "",
+        "ready": false,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 0
+      }
+    },
+    {
+      "seq": 3,
+      "tPerf": 242,
+      "tWall": 1760000000242,
+      "src": "twitch",
+      "dir": "in",
+      "ev": "READY",
+      "data": {
+        "kind": "video"
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": true,
+        "currentTimeMs": 0,
+        "durationMs": 0,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41,
+        "trackUri": "",
+        "converged": false,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 4,
+      "tPerf": 242,
+      "tWall": 1760000000242,
+      "src": "twitch",
+      "dir": "out",
+      "ev": "play",
+      "data": {
+        "source": "remote",
+        "isInitial": true
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": true,
+        "currentTimeMs": 0,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41,
+        "trackUri": "",
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 66
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "tPerf": 274,
+      "tWall": 1760000000274,
+      "src": "twitch",
+      "dir": "in",
+      "ev": "PLAYBACK_BLOCKED",
+      "data": null,
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": true,
+        "currentTimeMs": 0,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41,
+        "trackUri": "",
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 66
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "tPerf": 274,
+      "tWall": 1760000000274,
+      "src": "twitch",
+      "dir": "out",
+      "ev": "setMuted",
+      "data": {
+        "muted": true,
+        "reason": "autoplay-fallback"
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": true,
+        "currentTimeMs": 0,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41,
+        "trackUri": "",
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 0
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "tPerf": 274,
+      "tWall": 1760000000274,
+      "src": "twitch",
+      "dir": "out",
+      "ev": "play",
+      "data": {
+        "reason": "autoplay-fallback"
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": true,
+        "currentTimeMs": 0,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41,
+        "trackUri": "",
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 0
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "tPerf": 305,
+      "tWall": 1760000000305,
+      "src": "twitch",
+      "dir": "in",
+      "ev": "PLAY",
+      "data": {
+        "posMs": 0,
+        "vidChanged": false,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": false,
+        "currentTimeMs": 0,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "trackUri": "",
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 0
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "tPerf": 305,
+      "tWall": 1760000000305,
+      "src": "twitch",
+      "dir": "in",
+      "ev": "PLAYING",
+      "data": {
+        "posMs": 0,
+        "vidChanged": false,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": false,
+        "currentTimeMs": 0,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "trackUri": "",
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 0
+        }
+      }
+    },
+    {
+      "seq": 10,
+      "tPerf": 3239,
+      "tWall": 1760000003239,
+      "src": "twitch",
+      "dir": "out",
+      "ev": "onUserAction",
+      "data": {
+        "playing": true,
+        "positionMs": 214063
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": false,
+        "currentTimeMs": 214063,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 214063,
+        "trackUri": "",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 11,
+      "tPerf": 3239,
+      "tWall": 1760000003239,
+      "src": "controller",
+      "dir": "out",
+      "ev": "publishMediaSync",
+      "data": {
+        "source": "local-embed",
+        "active": true,
+        "playing": true,
+        "positionMs": 214063,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "twitch",
+        "mediaId": "video:12345678",
+        "playlistIndex": 0,
+        "trackUri": "",
+        "queueLen": 0
+      },
+      "getters": null
+    },
+    {
+      "seq": 12,
+      "tPerf": 3239,
+      "tWall": 1760000003239,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "local-embed",
+        "rev": 2,
+        "actor": "peer-subject",
+        "active": true,
+        "playing": true,
+        "positionMs": 214063,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "twitch",
+        "mediaId": "video:12345678",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 13,
+      "tPerf": 3239,
+      "tWall": 1760000003239,
+      "src": "twitch",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "local-embed",
+        "sameMedia": true,
+        "ready": true,
+        "rev": 2,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 214063,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "twitch",
+        "twitchKind": "video",
+        "ready": true,
+        "isPaused": false,
+        "currentTimeMs": 214063,
+        "durationMs": 600000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 214063,
+        "trackUri": "",
+        "converged": true,
+        "expectedCmd": null
+      }
+    }
+  ]
+}

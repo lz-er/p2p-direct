@@ -379,7 +379,12 @@ export class BaseFakeProviderAdapter {
       return null;
     }
     const baseDelay = this.prng.jitter(this.config.cmdLatencyMs, this.config.cmdLatencyJitterMs);
-    const delayMs = Math.max(0, baseDelay + Math.max(0, Number(extraDelayMs) || 0));
+    let delayMs = Math.max(0, baseDelay + Math.max(0, Number(extraDelayMs) || 0));
+    if (this.config.fifoCommands) {
+      const targetFire = Math.max(tBase + delayMs, this._lastCmdFireBaseMs || 0);
+      this._lastCmdFireBaseMs = targetFire;
+      delayMs = Math.max(0, targetFire - tBase);
+    }
     return this._scheduleTimer(delayMs, () => {
       if (this.destroyed) return;
       executor();

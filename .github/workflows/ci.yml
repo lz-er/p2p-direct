@@ -76,11 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f tests/fuzz/watch_chaos.test.mjs ]; then
-            FUZZ_SEEDS=500 node --test tests/fuzz/watch_chaos.test.mjs
-          else
-            echo "tests/fuzz/watch_chaos.test.mjs not present yet — skipping PR fuzz gate."
-          fi
+          FUZZ_SEEDS=500 node --test tests/fuzz/watch_chaos.test.mjs
 
       - name: Real Chromium E2E & 6-Viewport Layout Matrix
         shell: bash
@@ -118,10 +114,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p fuzz-artifacts
-          if [ ! -f tests/fuzz/watch_chaos.test.mjs ]; then
-            echo "tests/fuzz/watch_chaos.test.mjs not present yet — skipping nightly fuzz."
-            exit 0
-          fi
           echo "Running watch_chaos.test.mjs with FUZZ_SEEDS=${FUZZ_SEEDS}..."
           FUZZ_OUT_DIR=fuzz-artifacts node --test tests/fuzz/watch_chaos.test.mjs 2>&1 | tee fuzz-artifacts/watch_chaos.log
 

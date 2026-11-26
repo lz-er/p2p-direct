@@ -211,6 +211,8 @@ export class FakeYouTubeAdapter extends BaseFakeProviderAdapter {
           });
         },
         pauseVideo() {
+          // Cancel any earlier in-flight seekTo auto-resume without aborting a subsequent seekTo
+          adapter._seekSeq += 1;
           adapter._scheduleSdkCommand("pauseVideo", [], () => {
             if (instanceDestroyed || adapter.errored) return;
             adapter._setYtState(YT_STATE.PAUSED, { emit: true });
@@ -218,22 +220,29 @@ export class FakeYouTubeAdapter extends BaseFakeProviderAdapter {
         },
         seekTo(sec, allowSeekAhead = true) {
           const extra = Math.max(0, Number(adapter.config.slowSeekExtraMs) || 0);
+          const seq = ++adapter._seekSeq;
           adapter._scheduleSdkCommand(
             "seekTo",
             [sec, allowSeekAhead],
             () => {
-              if (instanceDestroyed || adapter.errored) return;
+              if (instanceDestroyed || adapter.errored || seq !== adapter._seekSeq) return;
               const targetMs = adapter._applyKeyframeSnap((Number(sec) || 0) * 1000);
               const wasPlaying = adapter.ytState === YT_STATE.PLAYING;
               const wasBuffering = adapter.ytState === YT_STATE.BUFFERING;
-              const seq = ++adapter._seekSeq;
               adapter.positionMs = targetMs;
               adapter.ended = false;
               const bufMs = Math.max(0, Number(adapter.config.bufferMs) || 0);
               if (bufMs > 0 && (wasPlaying || wasBuffering)) {
                 adapter._setYtState(YT_STATE.BUFFERING, { emit: true });
                 adapter._scheduleTimer(bufMs, () => {
-                  if (instanceDestroyed || seq !== adapter._seekSeq || adapter.errored) return;
+                  if (
+                    instanceDestroyed ||
+                    seq !== adapter._seekSeq ||
+                    adapter.errored ||
+                    adapter.ytState !== YT_STATE.BUFFERING
+                  ) {
+                    return;
+                  }
                   adapter._setYtState(YT_STATE.PLAYING, { emit: true });
                 });
               } else {
@@ -362,6 +371,7 @@ export class FakeYouTubeAdapter extends BaseFakeProviderAdapter {
    */
   userBufferedSeek(targetMs) {
     this._syncPhysics();
+    this._seekSeq += 1;
     this.hasUserGesture = true;
     this.positionMs = this._applyKeyframeSnap(targetMs);
     this.ended = false;
@@ -378,6 +388,7 @@ export class FakeYouTubeAdapter extends BaseFakeProviderAdapter {
    */
   userPausedSeek(targetMs) {
     this._syncPhysics();
+    this._seekSeq += 1;
     this.hasUserGesture = true;
     this.positionMs = this._applyKeyframeSnap(targetMs);
     this.ended = false;
@@ -417,6 +428,7 @@ export class FakeYouTubeAdapter extends BaseFakeProviderAdapter {
 
   userPlay() {
     this._syncPhysics();
+    this._seekSeq += 1;
     this.hasUserGesture = true;
     this.ended = false;
     this._setYtState(YT_STATE.PLAYING, { emit: true });
@@ -424,6 +436,7 @@ export class FakeYouTubeAdapter extends BaseFakeProviderAdapter {
 
   userPause() {
     this._syncPhysics();
+    this._seekSeq += 1;
     this.hasUserGesture = true;
     this._setYtState(YT_STATE.PAUSED, { emit: true });
   }

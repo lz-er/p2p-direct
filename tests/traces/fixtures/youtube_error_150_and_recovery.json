@@ -1,0 +1,569 @@
+{
+  "schema": "p2p-direct-watch-trace-v1",
+  "exportedAtMs": 1760000011777,
+  "exportedAtIso": "2025-10-09T08:53:31.777Z",
+  "appVersion": "v25",
+  "peerId": "peer-subject",
+  "maxEntries": 2000,
+  "dropped": 0,
+  "count": 20,
+  "watchState": {
+    "active": true,
+    "playing": true,
+    "provider": "youtube",
+    "mediaId": "dQw4w9WgXcQ",
+    "playlistId": "",
+    "playlistIndex": 0,
+    "trackUri": "",
+    "positionMs": 52044,
+    "projectedPosMs": 58303,
+    "rateMilli": 1000,
+    "loop": false,
+    "rev": 2,
+    "epoch": 1,
+    "actor": "peer-remote",
+    "actorName": "Remote",
+    "queueLength": 0
+  },
+  "watchNotice": null,
+  "entries": [
+    {
+      "seq": 1,
+      "tPerf": 225,
+      "tWall": 1760000000225,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "remote",
+        "rev": 1,
+        "actor": "peer-remote",
+        "active": true,
+        "playing": true,
+        "positionMs": 44,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "youtube",
+        "mediaId": "dQw4w9WgXcQ",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 2,
+      "tPerf": 225,
+      "tWall": 1760000000225,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "remote",
+        "sameMedia": false,
+        "ready": false,
+        "rev": 1,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 44,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "",
+        "ready": false,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 0
+      }
+    },
+    {
+      "seq": 3,
+      "tPerf": 250,
+      "tWall": 1760000000250,
+      "src": "youtube",
+      "dir": "in",
+      "ev": "onReady",
+      "data": {
+        "isPlaylist": false
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 5,
+        "currentTimeMs": 0,
+        "durationMs": 0,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 44,
+        "playlistIndex": 0,
+        "converged": false,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 4,
+      "tPerf": 250,
+      "tWall": 1760000000250,
+      "src": "youtube",
+      "dir": "out",
+      "ev": "playVideo",
+      "data": {
+        "source": "remote",
+        "isInitial": true
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 5,
+        "currentTimeMs": 0,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 44,
+        "playlistIndex": 0,
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 69
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "tPerf": 280,
+      "tWall": 1760000000280,
+      "src": "youtube",
+      "dir": "in",
+      "ev": "onStateChange",
+      "data": {
+        "code": 1,
+        "curMs": 0,
+        "rateMilli": 1000,
+        "trackChanged": false,
+        "jumped": false,
+        "stepErrorMs": 0
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 1,
+        "currentTimeMs": 0,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "playlistIndex": 0,
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 69
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "tPerf": 1425,
+      "tWall": 1760000001425,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-suppressed"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 1,
+        "currentTimeMs": 1145,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 969,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 69
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "tPerf": 2977,
+      "tWall": 1760000002977,
+      "src": "youtube",
+      "dir": "in",
+      "ev": "onError",
+      "data": {
+        "code": 150,
+        "kind": "restricted"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": -1,
+        "currentTimeMs": 2697,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2634,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 8,
+      "tPerf": 3825,
+      "tWall": 1760000003825,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-blocked"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": -1,
+        "currentTimeMs": 2697,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2697,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 9,
+      "tPerf": 5025,
+      "tWall": 1760000005025,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-blocked"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": -1,
+        "currentTimeMs": 2697,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2697,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 10,
+      "tPerf": 5518,
+      "tWall": 1760000005518,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "remote",
+        "rev": 2,
+        "actor": "peer-remote",
+        "active": true,
+        "playing": true,
+        "positionMs": 52044,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "youtube",
+        "mediaId": "dQw4w9WgXcQ",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 11,
+      "tPerf": 5518,
+      "tWall": 1760000005518,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "remote",
+        "sameMedia": true,
+        "ready": true,
+        "rev": 2,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 52044,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": -1,
+        "currentTimeMs": 2697,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2697,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 12,
+      "tPerf": 6225,
+      "tWall": 1760000006225,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-blocked"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": -1,
+        "currentTimeMs": 2697,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2697,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 13,
+      "tPerf": 7425,
+      "tWall": 1760000007425,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-blocked"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": -1,
+        "currentTimeMs": 2697,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2697,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 14,
+      "tPerf": 7977,
+      "tWall": 1760000007977,
+      "src": "youtube",
+      "dir": "in",
+      "ev": "onStateChange",
+      "data": {
+        "code": 5,
+        "curMs": 2697,
+        "rateMilli": 1000,
+        "trackChanged": false,
+        "jumped": false,
+        "stepErrorMs": 0
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 5,
+        "currentTimeMs": 2697,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2697,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 15,
+      "tPerf": 8577,
+      "tWall": 1760000008577,
+      "src": "controller",
+      "dir": "internal",
+      "ev": "reloadWatchPlayerSession",
+      "data": {
+        "provider": "youtube",
+        "reason": "error-recovery"
+      },
+      "getters": null
+    },
+    {
+      "seq": 16,
+      "tPerf": 8602,
+      "tWall": 1760000008602,
+      "src": "youtube",
+      "dir": "in",
+      "ev": "onReady",
+      "data": {
+        "isPlaylist": false
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 5,
+        "currentTimeMs": 55000,
+        "durationMs": 0,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 55103,
+        "playlistIndex": 0,
+        "converged": false,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 17,
+      "tPerf": 8602,
+      "tWall": 1760000008602,
+      "src": "youtube",
+      "dir": "out",
+      "ev": "playVideo",
+      "data": {
+        "source": "remote",
+        "isInitial": true
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 5,
+        "currentTimeMs": 55000,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 55103,
+        "playlistIndex": 0,
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 55128
+        }
+      }
+    },
+    {
+      "seq": 18,
+      "tPerf": 8625,
+      "tWall": 1760000008625,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-suppressed"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 5,
+        "currentTimeMs": 55000,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 55103,
+        "playlistIndex": 0,
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 55128
+        }
+      }
+    },
+    {
+      "seq": 19,
+      "tPerf": 8630,
+      "tWall": 1760000008630,
+      "src": "youtube",
+      "dir": "in",
+      "ev": "onStateChange",
+      "data": {
+        "code": 1,
+        "curMs": 55000,
+        "rateMilli": 1000,
+        "trackChanged": false,
+        "jumped": false,
+        "stepErrorMs": 0
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 1,
+        "currentTimeMs": 55000,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 55000,
+        "playlistIndex": 0,
+        "converged": false,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 55128
+        }
+      }
+    },
+    {
+      "seq": 20,
+      "tPerf": 9825,
+      "tWall": 1760000009825,
+      "src": "youtube",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-suppressed"
+      },
+      "getters": {
+        "provider": "youtube",
+        "ready": true,
+        "playerState": 1,
+        "currentTimeMs": 56195,
+        "durationMs": 240000,
+        "rateMilli": 1000,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 55971,
+        "playlistIndex": 0,
+        "converged": true,
+        "expectedCmd": {
+          "id": 2,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 55128
+        }
+      }
+    }
+  ]
+}

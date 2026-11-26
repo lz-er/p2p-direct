@@ -23,6 +23,7 @@ export class FakeSpotifyAdapter extends BaseFakeProviderAdapter {
         readyDelayMs: 30,
         updateCadenceMs: 500,
         delayedBootPausedMs: 120,
+        fifoCommands: true,
         previewMode: false,
         previewDurationMs: 29713,
         durationMs: 213_573,

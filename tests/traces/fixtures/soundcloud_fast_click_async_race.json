@@ -1,0 +1,706 @@
+{
+  "schema": "p2p-direct-watch-trace-v1",
+  "exportedAtMs": 1760000010473,
+  "exportedAtIso": "2025-10-09T08:53:30.473Z",
+  "appVersion": "v25",
+  "peerId": "peer-subject",
+  "maxEntries": 2000,
+  "dropped": 0,
+  "count": 27,
+  "watchState": {
+    "active": true,
+    "playing": true,
+    "provider": "soundcloud",
+    "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+    "playlistId": "https://soundcloud.com/simartist/sets/party-mix",
+    "playlistIndex": 1,
+    "trackUri": "",
+    "positionMs": 41000,
+    "projectedPosMs": 43800,
+    "rateMilli": 1000,
+    "loop": false,
+    "rev": 5,
+    "epoch": 1,
+    "actor": "peer-subject",
+    "actorName": "Subject",
+    "queueLength": 0
+  },
+  "watchNotice": null,
+  "entries": [
+    {
+      "seq": 1,
+      "tPerf": 173,
+      "tWall": 1760000000173,
+      "src": "controller",
+      "dir": "out",
+      "ev": "publishMediaSync",
+      "data": {
+        "source": "local-ui",
+        "active": true,
+        "playing": true,
+        "positionMs": 0,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": "",
+        "queueLen": 0
+      },
+      "getters": null
+    },
+    {
+      "seq": 2,
+      "tPerf": 173,
+      "tWall": 1760000000173,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "local-ui",
+        "rev": 1,
+        "actor": "peer-subject",
+        "active": true,
+        "playing": true,
+        "positionMs": 0,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 3,
+      "tPerf": 173,
+      "tWall": 1760000000173,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "local-ui",
+        "sameMedia": false,
+        "ready": false,
+        "rev": 1,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 0,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "",
+        "ready": false,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 0
+      }
+    },
+    {
+      "seq": 4,
+      "tPerf": 198,
+      "tWall": 1760000000198,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "READY",
+      "data": null,
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "durationMs": 0,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 5,
+      "tPerf": 198,
+      "tWall": 1760000000198,
+      "src": "soundcloud",
+      "dir": "out",
+      "ev": "play",
+      "data": {
+        "source": "remote",
+        "isInitial": true
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "durationMs": 0,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 25
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "tPerf": 236,
+      "tWall": 1760000000236,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "PLAY",
+      "data": {
+        "posMs": 0,
+        "soundId": 501
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": false,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 25
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "tPerf": 1373,
+      "tWall": 1760000001373,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "correctDrift",
+      "data": {
+        "decision": "skip-suppressed"
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 961,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 25
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "tPerf": 2973,
+      "tWall": 1760000002973,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "PAUSE",
+      "data": {
+        "posMs": 2737
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2737,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": {
+          "id": 1,
+          "expectSeek": false,
+          "expectPlayState": true,
+          "targetPlaying": true,
+          "targetPosMs": 25
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "tPerf": 2973,
+      "tWall": 1760000002973,
+      "src": "soundcloud",
+      "dir": "out",
+      "ev": "onUserAction",
+      "data": {
+        "playing": false,
+        "positionMs": 2737,
+        "playlistIndex": 0
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2737,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 10,
+      "tPerf": 2973,
+      "tWall": 1760000002973,
+      "src": "controller",
+      "dir": "out",
+      "ev": "publishMediaSync",
+      "data": {
+        "source": "local-embed",
+        "active": true,
+        "playing": false,
+        "positionMs": 2737,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": "",
+        "queueLen": 0
+      },
+      "getters": null
+    },
+    {
+      "seq": 11,
+      "tPerf": 2973,
+      "tWall": 1760000002973,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "local-embed",
+        "rev": 2,
+        "actor": "peer-subject",
+        "active": true,
+        "playing": false,
+        "positionMs": 2737,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 12,
+      "tPerf": 2973,
+      "tWall": 1760000002973,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "local-embed",
+        "sameMedia": true,
+        "ready": true,
+        "rev": 2,
+        "epoch": 1,
+        "playing": false,
+        "positionMs": 2737,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": false,
+        "lastKnownPosMs": 2737,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 13,
+      "tPerf": 3038,
+      "tWall": 1760000003038,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "PLAY",
+      "data": {
+        "posMs": 2737,
+        "soundId": 501
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 2737,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 14,
+      "tPerf": 3038,
+      "tWall": 1760000003038,
+      "src": "soundcloud",
+      "dir": "out",
+      "ev": "onUserAction",
+      "data": {
+        "playing": true,
+        "positionMs": 2737,
+        "playlistIndex": 0,
+        "trackTitle": "SimDJ — Sunset Drive"
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 2737,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 15,
+      "tPerf": 3038,
+      "tWall": 1760000003038,
+      "src": "controller",
+      "dir": "out",
+      "ev": "publishMediaSync",
+      "data": {
+        "source": "local-embed",
+        "active": true,
+        "playing": true,
+        "positionMs": 2737,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": "",
+        "queueLen": 0
+      },
+      "getters": null
+    },
+    {
+      "seq": 16,
+      "tPerf": 3038,
+      "tWall": 1760000003038,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "local-embed",
+        "rev": 3,
+        "actor": "peer-subject",
+        "active": true,
+        "playing": true,
+        "positionMs": 2737,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 17,
+      "tPerf": 3038,
+      "tWall": 1760000003038,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "local-embed",
+        "sameMedia": true,
+        "ready": true,
+        "rev": 3,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 2737,
+        "rateMilli": 1000,
+        "playlistIndex": 0,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 2737,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 18,
+      "tPerf": 5473,
+      "tWall": 1760000005473,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "PLAY",
+      "data": {
+        "posMs": 0,
+        "soundId": 502
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "durationMs": 215000,
+        "playlistIndex": 0,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 19,
+      "tPerf": 5473,
+      "tWall": 1760000005473,
+      "src": "soundcloud",
+      "dir": "out",
+      "ev": "onUserAction",
+      "data": {
+        "playing": true,
+        "positionMs": 0,
+        "playlistIndex": 1,
+        "trackTitle": "Track 2"
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "durationMs": 215000,
+        "playlistIndex": 1,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 20,
+      "tPerf": 5473,
+      "tWall": 1760000005473,
+      "src": "controller",
+      "dir": "out",
+      "ev": "publishMediaSync",
+      "data": {
+        "source": "local-embed",
+        "active": true,
+        "playing": true,
+        "positionMs": 0,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 1,
+        "trackUri": "",
+        "queueLen": 0
+      },
+      "getters": null
+    },
+    {
+      "seq": 21,
+      "tPerf": 5473,
+      "tWall": 1760000005473,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "local-embed",
+        "rev": 4,
+        "actor": "peer-subject",
+        "active": true,
+        "playing": true,
+        "positionMs": 0,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 1,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 22,
+      "tPerf": 5473,
+      "tWall": 1760000005473,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "local-embed",
+        "sameMedia": true,
+        "ready": true,
+        "rev": 4,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 0,
+        "rateMilli": 1000,
+        "playlistIndex": 1,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 0,
+        "durationMs": 215000,
+        "playlistIndex": 1,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 23,
+      "tPerf": 7673,
+      "tWall": 1760000007673,
+      "src": "soundcloud",
+      "dir": "in",
+      "ev": "SEEK",
+      "data": {
+        "posMs": 41000
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41000,
+        "durationMs": 198000,
+        "playlistIndex": 1,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 24,
+      "tPerf": 7673,
+      "tWall": 1760000007673,
+      "src": "soundcloud",
+      "dir": "out",
+      "ev": "onUserAction",
+      "data": {
+        "playing": true,
+        "positionMs": 41000,
+        "playlistIndex": 1
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41000,
+        "durationMs": 198000,
+        "playlistIndex": 1,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    },
+    {
+      "seq": 25,
+      "tPerf": 7673,
+      "tWall": 1760000007673,
+      "src": "controller",
+      "dir": "out",
+      "ev": "publishMediaSync",
+      "data": {
+        "source": "local-embed",
+        "active": true,
+        "playing": true,
+        "positionMs": 41000,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 1,
+        "trackUri": "",
+        "queueLen": 0
+      },
+      "getters": null
+    },
+    {
+      "seq": 26,
+      "tPerf": 7673,
+      "tWall": 1760000007673,
+      "src": "controller",
+      "dir": "in",
+      "ev": "handleIncomingMediaSync",
+      "data": {
+        "source": "local-embed",
+        "rev": 5,
+        "actor": "peer-subject",
+        "active": true,
+        "playing": true,
+        "positionMs": 41000,
+        "rateMilli": 1000,
+        "epoch": 1,
+        "provider": "soundcloud",
+        "mediaId": "https://soundcloud.com/simartist/sets/party-mix",
+        "playlistIndex": 1,
+        "trackUri": ""
+      },
+      "getters": null
+    },
+    {
+      "seq": 27,
+      "tPerf": 7673,
+      "tWall": 1760000007673,
+      "src": "soundcloud",
+      "dir": "internal",
+      "ev": "applyState",
+      "data": {
+        "source": "local-embed",
+        "sameMedia": true,
+        "ready": true,
+        "rev": 5,
+        "epoch": 1,
+        "playing": true,
+        "positionMs": 41000,
+        "rateMilli": 1000,
+        "playlistIndex": 1,
+        "trackUri": ""
+      },
+      "getters": {
+        "provider": "soundcloud",
+        "ready": true,
+        "lastKnownPlaying": true,
+        "lastKnownPosMs": 41000,
+        "durationMs": 198000,
+        "playlistIndex": 1,
+        "noticeCode": "[redacted]",
+        "converged": true,
+        "expectedCmd": null
+      }
+    }
+  ]
+}
