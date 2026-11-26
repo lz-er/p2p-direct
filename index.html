@@ -769,18 +769,7 @@
                 </div>
               </div>
 
-              <div class="watch-queue-section" id="watch-queue-section">
-                <form id="watch-url-form" class="watch-url-form">
-                  <input
-                    id="watch-url-input"
-                    class="text-input watch-url-input"
-                    type="url"
-                    placeholder="Paste YouTube, YT Music, Spotify, or SoundCloud link or playlist…"
-                    autocomplete="off"
-                  />
-                  <button type="submit" id="btn-watch-load-now" class="btn btn-primary btn-sm">Play Now</button>
-                  <button type="button" id="btn-watch-queue-add" class="btn btn-sm">+ Queue</button>
-                </form>
+              <div class="watch-queue-section hidden" id="watch-queue-section">
                 <div class="watch-queue-head hidden" id="watch-queue-head">
                   <span class="watch-queue-kicker" id="watch-queue-count">Up Next (0)</span>
                 </div>
@@ -804,12 +793,6 @@
                 <span class="panel-meta" id="chat-sync-meta">In-memory<span class="mobile-hide"> · Encrypted</span></span>
               </div>
               <div class="chat-header-right">
-                <button
-                  type="button"
-                  id="btn-open-watch-panel"
-                  class="btn btn-sm watch-header-trigger"
-                  title="Open synced Watch Together for YouTube, YouTube Music, Spotify, or SoundCloud links & playlists"
-                >▶ Watch Together</button>
                 <div class="btn-row advanced-only" style="margin-top: 0">
                   <button type="button" id="btn-toggle-raw" class="btn btn-sm">Raw JSON</button>
                   <button type="button" id="btn-export-encrypted" class="btn btn-sm">Backup</button>

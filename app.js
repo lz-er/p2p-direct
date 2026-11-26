@@ -640,7 +640,7 @@ const SAFE_VIDEO_DATA_URL_RE = /^data:video\/(mp4|webm|ogg|quicktime);base64,[A-
 const SAFE_IMAGE_DATA_URL_PREFIX_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,/;
 const SAFE_VIDEO_DATA_URL_PREFIX_RE = /^data:video\/(mp4|webm|ogg|quicktime);base64,/;
 const SAFE_HTTP_URL_RE = /^https?:\/\/[^\s<>"']+$/i;
-const URL_REGEX = /https?:\/\/[^\s<>"']+/gi;
+const URL_REGEX = /(?:https?:\/\/|(?:www\.|m\.|music\.|open\.|play\.|on\.)?(?:youtube\.com|youtu\.be|spotify\.com|soundcloud\.com)\/)[^\s<>"']+/gi;
 const MAX_MEDIA_PER_MESSAGE = 3;
 const MAX_STATIC_IMAGE_CHARS = 54000;
 const MAX_GIF_RAW_BYTES = 4 * 1024 * 1024;
@@ -925,15 +925,21 @@ function extractAndLinkify(text) {
       }
     }
 
+    const hasScheme = /^https?:\/\//i.test(candidate);
+    const prevChar = start > 0 ? raw[start - 1] : "";
+    const invalidBareBoundary = !hasScheme && prevChar && /[a-zA-Z0-9._/@-]/.test(prevChar);
+
     html += escapeHtml(raw.slice(lastIndex, start));
     let parsed = null;
-    try {
-      const u = new URL(candidate);
-      if (u.protocol === "http:" || u.protocol === "https:") {
-        parsed = u;
+    if (!invalidBareBoundary) {
+      try {
+        const u = new URL(hasScheme ? candidate : `https://${candidate}`);
+        if (u.protocol === "http:" || u.protocol === "https:") {
+          parsed = u;
+        }
+      } catch {
+        parsed = null;
       }
-    } catch {
-      parsed = null;
     }
 
     if (parsed) {
@@ -1383,7 +1389,6 @@ class P2PDirectApp {
       boundGifTick: () => this._tickSyncedGifs(),
       driftTimer: null,
       watchPlayer: null,
-      watchPanelOpenManual: false,
       watchMinimized: false,
       watchScrubbing: false,
       watchUiTimer: null,
@@ -1810,7 +1815,6 @@ class P2PDirectApp {
       "btn-lightbox-replay",
       "btn-lightbox-loop",
       "lightbox-meta",
-      "btn-open-watch-panel",
       "watch-panel",
       "watch-provider-badge",
       "watch-panel-title",
@@ -1844,10 +1848,6 @@ class P2PDirectApp {
       "watch-local-volume",
       "watch-local-vol-val",
       "watch-queue-section",
-      "watch-url-form",
-      "watch-url-input",
-      "btn-watch-load-now",
-      "btn-watch-queue-add",
       "watch-queue-head",
       "watch-queue-count",
       "watch-queue-list",
@@ -2543,10 +2543,7 @@ class P2PDirectApp {
       lbVid.addEventListener("ratechange", () => broadcastLightboxVideo(null));
     }
 
-    // Watch Together (YouTube / Spotify / SoundCloud) UI bindings
-    if (this.el["btn-open-watch-panel"]) {
-      this.el["btn-open-watch-panel"].addEventListener("click", () => this.toggleWatchPanelDrawer());
-    }
+    // Watch Together (YouTube / YouTube Music / Spotify / SoundCloud — started from chat links)
     if (this.el["btn-watch-minimize"]) {
       this.el["btn-watch-minimize"].addEventListener("click", () => this.toggleWatchMinimize());
     }
@@ -2617,25 +2614,6 @@ class P2PDirectApp {
     if (this.el["btn-watch-autoplay-unmute"]) {
       this.el["btn-watch-autoplay-unmute"].addEventListener("click", () => {
         this.setWatchLocalMuted(false);
-      });
-    }
-    if (this.el["watch-url-form"]) {
-      this.el["watch-url-form"].addEventListener("submit", (ev) => {
-        ev.preventDefault();
-        const url = this.el["watch-url-input"]?.value.trim() || "";
-        if (!url) return;
-        if (this.startWatchTogetherFromUrl(url, "")) {
-          this.el["watch-url-input"].value = "";
-        }
-      });
-    }
-    if (this.el["btn-watch-queue-add"]) {
-      this.el["btn-watch-queue-add"].addEventListener("click", () => {
-        const url = this.el["watch-url-input"]?.value.trim() || "";
-        if (!url) return;
-        if (this.enqueueWatchUrl(url)) {
-          this.el["watch-url-input"].value = "";
-        }
       });
     }
     this.el["image-lightbox"].addEventListener("click", (ev) => {
@@ -4018,7 +3996,6 @@ class P2PDirectApp {
     this.mediaSync.gifBindings.clear();
     this.mediaSync.videoBindings.clear();
     this.mediaSync.states.clear();
-    this.mediaSync.watchPanelOpenManual = false;
     this.mediaSync.watchMinimized = false;
     this.mediaSync.watchTitleOverride = "";
     this.mediaSync.watchDurationMs = 0;
@@ -4706,19 +4683,6 @@ class P2PDirectApp {
     return this.mediaSync.watchPlayer;
   }
 
-  toggleWatchPanelDrawer() {
-    const cur = this.mediaSync.states.get("watch");
-    if (cur && cur.active) {
-      this.toggleWatchMinimize();
-      return;
-    }
-    this.mediaSync.watchPanelOpenManual = !this.mediaSync.watchPanelOpenManual;
-    this._syncWatchTogetherUi(cur || null);
-    if (this.mediaSync.watchPanelOpenManual && this.el["watch-url-input"]) {
-      this.el["watch-url-input"].focus();
-    }
-  }
-
   toggleWatchMinimize() {
     this.mediaSync.watchMinimized = !this.mediaSync.watchMinimized;
     const panel = this.el["watch-panel"];
@@ -4733,12 +4697,11 @@ class P2PDirectApp {
   startWatchTogetherFromUrl(rawUrl, sourceMsgId = "") {
     const parsed = parseWatchMediaUrl(rawUrl);
     if (!parsed) {
-      this.showToast("Paste a valid YouTube, YouTube Music, Spotify, or SoundCloud link or playlist");
+      this.showToast("Share a valid YouTube, YouTube Music, Spotify, or SoundCloud link in chat");
       return false;
     }
     const prev = this.mediaSync.states.get("watch");
     this.mediaSync.watchMinimized = false;
-    this.mediaSync.watchPanelOpenManual = true;
     this.mediaSync.watchTitleOverride = "";
     this.mediaSync.watchDurationMs = 0;
     this.mediaSync.watchPlaylistCount = 0;
@@ -5000,7 +4963,6 @@ class P2PDirectApp {
 
   stopWatchTogetherForRoom() {
     const cur = this.mediaSync.states.get("watch");
-    this.mediaSync.watchPanelOpenManual = false;
     this.mediaSync.watchMinimized = false;
     this.mediaSync.watchPlaylistCount = 0;
     this.mediaSync.watchPlaylistItems = [];
@@ -5065,7 +5027,6 @@ class P2PDirectApp {
   _applyWatchTogetherState(state, prev) {
     if (!state || !state.active || !state.provider || !state.mediaId) {
       if (prev && prev.active) {
-        this.mediaSync.watchPanelOpenManual = false;
         this.mediaSync.watchMinimized = false;
       }
       if (this.mediaSync.watchPlayer) {
@@ -5112,19 +5073,41 @@ class P2PDirectApp {
     }
   }
 
+  _syncChatWatchCardActiveStates(state) {
+    const feed = this.el["log-feed"];
+    if (!feed) return;
+    const activeUrl = state && state.active ? state.url || "" : "";
+    const activeMediaId = state && state.active ? state.mediaId || "" : "";
+    const activePlaylistId = state && state.active ? state.playlistId || "" : "";
+    for (const card of feed.querySelectorAll(".chat-media-link-card")) {
+      const cardUrl = card.getAttribute("data-watch-url") || "";
+      const cardMediaId = card.getAttribute("data-watch-media-id") || "";
+      const cardPlaylistId = card.getAttribute("data-watch-playlist-id") || "";
+      const matches = Boolean(
+        activeUrl &&
+          (cardUrl === activeUrl ||
+            (activePlaylistId && cardPlaylistId === activePlaylistId) ||
+            (!activePlaylistId && !cardPlaylistId && activeMediaId && cardMediaId === activeMediaId))
+      );
+      card.classList.toggle("is-now-playing", matches);
+      const pill = card.querySelector(".chat-media-live-pill");
+      if (pill) {
+        pill.classList.toggle("hidden", !matches);
+      }
+    }
+  }
+
   _syncWatchTogetherUi(state) {
     const panel = this.el["watch-panel"];
-    const triggerBtn = this.el["btn-open-watch-panel"];
     if (!panel) return;
 
     const isActive = Boolean(state && state.active && state.provider && state.mediaId);
-    const shouldShow = isActive || this.mediaSync.watchPanelOpenManual;
-    panel.classList.toggle("hidden", !shouldShow);
-    if (triggerBtn) {
-      triggerBtn.classList.toggle("is-active", isActive);
-      triggerBtn.textContent = isActive ? "● Watch Together" : "▶ Watch Together";
+    panel.classList.toggle("hidden", !isActive);
+    this._syncChatWatchCardActiveStates(isActive ? state : null);
+    if (!isActive) {
+      this._renderWatchQueue([]);
+      return;
     }
-    if (!shouldShow) return;
 
     panel.classList.remove(
       "provider-youtube",
@@ -5139,22 +5122,6 @@ class P2PDirectApp {
     if (this.el["btn-watch-minimize"]) {
       this.el["btn-watch-minimize"].textContent = this.mediaSync.watchMinimized ? "Expand" : "Minimize";
       this.el["btn-watch-minimize"].setAttribute("aria-expanded", String(!this.mediaSync.watchMinimized));
-    }
-
-    if (!isActive) {
-      if (this.el["watch-provider-badge"]) this.el["watch-provider-badge"].textContent = "WATCH";
-      if (this.el["watch-panel-title"]) this.el["watch-panel-title"].textContent = "Watch Together";
-      if (this.el["watch-sync-meta"]) {
-        this.el["watch-sync-meta"].textContent =
-          "Paste a YouTube, YouTube Music, Spotify, or SoundCloud link or playlist to sync with everyone";
-      }
-      if (this.el["watch-stage-wrap"]) this.el["watch-stage-wrap"].classList.add("hidden");
-      if (this.el["watch-playlist-bar"]) this.el["watch-playlist-bar"].classList.add("hidden");
-      if (this.el["watch-transport"]) this.el["watch-transport"].classList.add("hidden");
-      if (this.el["watch-open-external"]) this.el["watch-open-external"].classList.add("hidden");
-      if (this.el["btn-watch-close"]) this.el["btn-watch-close"].textContent = "Close";
-      this._renderWatchQueue([]);
-      return;
     }
 
     const isPlaylist = this._isWatchPlaylistState(state);
@@ -5358,18 +5325,21 @@ class P2PDirectApp {
   }
 
   _renderWatchQueue(queue) {
+    const section = this.el["watch-queue-section"];
     const head = this.el["watch-queue-head"];
     const countEl = this.el["watch-queue-count"];
     const listEl = this.el["watch-queue-list"];
     if (!head || !listEl) return;
 
     if (!Array.isArray(queue) || queue.length === 0) {
+      if (section) section.classList.add("hidden");
       head.classList.add("hidden");
       listEl.classList.add("hidden");
       listEl.innerHTML = "";
       return;
     }
 
+    if (section) section.classList.remove("hidden");
     head.classList.remove("hidden");
     listEl.classList.remove("hidden");
     if (countEl) {
@@ -14846,17 +14816,40 @@ class P2PDirectApp {
           .map((lnk) => {
             const watch = parseWatchMediaUrl(lnk.href);
             if (watch) {
+              const activeWatch = this.mediaSync.states.get("watch");
+              const isNowPlaying = Boolean(
+                activeWatch &&
+                  activeWatch.active &&
+                  (activeWatch.url === watch.url ||
+                    (activeWatch.playlistId && watch.playlistId === activeWatch.playlistId) ||
+                    (!activeWatch.playlistId &&
+                      !watch.playlistId &&
+                      activeWatch.mediaId &&
+                      watch.mediaId === activeWatch.mediaId))
+              );
               return `
-                <div class="chat-media-link-card provider-${escapeHtml(watch.provider)}" data-watch-provider="${escapeHtml(watch.provider)}">
+                <div
+                  class="chat-media-link-card provider-${escapeHtml(watch.provider)}${isNowPlaying ? " is-now-playing" : ""}"
+                  data-watch-provider="${escapeHtml(watch.provider)}"
+                  data-watch-url="${escapeHtml(watch.url)}"
+                  data-watch-media-id="${escapeHtml(watch.mediaId || "")}"
+                  data-watch-playlist-id="${escapeHtml(watch.playlistId || "")}"
+                >
                   <div class="chat-media-link-info">
                     <div class="chat-media-link-top">
                       <span class="chat-media-provider-tag">${escapeHtml(watch.providerLabel)}</span>
                       <span class="chat-media-link-sub">${escapeHtml(watch.subtitle)}</span>
+                      <span class="chat-media-live-pill${isNowPlaying ? "" : " hidden"}">● Playing</span>
                     </div>
                     <span class="chat-media-link-title" title="${escapeHtml(watch.url)}">${escapeHtml(watch.title)}</span>
                   </div>
                   <div class="chat-media-link-actions">
-                    <button type="button" class="chat-watch-cta" data-watch-play="${escapeHtml(watch.url)}">▶ ${escapeHtml(watch.ctaLabel)}</button>
+                    <button
+                      type="button"
+                      class="chat-watch-cta"
+                      data-watch-play="${escapeHtml(watch.url)}"
+                      title="Watch Together — synced for everyone in the room"
+                    >▶ ${escapeHtml(watch.ctaLabel)}</button>
                     <button type="button" class="media-ctrl-btn" data-watch-queue="${escapeHtml(watch.url)}" title="Add to Watch Together queue">+ Queue</button>
                     <a class="chat-media-link-ext" href="${escapeHtml(watch.url)}" target="_blank" rel="noopener noreferrer" title="Open link in new tab">↗</a>
                   </div>
