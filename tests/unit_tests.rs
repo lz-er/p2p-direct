@@ -2068,6 +2068,17 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
                 playlist_id: "OLAK5uy_k9999999999".into(),
                 playlist_index: 3,
             },
+            WatchQueueItem {
+                id: "q3".into(),
+                url: "https://www.twitch.tv/videos/2145678901?collection=AbCdEfGh12".into(),
+                provider: "twitch".into(),
+                media_id: "collection:AbCdEfGh12".into(),
+                title: "Twitch Collection".into(),
+                added_by: "Alice".into(),
+                start_ms: 90_000,
+                playlist_id: "collection:AbCdEfGh12".into(),
+                playlist_index: 0,
+            },
         ],
         anchor_local_ms: t_a0 + 100,
     };
@@ -2081,10 +2092,14 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
     assert_eq!(b_watch.playlist_id, "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf");
     assert_eq!(b_watch.playlist_index, 2);
     assert_eq!(b_watch.track_uri, "dQw4w9WgXcQ");
-    assert_eq!(b_watch.queue.len(), 2);
+    assert_eq!(b_watch.queue.len(), 3);
     assert_eq!(b_watch.queue[1].provider, "ytmusic");
     assert_eq!(b_watch.queue[1].playlist_id, "OLAK5uy_k9999999999");
     assert_eq!(b_watch.queue[1].playlist_index, 3);
+    assert_eq!(b_watch.queue[2].provider, "twitch");
+    assert_eq!(b_watch.queue[2].media_id, "collection:AbCdEfGh12");
+    assert_eq!(b_watch.queue[2].playlist_id, "collection:AbCdEfGh12");
+    assert_eq!(b_watch.queue[2].start_ms, 90_000);
     // 5 seconds later on Bob's skewed clock, Bob is at 15_020ms!
     assert_eq!(b_watch.projected_position_ms(t_b0 + 5_120), 15_020);
 
@@ -2101,7 +2116,8 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
     assert_eq!(c_watch.playlist_id, "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf");
     assert_eq!(c_watch.playlist_index, 2);
     assert_eq!(c_watch.track_uri, "dQw4w9WgXcQ");
-    assert_eq!(c_watch.queue.len(), 2);
+    assert_eq!(c_watch.queue.len(), 3);
+    assert_eq!(c_watch.queue[2].provider, "twitch");
 
     // Chat video sync state gets pruned automatically when its message is CRDT-deleted
     let (chat_msg, pub_acts) = a.publish_local("chat".into(), parse_json(r#"{"text":"vid"}"#)?, t_a0 + 200, Some("m-vid-1".into()))?;

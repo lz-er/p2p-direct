@@ -6447,7 +6447,7 @@ input[type="checkbox"].metro-switch:checked::after {
   color: #0e0f12;
 }
 
-/* Rich Flat Metro Chat Cards for YouTube / Spotify / SoundCloud Links */
+/* Rich Flat Metro Chat Cards for YouTube / Spotify / SoundCloud / Twitch Links */
 .chat-media-link-card {
   display: flex;
   align-items: center;
@@ -6477,6 +6477,10 @@ input[type="checkbox"].metro-switch:checked::after {
 
 .chat-media-link-card.provider-soundcloud {
   border-left-color: #ff5500;
+}
+
+.chat-media-link-card.provider-twitch {
+  border-left-color: #9146ff;
 }
 
 .chat-media-link-info {
@@ -6525,13 +6529,22 @@ input[type="checkbox"].metro-switch:checked::after {
   color: #ffffff;
 }
 
+.chat-media-link-card.provider-twitch .chat-media-provider-tag {
+  background: #9146ff;
+  color: #ffffff;
+}
+
 .chat-media-link-card.is-now-playing {
   background: var(--bg-surface);
-  border-color: var(--cobalt);
+  border-top-color: var(--cobalt);
+  border-right-color: var(--cobalt);
+  border-bottom-color: var(--cobalt);
 }
 
 [data-theme="dark"] .chat-media-link-card.is-now-playing {
-  border-color: var(--acid);
+  border-top-color: var(--acid);
+  border-right-color: var(--acid);
+  border-bottom-color: var(--acid);
 }
 
 .chat-media-live-pill {
@@ -6675,6 +6688,11 @@ input[type="checkbox"].metro-switch:checked::after {
   color: #ffffff;
 }
 
+.watch-panel.provider-twitch .watch-provider-badge {
+  background: #9146ff;
+  color: #ffffff;
+}
+
 .watch-title-copy {
   display: flex;
   flex-direction: column;
@@ -6753,6 +6771,15 @@ input[type="checkbox"].metro-switch:checked::after {
   height: clamp(220px, 32vh, 290px);
 }
 
+.watch-panel.provider-twitch .watch-embed-stage {
+  height: clamp(300px, 38vh, 380px);
+}
+
+.watch-panel.is-twitch-live .watch-scrub-row,
+.watch-panel.is-twitch-clip .watch-scrub-row {
+  display: none;
+}
+
 .watch-embed-host,
 .watch-embed-iframe,
 .watch-embed-stage iframe {
@@ -6791,6 +6818,10 @@ input[type="checkbox"].metro-switch:checked::after {
 
 .watch-fallback-stage.provider-soundcloud {
   border-left-color: #ff5500;
+}
+
+.watch-fallback-stage.provider-twitch {
+  border-left-color: #9146ff;
 }
 
 .watch-fallback-tag {
@@ -7126,6 +7157,15 @@ input[type="checkbox"].metro-switch:checked::after {
   color: #ffffff;
 }
 
+.watch-queue-item.provider-twitch {
+  border-left-color: #9146ff;
+}
+
+.watch-queue-item.provider-twitch .chat-media-provider-tag {
+  background: #9146ff;
+  color: #ffffff;
+}
+
 .watch-queue-pl-pill {
   display: inline-block;
   padding: 1px 5px;
@@ -7177,6 +7217,11 @@ input[type="checkbox"].metro-switch:checked::after {
   .watch-panel.provider-spotify.is-spotify-collection .watch-embed-stage,
   .watch-panel.provider-soundcloud.is-soundcloud-playlist .watch-embed-stage {
     max-height: 260px;
+  }
+
+  .watch-panel.provider-twitch .watch-embed-stage {
+    height: clamp(220px, 34vh, 300px);
+    max-height: 300px;
   }
 
   .chat-media-link-card {

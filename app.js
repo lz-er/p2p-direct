@@ -640,7 +640,7 @@ const SAFE_VIDEO_DATA_URL_RE = /^data:video\/(mp4|webm|ogg|quicktime);base64,[A-
 const SAFE_IMAGE_DATA_URL_PREFIX_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,/;
 const SAFE_VIDEO_DATA_URL_PREFIX_RE = /^data:video\/(mp4|webm|ogg|quicktime);base64,/;
 const SAFE_HTTP_URL_RE = /^https?:\/\/[^\s<>"']+$/i;
-const URL_REGEX = /(?:https?:\/\/|(?:www\.|m\.|music\.|open\.|play\.|on\.)?(?:youtube\.com|youtu\.be|spotify\.com|soundcloud\.com)\/)[^\s<>"']+/gi;
+const URL_REGEX = /(?:https?:\/\/|(?:www\.|m\.|music\.|open\.|play\.|on\.|clips\.|player\.)?(?:youtube\.com|youtu\.be|spotify\.com|soundcloud\.com|twitch\.tv)\/)[^\s<>"']+/gi;
 const MAX_MEDIA_PER_MESSAGE = 3;
 const MAX_STATIC_IMAGE_CHARS = 54000;
 const MAX_GIF_RAW_BYTES = 4 * 1024 * 1024;
@@ -1379,7 +1379,7 @@ class P2PDirectApp {
     this.lightboxState = null; // { kind, blob, dataUrl, tempUrl, syncTargetId, gifBinding, videoBinding }
     this.dcChunkSeq = 0;
 
-    // Room-wide E2EE Synchronized Media (Videos, GIFs) & Watch Together (YouTube/Spotify/SoundCloud)
+    // Room-wide E2EE Synchronized Media (Videos, GIFs) & Watch Together (YouTube/Spotify/SoundCloud/Twitch)
     // Volume and mute are STRICTLY local-only and never included in mediaSync state.
     this.mediaSync = {
       states: new Map(), // targetId -> MediaSyncState
@@ -1398,6 +1398,7 @@ class P2PDirectApp {
       watchPlaylistItems: [],
       watchTracksOpen: false,
       watchSpotifyTrackDetached: false,
+      watchTwitchOffline: false,
       lightboxVideoApplying: false,
       lightboxVideoSuppressUntil: 0,
     };
@@ -2543,7 +2544,7 @@ class P2PDirectApp {
       lbVid.addEventListener("ratechange", () => broadcastLightboxVideo(null));
     }
 
-    // Watch Together (YouTube / YouTube Music / Spotify / SoundCloud — started from chat links)
+    // Watch Together (YouTube / YouTube Music / Spotify / SoundCloud / Twitch — started from chat links)
     if (this.el["btn-watch-minimize"]) {
       this.el["btn-watch-minimize"].addEventListener("click", () => this.toggleWatchMinimize());
     }
@@ -4568,14 +4569,25 @@ class P2PDirectApp {
     }
   }
 
-  /* ---- Synced Watch Together (YouTube / YouTube Music / Spotify / SoundCloud + Playlists) ---- */
+  /* ---- Synced Watch Together (YouTube / YouTube Music / Spotify / SoundCloud / Twitch + Playlists) ---- */
 
   _watchProviderLabel(provider) {
     if (provider === "ytmusic") return "YT MUSIC";
     if (provider === "youtube") return "YOUTUBE";
     if (provider === "spotify") return "SPOTIFY";
     if (provider === "soundcloud") return "SOUNDCLOUD";
+    if (provider === "twitch") return "TWITCH";
     return String(provider || "WATCH").toUpperCase();
+  }
+
+  _getTwitchEntityKind(state) {
+    if (!state || state.provider !== "twitch") return "";
+    const id = String(state.mediaId || "");
+    if (id.startsWith("channel:")) return "channel";
+    if (id.startsWith("clip:")) return "clip";
+    if (id.startsWith("collection:")) return "collection";
+    if (id.startsWith("video:")) return "video";
+    return "";
   }
 
   _isWatchPlaylistState(state) {
@@ -4583,6 +4595,14 @@ class P2PDirectApp {
       state &&
         state.active &&
         (state.playlistId || this.mediaSync.watchPlaylistCount > 1)
+    );
+  }
+
+  _isIndexableWatchPlaylist(state) {
+    return (
+      this._isWatchPlaylistState(state) &&
+      state.provider !== "spotify" &&
+      state.provider !== "twitch"
     );
   }
 
@@ -4595,7 +4615,7 @@ class P2PDirectApp {
         if (!cur || !cur.active) return;
         if (ev.ended) {
           if (cur.loop) {
-            if (cur.playlistId && (cur.playlistIndex || 0) > 0 && cur.provider !== "spotify") {
+            if (cur.playlistId && (cur.playlistIndex || 0) > 0 && this._isIndexableWatchPlaylist(cur)) {
               this.selectWatchPlaylistTrack(0);
             } else {
               this.replayWatch();
@@ -4649,23 +4669,30 @@ class P2PDirectApp {
             this.el["watch-panel-title"].textContent = meta.title;
           }
         }
-        let playlistMetaChanged = false;
+        let uiMetaChanged = false;
         if (typeof meta.playlistCount === "number" && meta.playlistCount !== this.mediaSync.watchPlaylistCount) {
           this.mediaSync.watchPlaylistCount = meta.playlistCount;
-          playlistMetaChanged = true;
+          uiMetaChanged = true;
         }
         if (Array.isArray(meta.playlistItems) && meta.playlistItems.length > 0) {
           this.mediaSync.watchPlaylistItems = meta.playlistItems;
-          playlistMetaChanged = true;
+          uiMetaChanged = true;
         }
         if (
           typeof meta.spotifyTrackDetached === "boolean" &&
           meta.spotifyTrackDetached !== this.mediaSync.watchSpotifyTrackDetached
         ) {
           this.mediaSync.watchSpotifyTrackDetached = meta.spotifyTrackDetached;
-          playlistMetaChanged = true;
+          uiMetaChanged = true;
         }
-        if (playlistMetaChanged) {
+        if (
+          typeof meta.twitchOffline === "boolean" &&
+          meta.twitchOffline !== this.mediaSync.watchTwitchOffline
+        ) {
+          this.mediaSync.watchTwitchOffline = meta.twitchOffline;
+          uiMetaChanged = true;
+        }
+        if (uiMetaChanged) {
           const cur = this.mediaSync.states.get("watch");
           if (cur && cur.active) {
             this._syncWatchTogetherUi(cur);
@@ -4697,7 +4724,7 @@ class P2PDirectApp {
   startWatchTogetherFromUrl(rawUrl, sourceMsgId = "") {
     const parsed = parseWatchMediaUrl(rawUrl);
     if (!parsed) {
-      this.showToast("Share a valid YouTube, YouTube Music, Spotify, or SoundCloud link in chat");
+      this.showToast("Share a valid YouTube, YouTube Music, Spotify, SoundCloud, or Twitch link in chat");
       return false;
     }
     const prev = this.mediaSync.states.get("watch");
@@ -4708,6 +4735,7 @@ class P2PDirectApp {
     this.mediaSync.watchPlaylistItems = [];
     this.mediaSync.watchTracksOpen = false;
     this.mediaSync.watchSpotifyTrackDetached = false;
+    this.mediaSync.watchTwitchOffline = false;
 
     this.publishMediaSync({
       targetId: "watch",
@@ -4728,7 +4756,16 @@ class P2PDirectApp {
       trackUri: parsed.trackUri || "",
       queue: Array.isArray(prev?.queue) ? prev.queue : [],
     });
-    const kindWord = parsed.isPlaylist ? " playlist" : "";
+    const kindWord =
+      parsed.entityType === "channel"
+        ? " live stream"
+        : parsed.entityType === "clip"
+          ? " clip"
+          : parsed.entityType === "collection"
+            ? " collection"
+            : parsed.isPlaylist
+              ? " playlist"
+              : "";
     this.showToast(`Started synced ${parsed.providerLabel}${kindWord} for room`);
     return true;
   }
@@ -4736,7 +4773,7 @@ class P2PDirectApp {
   enqueueWatchUrl(rawUrl) {
     const parsed = parseWatchMediaUrl(rawUrl);
     if (!parsed) {
-      this.showToast("Paste a valid YouTube, YouTube Music, Spotify, or SoundCloud link or playlist");
+      this.showToast("Share a valid YouTube, YouTube Music, Spotify, SoundCloud, or Twitch link in chat");
       return false;
     }
     const prev = this.mediaSync.states.get("watch");
@@ -4761,7 +4798,16 @@ class P2PDirectApp {
       active: true,
       queue: nextQueue,
     });
-    const noun = parsed.isPlaylist ? "playlist" : "track";
+    const noun =
+      parsed.entityType === "channel"
+        ? "stream"
+        : parsed.entityType === "clip"
+          ? "clip"
+          : parsed.entityType === "collection"
+            ? "collection"
+            : parsed.isPlaylist
+              ? "playlist"
+              : "track";
     this.showToast(`Queued ${parsed.providerLabel} ${noun} (#${nextQueue.length})`);
     return true;
   }
@@ -4769,7 +4815,9 @@ class P2PDirectApp {
   toggleWatchPlay() {
     const cur = this.mediaSync.states.get("watch");
     if (!cur || !cur.active) return;
-    const nowPos = projectMediaPositionMs(cur, Date.now());
+    const tk = this._getTwitchEntityKind(cur);
+    if (tk === "clip") return;
+    const nowPos = tk === "channel" ? 0 : projectMediaPositionMs(cur, Date.now());
     this.publishMediaSync({
       targetId: "watch",
       kind: "watch",
@@ -4782,6 +4830,8 @@ class P2PDirectApp {
   seekWatchBy(deltaMs) {
     const cur = this.mediaSync.states.get("watch");
     if (!cur || !cur.active) return;
+    const tk = this._getTwitchEntityKind(cur);
+    if (tk === "channel" || tk === "clip") return;
     const nowPos = projectMediaPositionMs(cur, Date.now());
     const dur = this.mediaSync.watchDurationMs || 0;
     let nextPos = Math.max(0, nowPos + deltaMs);
@@ -4792,6 +4842,8 @@ class P2PDirectApp {
   seekWatchTo(posMs) {
     const cur = this.mediaSync.states.get("watch");
     if (!cur || !cur.active) return;
+    const tk = this._getTwitchEntityKind(cur);
+    if (tk === "channel" || tk === "clip") return;
     this.publishMediaSync({
       targetId: "watch",
       kind: "watch",
@@ -4804,6 +4856,7 @@ class P2PDirectApp {
   replayWatch() {
     const cur = this.mediaSync.states.get("watch");
     if (!cur || !cur.active) return;
+    if (this._getTwitchEntityKind(cur) === "channel") return;
     this.publishMediaSync({
       targetId: "watch",
       kind: "watch",
@@ -4817,6 +4870,8 @@ class P2PDirectApp {
   toggleWatchLoop() {
     const cur = this.mediaSync.states.get("watch");
     if (!cur || !cur.active) return;
+    const tk = this._getTwitchEntityKind(cur);
+    if (tk === "channel" || tk === "clip") return;
     this.publishMediaSync({
       targetId: "watch",
       kind: "watch",
@@ -4840,7 +4895,7 @@ class P2PDirectApp {
 
   selectWatchPlaylistTrack(idx) {
     const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active || !this._isWatchPlaylistState(cur)) return;
+    if (!cur || !cur.active || !this._isIndexableWatchPlaylist(cur)) return;
     const count = this.mediaSync.watchPlaylistCount || 0;
     let targetIdx = Math.max(0, Math.floor(Number(idx) || 0));
     if (count > 0) {
@@ -4865,7 +4920,7 @@ class P2PDirectApp {
 
   playPrevWatchTrack() {
     const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active || !this._isWatchPlaylistState(cur) || cur.provider === "spotify") return;
+    if (!cur || !cur.active || !this._isIndexableWatchPlaylist(cur)) return;
     const curIdx = Math.max(0, Number(cur.playlistIndex) || 0);
     const count = this.mediaSync.watchPlaylistCount || 0;
     if (curIdx > 0) {
@@ -4880,8 +4935,7 @@ class P2PDirectApp {
   playNextWatchTrackOrQueue() {
     const cur = this.mediaSync.states.get("watch");
     if (!cur || !cur.active) return;
-    const isIndexablePlaylist = this._isWatchPlaylistState(cur) && cur.provider !== "spotify";
-    if (isIndexablePlaylist) {
+    if (this._isIndexableWatchPlaylist(cur)) {
       const curIdx = Math.max(0, Number(cur.playlistIndex) || 0);
       const count = this.mediaSync.watchPlaylistCount || 0;
       if (count === 0 || curIdx + 1 < count) {
@@ -4923,12 +4977,14 @@ class P2PDirectApp {
     if (!cur || !Array.isArray(cur.queue) || idx < 0 || idx >= cur.queue.length) return;
     const item = cur.queue[idx];
     const remaining = cur.queue.slice(0, idx).concat(cur.queue.slice(idx + 1));
+    const parsedItem = parseWatchMediaUrl(item.url);
     this.mediaSync.watchTitleOverride = "";
     this.mediaSync.watchDurationMs = 0;
     this.mediaSync.watchPlaylistCount = 0;
     this.mediaSync.watchPlaylistItems = [];
     this.mediaSync.watchTracksOpen = false;
     this.mediaSync.watchSpotifyTrackDetached = false;
+    this.mediaSync.watchTwitchOffline = false;
     this.publishMediaSync({
       targetId: "watch",
       kind: "watch",
@@ -4944,7 +5000,7 @@ class P2PDirectApp {
       sourceMsgId: "",
       playlistId: item.playlistId || "",
       playlistIndex: item.playlistIndex || 0,
-      trackUri: "",
+      trackUri: parsedItem?.trackUri || "",
       queue: remaining,
     });
   }
@@ -4968,6 +5024,7 @@ class P2PDirectApp {
     this.mediaSync.watchPlaylistItems = [];
     this.mediaSync.watchTracksOpen = false;
     this.mediaSync.watchSpotifyTrackDetached = false;
+    this.mediaSync.watchTwitchOffline = false;
     if (cur && cur.active) {
       this.publishMediaSync({
         targetId: "watch",
@@ -5038,6 +5095,7 @@ class P2PDirectApp {
       this.mediaSync.watchPlaylistItems = [];
       this.mediaSync.watchTracksOpen = false;
       this.mediaSync.watchSpotifyTrackDetached = false;
+      this.mediaSync.watchTwitchOffline = false;
       if (this.mediaSync.watchUiTimer) {
         clearInterval(this.mediaSync.watchUiTimer);
         this.mediaSync.watchUiTimer = null;
@@ -5058,6 +5116,7 @@ class P2PDirectApp {
       this.mediaSync.watchPlaylistItems = [];
       this.mediaSync.watchTracksOpen = false;
       this.mediaSync.watchSpotifyTrackDetached = false;
+      this.mediaSync.watchTwitchOffline = false;
       this.mediaSync.watchMinimized = false;
       if (this.el["btn-watch-autoplay-unmute"]) {
         this.el["btn-watch-autoplay-unmute"].classList.add("hidden");
@@ -5114,9 +5173,12 @@ class P2PDirectApp {
       "provider-ytmusic",
       "provider-spotify",
       "provider-soundcloud",
+      "provider-twitch",
       "is-playlist",
       "is-spotify-collection",
-      "is-soundcloud-playlist"
+      "is-soundcloud-playlist",
+      "is-twitch-live",
+      "is-twitch-clip"
     );
     panel.classList.toggle("is-minimized", this.mediaSync.watchMinimized);
     if (this.el["btn-watch-minimize"]) {
@@ -5125,9 +5187,20 @@ class P2PDirectApp {
     }
 
     const isPlaylist = this._isWatchPlaylistState(state);
+    const twitchKind = this._getTwitchEntityKind(state);
+    const isTwitchLive = twitchKind === "channel";
+    const isTwitchClip = twitchKind === "clip";
+    const isTwitchCollection = twitchKind === "collection";
+
     panel.classList.add(`provider-${state.provider}`);
     if (isPlaylist) {
       panel.classList.add("is-playlist");
+    }
+    if (isTwitchLive) {
+      panel.classList.add("is-twitch-live");
+    }
+    if (isTwitchClip) {
+      panel.classList.add("is-twitch-clip");
     }
     if (state.provider === "spotify") {
       const p = parseWatchMediaUrl(state.url);
@@ -5144,7 +5217,15 @@ class P2PDirectApp {
 
     if (this.el["watch-provider-badge"]) {
       const baseBadge = this._watchProviderLabel(state.provider);
-      this.el["watch-provider-badge"].textContent = isPlaylist ? `${baseBadge} · PLAYLIST` : baseBadge;
+      if (isTwitchLive) {
+        this.el["watch-provider-badge"].textContent = "TWITCH · LIVE";
+      } else if (isTwitchClip) {
+        this.el["watch-provider-badge"].textContent = "TWITCH · CLIP";
+      } else if (isTwitchCollection) {
+        this.el["watch-provider-badge"].textContent = "TWITCH · COLLECTION";
+      } else {
+        this.el["watch-provider-badge"].textContent = isPlaylist ? `${baseBadge} · PLAYLIST` : baseBadge;
+      }
     }
     if (this.el["watch-panel-title"]) {
       this.el["watch-panel-title"].textContent =
@@ -5153,13 +5234,25 @@ class P2PDirectApp {
     if (this.el["watch-sync-meta"]) {
       const who = state.actorName || "Room";
       const statusText = state.playing ? "Playing" : "Paused";
-      const hint =
-        state.provider === "spotify"
-          ? isPlaylist
-            ? " · Pick any track inside embed to sync room"
-            : " · Full track if logged into Spotify"
-          : " · Volume is local-only";
-      this.el["watch-sync-meta"].textContent = `SYNCED · ${statusText} · Last control: ${who}${hint}`;
+      if (isTwitchLive) {
+        const offlineNote = this.mediaSync.watchTwitchOffline ? " · Channel offline" : "";
+        this.el["watch-sync-meta"].textContent =
+          `SYNCED · LIVE STREAM · ${statusText} · Last control: ${who}${offlineNote} · Volume is local-only`;
+      } else if (isTwitchClip) {
+        this.el["watch-sync-meta"].textContent =
+          `SYNCED · CLIP · Last control: ${who} · Replay syncs room · Volume is local-only`;
+      } else if (isTwitchCollection) {
+        this.el["watch-sync-meta"].textContent =
+          `SYNCED · ${statusText} · Last control: ${who} · Pick any video in collection · Volume is local-only`;
+      } else {
+        const hint =
+          state.provider === "spotify"
+            ? isPlaylist
+              ? " · Pick any track inside embed to sync room"
+              : " · Full track if logged into Spotify"
+            : " · Volume is local-only";
+        this.el["watch-sync-meta"].textContent = `SYNCED · ${statusText} · Last control: ${who}${hint}`;
+      }
     }
     if (this.el["watch-open-external"]) {
       this.el["watch-open-external"].href = state.url;
@@ -5170,9 +5263,24 @@ class P2PDirectApp {
     if (this.el["watch-transport"]) this.el["watch-transport"].classList.remove("hidden");
 
     if (this.el["btn-watch-play"]) {
+      this.el["btn-watch-play"].classList.toggle("hidden", isTwitchClip);
       this.el["btn-watch-play"].textContent = state.playing ? "❚❚ Pause" : "▶ Play";
     }
+    if (this.el["btn-watch-back10"]) {
+      this.el["btn-watch-back10"].classList.toggle("hidden", isTwitchLive || isTwitchClip);
+    }
+    if (this.el["btn-watch-fwd10"]) {
+      this.el["btn-watch-fwd10"].classList.toggle("hidden", isTwitchLive || isTwitchClip);
+    }
+    if (this.el["btn-watch-replay"]) {
+      this.el["btn-watch-replay"].classList.toggle("hidden", isTwitchLive);
+      this.el["btn-watch-replay"].textContent = isTwitchClip ? "↺ Replay" : "↺ 0:00";
+      this.el["btn-watch-replay"].title = isTwitchClip
+        ? "Replay clip from start for everyone"
+        : "Restart from 0:00 for everyone";
+    }
     if (this.el["btn-watch-loop"]) {
+      this.el["btn-watch-loop"].classList.toggle("hidden", isTwitchLive || isTwitchClip);
       this.el["btn-watch-loop"].textContent = state.loop ? "Loop: On" : "Loop: Off";
       this.el["btn-watch-loop"].classList.toggle("is-active", Boolean(state.loop));
     }
@@ -5183,14 +5291,17 @@ class P2PDirectApp {
         this.el["watch-speed-select"].value = String(state.rateMilli || 1000);
       }
     }
-    // Spotify Embed API does not expose external setVolume — keep local slider for YouTube, YT Music & SoundCloud
+    // Spotify Embed API & Twitch Clips iframe do not expose external setVolume
     if (this.el["watch-local-vol-row"]) {
-      this.el["watch-local-vol-row"].classList.toggle("hidden", state.provider === "spotify");
+      this.el["watch-local-vol-row"].classList.toggle(
+        "hidden",
+        state.provider === "spotify" || isTwitchClip
+      );
     }
     this._updateWatchLocalVolUi();
 
     const queue = Array.isArray(state.queue) ? state.queue : [];
-    const indexablePlaylist = isPlaylist && state.provider !== "spotify";
+    const indexablePlaylist = this._isIndexableWatchPlaylist(state);
     if (this.el["btn-watch-prev"]) {
       this.el["btn-watch-prev"].classList.toggle("hidden", !indexablePlaylist);
     }
@@ -5224,6 +5335,7 @@ class P2PDirectApp {
     const curIdx = Math.max(0, Number(state.playlistIndex) || 0);
     const items = Array.isArray(this.mediaSync.watchPlaylistItems) ? this.mediaSync.watchPlaylistItems : [];
     const count = this.mediaSync.watchPlaylistCount || items.length;
+    const isIndexable = this._isIndexableWatchPlaylist(state);
 
     if (statusEl) {
       if (state.provider === "spotify") {
@@ -5234,6 +5346,11 @@ class P2PDirectApp {
         statusEl.textContent = trackCode
           ? `SPOTIFY PLAYLIST · SYNCED TRACK (${trackCode})`
           : "SPOTIFY PLAYLIST · PICK ANY TRACK TO SYNC ROOM";
+      } else if (state.provider === "twitch") {
+        const vidCode = state.trackUri ? String(state.trackUri).replace(/^v/i, "") : "";
+        statusEl.textContent = vidCode
+          ? `TWITCH COLLECTION · VIDEO ${vidCode}`
+          : "TWITCH COLLECTION · PICK ANY VIDEO TO SYNC ROOM";
       } else {
         const trackCounter = count > 0 ? `TRACK ${curIdx + 1} / ${count}` : `TRACK #${curIdx + 1}`;
         const curItem = items[curIdx];
@@ -5255,7 +5372,7 @@ class P2PDirectApp {
     }
 
     if (tracksBtn) {
-      const hasTracks = items.length > 0 && state.provider !== "spotify";
+      const hasTracks = items.length > 0 && isIndexable;
       tracksBtn.classList.toggle("hidden", !hasTracks);
       if (hasTracks) {
         tracksBtn.textContent = this.mediaSync.watchTracksOpen
@@ -5267,7 +5384,7 @@ class P2PDirectApp {
     }
 
     if (listEl) {
-      const showList = this.mediaSync.watchTracksOpen && items.length > 0 && state.provider !== "spotify";
+      const showList = this.mediaSync.watchTracksOpen && items.length > 0 && isIndexable;
       listEl.classList.toggle("hidden", !showList);
       if (!showList) {
         listEl.innerHTML = "";
@@ -5351,7 +5468,7 @@ class P2PDirectApp {
         <li class="watch-queue-item provider-${escapeHtml(item.provider)}">
           <div class="watch-queue-item-main">
             <span class="chat-media-provider-tag">${escapeHtml(this._watchProviderLabel(item.provider))}</span>
-            ${item.playlistId ? '<span class="watch-queue-pl-pill">PLAYLIST</span>' : ""}
+            ${item.playlistId ? `<span class="watch-queue-pl-pill">${item.provider === "twitch" ? "COLLECTION" : "PLAYLIST"}</span>` : ""}
             <span class="watch-queue-item-title">${escapeHtml(item.title || item.url)}</span>
             ${item.addedBy ? `<span class="watch-queue-item-by">by ${escapeHtml(item.addedBy)}</span>` : ""}
           </div>

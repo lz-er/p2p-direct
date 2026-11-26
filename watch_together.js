@@ -1,5 +1,5 @@
 /**
- * Synchronized Watch Together (YouTube / Spotify / SoundCloud) & GIF/Video sync helpers.
+ * Synchronized Watch Together (YouTube / Spotify / SoundCloud / Twitch) & GIF/Video sync helpers.
  *
  * Design principles:
  * - Zero third-party scripts are loaded until a room actually starts a Watch Together session.
@@ -29,6 +29,14 @@ const SOUNDCLOUD_HOSTS = new Set([
   "on.soundcloud.com",
 ]);
 
+const TWITCH_HOSTS = new Set([
+  "twitch.tv",
+  "www.twitch.tv",
+  "m.twitch.tv",
+  "clips.twitch.tv",
+  "player.twitch.tv",
+]);
+
 const SOUNDCLOUD_RESERVED_ROOTS = new Set([
   "",
   "discover",
@@ -46,15 +54,95 @@ const SOUNDCLOUD_RESERVED_ROOTS = new Set([
   "pages",
 ]);
 
+const TWITCH_RESERVED_ROOTS = new Set([
+  "",
+  "directory",
+  "downloads",
+  "jobs",
+  "p",
+  "settings",
+  "subscriptions",
+  "inventory",
+  "drops",
+  "wallet",
+  "turbo",
+  "prime",
+  "search",
+  "login",
+  "signup",
+  "videos",
+  "collections",
+  "popout",
+  "moderator",
+  "u",
+  "embed",
+  "friends",
+  "messages",
+  "broadcast",
+  "manager",
+  "store",
+  "bits",
+  "team",
+  "products",
+  "security",
+  "annual-recap",
+  "activate",
+]);
+
 const YOUTUBE_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const YOUTUBE_LIST_ID_RE = /^[A-Za-z0-9_-]{10,128}$/;
 const SPOTIFY_ID_RE = /^[A-Za-z0-9]{15,30}$/;
 const SPOTIFY_TYPES = new Set(["track", "album", "playlist", "episode", "show"]);
 const SOUNDCLOUD_SECRET_RE = /^s-[A-Za-z0-9_-]{4,64}$/i;
 const SOUNDCLOUD_PLAYLIST_TABS = new Set(["likes", "tracks", "popular-tracks"]);
+const TWITCH_CHANNEL_RE = /^[a-z0-9_]{2,25}$/i;
+const TWITCH_VIDEO_RE = /^\d{5,16}$/;
+const TWITCH_COLLECTION_RE = /^[A-Za-z0-9_-]{6,64}$/;
+const TWITCH_CLIP_RE = /^[A-Za-z0-9_-]{4,128}$/;
+
+function normalizeTwitchVideoId(raw) {
+  const cleaned = String(raw || "").trim().replace(/^v(?=\d+$)/i, "");
+  return TWITCH_VIDEO_RE.test(cleaned) ? cleaned : "";
+}
+
+function formatTwitchTime(ms) {
+  const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  return `${h}h${m}m${s}s`;
+}
+
+function parseTwitchMediaKind(mediaId) {
+  const s = String(mediaId || "");
+  if (s.startsWith("channel:")) {
+    const ch = s.slice(8).toLowerCase();
+    return TWITCH_CHANNEL_RE.test(ch) ? { kind: "channel", id: ch } : null;
+  }
+  if (s.startsWith("video:")) {
+    const vid = normalizeTwitchVideoId(s.slice(6));
+    return vid ? { kind: "video", id: vid } : null;
+  }
+  if (s.startsWith("collection:")) {
+    const col = s.slice(11);
+    return TWITCH_COLLECTION_RE.test(col) ? { kind: "collection", id: col } : null;
+  }
+  if (s.startsWith("clip:")) {
+    const slug = s.slice(5);
+    return TWITCH_CLIP_RE.test(slug) ? { kind: "clip", id: slug } : null;
+  }
+  return null;
+}
+
+function getTwitchParentHost() {
+  if (typeof window !== "undefined" && window.location && window.location.hostname) {
+    return window.location.hostname;
+  }
+  return "localhost";
+}
 
 /**
- * Parses YouTube `t=` / `start=` timestamp strings (`90`, `90s`, `1m30s`, `1h2m3s`) into ms.
+ * Parses YouTube / Twitch `t=` / `start=` timestamp strings (`90`, `90s`, `1m30s`, `1h2m3s`) into ms.
  */
 export function parseYouTubeStartMs(raw) {
   if (!raw) return 0;
@@ -72,8 +160,8 @@ export function parseYouTubeStartMs(raw) {
 }
 
 /**
- * Parses a YouTube, YouTube Music, Spotify, or SoundCloud link (track, video, or playlist)
- * into a normalized Watch Together descriptor, or returns `null` if unsupported.
+ * Parses a YouTube, YouTube Music, Spotify, SoundCloud, or Twitch link (live channel, video,
+ * VOD, clip, collection, or playlist) into a normalized Watch Together descriptor, or `null`.
  */
 export function parseWatchMediaUrl(rawUrl) {
   if (typeof rawUrl !== "string") return null;
@@ -277,6 +365,218 @@ export function parseWatchMediaUrl(rawUrl) {
     };
   }
 
+  // 4. Twitch (live channels, VODs, collections/playlists, clips, and player.twitch.tv links)
+  if (TWITCH_HOSTS.has(host)) {
+    const startMs = parseYouTubeStartMs(parsed.searchParams.get("t") || "");
+
+    // 4a. clips.twitch.tv/<slug> or clips.twitch.tv/embed?clip=<slug>
+    if (host === "clips.twitch.tv") {
+      const slug =
+        (segments[0] === "embed" ? parsed.searchParams.get("clip") : segments[0]) || "";
+      if (!TWITCH_CLIP_RE.test(slug)) return null;
+      return {
+        provider: "twitch",
+        providerLabel: "Twitch",
+        entityType: "clip",
+        ctaLabel: "Watch Clip",
+        mediaId: `clip:${slug}`,
+        isPlaylist: false,
+        playlistId: "",
+        playlistIndex: 0,
+        trackUri: "",
+        url: `https://clips.twitch.tv/${slug}`,
+        title: `Twitch Clip · ${slug.slice(0, 24)}`,
+        subtitle: "Clip",
+        startMs: 0,
+      };
+    }
+
+    // 4b. player.twitch.tv/?channel=<ch> | ?video=<id> | ?collection=<col>
+    if (host === "player.twitch.tv") {
+      const colRaw = (parsed.searchParams.get("collection") || "").trim();
+      const vidId = normalizeTwitchVideoId(parsed.searchParams.get("video") || "");
+      const chRaw = (parsed.searchParams.get("channel") || "").trim().toLowerCase();
+      if (colRaw && TWITCH_COLLECTION_RE.test(colRaw)) {
+        return {
+          provider: "twitch",
+          providerLabel: "Twitch",
+          entityType: "collection",
+          ctaLabel: "Watch Collection",
+          mediaId: `collection:${colRaw}`,
+          isPlaylist: true,
+          playlistId: `collection:${colRaw}`,
+          playlistIndex: 0,
+          trackUri: vidId,
+          url: vidId
+            ? `https://www.twitch.tv/videos/${vidId}?collection=${colRaw}${startMs > 0 ? `&t=${formatTwitchTime(startMs)}` : ""}`
+            : `https://www.twitch.tv/collections/${colRaw}`,
+          title: `Twitch Collection · ${colRaw.slice(0, 14)}`,
+          subtitle: "Collection",
+          startMs,
+        };
+      }
+      if (vidId) {
+        return {
+          provider: "twitch",
+          providerLabel: "Twitch",
+          entityType: "video",
+          ctaLabel: "Watch Together",
+          mediaId: `video:${vidId}`,
+          isPlaylist: false,
+          playlistId: "",
+          playlistIndex: 0,
+          trackUri: "",
+          url: `https://www.twitch.tv/videos/${vidId}${startMs > 0 ? `?t=${formatTwitchTime(startMs)}` : ""}`,
+          title: `Twitch VOD · ${vidId}`,
+          subtitle: "VOD",
+          startMs,
+        };
+      }
+      if (chRaw && !TWITCH_RESERVED_ROOTS.has(chRaw) && TWITCH_CHANNEL_RE.test(chRaw)) {
+        return {
+          provider: "twitch",
+          providerLabel: "Twitch",
+          entityType: "channel",
+          ctaLabel: "Watch Live",
+          mediaId: `channel:${chRaw}`,
+          isPlaylist: false,
+          playlistId: "",
+          playlistIndex: 0,
+          trackUri: "",
+          url: `https://www.twitch.tv/${chRaw}`,
+          title: `Twitch · ${chRaw}`,
+          subtitle: "Live Stream",
+          startMs: 0,
+        };
+      }
+      return null;
+    }
+
+    const first = (segments[0] || "").toLowerCase();
+    const second = (segments[1] || "").toLowerCase();
+
+    // 4c. /<channel>/clip/<slug>
+    if (
+      segments.length >= 3 &&
+      second === "clip" &&
+      TWITCH_CHANNEL_RE.test(first) &&
+      !TWITCH_RESERVED_ROOTS.has(first) &&
+      TWITCH_CLIP_RE.test(segments[2] || "")
+    ) {
+      const slug = segments[2];
+      return {
+        provider: "twitch",
+        providerLabel: "Twitch",
+        entityType: "clip",
+        ctaLabel: "Watch Clip",
+        mediaId: `clip:${slug}`,
+        isPlaylist: false,
+        playlistId: "",
+        playlistIndex: 0,
+        trackUri: "",
+        url: `https://www.twitch.tv/${first}/clip/${slug}`,
+        title: `Twitch Clip · ${first}`,
+        subtitle: "Clip",
+        startMs: 0,
+      };
+    }
+
+    // 4d. /videos/<id>, /<channel>/video/<id>, or /<channel>/v/<id> (optional ?collection=<col> & ?t=)
+    let vodId = "";
+    if (first === "videos" && segments[1]) {
+      vodId = normalizeTwitchVideoId(segments[1]);
+    } else if (
+      segments.length >= 3 &&
+      (second === "video" || second === "v") &&
+      TWITCH_CHANNEL_RE.test(first) &&
+      !TWITCH_RESERVED_ROOTS.has(first)
+    ) {
+      vodId = normalizeTwitchVideoId(segments[2]);
+    }
+    if (vodId) {
+      const colRaw = (parsed.searchParams.get("collection") || "").trim();
+      const validCol = TWITCH_COLLECTION_RE.test(colRaw) ? colRaw : "";
+      if (validCol) {
+        return {
+          provider: "twitch",
+          providerLabel: "Twitch",
+          entityType: "collection",
+          ctaLabel: "Watch Collection",
+          mediaId: `collection:${validCol}`,
+          isPlaylist: true,
+          playlistId: `collection:${validCol}`,
+          playlistIndex: 0,
+          trackUri: vodId,
+          url: `https://www.twitch.tv/videos/${vodId}?collection=${validCol}${startMs > 0 ? `&t=${formatTwitchTime(startMs)}` : ""}`,
+          title: `Twitch Collection · ${validCol.slice(0, 14)}`,
+          subtitle: "Collection",
+          startMs,
+        };
+      }
+      return {
+        provider: "twitch",
+        providerLabel: "Twitch",
+        entityType: "video",
+        ctaLabel: "Watch Together",
+        mediaId: `video:${vodId}`,
+        isPlaylist: false,
+        playlistId: "",
+        playlistIndex: 0,
+        trackUri: "",
+        url: `https://www.twitch.tv/videos/${vodId}${startMs > 0 ? `?t=${formatTwitchTime(startMs)}` : ""}`,
+        title: `Twitch VOD · ${vodId}`,
+        subtitle: "VOD",
+        startMs,
+      };
+    }
+
+    // 4e. /collections/<colId>
+    if (first === "collections" && segments[1] && TWITCH_COLLECTION_RE.test(segments[1])) {
+      const colId = segments[1];
+      const optVid = normalizeTwitchVideoId(parsed.searchParams.get("video") || "");
+      return {
+        provider: "twitch",
+        providerLabel: "Twitch",
+        entityType: "collection",
+        ctaLabel: "Watch Collection",
+        mediaId: `collection:${colId}`,
+        isPlaylist: true,
+        playlistId: `collection:${colId}`,
+        playlistIndex: 0,
+        trackUri: optVid,
+        url: `https://www.twitch.tv/collections/${colId}`,
+        title: `Twitch Collection · ${colId.slice(0, 14)}`,
+        subtitle: "Collection",
+        startMs,
+      };
+    }
+
+    // 4f. Live channel: /<channel> or mobile /<channel>/home
+    if (
+      (segments.length === 1 || (segments.length === 2 && second === "home")) &&
+      !TWITCH_RESERVED_ROOTS.has(first) &&
+      TWITCH_CHANNEL_RE.test(first)
+    ) {
+      return {
+        provider: "twitch",
+        providerLabel: "Twitch",
+        entityType: "channel",
+        ctaLabel: "Watch Live",
+        mediaId: `channel:${first}`,
+        isPlaylist: false,
+        playlistId: "",
+        playlistIndex: 0,
+        trackUri: "",
+        url: `https://www.twitch.tv/${first}`,
+        title: `Twitch · ${first}`,
+        subtitle: "Live Stream",
+        startMs: 0,
+      };
+    }
+
+    return null;
+  }
+
   return null;
 }
 
@@ -451,6 +751,40 @@ function loadSoundCloudWidgetApi() {
   return scApiPromise;
 }
 
+let twitchApiPromise = null;
+function loadTwitchEmbedApi() {
+  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
+  if (window.Twitch && typeof window.Twitch.Player === "function") {
+    return Promise.resolve(window.Twitch);
+  }
+  if (twitchApiPromise) return twitchApiPromise;
+  twitchApiPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      twitchApiPromise = null;
+      reject(new Error("Twitch Embed API load timed out"));
+    }, 6000);
+    const script = document.createElement("script");
+    script.src = "https://player.twitch.tv/js/embed/v1.js";
+    script.async = true;
+    script.onload = () => {
+      clearTimeout(timeout);
+      if (window.Twitch && typeof window.Twitch.Player === "function") {
+        resolve(window.Twitch);
+      } else {
+        twitchApiPromise = null;
+        reject(new Error("Twitch Embed API unavailable"));
+      }
+    };
+    script.onerror = () => {
+      clearTimeout(timeout);
+      twitchApiPromise = null;
+      reject(new Error("Twitch Embed API blocked or offline"));
+    };
+    document.head.appendChild(script);
+  });
+  return twitchApiPromise;
+}
+
 /* ==================== Unified Watch Together Player Adapter ==================== */
 
 function isYouTubeFamily(provider) {
@@ -462,7 +796,7 @@ export class WatchTogetherPlayer {
    * @param {HTMLElement} mountEl - Container element where the embed mounts
    * @param {object} callbacks
    * @param {(ev: {playing: boolean, positionMs: number, rateMilli?: number, ended?: boolean, playlistIndex?: number, trackUri?: string, trackTitle?: string}) => void} callbacks.onUserAction
-   * @param {(meta: {durationMs: number, positionMs: number, title?: string, ready?: boolean, apiUnavailable?: boolean, playlistCount?: number, playlistIndex?: number, playlistItems?: Array, trackUri?: string, spotifyTrackDetached?: boolean}) => void} callbacks.onTelemetry
+   * @param {(meta: {durationMs: number, positionMs: number, title?: string, ready?: boolean, apiUnavailable?: boolean, playlistCount?: number, playlistIndex?: number, playlistItems?: Array, trackUri?: string, spotifyTrackDetached?: boolean, twitchOffline?: boolean}) => void} callbacks.onTelemetry
    * @param {(muted: boolean) => void} callbacks.onAutoplayMuted
    */
   constructor(mountEl, callbacks = {}) {
@@ -486,6 +820,8 @@ export class WatchTogetherPlayer {
     this.playlistCount = 0;
     this.playlistItems = [];
     this.spotifyShowingTrackUri = "";
+    this.twitchKind = "";
+    this.twitchEpoch = 0;
     this.suppressUntilMs = 0;
 
     // Local-only volume (0..100) & mute — NEVER transmitted or overwritten by remote sync
@@ -496,6 +832,8 @@ export class WatchTogetherPlayer {
     this.spotifyCtrl = null;
     this.scWidget = null;
     this.scIframe = null;
+    this.twitchPlayer = null;
+    this.twitchIframe = null;
     this.pendingState = null;
     this.pollTimer = null;
   }
@@ -543,6 +881,9 @@ export class WatchTogetherPlayer {
         }
       } else if (this.provider === "soundcloud" && this.scWidget && this.ready) {
         this.scWidget.setVolume(this.localMuted ? 0 : this.localVolume);
+      } else if (this.provider === "twitch" && this.twitchPlayer && this.ready) {
+        this.twitchPlayer.setVolume?.(Math.max(0, Math.min(1, this.localVolume / 100)));
+        this.twitchPlayer.setMuted?.(Boolean(this.localMuted));
       }
     } catch {
       // ignore if player tearing down
@@ -585,7 +926,15 @@ export class WatchTogetherPlayer {
     }
 
     this.pendingState = state;
+    const isTwitchClipReplay =
+      state.provider === "twitch" &&
+      this.provider === "twitch" &&
+      this.mediaId === state.mediaId &&
+      this.twitchKind === "clip" &&
+      (Number(state.epoch) || 0) !== this.twitchEpoch;
+
     const sameMedia =
+      !isTwitchClipReplay &&
       this.provider === state.provider &&
       this.mediaId === state.mediaId &&
       (this.playlistId || "") === (state.playlistId || "");
@@ -623,6 +972,8 @@ export class WatchTogetherPlayer {
     this.playlistCount = 0;
     this.playlistItems = [];
     this.spotifyShowingTrackUri = "";
+    this.twitchKind = "";
+    this.twitchEpoch = Number(state.epoch) || 0;
 
     if (!this.mountEl) return;
     this.mountEl.innerHTML = "";
@@ -633,6 +984,8 @@ export class WatchTogetherPlayer {
       await this._mountSpotify(state, gen);
     } else if (state.provider === "soundcloud") {
       await this._mountSoundCloud(state, gen);
+    } else if (state.provider === "twitch") {
+      await this._mountTwitch(state, gen);
     }
   }
 
@@ -1268,6 +1621,245 @@ export class WatchTogetherPlayer {
     }
   }
 
+  async _mountTwitch(state, gen) {
+    const info = parseTwitchMediaKind(state.mediaId);
+    if (!info) {
+      this.apiUnavailable = true;
+      this._renderFallbackStage(state);
+      return;
+    }
+
+    this.twitchKind = info.kind;
+    this.twitchEpoch = Number(state.epoch) || 0;
+    const parentHost = getTwitchParentHost();
+
+    // Twitch Clips use the official Clips iframe embed (no interactive JS API available).
+    // Synced Replay increments `epoch`, which remounts the iframe cleanly across peers.
+    if (info.kind === "clip") {
+      const iframe = document.createElement("iframe");
+      iframe.className = "watch-embed-iframe is-twitch-clip";
+      iframe.setAttribute("allowfullscreen", "true");
+      iframe.setAttribute("allow", "autoplay; fullscreen");
+      iframe.setAttribute("scrolling", "no");
+      iframe.setAttribute("frameborder", "0");
+      iframe.src =
+        `https://clips.twitch.tv/embed?clip=${encodeURIComponent(info.id)}` +
+        `&parent=${encodeURIComponent(parentHost)}` +
+        `&autoplay=${state.playing ? "true" : "false"}` +
+        `&muted=${this.localMuted ? "true" : "false"}`;
+      this.twitchIframe = iframe;
+      this.mountEl.appendChild(iframe);
+      this.ready = true;
+      this.onTelemetry({
+        durationMs: 0,
+        positionMs: 0,
+        ready: true,
+      });
+      return;
+    }
+
+    const holder = document.createElement("div");
+    holder.id = `watch-twitch-host-${gen}`;
+    holder.className = "watch-embed-host is-twitch";
+    this.mountEl.appendChild(holder);
+
+    try {
+      const Twitch = await loadTwitchEmbedApi();
+      if (gen !== this.generation) return;
+
+      const opts = {
+        width: "100%",
+        height: "100%",
+        parent: [parentHost],
+        autoplay: Boolean(state.playing),
+        muted: Boolean(this.localMuted),
+      };
+
+      const initMs = projectMediaPositionMs(state, Date.now());
+      if (info.kind === "channel") {
+        opts.channel = info.id;
+      } else if (info.kind === "video") {
+        opts.video = info.id;
+        if (initMs > 0) opts.time = formatTwitchTime(initMs);
+      } else if (info.kind === "collection") {
+        opts.collection = info.id;
+        const initVid = normalizeTwitchVideoId(state.trackUri || "");
+        if (initVid) opts.video = initVid;
+        if (initMs > 0) opts.time = formatTwitchTime(initMs);
+      }
+
+      const player = new Twitch.Player(holder.id, opts);
+      this.twitchPlayer = player;
+
+      const EV = {
+        READY: Twitch.Player.READY || "ready",
+        PLAY: Twitch.Player.PLAY || "play",
+        PLAYING: Twitch.Player.PLAYING || "playing",
+        PAUSE: Twitch.Player.PAUSE || "pause",
+        SEEK: Twitch.Player.SEEK || "seek",
+        ENDED: Twitch.Player.ENDED || "ended",
+        PLAYBACK_BLOCKED: Twitch.Player.PLAYBACK_BLOCKED || "playbackBlocked",
+        ONLINE: Twitch.Player.ONLINE || "online",
+        OFFLINE: Twitch.Player.OFFLINE || "offline",
+      };
+
+      const readPosMs = () => {
+        if (this.twitchKind === "channel") return 0;
+        const sec = Number(player.getCurrentTime?.() || 0);
+        return Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : 0;
+      };
+      const readDurMs = () => {
+        if (this.twitchKind === "channel") return 0;
+        const dur = Number(player.getDuration?.() || 0);
+        return Number.isFinite(dur) && dur > 0 ? Math.round(dur * 1000) : 0;
+      };
+      const readVid = () => normalizeTwitchVideoId(player.getVideo?.() || "");
+
+      player.addEventListener(EV.READY, () => {
+        if (gen !== this.generation) return;
+        this.ready = true;
+        this._applyLocalVolumeToAdapter();
+        const durMs = readDurMs();
+        if (durMs > 0) this.durationMs = durMs;
+        if (this.twitchKind === "collection") {
+          const curVid = readVid();
+          if (curVid) this.lastKnownTrackUri = curVid;
+        }
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: readPosMs(),
+          ready: true,
+          trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+        });
+        if (this.pendingState) {
+          this._syncMountedPlayer(this.pendingState, Date.now(), true);
+        }
+        if (this.twitchKind === "video" || this.twitchKind === "collection") {
+          this._startPollLoop(gen);
+        }
+      });
+
+      const handlePlayEvent = () => {
+        if (gen !== this.generation) return;
+        const posMs = readPosMs();
+        const durMs = readDurMs();
+        if (durMs > 0) this.durationMs = durMs;
+        let vidChanged = false;
+        if (this.twitchKind === "collection") {
+          const curVid = readVid();
+          if (curVid && curVid !== this.lastKnownTrackUri) {
+            this.lastKnownTrackUri = curVid;
+            vidChanged = true;
+          }
+        }
+        this.lastKnownPosMs = posMs;
+        const wasPlaying = this.lastKnownPlaying;
+        this.lastKnownPlaying = true;
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: posMs,
+          ready: true,
+          trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+        });
+        if (!this._isSuppressed() && (!wasPlaying || vidChanged)) {
+          this.onUserAction({
+            playing: true,
+            positionMs: posMs,
+            trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+          });
+        }
+      };
+
+      player.addEventListener(EV.PLAY, handlePlayEvent);
+      player.addEventListener(EV.PLAYING, handlePlayEvent);
+
+      player.addEventListener(EV.PAUSE, () => {
+        if (gen !== this.generation) return;
+        const posMs = readPosMs();
+        this.lastKnownPosMs = posMs;
+        const wasPlaying = this.lastKnownPlaying;
+        this.lastKnownPlaying = false;
+        if (!this._isSuppressed() && wasPlaying) {
+          this.onUserAction({
+            playing: false,
+            positionMs: posMs,
+            trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+          });
+        }
+      });
+
+      player.addEventListener(EV.SEEK, (ev) => {
+        if (gen !== this.generation || this.twitchKind === "channel") return;
+        const sec =
+          typeof ev?.position === "number" ? ev.position : Number(player.getCurrentTime?.() || 0);
+        const posMs = Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : 0;
+        this.lastKnownPosMs = posMs;
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: posMs,
+          ready: true,
+          trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+        });
+        if (!this._isSuppressed()) {
+          this.onUserAction({
+            playing: this.lastKnownPlaying,
+            positionMs: posMs,
+            trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+          });
+        }
+      });
+
+      player.addEventListener(EV.ENDED, () => {
+        if (gen !== this.generation || this.twitchKind === "channel") return;
+        const posMs = readPosMs() || this.durationMs;
+        this.lastKnownPlaying = false;
+        this.onUserAction({
+          playing: false,
+          positionMs: posMs,
+          ended: true,
+          trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+        });
+      });
+
+      player.addEventListener(EV.PLAYBACK_BLOCKED, () => {
+        if (gen !== this.generation) return;
+        try {
+          this._suppress(900);
+          player.setMuted?.(true);
+          player.play?.();
+          this.localMuted = true;
+          this.onAutoplayMuted(true);
+        } catch {
+          // ignore
+        }
+      });
+
+      player.addEventListener(EV.OFFLINE, () => {
+        if (gen !== this.generation) return;
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: 0,
+          ready: this.ready,
+          twitchOffline: true,
+        });
+      });
+
+      player.addEventListener(EV.ONLINE, () => {
+        if (gen !== this.generation) return;
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: 0,
+          ready: this.ready,
+          twitchOffline: false,
+        });
+      });
+    } catch {
+      if (gen !== this.generation) return;
+      this.apiUnavailable = true;
+      this._renderFallbackStage(state);
+    }
+  }
+
   _renderFallbackStage(state) {
     if (!this.mountEl) return;
     this.mountEl.innerHTML = "";
@@ -1276,9 +1868,18 @@ export class WatchTogetherPlayer {
     box.dataset.watchFallback = state.provider;
     const tag = document.createElement("span");
     tag.className = "watch-fallback-tag";
-    const provTag = state.provider === "ytmusic" ? "YT MUSIC" : state.provider.toUpperCase();
+    const provTag =
+      state.provider === "ytmusic"
+        ? "YT MUSIC"
+        : state.provider === "twitch" && state.mediaId?.startsWith("channel:")
+          ? "TWITCH · LIVE"
+          : state.provider === "twitch" && state.mediaId?.startsWith("clip:")
+            ? "TWITCH · CLIP"
+            : state.provider.toUpperCase();
     const plTag = state.playlistId
-      ? ` · PLAYLIST · TRACK #${(Number(state.playlistIndex) || 0) + 1}`
+      ? state.provider === "twitch"
+        ? " · COLLECTION"
+        : ` · PLAYLIST · TRACK #${(Number(state.playlistIndex) || 0) + 1}`
       : "";
     tag.textContent = `${provTag}${plTag} · SYNCED TRANSPORT`;
     const title = document.createElement("strong");
@@ -1500,6 +2101,69 @@ export class WatchTogetherPlayer {
       } catch {
         // ignore
       }
+      return;
+    }
+
+    if (this.provider === "twitch" && this.twitchPlayer) {
+      this._suppress(isInitial ? 1400 : 950);
+      try {
+        if (this.twitchKind === "collection") {
+          const desiredVid = normalizeTwitchVideoId(state.trackUri || "");
+          const curVid = normalizeTwitchVideoId(
+            this.twitchPlayer.getVideo?.() || this.lastKnownTrackUri
+          );
+          const colId = this.mediaId.startsWith("collection:") ? this.mediaId.slice(11) : "";
+          if (desiredVid && colId && desiredVid !== curVid) {
+            this._suppress(1600);
+            this.lastKnownTrackUri = desiredVid;
+            this.twitchPlayer.setCollection?.(colId, desiredVid);
+            const checkGen = this.generation;
+            setTimeout(() => {
+              if (checkGen !== this.generation || !this.twitchPlayer) return;
+              try {
+                this._suppress(900);
+                if (targetSec > 1.5) {
+                  this.twitchPlayer.seek?.(targetSec);
+                }
+                if (state.playing) {
+                  this.twitchPlayer.play?.();
+                } else {
+                  this.twitchPlayer.pause?.();
+                }
+              } catch {
+                // ignore
+              }
+            }, 260);
+            return;
+          }
+        }
+
+        if (this.twitchKind === "video" || this.twitchKind === "collection") {
+          const curSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
+          const driftThreshold = isInitial ? 0.6 : 1.0;
+          if (Math.abs(curSec - targetSec) > driftThreshold) {
+            this.twitchPlayer.seek?.(targetSec);
+          }
+        }
+
+        const isPaused =
+          typeof this.twitchPlayer.isPaused === "function"
+            ? Boolean(this.twitchPlayer.isPaused())
+            : !this.lastKnownPlaying;
+        if (state.playing) {
+          if (isPaused || isInitial) {
+            this.twitchPlayer.play?.();
+          }
+          this.lastKnownPlaying = true;
+        } else {
+          if (!isPaused || isInitial) {
+            this.twitchPlayer.pause?.();
+          }
+          this.lastKnownPlaying = false;
+        }
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -1541,6 +2205,25 @@ export class WatchTogetherPlayer {
           // ignore
         }
       }
+    } else if (
+      this.provider === "twitch" &&
+      this.twitchPlayer &&
+      (this.twitchKind === "video" || this.twitchKind === "collection")
+    ) {
+      try {
+        if (this.twitchPlayer.isPaused?.()) return;
+        const curMs = Math.max(
+          0,
+          Math.round((Number(this.twitchPlayer.getCurrentTime?.()) || 0) * 1000)
+        );
+        this.lastKnownPosMs = curMs;
+        if (Math.abs(curMs - targetMs) > 1300) {
+          this._suppress(850);
+          this.twitchPlayer.seek?.(targetMs / 1000);
+        }
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -1549,74 +2232,133 @@ export class WatchTogetherPlayer {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
-    if (!isYouTubeFamily(this.provider)) return;
-    this.pollTimer = setInterval(() => {
-      if (gen !== this.generation || !this.ytPlayer || !this.ready) return;
-      try {
-        const curMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
-        const dur = Number(this.ytPlayer.getDuration?.() || 0);
-        if (dur > 0) this.durationMs = Math.round(dur * 1000);
-        const prevMs = this.lastKnownPosMs;
-        this.lastKnownPosMs = curMs;
+    if (isYouTubeFamily(this.provider)) {
+      this.pollTimer = setInterval(() => {
+        if (gen !== this.generation || !this.ytPlayer || !this.ready) return;
+        try {
+          const curMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
+          const dur = Number(this.ytPlayer.getDuration?.() || 0);
+          if (dur > 0) this.durationMs = Math.round(dur * 1000);
+          const prevMs = this.lastKnownPosMs;
+          this.lastKnownPosMs = curMs;
 
-        let trackChanged = false;
-        let vdata = null;
-        if (this.playlistId) {
-          this._refreshYouTubePlaylistInfo();
-          const curIdx = this.ytPlayer.getPlaylistIndex?.();
-          vdata = this.ytPlayer.getVideoData?.() || {};
-          if (typeof curIdx === "number" && curIdx >= 0 && curIdx !== this.lastKnownPlaylistIndex) {
-            this.lastKnownPlaylistIndex = curIdx;
-            trackChanged = true;
+          let trackChanged = false;
+          let vdata = null;
+          if (this.playlistId) {
+            this._refreshYouTubePlaylistInfo();
+            const curIdx = this.ytPlayer.getPlaylistIndex?.();
+            vdata = this.ytPlayer.getVideoData?.() || {};
+            if (typeof curIdx === "number" && curIdx >= 0 && curIdx !== this.lastKnownPlaylistIndex) {
+              this.lastKnownPlaylistIndex = curIdx;
+              trackChanged = true;
+            }
+            if (vdata.video_id) this.lastKnownTrackUri = vdata.video_id;
           }
-          if (vdata.video_id) this.lastKnownTrackUri = vdata.video_id;
+
+          this.onTelemetry({
+            durationMs: this.durationMs,
+            positionMs: curMs,
+            title: vdata?.title || undefined,
+            ready: true,
+            playlistCount: this.playlistCount,
+            playlistIndex: this.lastKnownPlaylistIndex,
+            playlistItems: this.playlistItems,
+            trackUri: this.lastKnownTrackUri,
+          });
+
+          // Detect in-iframe YouTube scrubber seeks or playlist track switches
+          if (!this._isSuppressed() && this.pendingState) {
+            const ytState = this.ytPlayer.getPlayerState?.();
+            const rateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
+            if (trackChanged && (ytState === 1 || ytState === 2 || ytState === 3)) {
+              this.onUserAction({
+                playing: ytState !== 2,
+                positionMs: curMs,
+                rateMilli,
+                playlistIndex: this.lastKnownPlaylistIndex,
+                trackUri: this.lastKnownTrackUri,
+                trackTitle: vdata?.title || undefined,
+              });
+              return;
+            }
+            const expectedMs = projectMediaPositionMs(this.pendingState, Date.now());
+            if (
+              (ytState === 1 || ytState === 2) &&
+              Math.abs(curMs - prevMs) > 1800 &&
+              Math.abs(curMs - expectedMs) > 1500
+            ) {
+              this.onUserAction({
+                playing: ytState === 1,
+                positionMs: curMs,
+                rateMilli,
+                playlistIndex: this.playlistId ? this.lastKnownPlaylistIndex : undefined,
+                trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
+              });
+            }
+          }
+        } catch {
+          // ignore
         }
+      }, 500);
+      return;
+    }
 
-        this.onTelemetry({
-          durationMs: this.durationMs,
-          positionMs: curMs,
-          title: vdata?.title || undefined,
-          ready: true,
-          playlistCount: this.playlistCount,
-          playlistIndex: this.lastKnownPlaylistIndex,
-          playlistItems: this.playlistItems,
-          trackUri: this.lastKnownTrackUri,
-        });
+    if (
+      this.provider === "twitch" &&
+      (this.twitchKind === "video" || this.twitchKind === "collection")
+    ) {
+      this.pollTimer = setInterval(() => {
+        if (gen !== this.generation || !this.twitchPlayer || !this.ready) return;
+        try {
+          const curSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
+          const curMs = Number.isFinite(curSec) && curSec > 0 ? Math.round(curSec * 1000) : 0;
+          const durSec = Number(this.twitchPlayer.getDuration?.() || 0);
+          if (Number.isFinite(durSec) && durSec > 0) {
+            this.durationMs = Math.round(durSec * 1000);
+          }
+          const prevMs = this.lastKnownPosMs;
+          this.lastKnownPosMs = curMs;
 
-        // Detect in-iframe YouTube scrubber seeks or playlist track switches
-        if (!this._isSuppressed() && this.pendingState) {
-          const ytState = this.ytPlayer.getPlayerState?.();
-          const rateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
-          if (trackChanged && (ytState === 1 || ytState === 2 || ytState === 3)) {
-            this.onUserAction({
-              playing: ytState !== 2,
-              positionMs: curMs,
-              rateMilli,
-              playlistIndex: this.lastKnownPlaylistIndex,
-              trackUri: this.lastKnownTrackUri,
-              trackTitle: vdata?.title || undefined,
-            });
-            return;
+          let vidChanged = false;
+          if (this.twitchKind === "collection") {
+            const curVid = normalizeTwitchVideoId(this.twitchPlayer.getVideo?.() || "");
+            if (curVid && curVid !== this.lastKnownTrackUri) {
+              this.lastKnownTrackUri = curVid;
+              vidChanged = true;
+            }
           }
-          const expectedMs = projectMediaPositionMs(this.pendingState, Date.now());
-          if (
-            (ytState === 1 || ytState === 2) &&
-            Math.abs(curMs - prevMs) > 1800 &&
-            Math.abs(curMs - expectedMs) > 1500
-          ) {
-            this.onUserAction({
-              playing: ytState === 1,
-              positionMs: curMs,
-              rateMilli,
-              playlistIndex: this.playlistId ? this.lastKnownPlaylistIndex : undefined,
-              trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
-            });
+
+          this.onTelemetry({
+            durationMs: this.durationMs,
+            positionMs: curMs,
+            ready: true,
+            trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+          });
+
+          if (!this._isSuppressed() && this.pendingState) {
+            const isPaused = Boolean(this.twitchPlayer.isPaused?.());
+            if (vidChanged) {
+              this.onUserAction({
+                playing: !isPaused,
+                positionMs: curMs,
+                trackUri: this.lastKnownTrackUri,
+              });
+              return;
+            }
+            const expectedMs = projectMediaPositionMs(this.pendingState, Date.now());
+            if (Math.abs(curMs - prevMs) > 1800 && Math.abs(curMs - expectedMs) > 1500) {
+              this.onUserAction({
+                playing: !isPaused,
+                positionMs: curMs,
+                trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+              });
+            }
           }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
-      }
-    }, 500);
+      }, 500);
+    }
   }
 
   _teardownAdapterOnly() {
@@ -1640,6 +2382,15 @@ export class WatchTogetherPlayer {
       }
       this.spotifyCtrl = null;
     }
+    if (this.twitchPlayer) {
+      try {
+        this.twitchPlayer.pause?.();
+      } catch {
+        // ignore
+      }
+      this.twitchPlayer = null;
+    }
+    this.twitchIframe = null;
     this.scWidget = null;
     this.scIframe = null;
     this.ready = false;
@@ -1662,6 +2413,8 @@ export class WatchTogetherPlayer {
     this.playlistCount = 0;
     this.playlistItems = [];
     this.spotifyShowingTrackUri = "";
+    this.twitchKind = "";
+    this.twitchEpoch = 0;
     if (this.mountEl) {
       this.mountEl.innerHTML = "";
     }

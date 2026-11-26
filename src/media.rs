@@ -2,7 +2,7 @@
 //!
 //! Responsibilities:
 //! - Deterministic LWW CRDT state merging for room-wide synchronized videos, GIFs, and
-//!   Watch Together sessions (YouTube / Spotify / SoundCloud) — strictly excluding local volume.
+//!   Watch Together sessions (YouTube / Spotify / SoundCloud / Twitch) — strictly excluding local volume.
 //! - Clock-skew-independent position projection (sends live projected `position_ms` at transmit
 //!   instant; receiver compensates by peer one-way RTT/2 and re-anchors to its own local clock).
 //! - Zero-copy GIF87a/GIF89a frame-delay table parser for frame-accurate multi-peer GIF sync.
@@ -229,7 +229,10 @@ impl WatchQueueItem {
             return None;
         }
         let provider = v.get_str("provider").unwrap_or("").trim();
-        if !matches!(provider, "youtube" | "ytmusic" | "spotify" | "soundcloud") {
+        if !matches!(
+            provider,
+            "youtube" | "ytmusic" | "spotify" | "soundcloud" | "twitch"
+        ) {
             return None;
         }
         let media_id = v.get_str("mediaId").unwrap_or("").trim();
