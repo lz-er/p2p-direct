@@ -37,11 +37,13 @@
           document.documentElement.setAttribute("data-advanced", adv ? "true" : "false");
           document.documentElement.setAttribute("data-has-pinned", hasPinned ? "true" : "false");
           document.documentElement.setAttribute("data-in-room", hasRoomHash ? "true" : "false");
+          document.documentElement.setAttribute("data-mobile-tab", "chat");
         } catch {
           document.documentElement.setAttribute("data-theme", "light");
           document.documentElement.setAttribute("data-advanced", "false");
           document.documentElement.setAttribute("data-has-pinned", "false");
           document.documentElement.setAttribute("data-in-room", "false");
+          document.documentElement.setAttribute("data-mobile-tab", "chat");
         }
       })();
     </script>
@@ -172,9 +174,36 @@
               <span class="lobby-saved-kicker">YOUR ROOMS</span>
               <span class="lobby-saved-count" id="lobby-saved-count"></span>
             </div>
-            <span class="lobby-saved-hint">Saved locally on this browser · Messages stay in-memory</span>
+            <div class="lobby-saved-head-right">
+              <span class="lobby-saved-hint">Saved locally on this browser · Messages stay in-memory</span>
+              <button
+                type="button"
+                id="btn-lobby-saved-toggle"
+                class="lobby-saved-toggle-btn hidden"
+                aria-expanded="true"
+                aria-controls="lobby-saved-rooms-grid"
+              >Hide ▴</button>
+            </div>
           </div>
           <div id="lobby-last-room-wrap" class="lobby-last-room-wrap hidden"></div>
+          <div id="lobby-saved-filter-wrap" class="lobby-saved-filter-wrap hidden">
+            <input
+              id="lobby-saved-filter"
+              class="lobby-saved-filter-input"
+              type="search"
+              placeholder="Filter saved rooms…"
+              autocomplete="off"
+              aria-label="Filter saved rooms"
+            />
+            <span id="lobby-saved-filter-meta" class="lobby-saved-filter-meta"></span>
+            <button
+              type="button"
+              id="btn-lobby-saved-filter-clear"
+              class="lobby-room-sub-btn hidden"
+              title="Clear room filter"
+              aria-label="Clear room filter"
+            >×</button>
+          </div>
           <div id="lobby-saved-rooms-grid" class="lobby-saved-rooms-grid hidden"></div>
         </section>
 
@@ -242,10 +271,25 @@
         </div>
       </section>
 
+      <!-- Mobile Advanced Section Bar (Visible <= 1020px in Advanced Mode or with Pinned Panels) -->
+      <nav id="mobile-adv-nav" class="mobile-adv-nav" aria-label="Workspace sections">
+        <button type="button" class="mobile-adv-tab is-active" data-mobile-tab-btn="chat" aria-pressed="true">
+          <span>Chat &amp; Voice</span>
+        </button>
+        <button type="button" class="mobile-adv-tab" data-mobile-tab-btn="connect" aria-pressed="false">
+          <span>Rooms &amp; Link</span>
+          <span class="mobile-tab-badge hidden" id="mobile-tab-rooms-badge">0</span>
+        </button>
+        <button type="button" class="mobile-adv-tab" data-mobile-tab-btn="network" aria-pressed="false">
+          <span>Mesh &amp; Stats</span>
+          <span class="mobile-tab-badge hidden" id="mobile-tab-peers-badge">0</span>
+        </button>
+      </nav>
+
       <main class="workbench">
         <!-- Main Focus Column: Simple Room Ribbon + Metro Voice Wall + Flat Chat Stream -->
         <section class="main-column">
-          <!-- Full-Bleed Architectural Room Ribbon (Simple Mode — Leave Room sits completely isolated here) -->
+          <!-- Full-Bleed Architectural Room Ribbon (Simple Mode, plus Mobile Advanced Room Bar) -->
           <section class="simple-room-bar simple-only" id="simple-room-bar" aria-label="Current room">
             <div class="simple-room-info">
               <h2 class="simple-room-title" id="simple-room-name">Shared Room</h2>
@@ -298,6 +342,13 @@
                 <span id="voice-codec-meta">End-to-end encrypted · 48 kHz Opus</span>
                 <span id="voice-join-hint" class="hidden">Click + Join Voice</span>
                 <span id="voice-packet-stats" class="advanced-only"></span>
+                <button
+                  type="button"
+                  id="btn-voice-stats-toggle"
+                  class="voice-stats-toggle advanced-only hidden"
+                  aria-pressed="false"
+                  title="Compact or expand detailed per-participant voice telemetry"
+                >Stats ▴</button>
                 <button
                   type="button"
                   id="btn-voice-settings"
@@ -750,7 +801,7 @@
             <div class="panel-header">
               <div class="chat-header-left">
                 <h2 class="panel-title" id="log-panel-title">Chat</h2>
-                <span class="panel-meta" id="chat-sync-meta">In-memory · Encrypted</span>
+                <span class="panel-meta" id="chat-sync-meta">In-memory<span class="mobile-hide"> · Encrypted</span></span>
               </div>
               <div class="chat-header-right">
                 <button
@@ -769,7 +820,7 @@
                     class="btn btn-sm btn-danger"
                     title="Clears only this tab's in-memory messages; syncing restores messages from connected peers"
                   >
-                    Clear Local
+                    Clear<span class="mobile-hide"> Local</span>
                   </button>
                 </div>
               </div>
@@ -1024,6 +1075,16 @@
                 <div class="room-card-head">
                   <span class="room-card-title">Saved Rooms</span>
                   <span class="panel-meta" id="adv-saved-rooms-count">0</span>
+                </div>
+                <div id="adv-saved-filter-wrap" class="adv-saved-filter-wrap hidden">
+                  <input
+                    id="adv-saved-filter"
+                    class="lobby-saved-filter-input adv-saved-filter-input"
+                    type="search"
+                    placeholder="Filter saved rooms…"
+                    autocomplete="off"
+                    aria-label="Filter saved rooms in rail"
+                  />
                 </div>
                 <div id="adv-saved-rooms-list" class="adv-saved-rooms-list"></div>
               </div>

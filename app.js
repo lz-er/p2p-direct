@@ -1464,6 +1464,12 @@ class P2PDirectApp {
     this.savedRooms = [];
     this.lastJoinedRoom = null;
     this.editingSavedRoomTopic = null;
+    this.savedRoomsFilter = "";
+    this.savedRoomsCollapsed = false;
+    this.advSavedRoomsFilter = "";
+    this.mobileAdvTab = "chat";
+    this.voiceStatsCompact = false;
+    this.collapsedVoiceStatsCards = new Set();
     this.roomRendezvous = null;
     this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0 };
     this.roomDialing = new Map();
@@ -1847,14 +1853,25 @@ class P2PDirectApp {
       "watch-queue-list",
       "lobby-saved-section",
       "lobby-saved-count",
+      "btn-lobby-saved-toggle",
       "lobby-last-room-wrap",
+      "lobby-saved-filter-wrap",
+      "lobby-saved-filter",
+      "lobby-saved-filter-meta",
+      "btn-lobby-saved-filter-clear",
       "lobby-saved-rooms-grid",
+      "mobile-adv-nav",
+      "mobile-tab-rooms-badge",
+      "mobile-tab-peers-badge",
+      "btn-voice-stats-toggle",
       "btn-simple-save-room",
       "simple-save-room-icon",
       "simple-save-room-label",
       "btn-room-save",
       "adv-saved-rooms-card",
       "adv-saved-rooms-count",
+      "adv-saved-filter-wrap",
+      "adv-saved-filter",
       "adv-saved-rooms-list",
       "toast",
     ];
@@ -1884,6 +1901,52 @@ class P2PDirectApp {
       ev.preventDefault();
       this.unlockRoomFromLobby();
     });
+    if (this.el["btn-lobby-saved-toggle"]) {
+      this.el["btn-lobby-saved-toggle"].addEventListener("click", () => {
+        this.savedRoomsCollapsed = !this.savedRoomsCollapsed;
+        this.renderSavedRooms();
+      });
+    }
+    if (this.el["lobby-saved-filter"]) {
+      this.el["lobby-saved-filter"].addEventListener("input", (ev) => {
+        this.savedRoomsFilter = String(ev.target.value || "");
+        this.renderSavedRooms();
+      });
+    }
+    if (this.el["btn-lobby-saved-filter-clear"]) {
+      this.el["btn-lobby-saved-filter-clear"].addEventListener("click", () => {
+        this.savedRoomsFilter = "";
+        if (this.el["lobby-saved-filter"]) {
+          this.el["lobby-saved-filter"].value = "";
+          this.el["lobby-saved-filter"].focus();
+        }
+        this.renderSavedRooms();
+      });
+    }
+    if (this.el["adv-saved-filter"]) {
+      this.el["adv-saved-filter"].addEventListener("input", (ev) => {
+        this.advSavedRoomsFilter = String(ev.target.value || "");
+        this.renderSavedRooms();
+      });
+    }
+    for (const tabBtn of document.querySelectorAll("[data-mobile-tab-btn]")) {
+      tabBtn.addEventListener("click", () => {
+        const tab = tabBtn.getAttribute("data-mobile-tab-btn");
+        if (tab) this.setMobileAdvTab(tab);
+      });
+    }
+    if (this.el["btn-voice-stats-toggle"]) {
+      this.el["btn-voice-stats-toggle"].addEventListener("click", () => this.toggleVoiceStatsCompact());
+    }
+    if (this.el["voice-participant-list"]) {
+      this.el["voice-participant-list"].addEventListener("click", (ev) => {
+        const head = ev.target?.closest?.(".vas-head");
+        if (!head) return;
+        const plate = head.closest("[data-voice-adv-stats]");
+        const key = plate?.getAttribute("data-voice-adv-stats");
+        if (key) this.toggleVoiceCardStatsCollapsed(key);
+      });
+    }
     if (this.el["btn-simple-save-room"]) {
       this.el["btn-simple-save-room"].addEventListener("click", () => this.toggleSaveActiveRoom());
     }
@@ -3148,6 +3211,13 @@ class P2PDirectApp {
       if (this.el["log-type-filter"]) this.el["log-type-filter"].value = "";
     }
 
+    if (this.advancedMode) {
+      const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+      if (!inRoom && typeof window !== "undefined" && window.innerWidth <= 1020) {
+        this.setMobileAdvTab("connect", { autoOpen: true, scrollTop: false });
+      }
+    }
+
     this._syncTopologyTimers();
 
     if (this.status) {
@@ -3174,7 +3244,122 @@ class P2PDirectApp {
       "data-has-pinned",
       this.advPanels.pinned.size > 0 ? "true" : "false"
     );
+    this.syncMobileAdvNav();
     this._syncTopologyTimers();
+  }
+
+  setMobileAdvTab(tab, { autoOpen = true, scrollTop = true } = {}) {
+    const valid = tab === "connect" || tab === "network" ? tab : "chat";
+    this.mobileAdvTab = valid;
+    document.documentElement.setAttribute("data-mobile-tab", valid);
+
+    for (const btn of document.querySelectorAll("[data-mobile-tab-btn]")) {
+      const isActive = btn.getAttribute("data-mobile-tab-btn") === valid;
+      btn.classList.toggle("is-active", isActive);
+      btn.setAttribute("aria-pressed", String(isActive));
+    }
+
+    if (autoOpen) {
+      if (valid === "connect") {
+        this.setAdvPanelOpen("connect", true, false);
+      } else if (valid === "network") {
+        const netTargets = this.advancedMode
+          ? ["network"]
+          : ["network", "bot", "diagnostics"].filter((k) => this.advPanels.pinned.has(k));
+        for (const key of netTargets) {
+          this.setAdvPanelOpen(key, true, false);
+        }
+        if (this.status && this.advPanels.open.has("network")) {
+          this.pollPeerTransportStats();
+          this.renderTopology();
+          this.renderTopologyInspector();
+        }
+      }
+    }
+
+    if (scrollTop && typeof window !== "undefined" && window.innerWidth <= 1020) {
+      window.scrollTo(0, 0);
+    }
+  }
+
+  syncMobileAdvNav() {
+    const roomsBadge = this.el["mobile-tab-rooms-badge"];
+    if (roomsBadge) {
+      const savedCount = Array.isArray(this.savedRooms) ? this.savedRooms.length : 0;
+      roomsBadge.textContent = String(savedCount);
+      roomsBadge.classList.toggle("hidden", savedCount === 0);
+    }
+    const peersBadge = this.el["mobile-tab-peers-badge"];
+    if (peersBadge) {
+      const peerCount = Array.isArray(this.status?.peers) ? this.status.peers.length : 0;
+      peersBadge.textContent = String(peerCount);
+      peersBadge.classList.toggle("hidden", peerCount === 0);
+    }
+
+    const nav = this.el["mobile-adv-nav"];
+    if (!nav) return;
+    const connectBtn = nav.querySelector('[data-mobile-tab-btn="connect"]');
+    const networkBtn = nav.querySelector('[data-mobile-tab-btn="network"]');
+    const showConnect = this.advancedMode || this.advPanels.pinned.has("connect");
+    const showNetwork =
+      this.advancedMode ||
+      this.advPanels.pinned.has("network") ||
+      this.advPanels.pinned.has("bot") ||
+      this.advPanels.pinned.has("diagnostics");
+    if (connectBtn) connectBtn.classList.toggle("hidden", !showConnect);
+    if (networkBtn) networkBtn.classList.toggle("hidden", !showNetwork);
+
+    if (
+      (this.mobileAdvTab === "connect" && !showConnect) ||
+      (this.mobileAdvTab === "network" && !showNetwork)
+    ) {
+      this.setMobileAdvTab("chat", { autoOpen: false, scrollTop: false });
+    } else {
+      document.documentElement.setAttribute("data-mobile-tab", this.mobileAdvTab || "chat");
+    }
+  }
+
+  _syncVoiceStatsCollapseUi() {
+    const toggleBtn = this.el["btn-voice-stats-toggle"];
+    const cardCount = this.voice?.cardCache ? this.voice.cardCache.size : 0;
+    if (toggleBtn) {
+      toggleBtn.classList.toggle("hidden", !this.advancedMode || cardCount === 0);
+      toggleBtn.classList.toggle("is-compact", this.voiceStatsCompact);
+      toggleBtn.setAttribute("aria-pressed", String(this.voiceStatsCompact));
+      toggleBtn.textContent = this.voiceStatsCompact ? "Stats ▾" : "Stats ▴";
+    }
+    if (this.voice?.cardCache) {
+      for (const [rowKey, entry] of this.voice.cardCache.entries()) {
+        if (!entry?.advStatsEl) continue;
+        const collapsed = this.voiceStatsCompact
+          ? !this.collapsedVoiceStatsCards.has(`expand:${rowKey}`)
+          : this.collapsedVoiceStatsCards.has(rowKey);
+        entry.advStatsEl.setAttribute("data-vas-collapsed", collapsed ? "true" : "false");
+      }
+    }
+  }
+
+  toggleVoiceStatsCompact() {
+    this.voiceStatsCompact = !this.voiceStatsCompact;
+    this.collapsedVoiceStatsCards.clear();
+    this._syncVoiceStatsCollapseUi();
+  }
+
+  toggleVoiceCardStatsCollapsed(rowKey) {
+    if (!rowKey) return;
+    if (this.voiceStatsCompact) {
+      const expKey = `expand:${rowKey}`;
+      if (this.collapsedVoiceStatsCards.has(expKey)) {
+        this.collapsedVoiceStatsCards.delete(expKey);
+      } else {
+        this.collapsedVoiceStatsCards.add(expKey);
+      }
+    } else if (this.collapsedVoiceStatsCards.has(rowKey)) {
+      this.collapsedVoiceStatsCards.delete(rowKey);
+    } else {
+      this.collapsedVoiceStatsCards.add(rowKey);
+    }
+    this._syncVoiceStatsCollapseUi();
   }
 
   createRoomFromLobby() {
@@ -6702,6 +6887,9 @@ class P2PDirectApp {
 
     this.startRoomRendezvous(encoded.roomTopic, relay);
     this.broadcastMeshBeacon(true);
+    if (this.mobileAdvTab === "connect" && typeof window !== "undefined" && window.innerWidth <= 1020) {
+      this.setMobileAdvTab("chat", { autoOpen: false, scrollTop: false });
+    }
     this.renderAll();
 
     this.addTelemetry(
@@ -6927,6 +7115,9 @@ class P2PDirectApp {
       editing: this.editingSavedRoomTopic,
       last: this.lastJoinedRoom,
       saved: this.savedRooms,
+      filter: this.savedRoomsFilter,
+      advFilter: this.advSavedRoomsFilter,
+      collapsed: this.savedRoomsCollapsed,
     });
     if (this._lastSavedRoomsRenderKey === renderKey) {
       return;
@@ -6936,15 +7127,40 @@ class P2PDirectApp {
     const saved = this.savedRooms || [];
     const last = this.lastJoinedRoom || null;
 
+    if (saved.length < 4) {
+      if (this.savedRoomsFilter) {
+        this.savedRoomsFilter = "";
+        if (this.el["lobby-saved-filter"]) this.el["lobby-saved-filter"].value = "";
+      }
+      if (this.advSavedRoomsFilter) {
+        this.advSavedRoomsFilter = "";
+        if (this.el["adv-saved-filter"]) this.el["adv-saved-filter"].value = "";
+      }
+    }
+
+    const filterQuery = (this.savedRoomsFilter || "").trim().toLowerCase();
+    const filteredSaved = filterQuery
+      ? saved.filter(
+          (r) =>
+            String(r.name || "").toLowerCase().includes(filterQuery) ||
+            String(r.topic || "").toLowerCase().includes(filterQuery)
+        )
+      : saved;
+
     // 3. Render Lobby Saved Rooms & Last Joined Dock
     const lobbySection = this.el["lobby-saved-section"];
     const lastWrap = this.el["lobby-last-room-wrap"];
     const gridEl = this.el["lobby-saved-rooms-grid"];
     const countEl = this.el["lobby-saved-count"];
+    const toggleBtn = this.el["btn-lobby-saved-toggle"];
+    const filterWrap = this.el["lobby-saved-filter-wrap"];
+    const filterMeta = this.el["lobby-saved-filter-meta"];
+    const filterClearBtn = this.el["btn-lobby-saved-filter-clear"];
 
     if (lobbySection && lastWrap && gridEl) {
       const hasAnything = Boolean(last || saved.length > 0);
       lobbySection.classList.toggle("hidden", !hasAnything);
+      lobbySection.classList.toggle("is-many-rooms", saved.length >= 4);
 
       if (hasAnything) {
         if (countEl) {
@@ -6956,7 +7172,16 @@ class P2PDirectApp {
           countEl.textContent = summaryParts.join(" · ");
         }
 
-        // Last Joined card (never auto-joins; 1-click manual Rejoin)
+        if (toggleBtn) {
+          const showToggle = saved.length >= 1;
+          toggleBtn.classList.toggle("hidden", !showToggle);
+          toggleBtn.setAttribute("aria-expanded", String(!this.savedRoomsCollapsed));
+          toggleBtn.textContent = this.savedRoomsCollapsed
+            ? `Saved (${saved.length}) ▾`
+            : "Hide Saved ▴";
+        }
+
+        // Sleek Last Joined Quick-Resume Strip (never auto-joins; 1-click manual Rejoin)
         if (last) {
           lastWrap.classList.remove("hidden");
           const lastSaved = this.isRoomTopicSaved(last.topic);
@@ -6965,7 +7190,7 @@ class P2PDirectApp {
             ? '<span class="lobby-room-tag is-lock">Passphrase</span>'
             : "";
           const savedTag = lastSaved
-            ? '<span class="lobby-room-tag is-saved-badge">★ Saved</span>'
+            ? '<span class="lobby-room-tag is-saved-badge" title="Also in your Saved Rooms">★</span>'
             : "";
           const saveBtnHtml = lastSaved
             ? ""
@@ -6976,11 +7201,11 @@ class P2PDirectApp {
               <div class="lobby-room-main">
                 <div class="lobby-room-top">
                   <span class="lobby-room-tag">Last Joined</span>
-                  ${lockTag}
                   ${savedTag}
+                  ${lockTag}
+                  <span class="lobby-room-meta">${relTime ? `${escapeHtml(relTime)} · ` : ""}#${escapeHtml(last.topic.slice(0, 6))}</span>
                 </div>
                 <span class="lobby-room-name" title="${escapeHtml(last.name)}">${escapeHtml(last.name)}</span>
-                <span class="lobby-room-meta">${relTime ? `${escapeHtml(relTime)} · ` : ""}#${escapeHtml(last.topic.slice(0, 8))}</span>
               </div>
               <div class="lobby-room-actions">
                 <button type="button" class="lobby-room-join-btn" id="btn-lobby-rejoin-last">▶ Rejoin</button>
@@ -7006,109 +7231,146 @@ class P2PDirectApp {
           lastWrap.innerHTML = "";
         }
 
-        // Saved Rooms grid
-        if (saved.length > 0) {
+        // Filter bar (auto-shown when 4+ saved rooms exist and section isn't collapsed)
+        if (filterWrap) {
+          const showFilter = saved.length >= 4 && !this.savedRoomsCollapsed;
+          filterWrap.classList.toggle("hidden", !showFilter);
+          if (filterMeta) {
+            filterMeta.textContent = filterQuery
+              ? `${filteredSaved.length} / ${saved.length}`
+              : `${saved.length} rooms`;
+          }
+          if (filterClearBtn) {
+            filterClearBtn.classList.toggle("hidden", !filterQuery);
+          }
+        }
+
+        // Saved Rooms compact grid/list
+        if (saved.length > 0 && !this.savedRoomsCollapsed) {
           gridEl.classList.remove("hidden");
-          gridEl.innerHTML = saved
-            .map((room, idx) => {
-              const isEditing = this.editingSavedRoomTopic === room.topic;
-              const accentCls = this._savedRoomAccentClass(room.topic);
-              const relTime = this._formatRelativeRoomTime(room.lastJoinedAt || room.savedAt);
-              const lockTag = room.encrypted
-                ? '<span class="lobby-room-tag is-lock">Passphrase</span>'
-                : "";
-              const titleBlock = isEditing
-                ? `
-                  <form class="saved-room-rename-form" data-rename-form="${idx}">
-                    <input
-                      type="text"
-                      class="saved-room-rename-input"
-                      data-rename-input="${idx}"
-                      maxlength="40"
-                      value="${escapeHtml(room.name)}"
-                      aria-label="Room name"
-                    />
-                    <button type="submit" class="lobby-room-sub-btn" title="Save name">✓</button>
-                    <button type="button" class="lobby-room-sub-btn" data-rename-cancel="${idx}" title="Cancel rename">✕</button>
-                  </form>
-                `
-                : `<span class="lobby-room-name" title="${escapeHtml(room.name)}">${escapeHtml(room.name)}</span>`;
-
-              return `
-                <article class="saved-room-card ${accentCls}" data-saved-room-topic="${escapeHtml(room.topic)}">
-                  <div class="lobby-room-main">
-                    <div class="lobby-room-top">
-                      <span class="lobby-room-tag is-saved-badge">★ Saved</span>
-                      ${lockTag}
-                    </div>
-                    ${titleBlock}
-                    <span class="lobby-room-meta">${relTime ? `${escapeHtml(relTime)} · ` : ""}#${escapeHtml(room.topic.slice(0, 8))}</span>
-                  </div>
-                  <div class="lobby-room-actions">
-                    <button type="button" class="lobby-room-join-btn" data-saved-join="${idx}">▶ Join</button>
-                    <button type="button" class="lobby-room-sub-btn" data-saved-copy="${idx}" title="Copy room invite link">Copy</button>
-                    <button type="button" class="lobby-room-sub-btn" data-saved-rename="${idx}" title="Rename saved room" aria-label="Rename saved room">✎</button>
-                    <button type="button" class="lobby-room-sub-btn is-danger" data-saved-remove="${idx}" title="Remove from saved rooms" aria-label="Remove saved room">×</button>
-                  </div>
-                </article>
-              `;
-            })
-            .join("");
-
-          for (const btn of gridEl.querySelectorAll("[data-saved-join]")) {
-            const room = saved[Number(btn.dataset.savedJoin)];
-            if (room) btn.addEventListener("click", () => this.joinSavedRoom(room));
-          }
-          for (const btn of gridEl.querySelectorAll("[data-saved-copy]")) {
-            const room = saved[Number(btn.dataset.savedCopy)];
-            if (room) {
-              btn.addEventListener("click", () => {
-                const copyUrl = room.url || `${shareableBaseUrl()}#room=${room.code}`;
-                this.copyText(copyUrl, `Copied link for "${room.name}"`);
-              });
-            }
-          }
-          for (const btn of gridEl.querySelectorAll("[data-saved-rename]")) {
-            const room = saved[Number(btn.dataset.savedRename)];
-            if (room) {
-              btn.addEventListener("click", () => {
-                this.editingSavedRoomTopic =
-                  this.editingSavedRoomTopic === room.topic ? null : room.topic;
+          if (filteredSaved.length === 0) {
+            gridEl.innerHTML = `
+              <div class="saved-rooms-empty-filter">
+                <span>No saved rooms match "${escapeHtml(this.savedRoomsFilter.trim())}"</span>
+                <button type="button" class="lobby-room-sub-btn" data-saved-clear-filter>Clear Filter</button>
+              </div>
+            `;
+            const clr = gridEl.querySelector("[data-saved-clear-filter]");
+            if (clr) {
+              clr.addEventListener("click", () => {
+                this.savedRoomsFilter = "";
+                if (this.el["lobby-saved-filter"]) this.el["lobby-saved-filter"].value = "";
                 this.renderSavedRooms();
               });
             }
-          }
-          for (const btn of gridEl.querySelectorAll("[data-saved-remove]")) {
-            const room = saved[Number(btn.dataset.savedRemove)];
-            if (room) btn.addEventListener("click", () => this.removeSavedRoomByTopic(room.topic));
-          }
-          for (const form of gridEl.querySelectorAll("[data-rename-form]")) {
-            const idx = Number(form.dataset.renameForm);
-            const room = saved[idx];
-            const input = form.querySelector(`[data-rename-input="${idx}"]`);
-            const cancelBtn = form.querySelector(`[data-rename-cancel="${idx}"]`);
-            if (input) {
-              input.focus();
-              input.select();
-              input.addEventListener("keydown", (ev) => {
-                if (ev.key === "Escape") {
-                  ev.preventDefault();
+          } else {
+            gridEl.innerHTML = filteredSaved
+              .map((room) => {
+                const idx = saved.indexOf(room);
+                const isEditing = this.editingSavedRoomTopic === room.topic;
+                const isLast = Boolean(last && last.topic === room.topic);
+                const accentCls = this._savedRoomAccentClass(room.topic);
+                const relTime = this._formatRelativeRoomTime(room.lastJoinedAt || room.savedAt);
+                const lockTag = room.encrypted
+                  ? '<span class="lobby-room-tag is-lock">Passphrase</span>'
+                  : "";
+                const lastTag = isLast
+                  ? '<span class="lobby-room-tag is-last-pill">Recent</span>'
+                  : "";
+                const titleBlock = isEditing
+                  ? `
+                    <form class="saved-room-rename-form" data-rename-form="${idx}">
+                      <input
+                        type="text"
+                        class="saved-room-rename-input"
+                        data-rename-input="${idx}"
+                        maxlength="40"
+                        value="${escapeHtml(room.name)}"
+                        aria-label="Room name"
+                      />
+                      <button type="submit" class="lobby-room-sub-btn" title="Save name">✓</button>
+                      <button type="button" class="lobby-room-sub-btn" data-rename-cancel="${idx}" title="Cancel rename">✕</button>
+                    </form>
+                  `
+                  : `<div class="saved-room-name-line">
+                      <span class="saved-room-star" aria-hidden="true">★</span>
+                      <span class="lobby-room-name" title="${escapeHtml(room.name)}">${escapeHtml(room.name)}</span>
+                      ${lastTag}
+                      ${lockTag}
+                    </div>`;
+
+                return `
+                  <article class="saved-room-card ${accentCls}${isLast ? " is-last-joined" : ""}" data-saved-room-topic="${escapeHtml(room.topic)}">
+                    <div class="lobby-room-main">
+                      ${titleBlock}
+                      <span class="lobby-room-meta">${relTime ? `${escapeHtml(relTime)} · ` : ""}#${escapeHtml(room.topic.slice(0, 8))}</span>
+                    </div>
+                    <div class="lobby-room-actions">
+                      <button type="button" class="lobby-room-join-btn" data-saved-join="${idx}">▶ Join</button>
+                      <button type="button" class="lobby-room-sub-btn" data-saved-copy="${idx}" title="Copy room invite link">Copy</button>
+                      <button type="button" class="lobby-room-sub-btn" data-saved-rename="${idx}" title="Rename saved room" aria-label="Rename saved room">✎</button>
+                      <button type="button" class="lobby-room-sub-btn is-danger" data-saved-remove="${idx}" title="Remove from saved rooms" aria-label="Remove saved room">×</button>
+                    </div>
+                  </article>
+                `;
+              })
+              .join("");
+
+            for (const btn of gridEl.querySelectorAll("[data-saved-join]")) {
+              const room = saved[Number(btn.dataset.savedJoin)];
+              if (room) btn.addEventListener("click", () => this.joinSavedRoom(room));
+            }
+            for (const btn of gridEl.querySelectorAll("[data-saved-copy]")) {
+              const room = saved[Number(btn.dataset.savedCopy)];
+              if (room) {
+                btn.addEventListener("click", () => {
+                  const copyUrl = room.url || `${shareableBaseUrl()}#room=${room.code}`;
+                  this.copyText(copyUrl, `Copied link for "${room.name}"`);
+                });
+              }
+            }
+            for (const btn of gridEl.querySelectorAll("[data-saved-rename]")) {
+              const room = saved[Number(btn.dataset.savedRename)];
+              if (room) {
+                btn.addEventListener("click", () => {
+                  this.editingSavedRoomTopic =
+                    this.editingSavedRoomTopic === room.topic ? null : room.topic;
+                  this.renderSavedRooms();
+                });
+              }
+            }
+            for (const btn of gridEl.querySelectorAll("[data-saved-remove]")) {
+              const room = saved[Number(btn.dataset.savedRemove)];
+              if (room) btn.addEventListener("click", () => this.removeSavedRoomByTopic(room.topic));
+            }
+            for (const form of gridEl.querySelectorAll("[data-rename-form]")) {
+              const idx = Number(form.dataset.renameForm);
+              const room = saved[idx];
+              const input = form.querySelector(`[data-rename-input="${idx}"]`);
+              const cancelBtn = form.querySelector(`[data-rename-cancel="${idx}"]`);
+              if (input) {
+                input.focus();
+                input.select();
+                input.addEventListener("keydown", (ev) => {
+                  if (ev.key === "Escape") {
+                    ev.preventDefault();
+                    this.editingSavedRoomTopic = null;
+                    this.renderSavedRooms();
+                  }
+                });
+              }
+              if (cancelBtn) {
+                cancelBtn.addEventListener("click", () => {
                   this.editingSavedRoomTopic = null;
                   this.renderSavedRooms();
-                }
-              });
-            }
-            if (cancelBtn) {
-              cancelBtn.addEventListener("click", () => {
-                this.editingSavedRoomTopic = null;
-                this.renderSavedRooms();
-              });
-            }
-            if (room && input) {
-              form.addEventListener("submit", (ev) => {
-                ev.preventDefault();
-                this.renameSavedRoomByTopic(room.topic, input.value);
-              });
+                });
+              }
+              if (room && input) {
+                form.addEventListener("submit", (ev) => {
+                  ev.preventDefault();
+                  this.renameSavedRoomByTopic(room.topic, input.value);
+                });
+              }
             }
           }
         } else {
@@ -7116,6 +7378,8 @@ class P2PDirectApp {
           gridEl.innerHTML = "";
         }
       } else {
+        if (toggleBtn) toggleBtn.classList.add("hidden");
+        if (filterWrap) filterWrap.classList.add("hidden");
         lastWrap.classList.add("hidden");
         lastWrap.innerHTML = "";
         gridEl.classList.add("hidden");
@@ -7127,48 +7391,72 @@ class P2PDirectApp {
     const advCard = this.el["adv-saved-rooms-card"];
     const advList = this.el["adv-saved-rooms-list"];
     const advCount = this.el["adv-saved-rooms-count"];
+    const advFilterWrap = this.el["adv-saved-filter-wrap"];
     if (advCard && advList) {
       advCard.classList.toggle("hidden", saved.length === 0);
-      if (advCount) advCount.textContent = String(saved.length);
-      if (saved.length > 0) {
-        advList.innerHTML = saved
-          .map((room, idx) => {
-            const isCurrent = Boolean(activeTopic && activeTopic === room.topic);
-            const subParts = [
-              isCurrent ? "Active" : this._formatRelativeRoomTime(room.lastJoinedAt || room.savedAt),
-              room.encrypted ? "Passphrase" : "",
-            ].filter(Boolean);
-            return `
-              <div class="adv-saved-room-row${isCurrent ? " is-current" : ""}" data-adv-saved-topic="${escapeHtml(room.topic)}">
-                <div class="adv-saved-room-info">
-                  <span class="adv-saved-room-name" title="${escapeHtml(room.name)}">${escapeHtml(room.name)}</span>
-                  <span class="adv-saved-room-sub">${escapeHtml(subParts.join(" · "))}</span>
-                </div>
-                <div class="adv-saved-room-actions">
-                  ${
-                    isCurrent
-                      ? '<span class="badge auto">Here</span>'
-                      : `<button type="button" class="btn btn-sm btn-primary" data-adv-saved-join="${idx}">Join</button>`
-                  }
-                  <button type="button" class="btn btn-sm" data-adv-saved-remove="${idx}" title="Remove saved room" aria-label="Remove saved room">×</button>
-                </div>
-              </div>
-            `;
-          })
-          .join("");
+      if (advFilterWrap) {
+        advFilterWrap.classList.toggle("hidden", saved.length < 4);
+      }
+      const advQ = (this.advSavedRoomsFilter || "").trim().toLowerCase();
+      const advFiltered = advQ
+        ? saved.filter(
+            (r) =>
+              String(r.name || "").toLowerCase().includes(advQ) ||
+              String(r.topic || "").toLowerCase().includes(advQ)
+          )
+        : saved;
 
-        for (const btn of advList.querySelectorAll("[data-adv-saved-join]")) {
-          const room = saved[Number(btn.dataset.advSavedJoin)];
-          if (room) btn.addEventListener("click", () => this.joinSavedRoom(room));
-        }
-        for (const btn of advList.querySelectorAll("[data-adv-saved-remove]")) {
-          const room = saved[Number(btn.dataset.advSavedRemove)];
-          if (room) btn.addEventListener("click", () => this.removeSavedRoomByTopic(room.topic));
+      if (advCount) {
+        advCount.textContent = advQ ? `${advFiltered.length} / ${saved.length}` : String(saved.length);
+      }
+      if (saved.length > 0) {
+        if (advFiltered.length === 0) {
+          advList.innerHTML = `<div class="adv-saved-empty">No rooms match "${escapeHtml(this.advSavedRoomsFilter.trim())}"</div>`;
+        } else {
+          advList.innerHTML = advFiltered
+            .map((room) => {
+              const idx = saved.indexOf(room);
+              const isCurrent = Boolean(activeTopic && activeTopic === room.topic);
+              const isLast = Boolean(last && last.topic === room.topic);
+              const subParts = [
+                isCurrent ? "Active" : this._formatRelativeRoomTime(room.lastJoinedAt || room.savedAt),
+                isLast && !isCurrent ? "Recent" : "",
+                room.encrypted ? "Passphrase" : "",
+              ].filter(Boolean);
+              return `
+                <div class="adv-saved-room-row${isCurrent ? " is-current" : ""}" data-adv-saved-topic="${escapeHtml(room.topic)}">
+                  <div class="adv-saved-room-info">
+                    <span class="adv-saved-room-name" title="${escapeHtml(room.name)}">${escapeHtml(room.name)}</span>
+                    <span class="adv-saved-room-sub">${escapeHtml(subParts.join(" · "))}</span>
+                  </div>
+                  <div class="adv-saved-room-actions">
+                    ${
+                      isCurrent
+                        ? '<span class="badge auto">Here</span>'
+                        : `<button type="button" class="btn btn-sm btn-primary" data-adv-saved-join="${idx}">Join</button>`
+                    }
+                    <button type="button" class="btn btn-sm" data-adv-saved-remove="${idx}" title="Remove saved room" aria-label="Remove saved room">×</button>
+                  </div>
+                </div>
+              `;
+            })
+            .join("");
+
+          for (const btn of advList.querySelectorAll("[data-adv-saved-join]")) {
+            const room = saved[Number(btn.dataset.advSavedJoin)];
+            if (room) btn.addEventListener("click", () => this.joinSavedRoom(room));
+          }
+          for (const btn of advList.querySelectorAll("[data-adv-saved-remove]")) {
+            const room = saved[Number(btn.dataset.advSavedRemove)];
+            if (room) btn.addEventListener("click", () => this.removeSavedRoomByTopic(room.topic));
+          }
         }
       } else {
         advList.innerHTML = "";
       }
     }
+
+    this.syncMobileAdvNav();
   }
 
   _resetRoomRelayState() {
@@ -12793,6 +13081,7 @@ class P2PDirectApp {
       }
     }
 
+    this._syncVoiceStatsCollapseUi();
     if (this.advancedMode) {
       this.updateVoiceAdvancedStats();
     }
@@ -12920,10 +13209,11 @@ class P2PDirectApp {
     const keyFp = String(this.status?.e2ee?.keyFingerprint || "—").slice(0, 12);
 
     return `
-      <div class="vas-head">
+      <div class="vas-head" title="Tap to collapse or expand detailed telemetry">
         <span class="vas-pill is-accent">${escapeHtml(presetLabel)}</span>
         <span class="vas-pill">${escapeHtml(codecLabel)}</span>
         <span class="vas-pill vas-pill-right ${stateTone}">${escapeHtml(stateLabel)}</span>
+        <span class="vas-chevron" aria-hidden="true">▴</span>
       </div>
       <div class="vas-bar-wrap">
         <div class="vas-bar-meta">
@@ -12999,10 +13289,11 @@ class P2PDirectApp {
       const linkKbps = link ? link.kbps.toFixed(1) : "0.0";
       const linkPps = link ? (link.txPps || 0) + (link.rxPps || 0) : 0;
       return `
-        <div class="vas-head">
+        <div class="vas-head" title="Tap to collapse or expand detailed telemetry">
           <span class="vas-pill ${transportTone}">${escapeHtml(tech.shortLabel)}</span>
           <span class="vas-pill">${escapeHtml(codecLabel)}</span>
           <span class="vas-pill vas-pill-right is-muted">PRE-JOIN</span>
+          <span class="vas-chevron" aria-hidden="true">▴</span>
         </div>
         <div class="vas-grid">
           <div class="vas-cell"><span class="vas-k">RTT</span><span class="vas-v ${rttTone}">${escapeHtml(rttStr)}</span></div>
@@ -13106,10 +13397,11 @@ class P2PDirectApp {
     const aeadMixVal = `#${txSeq}/#${rxSeq} · ${volStr}${rxRej > 0 ? ` · rej ${rxRej}` : ""}`;
 
     return `
-      <div class="vas-head">
+      <div class="vas-head" title="Tap to collapse or expand detailed telemetry">
         <span class="vas-pill ${transportTone}">${escapeHtml(tech.shortLabel)}</span>
         <span class="vas-pill">${escapeHtml(codecLabel)}</span>
         <span class="vas-pill vas-pill-right ${stateTone}">${escapeHtml(stateLabel)}</span>
+        <span class="vas-chevron" aria-hidden="true">▴</span>
       </div>
       <div class="vas-bar-wrap">
         <div class="vas-bar-meta">
@@ -13143,6 +13435,7 @@ class P2PDirectApp {
   }
 
   updateVoiceAdvancedStats() {
+    this._syncVoiceStatsCollapseUi();
     if (!this.advancedMode || !this.status) return;
     const nowPerf = performance.now();
     const peerMap = new Map((this.status.peers || []).map((p) => [p.peerId, p]));
