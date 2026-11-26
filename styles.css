@@ -9773,10 +9773,58 @@ html[data-watch-stage="true"] .join-listen-strip {
 .bot-blk-progress {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 7px 9px;
+  gap: 5px;
+  padding: 8px 10px;
   background: var(--bg-surface);
   border: 1.5px solid var(--rule-soft);
+}
+
+.bot-blk-progress.is-clickable {
+  appearance: none;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  border: 2px solid var(--rule);
+  border-left-width: 5px;
+  border-left-color: var(--cobalt);
+  border-radius: 0;
+  cursor: pointer;
+  transition: background-color 110ms ease, border-color 110ms ease;
+}
+
+.bot-blk-progress.is-clickable.is-mint {
+  border-left-color: var(--mint);
+}
+
+.bot-blk-progress.is-clickable.is-ochre {
+  border-left-color: var(--ochre);
+}
+
+.bot-blk-progress.is-clickable.is-coral {
+  border-left-color: var(--coral);
+}
+
+.bot-blk-progress.is-clickable.is-cyan {
+  border-left-color: var(--cyan);
+}
+
+.bot-blk-progress.is-clickable:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  border-color: var(--cobalt);
+}
+
+[data-theme="dark"] .bot-blk-progress.is-clickable:hover:not(:disabled) {
+  border-color: var(--acid);
+}
+
+.bot-blk-progress.is-clickable:focus-visible {
+  outline: 2px solid var(--cobalt);
+  outline-offset: 2px;
+}
+
+.bot-blk-progress.is-clickable:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
 }
 
 .bot-blk-progress-head {
@@ -9784,6 +9832,7 @@ html[data-watch-stage="true"] .join-listen-strip {
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
+  width: 100%;
   font-size: 12.5px;
 }
 
@@ -9804,6 +9853,7 @@ html[data-watch-stage="true"] .join-listen-strip {
 }
 
 .bot-blk-progress-track {
+  display: block;
   height: 10px;
   width: 100%;
   background: var(--bg-subtle);
@@ -9812,6 +9862,7 @@ html[data-watch-stage="true"] .join-listen-strip {
 }
 
 .bot-blk-progress-fill {
+  display: block;
   height: 100%;
   background: var(--cobalt);
   transition: width 160ms ease;

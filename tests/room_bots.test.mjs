@@ -56,6 +56,9 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     assert.equal(card.badge, "2 VOTES");
     assert.equal(card.blocks.length, 2);
     assert.equal(card.blocks[0].type, "progress");
+    assert.equal(card.blocks[0].id, "poll:vote:0");
+    assert.equal(card.blocks[1].id, "poll:vote:1");
+    assert.equal(card.buttons.length, 1); // Only Reset/Hide row; voting happens on the bars themselves
     assert.match(card.blocks[0].display, /50%/);
 
     // Bob switches to StS2

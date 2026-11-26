@@ -136,7 +136,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v31";
+export const APP_VERSION = "v32";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -17728,17 +17728,47 @@ export class P2PDirectApp {
         const pct = Math.round((val / max) * 100);
         const barColor = allowedColors.has(blk.color) ? blk.color : "cobalt";
         const disp = blk.display !== undefined ? String(blk.display) : `${pct}%`;
-        out.push(`
-          <div class="bot-blk-progress">
-            <div class="bot-blk-progress-head">
-              <span class="bot-blk-progress-label">${formatBotRichText(blk.label || "")}</span>
-              <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
+        const actId = blk.actionId || blk.id || "";
+        const isClickable = Boolean(
+          actId || blk.editPatch || blk.editPayload || (typeof blk.url === "string" && blk.url.trim())
+        );
+        if (isClickable) {
+          const idx = flatButtons.length;
+          flatButtons.push({
+            id: actId || `progress_${idx}`,
+            label: blk.label || actId || "Select",
+            value: blk.value !== undefined ? blk.value : null,
+            url: blk.url || null,
+            editPatch: blk.editPatch || null,
+            editPayload: blk.editPayload || null,
+            disabled: Boolean(blk.disabled),
+          });
+          const actCls = blk.active ? " is-active" : "";
+          const disabledAttr = blk.disabled ? " disabled" : "";
+          out.push(`
+            <button type="button" class="bot-blk-progress is-clickable is-${barColor}${actCls}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(actId)}"${disabledAttr}>
+              <span class="bot-blk-progress-head">
+                <span class="bot-blk-progress-label">${escapeHtml(blk.label || "")}</span>
+                <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
+              </span>
+              <span class="bot-blk-progress-track">
+                <span class="bot-blk-progress-fill is-${barColor}" style="width:${pct}%"></span>
+              </span>
+            </button>
+          `);
+        } else {
+          out.push(`
+            <div class="bot-blk-progress">
+              <div class="bot-blk-progress-head">
+                <span class="bot-blk-progress-label">${formatBotRichText(blk.label || "")}</span>
+                <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
+              </div>
+              <div class="bot-blk-progress-track">
+                <div class="bot-blk-progress-fill is-${barColor}" style="width:${pct}%"></div>
+              </div>
             </div>
-            <div class="bot-blk-progress-track">
-              <div class="bot-blk-progress-fill is-${barColor}" style="width:${pct}%"></div>
-            </div>
-          </div>
-        `);
+          `);
+        }
       } else if (type === "stats" && Array.isArray(blk.items) && blk.items.length > 0) {
         const tiles = blk.items
           .slice(0, 8)

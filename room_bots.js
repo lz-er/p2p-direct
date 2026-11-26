@@ -222,37 +222,28 @@ export function buildPollCard(stateInput, { nowMs = Date.now() } = {}) {
     const voters = votersByIdx[idx];
     const count = voters.length;
     const pct = totalVotes > 0 ? Math.round((count / totalVotes) * 100) : 0;
-    const leadMark = totalVotes > 0 && count === maxVotes && count > 0 ? " ★" : "";
+    const isLeading = totalVotes > 0 && count === maxVotes && count > 0;
+    const leadMark = isLeading ? " ★" : "";
     const voterNames =
       voters.length > 0 ? ` · ${voters.slice(0, 5).join(", ")}${voters.length > 5 ? "…" : ""}` : "";
     return {
       type: "progress",
+      id: `poll:vote:${idx}`,
       label: `${idx + 1}. ${opt}${leadMark}`,
       value: count,
       max: Math.max(1, totalVotes),
       display: `${pct}% (${count})${voterNames}`,
-      color: totalVotes > 0 && count === maxVotes && count > 0 ? "mint" : "cobalt",
+      color: isLeading ? "mint" : "cobalt",
+      active: isLeading,
     };
   });
 
-  const voteButtons = options.map((opt, idx) => {
-    const count = votersByIdx[idx].length;
-    const shortOpt = opt.length > 22 ? `${opt.slice(0, 21)}…` : opt;
-    return {
-      id: `poll:vote:${idx}`,
-      label: `${idx + 1}. ${shortOpt} (${count})`,
-      style: totalVotes > 0 && count === maxVotes && count > 0 ? "success" : "primary",
-    };
-  });
-
-  const btnRows = [];
-  for (let i = 0; i < voteButtons.length; i += 2) {
-    btnRows.push(voteButtons.slice(i, i + 2));
-  }
-  btnRows.push([
-    { id: "poll:reset", label: "↺ Reset Votes", style: "warning" },
-    { id: "poll:dismiss", label: "✕ Hide", style: "danger" },
-  ]);
+  const btnRows = [
+    [
+      { id: "poll:reset", label: "↺ Reset Votes", style: "warning" },
+      { id: "poll:dismiss", label: "✕ Hide", style: "danger" },
+    ],
+  ];
 
   return {
     builtinBot: POLL_BOT_ID,
