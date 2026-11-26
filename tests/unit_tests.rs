@@ -2252,6 +2252,110 @@ fn peer_color_sync_converges_without_duplicates_across_multihop_and_partitions()
     Ok(())
 }
 
+#[test]
+fn status_json_exposes_per_peer_voice_and_rtt_telemetry() -> TestResult {
+    use p2p_direct::mesh::MeshAction;
+
+    let mesh_key = [0x33u8; 32];
+    let mut alice = MeshNode::new(
+        "alice".into(),
+        "Alice".into(),
+        "TelemetryRoom".into(),
+        [0x11u8; 32],
+        mesh_key,
+        &[1; 16],
+        MeshConfig::default(),
+    );
+    let mut bob = MeshNode::new(
+        "bob".into(),
+        "Bob".into(),
+        "TelemetryRoom".into(),
+        [0x22u8; 32],
+        mesh_key,
+        &[2; 16],
+        MeshConfig::default(),
+    );
+    let pk_a = alice.public_key();
+    let pk_b = bob.public_key();
+
+    let a_acts = alice.on_peer_connected("bob".into(), "Bob".into(), pk_b, false, None)?;
+    let b_acts = bob.on_peer_connected("alice".into(), "Alice".into(), pk_a, false, None)?;
+    for act in a_acts {
+        if let MeshAction::SendWire { frame, .. } = act {
+            let _ = bob.on_wire_message("alice", &frame, 1000)?;
+        }
+    }
+    for act in b_acts {
+        if let MeshAction::SendWire { frame, .. } = act {
+            let _ = alice.on_wire_message("bob", &frame, 1000)?;
+        }
+    }
+
+    // Both join voice so voice packets are sealed & opened
+    for act in alice.set_voice_state(true, false) {
+        if let MeshAction::SendWire { frame, .. } = act {
+            let _ = bob.on_wire_message("alice", &frame, 1010)?;
+        }
+    }
+    for act in bob.set_voice_state(true, false) {
+        if let MeshAction::SendWire { frame, .. } = act {
+            let _ = alice.on_wire_message("bob", &frame, 1010)?;
+        }
+    }
+
+    // Exchange Ping -> Pong with known simulated RTT (30ms) & clock offset (+15ms)
+    let ping_acts = alice.send_keepalive_pings(2000);
+    for act in ping_acts {
+        if let MeshAction::SendWire { frame, .. } = act {
+            let pong_acts = bob.on_wire_message("alice", &frame, 2030)?;
+            for pact in pong_acts {
+                if let MeshAction::SendWire { frame: pframe, .. } = pact {
+                    let _ = alice.on_wire_message("bob", &pframe, 2030)?;
+                }
+            }
+        }
+    }
+
+    // Alice seals 3 V2 voice frames; deliver #1, #3, #2 (out of order) + replay #2 (rejected)
+    let p1 = alice.seal_voice_raw(b"frame-1");
+    let p2 = alice.seal_voice_raw(b"frame-2");
+    let p3 = alice.seal_voice_raw(b"frame-3");
+    assert_eq!(p1.len(), 1);
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p3.len(), 1);
+
+    let _ = bob.open_voice_v2_packet("alice", &p1[0].1)?;
+    let _ = bob.open_voice_v2_packet("alice", &p3[0].1)?;
+    let _ = bob.open_voice_v2_packet("alice", &p2[0].1)?; // out-of-order
+    assert!(bob.open_voice_v2_packet("alice", &p2[0].1).is_err()); // replay -> rejected
+
+    let alice_status = parse_json(&alice.status_json())?;
+    let a_peer = alice_status
+        .get("peers")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or("missing peer on alice")?;
+    assert_eq!(a_peer.get_u64("rttMs"), Some(30));
+    assert_eq!(a_peer.get_u64("minRttMs"), Some(30));
+    assert_eq!(a_peer.get_u64("clockOffsetMs"), Some(15));
+    assert_eq!(a_peer.get_u64("voiceTxSeq"), Some(3));
+    assert_eq!(a_peer.get_u64("voiceRxSeq"), Some(0));
+
+    let bob_status = parse_json(&bob.status_json())?;
+    let b_peer = bob_status
+        .get("peers")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or("missing peer on bob")?;
+    assert_eq!(b_peer.get_u64("voiceRxSeq"), Some(3));
+    assert_eq!(b_peer.get_u64("voiceRxAccepted"), Some(3));
+    assert_eq!(b_peer.get_u64("voiceRxOutOfOrder"), Some(1));
+    assert_eq!(b_peer.get_u64("voiceRxRejected"), Some(1));
+
+    Ok(())
+}
+
+
 
 
 

@@ -274,6 +274,9 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
     this.rsPrev2 = 0;
     this.rsPhase = 0;
     this.curRate = 1.0;
+    this.underruns = 0;
+    this.overruns = 0;
+    this.statsBlocks = 0;
 
     this.port.onmessage = (ev) => {
       const msg = ev.data;
@@ -313,6 +316,9 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
         this.rsRate = 0;
         this.rsPhase = 0;
         this.curRate = 1.0;
+        this.underruns = 0;
+        this.overruns = 0;
+        this.statsBlocks = 0;
         return;
       }
       if (msg.type === "pcm" && msg.samples && msg.samples.length > 0) {
@@ -330,6 +336,32 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
   effectiveStartSamples() {
     const effTrough = this.effectiveTargetTrough();
     return Math.min(Math.round(this.maxSamples * 0.65), Math.max(this.startSamples, effTrough));
+  }
+
+  maybePostStats(avail, effTrough) {
+    this.statsBlocks++;
+    if (this.statsBlocks < 100) return;
+    this.statsBlocks = 0;
+    const clampedAvail = avail > 0 ? avail : 0;
+    const availMs = (clampedAvail * 1000) / sampleRate;
+    const effTargetMs = (effTrough * 1000) / sampleRate;
+    const troughMs = this.smoothTrough >= 0 ? (this.smoothTrough * 1000) / sampleRate : availMs;
+    const driftPpm = Math.round((this.curRate - 1.0) * 1000000);
+    this.port.postMessage({
+      type: "stats",
+      cacheMs: Math.round(availMs * 10) / 10,
+      targetMs: Math.round(effTargetMs),
+      baseTargetMs: this.targetMs,
+      maxMs: this.maxMs,
+      troughMs: Math.round(troughMs * 10) / 10,
+      jitterMs: Math.round(this.jitterMs * 10) / 10,
+      driftPpm,
+      underruns: this.underruns,
+      overruns: this.overruns,
+      playing: this.playing,
+      burstMs: Math.round(this.curBurstMs || this.prevBurstMs || 20),
+      sampleRate,
+    });
   }
 
   pushPcm(samples, inRate) {
@@ -433,6 +465,7 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
       Math.max(this.maxSamples, effTrough + burstSamples + Math.round(sampleRate * 0.05))
     );
     if (avail > hardCap) {
+      this.overruns++;
       if (this.playing) {
         const base = Math.floor(this.readPos);
         for (let i = 0; i < this.xfadeLen; i++) {
@@ -461,12 +494,14 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
       if (avail <= 0) {
         this.waitSamples = 0;
         out.fill(0);
+        this.maybePostStats(0, effTrough);
         return true;
       }
       this.waitSamples += len;
       const maxWait = Math.max(effStart + Math.round(sampleRate * 0.03), Math.round(sampleRate * 0.04));
       if (avail < effStart && this.waitSamples < maxWait) {
         out.fill(0);
+        this.maybePostStats(avail, effTrough);
         return true;
       }
       this.playing = true;
@@ -517,6 +552,9 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
         this.lastOut = sample;
       } else {
         this.plcCount++;
+        if (this.plcCount === 1) {
+          this.underruns++;
+        }
         if (this.plcCount <= this.plcMax) {
           const t = this.plcCount / this.plcMax;
           const env = 0.5 * (1 + Math.cos(Math.PI * t));
@@ -550,6 +588,7 @@ class P2PVoicePlaybackProcessor extends AudioWorkletProcessor {
       this.readPos -= shift;
       this.writeIdx -= shift;
     }
+    this.maybePostStats(this.writeIdx - this.readPos, effTrough);
     return true;
   }
 }
@@ -1495,8 +1534,14 @@ class P2PDirectApp {
       peerMixers: new Map(), // peerId -> { gainNode, playbackNode, opusDecoder, codec, isRelayed, volume, muted, nextPlayTime, rms, smoothLevel, lastAudioAt, packetsReceived, decodedFrames }
       joinOrder: [], // ordered participant keys (peerId or "self") so cards never jump when joining
       localRms: 0,
+      rawMicRms: 0,
+      peakMicRms: 0,
       localSmoothLevel: 0,
       localSpeakingAt: 0,
+      txWindow: [],
+      txKbps: 0,
+      txPps: 0,
+      txDropped: 0,
       meterTimer: null,
       meterTicks: 0,
       lastRosterKey: "",
@@ -3015,29 +3060,31 @@ class P2PDirectApp {
 
   _syncTopologyTimers() {
     const visible = this.isTopologyVisible();
-    if (visible) {
+    const needStatsPoll = visible || (this.advancedMode && this.directPeers.size > 0);
+    if (needStatsPoll) {
       if (!this.topo.statsTimer) {
         this.topo.statsTimer = setInterval(() => {
-          if (!this.isTopologyVisible()) {
+          const stillNeed = this.isTopologyVisible() || (this.advancedMode && this.directPeers.size > 0);
+          if (!stillNeed) {
             this._syncTopologyTimers();
             return;
           }
           this.pollPeerTransportStats();
         }, 2400);
       }
+    } else if (this.topo.statsTimer) {
+      clearInterval(this.topo.statsTimer);
+      this.topo.statsTimer = null;
+    }
+
+    if (visible) {
       if (this.topo.particles.length > 0 && !this.topo.rafId) {
         this.topo.lastFrameMs = performance.now();
         this.topo.rafId = requestAnimationFrame(this.topo.boundTick);
       }
-    } else {
-      if (this.topo.statsTimer) {
-        clearInterval(this.topo.statsTimer);
-        this.topo.statsTimer = null;
-      }
-      if (this.topo.rafId) {
-        cancelAnimationFrame(this.topo.rafId);
-        this.topo.rafId = null;
-      }
+    } else if (this.topo.rafId) {
+      cancelAnimationFrame(this.topo.rafId);
+      this.topo.rafId = null;
     }
   }
 
@@ -3086,6 +3133,12 @@ class P2PDirectApp {
 
     if (this.status) {
       this.renderAll();
+      if (this.advancedMode) {
+        this.updateVoiceAdvancedStats();
+        if (this.directPeers.size > 0) {
+          this.pollPeerTransportStats();
+        }
+      }
     } else {
       this.syncLayoutAttributes();
     }
@@ -5056,6 +5109,9 @@ class P2PDirectApp {
           this.cleanupStaleLocalDialing(now);
           this.tryBackgroundDirectUpgrades(now);
           this.renderStats();
+          if (this.advancedMode) {
+            this.updateVoiceAdvancedStats();
+          }
         } catch {
           // ignore
         }
@@ -7468,6 +7524,7 @@ class P2PDirectApp {
     };
 
     const voiceQueue = [];
+    let voiceQueuedBytes = 0;
     let voiceFlushTimer = null;
     let peerVoiceBundleSeq = 0;
     const flushVoiceQueue = () => {
@@ -7477,9 +7534,15 @@ class P2PDirectApp {
       }
       if (voiceQueue.length === 0 || !app.roomRendezvous || !app.activeRoom) {
         voiceQueue.length = 0;
+        voiceQueuedBytes = 0;
+        virtualVoiceDc.bufferedAmount = 0;
         return;
       }
       const batch = voiceQueue.splice(0, VOICE_RELAY_MAX_FRAMES);
+      for (const pkt of batch) {
+        voiceQueuedBytes = Math.max(0, voiceQueuedBytes - pkt.byteLength);
+      }
+      virtualVoiceDc.bufferedAmount = voiceQueuedBytes;
       peerVoiceBundleSeq = ((peerVoiceBundleSeq + 1) >>> 0) || 1;
       const bundle = encodeRelayVoiceBundle(myTag.bytes, peerInfo.tagBytes, peerVoiceBundleSeq, batch);
       const preferredUrls = peerInfo.relays && peerInfo.relays.length > 0 ? peerInfo.relays : null;
@@ -7515,6 +7578,8 @@ class P2PDirectApp {
             ? packetBytes.slice()
             : new Uint8Array(packetBytes).slice();
         voiceQueue.push(copy);
+        voiceQueuedBytes += copy.byteLength;
+        this.bufferedAmount = voiceQueuedBytes;
         if (voiceQueue.length >= VOICE_RELAY_MAX_FRAMES) {
           flushVoiceQueue();
         } else if (!voiceFlushTimer) {
@@ -7525,6 +7590,8 @@ class P2PDirectApp {
         if (this.readyState === "closed") return;
         this.readyState = "closed";
         voiceQueue.length = 0;
+        voiceQueuedBytes = 0;
+        this.bufferedAmount = 0;
         if (voiceFlushTimer) {
           clearTimeout(voiceFlushTimer);
           voiceFlushTimer = null;
@@ -7600,6 +7667,9 @@ class P2PDirectApp {
         pending: new Map(),
         seen: new Set(),
         flushTimer: null,
+        reorderedCount: 0,
+        skippedCount: 0,
+        lateDropCount: 0,
       };
       this.relayVoiceReorder.set(fromHex, st);
     }
@@ -7648,6 +7718,12 @@ class P2PDirectApp {
         }
       }
       if (lowest !== null) {
+        if (st.expectedSeq !== null) {
+          const gap = (lowest - st.expectedSeq) | 0;
+          if (gap > 0) {
+            st.skippedCount += gap;
+          }
+        }
         st.expectedSeq = lowest;
         drain();
         if (st.pending.size > 0) {
@@ -7676,9 +7752,11 @@ class P2PDirectApp {
     }
     if (diff < 0) {
       // Stale late bundle already skipped after timeout; drop cleanly to avoid out-of-order glitches
+      st.lateDropCount += 1;
       return;
     }
 
+    st.reorderedCount += 1;
     st.pending.set(seq, {
       frames: frames.map((f) => f.slice()),
       receivedAt: Date.now(),
@@ -8732,6 +8810,9 @@ class P2PDirectApp {
       );
       this.el["audio-output-select"].value = hasOpt ? targetOut : "";
     }
+    if (this.advancedMode && this.voice.inVoice) {
+      this.updateVoiceAdvancedStats();
+    }
   }
 
   async refreshAudioInputDevices() {
@@ -9463,6 +9544,34 @@ class P2PDirectApp {
     return this.voice.workletsLoadingPromise;
   }
 
+  _recordRateSample(win, bytes, now = performance.now()) {
+    win.push([now, bytes]);
+    const cutoff = now - 1000;
+    while (win.length > 0 && win[0][0] < cutoff) {
+      win.shift();
+    }
+    if (win.length > 160) {
+      win.splice(0, win.length - 160);
+    }
+  }
+
+  _computeRateWindow(win, now = performance.now()) {
+    if (!win || win.length === 0) return { kbps: 0, pps: 0 };
+    const cutoff = now - 1000;
+    while (win.length > 0 && win[0][0] < cutoff) {
+      win.shift();
+    }
+    if (win.length === 0) return { kbps: 0, pps: 0 };
+    let bytes = 0;
+    for (let i = 0; i < win.length; i++) {
+      bytes += win[i][1];
+    }
+    return {
+      kbps: Math.round(((bytes * 8) / 1000) * 10) / 10,
+      pps: win.length,
+    };
+  }
+
   _attachPlaybackWorklet(ctx, mixer, isRelayed) {
     if (mixer.playbackNode || !this.voice.workletsLoaded || typeof AudioWorkletNode !== "function") {
       return Boolean(mixer.playbackNode);
@@ -9473,6 +9582,12 @@ class P2PDirectApp {
         numberOfOutputs: 1,
         outputChannelCount: [1],
       });
+      node.port.onmessage = (ev) => {
+        const msg = ev.data;
+        if (msg && msg.type === "stats") {
+          mixer.workletStats = msg;
+        }
+      };
       node.connect(mixer.gainNode);
       node.port.postMessage({
         type: "config",
@@ -9507,10 +9622,18 @@ class P2PDirectApp {
         muted: false,
         nextPlayTime: 0,
         rms: 0,
+        peakRms: 0,
         smoothLevel: 0,
         lastAudioAt: 0,
         packetsReceived: 0,
         decodedFrames: 0,
+        workletStats: null,
+        rxWindow: [],
+        lastPktBytes: 0,
+        lastTsSamples: null,
+        lastTsAt: 0,
+        lostFrames: 0,
+        decodeErrors: 0,
       };
       this._attachPlaybackWorklet(ctx, mixer, isRelayed);
       this.voice.peerMixers.set(peerId, mixer);
@@ -9663,16 +9786,20 @@ class P2PDirectApp {
     }
 
     const packets = this.wasm.sealVoiceRaw(buf.subarray(0, totalLen));
+    const nowPerf = performance.now();
     for (const { peerId, data } of packets) {
       if (this.getPeerVoiceCodec(peerId) !== "opus48") continue;
       const vdc = this.voiceChannels.get(peerId);
       if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
         try {
           vdc.send(data);
+          this._recordRateSample(this.voice.txWindow, data.byteLength, nowPerf);
           this.recordTopologyPacket(peerId, "tx", "voice", data.byteLength);
         } catch {
-          // drop frame cleanly under congestion
+          this.voice.txDropped += 1;
         }
+      } else if (vdc && vdc.readyState === "open") {
+        this.voice.txDropped += 1;
       }
     }
   }
@@ -9722,8 +9849,11 @@ class P2PDirectApp {
         },
         error: () => {
           const liveMixer = this.voice.peerMixers.get(peerId);
-          if (liveMixer && liveMixer.opusDecoder === dec) {
-            liveMixer.opusDecoder = null;
+          if (liveMixer) {
+            liveMixer.decodeErrors = (liveMixer.decodeErrors || 0) + 1;
+            if (liveMixer.opusDecoder === dec) {
+              liveMixer.opusDecoder = null;
+            }
           }
         },
       });
@@ -9823,8 +9953,14 @@ class P2PDirectApp {
       this.voice.inVoice = true;
       this.voice.monitorActive = false;
       this.voice.localRms = 0;
+      this.voice.rawMicRms = 0;
+      this.voice.peakMicRms = 0;
       this.voice.localSmoothLevel = 0;
       this.voice.localSpeakingAt = 0;
+      this.voice.txWindow = [];
+      this.voice.txKbps = 0;
+      this.voice.txPps = 0;
+      this.voice.txDropped = 0;
       this.voice.gateClosed = false;
       this.voice.opusTxSampleCounter = 0;
       this.voice.opusPendingMeta = [];
@@ -10028,6 +10164,11 @@ class P2PDirectApp {
       returnProcessed48k: needOpusV2,
     });
 
+    this.voice.rawMicRms = dsp.rawRms || 0;
+    this.voice.peakMicRms = Math.max(
+      this.voice.rawMicRms,
+      Math.round((this.voice.peakMicRms || 0) * 0.88)
+    );
     this.voice.gateClosed = dsp.gated;
     if (this.voice.settingsOpen) {
       this.updateAudioMeterUi(dsp.rawRms, dsp.gated, "Live");
@@ -10092,21 +10233,27 @@ class P2PDirectApp {
             }
           }
         }
+      } else {
+        this.voice.txDropped += 1;
       }
     }
 
     // Fast path 2: Anti-aliased 16 kHz V1 ADPCM (downsampled & E2EE sealed in Rust) for bots/legacy peers
     if (v1Packets.length > 0) {
+      const nowPerf = performance.now();
       for (const { peerId, data } of v1Packets) {
         if (!sendV1ToOpusFallback && this.getPeerVoiceCodec(peerId) === "opus48") continue;
         const vdc = this.voiceChannels.get(peerId);
         if (vdc && vdc.readyState === "open" && vdc.bufferedAmount < 16384) {
           try {
             vdc.send(data);
+            this._recordRateSample(this.voice.txWindow, data.byteLength, nowPerf);
             this.recordTopologyPacket(peerId, "tx", "voice", data.byteLength);
           } catch {
-            // drop frame cleanly under congestion
+            this.voice.txDropped += 1;
           }
+        } else if (vdc && vdc.readyState === "open") {
+          this.voice.txDropped += 1;
         }
       }
     }
@@ -10137,10 +10284,31 @@ class P2PDirectApp {
         const opusData = plain.subarray(VOICE_V2_HEADER_BYTES);
 
         const mixer = this.ensurePeerVoiceMixer(peerId);
+        const nowPerf = performance.now();
+        const frameSamples = Math.max(160, Math.round(sampleRate * 0.02));
+        if (mixer.lastTsSamples !== null && nowPerf - mixer.lastTsAt < 260) {
+          const delta = (tsSamples - mixer.lastTsSamples) | 0;
+          if (delta > frameSamples * 1.5 && delta < frameSamples * 25) {
+            mixer.lostFrames += Math.max(0, Math.round(delta / frameSamples) - 1);
+          } else if (delta < 0 && delta > -frameSamples * 25) {
+            mixer.lostFrames = Math.max(0, mixer.lostFrames - 1);
+          }
+        }
+        if (
+          mixer.lastTsSamples === null ||
+          ((tsSamples - mixer.lastTsSamples) | 0) > 0 ||
+          nowPerf - mixer.lastTsAt >= 260
+        ) {
+          mixer.lastTsSamples = tsSamples;
+        }
+        mixer.lastTsAt = nowPerf;
         mixer.codec = "opus48";
         mixer.rms = headerRms;
+        mixer.peakRms = Math.max(headerRms, Math.round((mixer.peakRms || 0) * 0.88));
         mixer.packetsReceived += 1;
+        mixer.lastPktBytes = pktBytes.byteLength;
         mixer.lastAudioAt = Date.now();
+        this._recordRateSample(mixer.rxWindow, pktBytes.byteLength, nowPerf);
         this.recordTopologyPacket(peerId, "rx", "voice", pktBytes.byteLength);
 
         if (this.voice.deafened || mixer.muted || !this.voice.audioCtx) {
@@ -10148,6 +10316,9 @@ class P2PDirectApp {
         }
         const dec = this.ensurePeerOpusDecoder(peerId, mixer);
         if (!dec || dec.state !== "configured" || dec.decodeQueueSize > 6) {
+          if (dec && dec.decodeQueueSize > 6) {
+            mixer.decodeErrors += 1;
+          }
           return;
         }
         try {
@@ -10159,6 +10330,7 @@ class P2PDirectApp {
             })
           );
         } catch {
+          mixer.decodeErrors += 1;
           // Reset decoder cleanly if a damaged stream frame occurred
           if (mixer.opusDecoder === dec) {
             try {
@@ -10181,10 +10353,15 @@ class P2PDirectApp {
       }
 
       const mixer = this.ensurePeerVoiceMixer(peerId);
+      const nowPerf = performance.now();
       mixer.codec = "adpcm16";
       mixer.rms = decoded.rms;
+      mixer.peakRms = Math.max(decoded.rms || 0, Math.round((mixer.peakRms || 0) * 0.88));
       mixer.packetsReceived += 1;
+      mixer.decodedFrames += 1;
+      mixer.lastPktBytes = pktBytes.byteLength;
       mixer.lastAudioAt = Date.now();
+      this._recordRateSample(mixer.rxWindow, pktBytes.byteLength, nowPerf);
       this.recordTopologyPacket(peerId, "rx", "voice", pktBytes.byteLength);
 
       if (this.voice.deafened || mixer.muted || !this.voice.audioCtx) {
@@ -10352,7 +10529,13 @@ class P2PDirectApp {
     this.voice.deafened = false;
     this.voice.listenOnly = false;
     this.voice.localRms = 0;
+    this.voice.rawMicRms = 0;
+    this.voice.peakMicRms = 0;
     this.voice.localSmoothLevel = 0;
+    this.voice.txWindow = [];
+    this.voice.txKbps = 0;
+    this.voice.txPps = 0;
+    this.voice.txDropped = 0;
     this.voice.gateClosed = false;
     this.voice.joinOrder = this.voice.joinOrder.filter((id) => id !== "self");
     this.voice.renderedKeys.delete("self");
@@ -10389,6 +10572,8 @@ class P2PDirectApp {
       entry = {
         card,
         stateEl: card.querySelector("[data-voice-state]"),
+        advStatsEl: card.querySelector("[data-voice-adv-stats]"),
+        lastAdvHtml: "",
         bars,
         lastSpeaking: null,
         lastLevelStr: "",
@@ -10512,6 +10697,20 @@ class P2PDirectApp {
         }
       } catch {
         // ignore
+      }
+
+      if (this.advancedMode) {
+        if (this.voice.meterTicks % 16 === 0) {
+          try {
+            const st = this.wasm.call({ cmd: "get_status" });
+            if (st && st.status) {
+              this.status = st.status;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        this.updateVoiceAdvancedStats();
       }
     }
   }
@@ -12075,6 +12274,9 @@ class P2PDirectApp {
     });
 
     if (!forceRebuild && rosterKey === this.voice.lastRosterKey) {
+      if (this.advancedMode) {
+        this.updateVoiceAdvancedStats();
+      }
       return;
     }
     this.voice.lastRosterKey = rosterKey;
@@ -12146,6 +12348,7 @@ class P2PDirectApp {
                 </div>
               </div>
               <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
+              <div class="voice-adv-stats advanced-only" data-voice-adv-stats="self"></div>
             </div>
           </li>
         `);
@@ -12201,6 +12404,7 @@ class P2PDirectApp {
                 </div>
               </div>
               <div class="voice-eq" aria-hidden="true">${eqBarsHtml}</div>
+              <div class="voice-adv-stats advanced-only" data-voice-adv-stats="${escapeHtml(p.peerId)}"></div>
             </div>
           </li>
         `);
@@ -12221,6 +12425,7 @@ class P2PDirectApp {
                 <span class="tile-prejoin-hint">Active in voice channel</span>
               </div>
               <div class="voice-eq${p.voiceMuted ? "" : " is-preview"}" aria-hidden="true">${eqBarsHtml}</div>
+              <div class="voice-adv-stats advanced-only" data-voice-adv-stats="${escapeHtml(p.peerId)}"></div>
             </div>
           </li>
         `);
@@ -12238,6 +12443,8 @@ class P2PDirectApp {
       this.voice.cardCache.set(rowKey, {
         card,
         stateEl: card.querySelector("[data-voice-state]"),
+        advStatsEl: card.querySelector("[data-voice-adv-stats]"),
+        lastAdvHtml: "",
         bars,
         lastSpeaking: false,
         lastLevelStr: "",
@@ -12263,9 +12470,384 @@ class P2PDirectApp {
         btn.addEventListener("click", () => this.togglePeerVoiceMute(btn.dataset.peerVoiceMute));
       }
       for (const slider of listEl.querySelectorAll("[data-peer-voice-vol]")) {
-        slider.addEventListener("input", () =>
-          this.setPeerVoiceVolume(slider.dataset.peerVoiceVol, Number(slider.value) / 100)
-        );
+        slider.addEventListener("input", () => {
+          this.setPeerVoiceVolume(slider.dataset.peerVoiceVol, Number(slider.value) / 100);
+          if (this.advancedMode) {
+            this.updateVoiceAdvancedStats();
+          }
+        });
+      }
+    }
+
+    if (this.advancedMode) {
+      this.updateVoiceAdvancedStats();
+    }
+  }
+
+  _rmsToDbfs(rms) {
+    if (!rms || rms <= 0) return null;
+    const clamped = Math.min(32768, Math.max(1, rms));
+    return Math.max(-60, Math.round(20 * Math.log10(clamped / 32768)));
+  }
+
+  _formatBytesCompact(bytes) {
+    const b = Math.max(0, Number(bytes) || 0);
+    if (b < 1024) return `${Math.round(b)}B`;
+    if (b < 1048576) return `${(b / 1024).toFixed(1)}K`;
+    return `${(b / 1048576).toFixed(1)}M`;
+  }
+
+  _buildSelfVoiceAdvStatsHtml(nowPerf) {
+    const s = this.audioSettings;
+    const ctx = this.voice.audioCtx;
+    const presetLabel = String(s.preset || "voice").toUpperCase();
+    const targetBitrate = this.voice.opusEncoderBitrate || this.computeDesiredOpusBitrate();
+    const targetKbps = Math.round(targetBitrate / 1000);
+    const codecLabel = this.voice.opusSupported ? `OPUS 48K · ${targetKbps}K` : "ADPCM 16K";
+
+    let stateLabel = "OPEN";
+    let stateTone = "is-ok";
+    if (this.voice.listenOnly) {
+      stateLabel = "LISTEN";
+      stateTone = "is-muted";
+    } else if (this.voice.muted) {
+      stateLabel = "MUTED";
+      stateTone = "is-bad";
+    } else if (this.voice.gateClosed) {
+      stateLabel = "GATED";
+      stateTone = "is-warn";
+    }
+
+    const rawRms =
+      this.voice.muted || this.voice.listenOnly
+        ? 0
+        : Math.round(this.voice.peakMicRms || this.voice.rawMicRms || this.voice.localRms || 0);
+    const dbfs = this._rmsToDbfs(rawRms);
+    const dbfsStr = dbfs === null ? "-∞" : `${dbfs}`;
+    const barPct = dbfs === null ? 0 : Math.max(0, Math.min(100, Math.round(((dbfs + 60) / 60) * 100)));
+    const gatePct = Number(s.noiseGate) || 0;
+    const gateTickPct =
+      gatePct > 0
+        ? Math.max(
+            2,
+            Math.min(
+              98,
+              Math.round(
+                ((Math.max(-60, 20 * Math.log10(((gatePct / 100) * 14000) / 32768)) + 60) / 60) * 100
+              )
+            )
+          )
+        : 0;
+    const barTone =
+      this.voice.muted || this.voice.listenOnly || this.voice.gateClosed
+        ? "is-muted"
+        : dbfs !== null && dbfs >= -3
+          ? "is-bad"
+          : "is-ok";
+
+    const baseLatMs =
+      ctx && typeof ctx.baseLatency === "number" && Number.isFinite(ctx.baseLatency)
+        ? Math.round(ctx.baseLatency * 1000 * 10) / 10
+        : null;
+    const outLatMs =
+      ctx && typeof ctx.outputLatency === "number" && Number.isFinite(ctx.outputLatency) && ctx.outputLatency > 0
+        ? Math.round(ctx.outputLatency * 1000 * 10) / 10
+        : null;
+    const hwLatStr = `${baseLatMs !== null ? `${baseLatMs}ms` : "—"} · out ${outLatMs !== null ? `${outLatMs}ms` : "—"}`;
+
+    const sampleRateKhz = ctx?.sampleRate ? (ctx.sampleRate / 1000).toFixed(1).replace(/\.0$/, "") : "48";
+    const ctxState = ctx?.state || "idle";
+    const txRate = this._computeRateWindow(this.voice.txWindow, nowPerf);
+    this.voice.txKbps = txRate.kbps;
+    this.voice.txPps = txRate.pps;
+
+    const encQ = this.voice.opusEncoder ? Number(this.voice.opusEncoder.encodeQueueSize) || 0 : 0;
+    const encTone = encQ > 1 || this.voice.txDropped > 0 ? "is-warn" : "";
+    const stats = this.status?.stats || {};
+    const txSentTotal = stats.voicePacketsSent || 0;
+    const rxRecvTotal = stats.voicePacketsReceived || 0;
+    const authFailures = stats.e2eeAuthFailures || 0;
+
+    let maxVoiceBuf = 0;
+    for (const vdc of this.voiceChannels.values()) {
+      if (vdc && vdc.readyState === "open") {
+        maxVoiceBuf = Math.max(maxVoiceBuf, Number(vdc.bufferedAmount) || 0);
+      }
+    }
+    let maxBulkBuf = 0;
+    for (const bdc of this.bulkChannels.values()) {
+      if (bdc && bdc.readyState === "open") {
+        maxBulkBuf = Math.max(maxBulkBuf, Number(bdc.bufferedAmount) || 0);
+      }
+    }
+    const bufTone = maxVoiceBuf >= 8192 ? "is-warn" : "";
+
+    const hpfStr = s.highPassHz > 0 ? `${s.highPassHz}Hz` : "OFF";
+    const eqSign = s.presenceDb > 0 ? "+" : "";
+    const cmpStr = s.compressor ? "CMP+LIM" : "LIM";
+    const codecDetail = this.voice.opusSupported
+      ? `${targetKbps}k · ${this.voice.opusUseRichConfig ? "VBR+FEC" : "VBR"}`
+      : "64k · ADPCM";
+
+    let trackSummary = "LISTEN-ONLY";
+    if (!this.voice.listenOnly) {
+      const micTrack = this.voice.micStream?.getAudioTracks?.()[0];
+      const ts = micTrack && typeof micTrack.getSettings === "function" ? micTrack.getSettings() : null;
+      const aec = ts && typeof ts.echoCancellation === "boolean" ? ts.echoCancellation : s.echoCancellation;
+      const ns = ts && typeof ts.noiseSuppression === "boolean" ? ts.noiseSuppression : s.noiseSuppression;
+      const agc = ts && typeof ts.autoGainControl === "boolean" ? ts.autoGainControl : s.autoGainControl;
+      const flags = [aec ? "AEC" : null, ns ? "NS" : null, agc ? "AGC" : null].filter(Boolean);
+      const chTag = ts?.channelCount ? `${ts.channelCount}ch` : "1ch";
+      trackSummary = `${flags.length > 0 ? flags.join("/") : "RAW"} · ${chTag}`;
+    }
+
+    const activeVoicePeers = (this.status?.peers || []).filter((p) => p.inVoice).length;
+    const totalMeshPeers = (this.status?.peers || []).length;
+    const keyFp = String(this.status?.e2ee?.keyFingerprint || "—").slice(0, 12);
+
+    return `
+      <div class="vas-head">
+        <span class="vas-pill is-accent">${escapeHtml(presetLabel)}</span>
+        <span class="vas-pill">${escapeHtml(codecLabel)}</span>
+        <span class="vas-pill vas-pill-right ${stateTone}">${escapeHtml(stateLabel)}</span>
+      </div>
+      <div class="vas-bar-wrap">
+        <div class="vas-bar-meta">
+          <span>MIC <strong>${escapeHtml(dbfsStr)} dBFS</strong></span>
+          <span>GATE ${gatePct}% · ${escapeHtml(stateLabel)}</span>
+        </div>
+        <div class="vas-bar-track">
+          <div class="vas-bar-fill ${barTone}" style="width:${barPct}%"></div>
+          ${gateTickPct > 0 ? `<span class="vas-bar-tgt" style="left:${gateTickPct}%" title="Noise gate threshold (${gatePct}%)"></span>` : ""}
+        </div>
+      </div>
+      <div class="vas-grid">
+        <div class="vas-cell"><span class="vas-k">HW LAT</span><span class="vas-v">${escapeHtml(hwLatStr)}</span></div>
+        <div class="vas-cell"><span class="vas-k">AUDIO</span><span class="vas-v">${escapeHtml(`${sampleRateKhz}kHz · 20ms · ${ctxState}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">TX RATE</span><span class="vas-v">${escapeHtml(`${txRate.kbps.toFixed(1)}k · ${txRate.pps}/s`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">TARGET</span><span class="vas-v">${escapeHtml(codecDetail)}</span></div>
+        <div class="vas-cell"><span class="vas-k">ENC Q</span><span class="vas-v ${encTone}">${escapeHtml(`q${encQ} · drop ${this.voice.txDropped}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">TX / RX</span><span class="vas-v">${escapeHtml(`${txSentTotal} / ${rxRecvTotal}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">TX BUF</span><span class="vas-v ${bufTone}">${escapeHtml(`v:${this._formatBytesCompact(maxVoiceBuf)} · b:${this._formatBytesCompact(maxBulkBuf)}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">SIGNAL</span><span class="vas-v">${escapeHtml(`${dbfsStr}dB · rms ${rawRms}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">GAIN</span><span class="vas-v">${escapeHtml(`mic ${s.micGain}% · out ${s.outputGain}%`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">DSP</span><span class="vas-v">${escapeHtml(`HPF ${hpfStr} · EQ${eqSign}${s.presenceDb} · ${cmpStr}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">PEERS</span><span class="vas-v">${escapeHtml(`${activeVoicePeers} voice · ${totalMeshPeers} mesh`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">CIPHER</span><span class="vas-v">${escapeHtml(`X25519 · AEAD${authFailures > 0 ? ` · err ${authFailures}` : ""}`)}</span></div>
+      </div>
+      <div class="vas-foot">
+        <span>TRACK ${escapeHtml(trackSummary)}</span>
+        <span>KEY ${escapeHtml(keyFp)}</span>
+      </div>
+    `;
+  }
+
+  _buildPeerVoiceAdvStatsHtml(peer, mixer, isPreview, nowPerf) {
+    const tech = this._getPeerTechInfo(peer.peerId);
+    const isRelayed = tech.transport === "relay";
+    const codec = mixer?.codec || this.getPeerVoiceCodec(peer.peerId);
+    const codecLabel = codec === "opus48" ? "OPUS 48K" : "ADPCM 16K";
+    const transportTone = isRelayed ? "is-warn" : "is-ok";
+
+    const vdc = this.voiceChannels.get(peer.peerId);
+    const bdc = this.bulkChannels.get(peer.peerId);
+    const vBuf = vdc && vdc.readyState === "open" ? Number(vdc.bufferedAmount) || 0 : 0;
+    const bBuf = bdc && bdc.readyState === "open" ? Number(bdc.bufferedAmount) || 0 : 0;
+    const vBufStr = this._formatBytesCompact(vBuf);
+    const bBufStr = this._formatBytesCompact(bBuf);
+
+    const rustRtt = typeof peer.rttMs === "number" ? peer.rttMs : null;
+    const iceRtt = typeof tech.statsRttMs === "number" ? tech.statsRttMs : null;
+    const effRtt = rustRtt !== null ? rustRtt : iceRtt;
+    const minRtt = typeof peer.minRttMs === "number" ? peer.minRttMs : iceRtt;
+    const rttMain =
+      rustRtt !== null ? `${rustRtt}ms` : iceRtt !== null ? `${iceRtt}ms ICE` : "—";
+    const rttStr = `${rttMain} · min ${minRtt !== null ? `${minRtt}ms` : "—"}`;
+    const rttTone = effRtt === null ? "is-muted" : effRtt > 180 ? "is-bad" : effRtt > 80 ? "is-warn" : "is-ok";
+
+    const clockOffset = typeof peer.clockOffsetMs === "number" ? peer.clockOffsetMs : null;
+    const clockStr =
+      clockOffset !== null ? `${clockOffset >= 0 ? "+" : ""}${clockOffset}ms` : "syncing…";
+
+    const txSeq = Number(peer.voiceTxSeq) || 0;
+    const rxSeq = Number(peer.voiceRxSeq) || 0;
+    const rxOoo = Number(peer.voiceRxOutOfOrder) || 0;
+    const rxRej = Number(peer.voiceRxRejected) || 0;
+    const safetyCode = peer.safetyCode || "—";
+
+    const pathFoot = isRelayed
+      ? `${tech.brokerHost || "WSS"} · tx ${vBufStr}`
+      : `${tech.localType}↔${tech.remoteType}${tech.availOutKbps ? ` · ${tech.availOutKbps}k bw` : ""}`;
+
+    if (isPreview) {
+      const link = this.topo.linkStats.get(peer.peerId);
+      if (link) this._rollLinkWindow(link, nowPerf);
+      const linkKbps = link ? link.kbps.toFixed(1) : "0.0";
+      const linkPps = link ? (link.txPps || 0) + (link.rxPps || 0) : 0;
+      return `
+        <div class="vas-head">
+          <span class="vas-pill ${transportTone}">${escapeHtml(tech.shortLabel)}</span>
+          <span class="vas-pill">${escapeHtml(codecLabel)}</span>
+          <span class="vas-pill vas-pill-right is-muted">PRE-JOIN</span>
+        </div>
+        <div class="vas-grid">
+          <div class="vas-cell"><span class="vas-k">RTT</span><span class="vas-v ${rttTone}">${escapeHtml(rttStr)}</span></div>
+          <div class="vas-cell"><span class="vas-k">CLOCK Δ</span><span class="vas-v">${escapeHtml(clockStr)}</span></div>
+          <div class="vas-cell"><span class="vas-k">LINK</span><span class="vas-v">${escapeHtml(`${linkKbps}k · ${linkPps}/s`)}</span></div>
+          <div class="vas-cell"><span class="vas-k">QUEUE</span><span class="vas-v">${escapeHtml(`v:${vBufStr} · b:${bBufStr}`)}</span></div>
+          <div class="vas-cell"><span class="vas-k">AEAD SEQ</span><span class="vas-v">${escapeHtml(`#${txSeq} / #${rxSeq}`)}</span></div>
+          <div class="vas-cell"><span class="vas-k">ROUTE</span><span class="vas-v">${escapeHtml(`${peer.viaAutoMesh ? "AUTO-MESH" : "DIRECT"} · ${peer.knownCount || 0} log`)}</span></div>
+        </div>
+        <div class="vas-foot">
+          <span>${escapeHtml(pathFoot)}</span>
+          <span>SAFE ${escapeHtml(safetyCode)}</span>
+        </div>
+      `;
+    }
+
+    const ws = mixer?.workletStats || null;
+    const cacheMs = ws ? Number(ws.cacheMs) || 0 : 0;
+    const targetMs = ws ? Number(ws.targetMs) || (isRelayed ? 60 : 20) : isRelayed ? 60 : 20;
+    const maxMs = ws ? Number(ws.maxMs) || (isRelayed ? 420 : 150) : isRelayed ? 420 : 150;
+    const troughMs = ws ? Number(ws.troughMs) || 0 : 0;
+    const jitterMs = ws ? Number(ws.jitterMs) || 0 : 0;
+    const driftPpm = ws ? Number(ws.driftPpm) || 0 : 0;
+    const underruns = ws ? Number(ws.underruns) || 0 : 0;
+    const overruns = ws ? Number(ws.overruns) || 0 : 0;
+    const burstMs = ws ? Number(ws.burstMs) || 20 : isRelayed ? 60 : 20;
+    const isPlaying = Boolean(ws && ws.playing);
+
+    let stateLabel = "IDLE";
+    let stateTone = "is-muted";
+    if (this.voice.deafened) {
+      stateLabel = "DEAF";
+      stateTone = "is-muted";
+    } else if (mixer?.muted || peer.voiceMuted) {
+      stateLabel = "MUTED";
+      stateTone = "is-muted";
+    } else if (isPlaying) {
+      stateLabel = "PLAY";
+      stateTone = "is-ok";
+    } else if (cacheMs > 0) {
+      stateLabel = "BUF";
+      stateTone = "is-warn";
+    }
+
+    const barPct = Math.max(0, Math.min(100, Math.round((cacheMs / Math.max(1, maxMs)) * 100)));
+    const tgtPct = Math.max(4, Math.min(96, Math.round((targetMs / Math.max(1, maxMs)) * 100)));
+    const cacheBarTone =
+      barPct > 85
+        ? "is-bad"
+        : barPct > 65 || jitterMs > 25
+          ? "is-warn"
+          : isPlaying || cacheMs > 0
+            ? "is-ok"
+            : "is-muted";
+
+    const ctx = this.voice.audioCtx;
+    const hwOutMs =
+      ctx && typeof ctx.outputLatency === "number" && Number.isFinite(ctx.outputLatency) && ctx.outputLatency > 0
+        ? Math.round(ctx.outputLatency * 1000)
+        : ctx && typeof ctx.baseLatency === "number" && Number.isFinite(ctx.baseLatency)
+          ? Math.round(ctx.baseLatency * 1000)
+          : 10;
+    const estE2e =
+      effRtt !== null
+        ? Math.round(effRtt / 2 + (cacheMs > 0 ? cacheMs : targetMs) + hwOutMs + 20)
+        : null;
+    const e2eTone =
+      estE2e === null ? "is-muted" : estE2e > 220 ? "is-bad" : estE2e > 120 ? "is-warn" : "is-ok";
+
+    const rxRate = mixer ? this._computeRateWindow(mixer.rxWindow, nowPerf) : { kbps: 0, pps: 0 };
+    const lastBytes = mixer?.lastPktBytes || 0;
+    const rxRateStr = `${rxRate.kbps.toFixed(1)}k · ${rxRate.pps}/s${lastBytes ? ` · ${lastBytes}B` : ""}`;
+
+    const pktsRx = mixer?.packetsReceived || 0;
+    const decFrames = mixer?.decodedFrames || 0;
+    const decQ = mixer?.opusDecoder ? Number(mixer.opusDecoder.decodeQueueSize) || 0 : 0;
+    const decErr = mixer?.decodeErrors || 0;
+    const lostFrames = mixer?.lostFrames || 0;
+    const lossTotal = pktsRx + lostFrames;
+    const lossPct = lossTotal > 0 ? (lostFrames / lossTotal) * 100 : 0;
+    const lossTone =
+      lossPct >= 5 || rxRej > 0 ? "is-bad" : lostFrames > 0 || rxOoo > 0 ? "is-warn" : "is-ok";
+
+    const undOvrTone = underruns > 0 || overruns > 0 ? "is-warn" : "is-ok";
+    const jitterTone = jitterMs > 25 ? "is-bad" : jitterMs > 12 ? "is-warn" : "";
+
+    const freshAudio = mixer && Date.now() - mixer.lastAudioAt < 450 && !peer.voiceMuted && !mixer.muted;
+    const peerRms = freshAudio ? Math.round(mixer.peakRms || mixer.rms || 0) : 0;
+    const peerDbfs = this._rmsToDbfs(peerRms);
+    const peerDbfsStr = peerDbfs === null ? "-∞" : `${peerDbfs}`;
+
+    const known = this.roomKnownPeers.get(peer.peerId);
+    const reord = known?.tagHex ? this.relayVoiceReorder.get(known.tagHex) : null;
+    const queueLabel = isRelayed && reord ? "REORDER" : "QUEUE";
+    const queueVal =
+      isRelayed && reord
+        ? `q${reord.pending.size} · ooo ${reord.reorderedCount} · skp ${reord.skippedCount}`
+        : `v:${vBufStr} · b:${bBufStr}`;
+
+    const volStr = mixer?.muted ? "MUTE" : `${mixer ? Math.round(mixer.volume * 100) : 100}%`;
+    const aeadMixVal = `#${txSeq}/#${rxSeq} · ${volStr}${rxRej > 0 ? ` · rej ${rxRej}` : ""}`;
+
+    return `
+      <div class="vas-head">
+        <span class="vas-pill ${transportTone}">${escapeHtml(tech.shortLabel)}</span>
+        <span class="vas-pill">${escapeHtml(codecLabel)}</span>
+        <span class="vas-pill vas-pill-right ${stateTone}">${escapeHtml(stateLabel)}</span>
+      </div>
+      <div class="vas-bar-wrap">
+        <div class="vas-bar-meta">
+          <span>CACHE <strong>${cacheMs.toFixed(0)}ms</strong></span>
+          <span>TGT ${targetMs}ms · MAX ${maxMs}ms</span>
+        </div>
+        <div class="vas-bar-track">
+          <div class="vas-bar-fill ${cacheBarTone}" style="width:${barPct}%"></div>
+          <span class="vas-bar-tgt" style="left:${tgtPct}%" title="Adaptive target trough (${targetMs}ms)"></span>
+        </div>
+      </div>
+      <div class="vas-grid">
+        <div class="vas-cell"><span class="vas-k">RTT</span><span class="vas-v ${rttTone}">${escapeHtml(rttStr)}</span></div>
+        <div class="vas-cell"><span class="vas-k">EST E2E</span><span class="vas-v ${e2eTone}">${escapeHtml(estE2e !== null ? `~${estE2e}ms` : "—")}</span></div>
+        <div class="vas-cell"><span class="vas-k">JITTER</span><span class="vas-v ${jitterTone}">${escapeHtml(`${jitterMs.toFixed(1)}ms · tr ${troughMs.toFixed(0)}ms`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">DRIFT</span><span class="vas-v">${escapeHtml(`${driftPpm >= 0 ? "+" : ""}${driftPpm}ppm · ${burstMs}ms`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">RX RATE</span><span class="vas-v">${escapeHtml(rxRateStr)}</span></div>
+        <div class="vas-cell"><span class="vas-k">LOSS / OOO</span><span class="vas-v ${lossTone}">${escapeHtml(`${lossPct.toFixed(1)}% (${lostFrames}) · ooo ${rxOoo}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">UND / OVR</span><span class="vas-v ${undOvrTone}">${escapeHtml(`${underruns} / ${overruns}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">PKT / DEC</span><span class="vas-v">${escapeHtml(`${pktsRx} / ${decFrames} · q${decQ}${decErr > 0 ? ` · e${decErr}` : ""}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">SIGNAL</span><span class="vas-v">${escapeHtml(`${peerDbfsStr}dB · rms ${peerRms}`)}</span></div>
+        <div class="vas-cell"><span class="vas-k">CLOCK Δ</span><span class="vas-v">${escapeHtml(clockStr)}</span></div>
+        <div class="vas-cell"><span class="vas-k">${queueLabel}</span><span class="vas-v">${escapeHtml(queueVal)}</span></div>
+        <div class="vas-cell"><span class="vas-k">AEAD / MIX</span><span class="vas-v">${escapeHtml(aeadMixVal)}</span></div>
+      </div>
+      <div class="vas-foot">
+        <span>${escapeHtml(pathFoot)}</span>
+        <span>SAFE ${escapeHtml(safetyCode)}</span>
+      </div>
+    `;
+  }
+
+  updateVoiceAdvancedStats() {
+    if (!this.advancedMode || !this.status) return;
+    const nowPerf = performance.now();
+    const peerMap = new Map((this.status.peers || []).map((p) => [p.peerId, p]));
+
+    for (const [rowKey, entry] of this.voice.cardCache.entries()) {
+      if (!entry || !entry.advStatsEl || !entry.card?.isConnected) continue;
+      let html = "";
+      if (rowKey === "self") {
+        if (!this.voice.inVoice) continue;
+        html = this._buildSelfVoiceAdvStatsHtml(nowPerf);
+      } else {
+        const peer = peerMap.get(rowKey);
+        if (!peer) continue;
+        const mixer = this.voice.peerMixers.get(rowKey) || null;
+        html = this._buildPeerVoiceAdvStatsHtml(peer, mixer, !this.voice.inVoice, nowPerf);
+      }
+      if (html !== entry.lastAdvHtml) {
+        entry.lastAdvHtml = html;
+        entry.advStatsEl.innerHTML = html;
       }
     }
   }
@@ -12301,6 +12883,10 @@ class P2PDirectApp {
       typeof pair?.currentRoundTripTime === "number" && Number.isFinite(pair.currentRoundTripTime)
         ? Math.max(1, Math.round(pair.currentRoundTripTime * 1000))
         : null;
+    const availOutKbps =
+      typeof pair?.availableOutgoingBitrate === "number" && Number.isFinite(pair.availableOutgoingBitrate)
+        ? Math.round(pair.availableOutgoingBitrate / 1000)
+        : null;
     this.topo.peerTech.set(peerId, {
       transport: "direct",
       shortLabel,
@@ -12309,6 +12895,9 @@ class P2PDirectApp {
       localType: lt || "?",
       remoteType: rt || "?",
       statsRttMs,
+      availOutKbps,
+      iceBytesSent: typeof pair?.bytesSent === "number" ? pair.bytesSent : null,
+      iceBytesRecv: typeof pair?.bytesReceived === "number" ? pair.bytesReceived : null,
       brokerHost: "",
     });
   }
@@ -12347,6 +12936,7 @@ class P2PDirectApp {
         localType: "wss",
         remoteType: "wss",
         statsRttMs: bestRtt,
+        availOutKbps: null,
         brokerHost,
       };
     }
@@ -12362,6 +12952,7 @@ class P2PDirectApp {
       localType: "?",
       remoteType: "?",
       statsRttMs: null,
+      availOutKbps: null,
       brokerHost: "",
     };
   }
@@ -12418,7 +13009,8 @@ class P2PDirectApp {
               if (
                 !prev ||
                 prev.shortLabel !== next.shortLabel ||
-                prev.statsRttMs !== next.statsRttMs
+                prev.statsRttMs !== next.statsRttMs ||
+                prev.availOutKbps !== next.availOutKbps
               ) {
                 changed = true;
               }
@@ -12434,6 +13026,9 @@ class P2PDirectApp {
       this.renderPeers();
       this.renderTopology();
       this.renderTopologyInspector();
+    }
+    if (this.advancedMode) {
+      this.updateVoiceAdvancedStats();
     }
   }
 

@@ -301,6 +301,8 @@ pub fn actions_to_json_array(actions: &[MeshAction]) -> String {
 struct ReplayWindow {
     max_seq: u64,
     seen_bits: [u64; 4],
+    accepted: u64,
+    out_of_order: u64,
 }
 
 impl ReplayWindow {
@@ -321,6 +323,7 @@ impl ReplayWindow {
     }
 
     fn accept(&mut self, seq: u64) {
+        self.accepted = self.accepted.saturating_add(1);
         if self.max_seq == 0 {
             self.max_seq = seq;
             self.seen_bits = [1, 0, 0, 0];
@@ -348,6 +351,9 @@ impl ReplayWindow {
             self.max_seq = seq;
         } else {
             let diff = self.max_seq - seq;
+            if diff > 0 {
+                self.out_of_order = self.out_of_order.saturating_add(1);
+            }
             if diff < 256 {
                 let word = (diff / 64) as usize;
                 let bit = diff % 64;
@@ -370,6 +376,7 @@ struct PeerCryptoState {
     voice_tx_nonce_prefix: [u8; 4],
     voice_tx_seq: u64,
     voice_replay_window: ReplayWindow,
+    voice_rx_rejected: u64,
     safety_code: String,
 }
 
@@ -721,6 +728,7 @@ impl MeshNode {
             peer.crypto.voice_tx_nonce_prefix = voice_prefix;
             peer.crypto.voice_tx_seq = 0;
             peer.crypto.voice_replay_window = ReplayWindow::default();
+            peer.crypto.voice_rx_rejected = 0;
             peer.crypto.safety_code =
                 pair_safety_code(&self.x25519_public, &peer.crypto.pub_key, &self.mesh_key);
         }
@@ -1440,6 +1448,7 @@ impl MeshNode {
                     voice_tx_nonce_prefix,
                     voice_tx_seq: 0,
                     voice_replay_window: ReplayWindow::default(),
+                    voice_rx_rejected: 0,
                     safety_code: safety_code.clone(),
                 },
                 known_ids: HashSet::new(),
@@ -1621,6 +1630,13 @@ impl MeshNode {
         (rms, packets)
     }
 
+    fn note_voice_rx_rejected(&mut self, from_peer: &str) {
+        self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+        if let Some(peer) = self.peers.get_mut(from_peer) {
+            peer.crypto.voice_rx_rejected = peer.crypto.voice_rx_rejected.saturating_add(1);
+        }
+    }
+
     /// Authenticates, anti-replay-checks, decrypts, and IMA-ADPCM-decodes an incoming binary `V1` voice packet.
     /// Returns `Ok((rms, pcm_samples))`. If local node is not currently in voice chat, silently returns empty PCM.
     pub fn open_voice_packet(
@@ -1635,7 +1651,7 @@ impl MeshNode {
         let (seq, nonce, ct) = match parse_voice_packet_header(packet) {
             Ok(parts) => parts,
             Err(err) => {
-                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                self.note_voice_rx_rejected(from_peer);
                 return Err(err);
             }
         };
@@ -1654,7 +1670,7 @@ impl MeshNode {
         };
 
         if !replay_ok {
-            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            self.note_voice_rx_rejected(from_peer);
             return Err(format!(
                 "rejected replayed or out-of-window voice sequence {seq} from {from_peer}"
             ));
@@ -1670,7 +1686,7 @@ impl MeshNode {
         ) {
             Ok(plain) => plain,
             Err(err) => {
-                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                self.note_voice_rx_rejected(from_peer);
                 return Err(err);
             }
         };
@@ -1748,7 +1764,7 @@ impl MeshNode {
         let (seq, nonce, ct) = match parse_voice_v2_packet_header(packet) {
             Ok(parts) => parts,
             Err(err) => {
-                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                self.note_voice_rx_rejected(from_peer);
                 return Err(err);
             }
         };
@@ -1765,7 +1781,7 @@ impl MeshNode {
             }
         };
         if !replay_ok {
-            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            self.note_voice_rx_rejected(from_peer);
             return Err(format!(
                 "rejected replayed or out-of-window V2 voice sequence {seq} from {from_peer}"
             ));
@@ -1780,7 +1796,7 @@ impl MeshNode {
         ) {
             Ok(p) => p,
             Err(err) => {
-                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                self.note_voice_rx_rejected(from_peer);
                 return Err(err);
             }
         };
@@ -1873,7 +1889,7 @@ impl MeshNode {
         let (seq, nonce, ct) = match parse_voice_packet_header(packet) {
             Ok(parts) => parts,
             Err(err) => {
-                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                self.note_voice_rx_rejected(from_peer);
                 return Err(err);
             }
         };
@@ -1892,7 +1908,7 @@ impl MeshNode {
         };
 
         if !replay_ok {
-            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            self.note_voice_rx_rejected(from_peer);
             return Err(format!(
                 "rejected replayed or out-of-window voice sequence {seq} from {from_peer}"
             ));
@@ -1908,7 +1924,7 @@ impl MeshNode {
             ct,
             adpcm_scratch,
         ) {
-            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            self.note_voice_rx_rejected(from_peer);
             return Err(err);
         }
 
@@ -1993,7 +2009,7 @@ impl MeshNode {
         let (seq, nonce, ct) = match parse_voice_v2_packet_header(packet) {
             Ok(parts) => parts,
             Err(err) => {
-                self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+                self.note_voice_rx_rejected(from_peer);
                 return Err(err);
             }
         };
@@ -2010,7 +2026,7 @@ impl MeshNode {
             }
         };
         if !replay_ok {
-            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            self.note_voice_rx_rejected(from_peer);
             return Err(format!(
                 "rejected replayed or out-of-window V2 voice sequence {seq} from {from_peer}"
             ));
@@ -2024,7 +2040,7 @@ impl MeshNode {
             ct,
             out,
         ) {
-            self.stats.e2ee_auth_failures = self.stats.e2ee_auth_failures.saturating_add(1);
+            self.note_voice_rx_rejected(from_peer);
             return Err(err);
         }
         if let Some(peer) = self.peers.get_mut(from_peer) {
@@ -3599,6 +3615,29 @@ impl MeshNode {
                 }
                 None => out.push_str("null"),
             }
+            out.push_str(",\"minRttMs\":");
+            match peer.min_rtt_ms {
+                Some(r) => {
+                    let _ = write!(out, "{r}");
+                }
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"clockOffsetMs\":");
+            match peer.clock_offset_ms {
+                Some(off) => {
+                    let _ = write!(out, "{off}");
+                }
+                None => out.push_str("null"),
+            }
+            let _ = write!(
+                out,
+                ",\"voiceTxSeq\":{},\"voiceRxSeq\":{},\"voiceRxAccepted\":{},\"voiceRxOutOfOrder\":{},\"voiceRxRejected\":{}",
+                peer.crypto.voice_tx_seq,
+                peer.crypto.voice_replay_window.max_seq,
+                peer.crypto.voice_replay_window.accepted,
+                peer.crypto.voice_replay_window.out_of_order,
+                peer.crypto.voice_rx_rejected
+            );
             out.push_str(",\"remotePeers\":[");
             for (j, rp) in peer.remote_peers.iter().enumerate() {
                 if j > 0 {
@@ -3952,5 +3991,10 @@ mod replay_window_tests {
         assert!(rw.would_accept(250));
         rw.accept(250);
         assert!(!rw.would_accept(250));
+
+        // 1 + 200 (3..=202) + 1 (2) + 1 (262) + 1 (250) = 204 accepted; 2 out-of-order (seq 2 and 250)
+        assert_eq!(rw.max_seq, 262);
+        assert_eq!(rw.accepted, 204);
+        assert_eq!(rw.out_of_order, 2);
     }
 }
