@@ -950,7 +950,7 @@ fn replicated_log_delete_tombstones_scrub_and_prevent_zombie_resurrection() -> T
     )?;
     assert_eq!(log.len(), 2);
 
-    // Delete m-1 via CRDT tombstone
+    // Delete m-1 via append-only msg-delete event
     let _t1 = log.append_local(
         "del-1".to_owned(),
         "msg-delete".to_owned(),
@@ -959,16 +959,19 @@ fn replicated_log_delete_tombstones_scrub_and_prevent_zombie_resurrection() -> T
         "Bob".to_owned(),
         parse_json(r#"{"targetId":"m-1"}"#)?,
     )?;
-    assert_eq!(log.len(), 1);
+    assert_eq!(log.len(), 1); // parsed visible count omits deleted target
     assert!(log.is_deleted("m-1"));
-    assert!(log.get_by_id("m-1").is_none()); // scrubbed from RAM!
+    assert!(log.get_by_id("m-1").is_some()); // immutable raw log retains original m-1!
+    assert!(log.get_by_id("del-1").is_some()); // and retains msg-delete event!
+    assert_eq!(log.stored_len(), 3);
     assert!(log.contains_or_deleted("m-1"));
 
-    // Late re-delivery of m-1 must NOT resurrect it
+    // Late duplicate re-delivery of m-1 is idempotent and must NOT resurrect it in parsed view
     assert!(!log.insert(m1)?);
     assert_eq!(log.len(), 1);
 
-    // Out-of-order tombstone arriving BEFORE original message m-3
+    // Out-of-order tombstone arriving BEFORE original message m-3:
+    // m-3 is recorded in the raw append-only log, while parsed view keeps m-3 hidden (no zombie!)
     let _t3 = log.append_local(
         "del-3".to_owned(),
         "msg-delete".to_owned(),
@@ -986,15 +989,25 @@ fn replicated_log_delete_tombstones_scrub_and_prevent_zombie_resurrection() -> T
         author_name: "Carol".to_owned(),
         payload: parse_json(r#"{"text":"late arrival"}"#)?,
     };
-    assert!(!log.insert(late_m3)?);
+    assert!(log.insert(late_m3)?);
     assert_eq!(log.len(), 1);
+    assert_eq!(log.stored_len(), 5);
 
-    // JSON export omits tombstones and deleted content completely
+    // Parsed JSON array omits deleted targets and mutation records completely
     let mut json_arr = String::new();
     log.write_messages_json_array(&mut json_arr);
     assert!(!json_arr.contains("secret message"));
+    assert!(!json_arr.contains("late arrival"));
     assert!(!json_arr.contains("msg-delete"));
     assert!(json_arr.contains("keep me"));
+
+    // Raw JSON array preserves ALL originals AND msg-delete events interleaved in canonical order!
+    let mut raw_arr = String::new();
+    log.write_raw_messages_json_array_with_key(None, false, &mut raw_arr);
+    assert!(raw_arr.contains("secret message"));
+    assert!(raw_arr.contains("late arrival"));
+    assert!(raw_arr.contains("msg-delete"));
+    assert!(raw_arr.contains("keep me"));
     Ok(())
 }
 
@@ -1017,6 +1030,7 @@ fn replicated_log_bot_update_lww_folding_and_scrub_on_delete() -> TestResult {
         "Alice".to_owned(),
         parse_json(r#"{"text":"nice"}"#)?,
     )?;
+    // Legacy bot-update and unified msg-edit both fold cleanly in canonical order
     let _u1 = log.append_local(
         "upd-1".to_owned(),
         "bot-update".to_owned(),
@@ -1026,7 +1040,7 @@ fn replicated_log_bot_update_lww_folding_and_scrub_on_delete() -> TestResult {
         parse_json(r#"{"targetId":"bot-msg-1","card":{"title":"Cetus","badge":"NIGHT"}}"#)?,
     )?;
 
-    // Visible count stays 2 (bot-msg-1 + chat-1), and bot-msg-1 stays at index 0 with NIGHT badge
+    // Visible count stays 2 (bot-msg-1 + chat-1), and bot-msg-1 stays at index 0 with NIGHT badge + attribution
     assert_eq!(log.len(), 2);
     let mut json_arr = String::new();
     log.write_messages_json_array(&mut json_arr);
@@ -1039,9 +1053,12 @@ fn replicated_log_bot_update_lww_folding_and_scrub_on_delete() -> TestResult {
         Some("NIGHT")
     );
     assert_eq!(items[0].get_u64("updatedLamport"), Some(3));
+    assert_eq!(items[0].get_str("editedBy"), Some("bot-1"));
+    assert_eq!(items[0].get_str("editedByName"), Some("WarframeBot"));
+    assert_eq!(items[0].get_u64("editCount"), Some(1));
     assert_eq!(items[1].get_str("id"), Some("chat-1"));
 
-    // Deleting bot-msg-1 scrubs both bot-msg-1 AND its bot-update from memory
+    // Deleting bot-msg-1 hides it in parsed view while retaining bot-msg-1, upd-1, and del-bot-1 in raw log
     let _del = log.append_local(
         "del-bot-1".to_owned(),
         "msg-delete".to_owned(),
@@ -1051,8 +1068,154 @@ fn replicated_log_bot_update_lww_folding_and_scrub_on_delete() -> TestResult {
         parse_json(r#"{"targetId":"bot-msg-1"}"#)?,
     )?;
     assert_eq!(log.len(), 1);
-    assert!(log.get_by_id("bot-msg-1").is_none());
-    assert!(log.get_by_id("upd-1").is_none());
+    assert!(log.is_deleted("bot-msg-1"));
+    assert!(log.get_by_id("bot-msg-1").is_some());
+    assert!(log.get_by_id("upd-1").is_some());
+    assert_eq!(log.stored_len(), 4);
+    Ok(())
+}
+
+#[test]
+fn event_sourced_message_edits_attribution_media_preserve_and_raw_log_rpc() -> TestResult {
+    let mesh_key = [0x61u8; 32];
+    let sk_a = [0x11u8; 32];
+    let sk_b = [0x22u8; 32];
+    let pk_a = base64url_encode(&x25519_public_key(&sk_a));
+    let pk_b = base64url_encode(&x25519_public_key(&sk_b));
+    let mk_b64 = base64url_encode(&mesh_key);
+
+    let init_peer = |id: &str, name: &str, sk: &[u8; 32]| -> Result<Option<MeshNode>, String> {
+        let mut st: Option<MeshNode> = None;
+        let res = parse_json(&dispatch_rpc(
+            &mut st,
+            &format!(
+                r#"{{"cmd":"init","peerId":"{id}","authorName":"{name}","room":"edits","x25519Secret":"{}","meshKey":"{mk_b64}"}}"#,
+                base64url_encode(sk)
+            ),
+        ))?;
+        assert_eq!(res.get_bool("ok"), Some(true));
+        Ok(st)
+    };
+
+    let mut a = init_peer("peer-a", "Alice", &sk_a)?;
+    let mut b = init_peer("peer-b", "Bob", &sk_b)?;
+
+    let deliver = |src_id: &str, dst: &mut Option<MeshNode>, actions: Option<&JsonValue>| -> Result<(), String> {
+        if let Some(arr) = actions.and_then(JsonValue::as_array) {
+            for act in arr {
+                if act.get_str("action") == Some("send_wire")
+                    && let Some(frame) = act.get_str("frame")
+                {
+                    let rx = parse_json(&dispatch_rpc(
+                        dst,
+                        &format!(
+                            r#"{{"cmd":"wire_message","fromPeer":"{src_id}","frame":{},"nowMs":5000}}"#,
+                            JsonValue::string(frame).to_json_string()
+                        ),
+                    ))?;
+                    assert_eq!(rx.get_bool("ok"), Some(true));
+                }
+            }
+        }
+        Ok(())
+    };
+
+    let ca = parse_json(&dispatch_rpc(
+        &mut a,
+        &format!(r#"{{"cmd":"peer_connected","peerId":"peer-b","authorName":"Bob","peerPubKey":"{pk_b}"}}"#),
+    ))?;
+    let cb = parse_json(&dispatch_rpc(
+        &mut b,
+        &format!(r#"{{"cmd":"peer_connected","peerId":"peer-a","authorName":"Alice","peerPubKey":"{pk_a}"}}"#),
+    ))?;
+    deliver("peer-a", &mut b, ca.get("actions"))?;
+    deliver("peer-b", &mut a, cb.get("actions"))?;
+
+    // 1. Alice sends a chat message WITH an attached image
+    let p1 = parse_json(&dispatch_rpc(
+        &mut a,
+        r#"{"cmd":"publish","type":"chat","payload":{"text":"Meet at 6","images":[{"name":"map.png","dataUrl":"data:image/png;base64,AAAA"}]},"ts":1000}"#,
+    ))?;
+    let m1_id = p1.get("message").and_then(|m| m.get_str("id")).ok_or("m1 id")?.to_owned();
+    deliver("peer-a", &mut b, p1.get("actions"))?;
+
+    // 2. Bob edits Alice's message text via unified edit_message RPC (msg-edit)
+    let e1 = parse_json(&dispatch_rpc(
+        &mut b,
+        &format!(
+            r#"{{"cmd":"edit_message","targetId":"{m1_id}","payload":{{"text":"Meet at 7"}},"ts":1100}}"#
+        ),
+    ))?;
+    assert_eq!(e1.get_bool("ok"), Some(true));
+    assert_eq!(e1.get("message").and_then(|m| m.get_str("type")), Some("msg-edit"));
+    deliver("peer-b", &mut a, e1.get("actions"))?;
+
+    // 3. Alice edits it again -> "Meet at 7:30"
+    let e2 = parse_json(&dispatch_rpc(
+        &mut a,
+        &format!(
+            r#"{{"cmd":"edit_message","targetId":"{m1_id}","payload":{{"text":"Meet at 7:30"}},"ts":1200}}"#
+        ),
+    ))?;
+    deliver("peer-a", &mut b, e2.get("actions"))?;
+
+    // 4. Verify BOTH peers parse identical folded view with full attribution AND preserved image!
+    for st in [&mut a, &mut b] {
+        let state = parse_json(&dispatch_rpc(st, r#"{"cmd":"get_state"}"#))?;
+        let log = state.get("log").and_then(JsonValue::as_array).ok_or("log arr")?;
+        assert_eq!(log.len(), 1);
+        let msg = &log[0];
+        assert_eq!(msg.get_str("id"), Some(m1_id.as_str()));
+        assert_eq!(msg.get_str("author"), Some("peer-a"));
+        assert_eq!(msg.get_str("authorName"), Some("Alice"));
+        assert_eq!(msg.get("payload").and_then(|p| p.get_str("text")), Some("Meet at 7:30"));
+        assert_eq!(
+            msg.get("payload")
+                .and_then(|p| p.get("images"))
+                .and_then(JsonValue::as_array)
+                .map(<[JsonValue]>::len),
+            Some(1),
+            "chat text edit must preserve attached images"
+        );
+        assert_eq!(msg.get_str("editedBy"), Some("peer-a"));
+        assert_eq!(msg.get_str("editedByName"), Some("Alice"));
+        assert_eq!(msg.get_u64("editCount"), Some(2));
+        assert_eq!(
+            msg.get("originalPayload").and_then(|p| p.get_str("text")),
+            Some("Meet at 6")
+        );
+        let edits = msg.get("edits").and_then(JsonValue::as_array).ok_or("edits")?;
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].get_str("authorName"), Some("Bob"));
+        assert_eq!(edits[0].get("payload").and_then(|p| p.get_str("text")), Some("Meet at 7"));
+        assert_eq!(edits[1].get_str("authorName"), Some("Alice"));
+        assert_eq!(edits[1].get("payload").and_then(|p| p.get_str("text")), Some("Meet at 7:30"));
+    }
+
+    // 5. Bob deletes m1 -> parsed log becomes empty, while get_raw_log STILL shows original + 2 edits + 1 delete!
+    let d1 = parse_json(&dispatch_rpc(
+        &mut b,
+        &format!(r#"{{"cmd":"delete_message","targetId":"{m1_id}","ts":1300}}"#),
+    ))?;
+    deliver("peer-b", &mut a, d1.get("actions"))?;
+
+    for st in [&mut a, &mut b] {
+        let state = parse_json(&dispatch_rpc(st, r#"{"cmd":"get_state"}"#))?;
+        assert_eq!(state.get("log").and_then(JsonValue::as_array).map(<[JsonValue]>::len), Some(0));
+        assert_eq!(state.get("status").and_then(|s| s.get_u64("logCount")), Some(0));
+        assert_eq!(state.get("status").and_then(|s| s.get_u64("rawLogCount")), Some(4));
+
+        let raw = parse_json(&dispatch_rpc(st, r#"{"cmd":"get_raw_log","compactMedia":true}"#))?;
+        let raw_arr = raw.get("rawLog").and_then(JsonValue::as_array).ok_or("rawLog")?;
+        assert_eq!(raw_arr.len(), 4);
+        assert_eq!(raw_arr[0].get_str("type"), Some("chat"));
+        assert_eq!(raw_arr[1].get_str("type"), Some("msg-edit"));
+        assert_eq!(raw_arr[1].get_str("authorName"), Some("Bob"));
+        assert_eq!(raw_arr[2].get_str("type"), Some("msg-edit"));
+        assert_eq!(raw_arr[2].get_str("authorName"), Some("Alice"));
+        assert_eq!(raw_arr[3].get_str("type"), Some("msg-delete"));
+        assert_eq!(raw_arr[3].get_str("authorName"), Some("Bob"));
+    }
     Ok(())
 }
 

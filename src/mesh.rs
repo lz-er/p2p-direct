@@ -16,7 +16,8 @@ use crate::deflate::{
 };
 use crate::json::{JsonValue, write_json_string, write_json_value};
 use crate::log::{
-    LogMessage, MSG_TYPE_DELETE, ReplicatedLog, SealedLogRecord, is_internal_log_type,
+    LogMessage, MSG_TYPE_DELETE, MSG_TYPE_EDIT, ReplicatedLog, SealedLogRecord, is_edit_log_type,
+    is_internal_log_type,
 };
 use crate::media::{MAX_MEDIA_SYNC_TARGETS, MAX_ONE_WAY_COMPENSATION_MS, MediaSyncState};
 use crate::protocol::{
@@ -901,7 +902,7 @@ impl MeshNode {
                     claimed_lamport: 0,
                 });
         }
-        for msg in self.log.ordered() {
+        for msg in self.log.raw_ordered() {
             if self.peer_colors.len() >= MAX_COLOR_SYNC_CLAIMS {
                 break;
             }
@@ -1214,6 +1215,8 @@ impl MeshNode {
         actions.push(MeshAction::Telemetry {
             event: if msg.msg_type == MSG_TYPE_DELETE {
                 "delete_message".to_owned()
+            } else if is_edit_log_type(&msg.msg_type) {
+                "edit_message".to_owned()
             } else {
                 "publish".to_owned()
             },
@@ -1228,8 +1231,33 @@ impl MeshNode {
         Ok((msg, actions))
     }
 
-    /// Publishes an authenticated CRDT tombstone (`msg-delete`) that immediately scrubs `target_id`
-    /// from local RAM and gossips/syncs the deletion to all peers in the room.
+    /// Publishes an authenticated event-sourced edit message (`msg-edit`) targeting `target_id`.
+    /// Original messages remain immutable in the raw log while parsed views fold all edits
+    /// deterministically with full author/editor attribution (used by both humans and bots).
+    pub fn edit_message(
+        &mut self,
+        target_id: String,
+        new_payload: JsonValue,
+        ts_ms: u64,
+    ) -> Result<(LogMessage, Vec<MeshAction>), String> {
+        let clean = target_id.trim().to_owned();
+        if clean.is_empty() {
+            return Err("edit_message missing non-empty 'targetId'".to_owned());
+        }
+        if let Some(existing) = self.log.get_by_id(&clean)
+            && is_internal_log_type(&existing.msg_type)
+        {
+            return Err("cannot edit a mutation event record directly".to_owned());
+        }
+        let mut map = BTreeMap::new();
+        map.insert("targetId".to_owned(), JsonValue::string(&clean));
+        map.insert("payload".to_owned(), new_payload);
+        self.publish_local(MSG_TYPE_EDIT.to_owned(), JsonValue::Object(map), ts_ms, None)
+    }
+
+    /// Publishes an authenticated event-sourced deletion message (`msg-delete`) targeting `target_id`.
+    /// Original messages remain intact in the raw log while parsed views hide the deleted message
+    /// and prune any active synced media state across all peers.
     pub fn delete_message(
         &mut self,
         target_id: String,
@@ -2971,7 +2999,7 @@ impl MeshNode {
             peer.known_ids.insert(msg_id.clone());
         }
 
-        if self.log.contains_or_deleted(&msg_id) {
+        if self.log.contains_id(&msg_id) {
             self.stats.gossip_duplicates_dropped =
                 self.stats.gossip_duplicates_dropped.saturating_add(1);
             return Ok(());
@@ -3122,7 +3150,7 @@ impl MeshNode {
             if should_send_req {
                 let mut missing_locally: Vec<String> = remote_ids
                     .into_iter()
-                    .filter(|id| !self.log.contains_or_deleted(id))
+                    .filter(|id| !self.log.contains_id(id))
                     .collect();
                 missing_locally.sort();
                 if !missing_locally.is_empty() {
@@ -3169,7 +3197,7 @@ impl MeshNode {
             if let Some(peer) = self.peers.get_mut(from_peer) {
                 peer.known_ids.insert(rec.id.clone());
             }
-            if self.log.contains_or_deleted(&rec.id) {
+            if self.log.contains_id(&rec.id) {
                 continue;
             }
             match self.log.insert_sealed(rec.clone(), &self.log_key) {
@@ -3526,12 +3554,13 @@ impl MeshNode {
         base64url_encode_into(&self.x25519_public, &mut out);
         let _ = write!(
             out,
-            "\",\"passphraseMode\":{}}},\"voice\":{{\"inVoice\":{},\"muted\":{}}},\"lamport\":{},\"logCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
+            "\",\"passphraseMode\":{}}},\"voice\":{{\"inVoice\":{},\"muted\":{}}},\"lamport\":{},\"logCount\":{},\"rawLogCount\":{},\"autoMeshEnabled\":{},\"peers\":[",
             self.passphrase_mode,
             self.in_voice,
             self.voice_muted,
             self.log.lamport(),
             self.log.len(),
+            self.log.stored_len(),
             self.config.auto_mesh_enabled
         );
         for (i, peer) in self.peers.values().enumerate() {
@@ -3659,7 +3688,7 @@ impl MeshNode {
             Some(cid) if !cid.trim().is_empty() => cid,
             _ => format!("{}-{}-{}-{}", self.peer_id, next_lp, ts_ms, seq),
         };
-        if self.log.contains_or_deleted(&id) {
+        if self.log.contains_id(&id) {
             return Err(format!("duplicate local message id '{id}'"));
         }
         self.log.observe_lamport(next_lp);
@@ -3768,7 +3797,7 @@ impl MeshNode {
         self.stats.frames_received = self.stats.frames_received.saturating_add(1);
         self.stats.e2ee_frames_decrypted = self.stats.e2ee_frames_decrypted.saturating_add(1);
 
-        if self.log.contains_or_deleted(&msg_id) {
+        if self.log.contains_id(&msg_id) {
             self.stats.gossip_duplicates_dropped =
                 self.stats.gossip_duplicates_dropped.saturating_add(1);
             return Ok((false, Vec::new(), Vec::new(), 0));
@@ -3825,11 +3854,23 @@ impl MeshNode {
         Ok((true, forward_targets, next_path, next_ttl))
     }
 
-    /// Serializes the entire ordered replicated log as a JSON string.
+    /// Serializes the parsed visible replicated log (with edits folded & deleted targets hidden).
     pub fn log_json(&self) -> String {
         let mut out = String::with_capacity(self.log.len().saturating_mul(160) + 8);
         self.log
             .write_messages_json_array_with_key(Some(&self.log_key), &mut out);
+        out
+    }
+
+    /// Serializes ALL raw append-only event records (originals, `msg-edit`, `bot-update`, `msg-delete`)
+    /// in strict `(lamport, ts, id)` order.
+    pub fn raw_log_json(&self, compact_media: bool) -> String {
+        let mut out = String::with_capacity(self.log.stored_len().saturating_mul(160) + 8);
+        self.log.write_raw_messages_json_array_with_key(
+            Some(&self.log_key),
+            compact_media,
+            &mut out,
+        );
         out
     }
 
@@ -3838,6 +3879,23 @@ impl MeshNode {
         let mut out = String::with_capacity(self.log.len().saturating_mul(32) + 64);
         self.log
             .write_messages_delta_json_with_key(known_versions, Some(&self.log_key), &mut out);
+        out
+    }
+
+    /// Serializes incremental log delta using exact revision strings (`"<lamport>:<count>:<lastEditId>"`)
+    /// when supplied, falling back to numeric `known_versions`.
+    pub fn log_delta_json_with_revs(
+        &self,
+        known_versions: &std::collections::HashMap<&str, u64>,
+        known_revs: Option<&std::collections::HashMap<&str, &str>>,
+    ) -> String {
+        let mut out = String::with_capacity(self.log.len().saturating_mul(32) + 64);
+        self.log.write_messages_delta_json_with_revs(
+            known_versions,
+            known_revs,
+            Some(&self.log_key),
+            &mut out,
+        );
         out
     }
 }

@@ -275,6 +275,15 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
             let states = node.media_states_json(now_ms);
             Ok(format!("{{\"ok\":true,\"states\":{states}}}"))
         }
+        "get_raw_log" => {
+            let node = require_node(state)?;
+            let compact_media = val.get_bool("compactMedia").unwrap_or(false);
+            let status = node.status_json();
+            let raw_log = node.raw_log_json(compact_media);
+            Ok(format!(
+                "{{\"ok\":true,\"status\":{status},\"rawLog\":{raw_log}}}"
+            ))
+        }
         "get_log_delta" => {
             let node = require_node(state)?;
             let mut known: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
@@ -285,8 +294,20 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                     }
                 }
             }
+            let known_revs: Option<std::collections::HashMap<&str, &str>> =
+                if let Some(JsonValue::Object(map)) = val.get("knownRevs") {
+                    let mut revs = std::collections::HashMap::with_capacity(map.len());
+                    for (k, v) in map {
+                        if let Some(s) = v.as_str() {
+                            revs.insert(k.as_str(), s);
+                        }
+                    }
+                    Some(revs)
+                } else {
+                    None
+                };
             let status = node.status_json();
-            let delta = node.log_delta_json(&known);
+            let delta = node.log_delta_json_with_revs(&known, known_revs.as_ref());
             Ok(format!(
                 "{{\"ok\":true,\"status\":{status},\"delta\":{delta}}}"
             ))
@@ -333,6 +354,44 @@ fn dispatch_inner(state: &mut Option<MeshNode>, req_json: &str) -> Result<String
                     "{{\"ok\":true,\"message\":{msg_json},\"actions\":{actions_json},\"status\":{status}}}"
                 ))
             }
+        }
+        "edit_message" => {
+            let node = require_node(state)?;
+            if let Some(e) = val.get_str("entropy")
+                && let Ok(bytes) = base64url_decode(e)
+            {
+                node.reseed_entropy(&bytes);
+            }
+            let target_id = val
+                .get_str("targetId")
+                .ok_or_else(|| "edit_message missing string field 'targetId'".to_owned())?
+                .to_owned();
+            let ts = val.get_u64("ts").unwrap_or(0);
+            let new_payload = match &mut val {
+                JsonValue::Object(map) => map
+                    .remove("payload")
+                    .or_else(|| map.remove("card"))
+                    .ok_or_else(|| "edit_message missing field 'payload'".to_owned())?,
+                _ => return Err("edit_message missing field 'payload'".to_owned()),
+            };
+            let (edit_msg, actions) = node.edit_message(target_id.clone(), new_payload, ts)?;
+            let actions_json = actions_to_json_array(&actions);
+            let status = node.status_json();
+            let msg_json = edit_msg.to_json_string();
+            let mut out =
+                String::with_capacity(actions_json.len() + status.len() + msg_json.len() + 128);
+            out.push_str("{\"ok\":true,\"targetId\":");
+            write_json_string(&mut out, &target_id);
+            out.push_str(",\"editMessageId\":");
+            write_json_string(&mut out, &edit_msg.id);
+            out.push_str(",\"message\":");
+            out.push_str(&msg_json);
+            out.push_str(",\"actions\":");
+            out.push_str(&actions_json);
+            out.push_str(",\"status\":");
+            out.push_str(&status);
+            out.push('}');
+            Ok(out)
         }
         "delete_message" => {
             let node = require_node(state)?;

@@ -469,17 +469,61 @@ export class P2PBot extends EventEmitter {
   }
 
   /**
-   * Updates an existing bot message card in place across all peers (CRDT LWW update).
+   * Edits any message (bot card, chat text, or structured JSON) by appending a new
+   * E2EE `msg-edit` event message targeting `targetId` — identical to human message edits.
    */
-  updateBotMessage(targetId, card) {
+  editMessage(targetId, payload) {
+    this._requireReady();
     const cleanTarget = String(targetId || "").trim();
-    if (!cleanTarget) throw new Error("updateBotMessage requires targetId");
-    if (!card || typeof card !== "object") throw new Error("updateBotMessage requires card object");
-    return this.sendRaw("bot-update", { targetId: cleanTarget, card });
+    if (!cleanTarget) throw new Error("editMessage requires targetId");
+    if (payload === undefined || payload === null) {
+      throw new Error("editMessage requires a non-null payload");
+    }
+    const res = this.wasm.call({
+      cmd: "edit_message",
+      targetId: cleanTarget,
+      payload,
+      ts: Date.now(),
+      entropy: randomBase64Url(16),
+    });
+    this.status = res.status;
+    this._executeActions(res.actions);
+    return { id: res.editMessageId, targetId: res.targetId, message: res.message };
   }
 
   /**
-   * Deletes any message in the room via an authenticated CRDT tombstone.
+   * Edits a chat message's text in place by appending a unified `msg-edit` event.
+   */
+  editText(targetId, text) {
+    const clean = String(text ?? "").trim();
+    if (!clean) throw new Error("editText requires non-empty text");
+    return this.editMessage(targetId, { text: clean });
+  }
+
+  /**
+   * Updates an existing bot message card across all peers using the unified `msg-edit` event.
+   */
+  updateBotMessage(targetId, card) {
+    if (!card || typeof card !== "object") throw new Error("updateBotMessage requires card object");
+    return this.editMessage(targetId, card);
+  }
+
+  /**
+   * Returns the complete immutable raw append-only event log (original messages,
+   * `msg-edit` events, and `msg-delete` events in canonical order).
+   */
+  getRawLog({ compactMedia = false } = {}) {
+    this._requireReady();
+    const res = this.wasm.call({
+      cmd: "get_raw_log",
+      compactMedia: Boolean(compactMedia),
+    });
+    this.status = res.status;
+    return res.rawLog || [];
+  }
+
+  /**
+   * Deletes any message in the room by appending an authenticated `msg-delete` event.
    */
   deleteMessage(targetId) {
     this._requireReady();
@@ -2134,7 +2178,11 @@ export class P2PBot extends EventEmitter {
     }
 
     for (const m of messages) {
-      const rev = m.updatedLamport || 0;
+      const lastEditId =
+        Array.isArray(m.edits) && m.edits.length > 0 ? m.edits[m.edits.length - 1].id : "";
+      const rev = m.updatedLamport
+        ? `${m.updatedLamport}:${m.editCount || 1}:${lastEditId}`
+        : "0";
       const prev = this.knownMessages.get(m.id);
       if (!prev) {
         this.knownMessages.set(m.id, { msg: m, rev });
@@ -2163,7 +2211,7 @@ export class P2PBot extends EventEmitter {
         }
       } else if (prev.rev !== rev) {
         this.knownMessages.set(m.id, { msg: m, rev });
-        if (m.author !== this.peerId) {
+        if ((m.editedBy || m.author) !== this.peerId) {
           this.emit("messageUpdate", m);
         }
       }

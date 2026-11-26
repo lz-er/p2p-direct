@@ -202,6 +202,22 @@ export class P2PBotBridge {
           replyOk(this.bot.updateBotMessage(req.targetId, req.card || req.payload));
           break;
         }
+        case "edit_message": {
+          const editPayload =
+            req.payload !== undefined
+              ? req.payload
+              : req.card !== undefined
+                ? req.card
+                : typeof req.text === "string"
+                  ? { text: req.text }
+                  : null;
+          replyOk(this.bot.editMessage(req.targetId, editPayload));
+          break;
+        }
+        case "get_raw_log": {
+          replyOk({ rawLog: this.bot.getRawLog({ compactMedia: Boolean(req.compactMedia) }) });
+          break;
+        }
         case "delete_message": {
           replyOk(this.bot.deleteMessage(req.targetId));
           break;

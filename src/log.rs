@@ -269,10 +269,15 @@ impl SealedLogRecord {
 }
 
 pub const MSG_TYPE_DELETE: &str = "msg-delete";
+pub const MSG_TYPE_EDIT: &str = "msg-edit";
 pub const MSG_TYPE_BOT_UPDATE: &str = "bot-update";
 
+pub fn is_edit_log_type(msg_type: &str) -> bool {
+    msg_type == MSG_TYPE_EDIT || msg_type == MSG_TYPE_BOT_UPDATE
+}
+
 pub fn is_internal_log_type(msg_type: &str) -> bool {
-    msg_type == MSG_TYPE_DELETE || msg_type == MSG_TYPE_BOT_UPDATE
+    msg_type == MSG_TYPE_DELETE || is_edit_log_type(msg_type)
 }
 
 fn extract_target_id(payload: &JsonValue) -> Option<&str> {
@@ -282,6 +287,129 @@ fn extract_target_id(payload: &JsonValue) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+fn extract_edit_payload(msg: &LogMessage) -> Option<&JsonValue> {
+    if msg.msg_type == MSG_TYPE_EDIT {
+        msg.payload
+            .get("payload")
+            .or_else(|| msg.payload.get("card"))
+    } else if msg.msg_type == MSG_TYPE_BOT_UPDATE {
+        msg.payload
+            .get("card")
+            .or_else(|| msg.payload.get("payload"))
+    } else {
+        None
+    }
+}
+
+fn apply_edit_payload(msg_type: &str, current: &JsonValue, edit_val: &JsonValue) -> JsonValue {
+    if msg_type == "chat"
+        && let (JsonValue::Object(cur_map), JsonValue::Object(edit_map)) = (current, edit_val)
+    {
+        let mut merged = cur_map.clone();
+        for (k, v) in edit_map {
+            merged.insert(k.clone(), v.clone());
+        }
+        return JsonValue::Object(merged);
+    }
+    edit_val.clone()
+}
+
+fn compact_media_value(val: &JsonValue, max_data_url_len: usize) -> JsonValue {
+    match val {
+        JsonValue::Object(map) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in map {
+                if k == "dataUrl"
+                    && let JsonValue::String(s) = v
+                    && s.len() > max_data_url_len
+                {
+                    out.insert(
+                        k.clone(),
+                        JsonValue::String(format!("[media data omitted · {} chars]", s.len())),
+                    );
+                } else {
+                    out.insert(k.clone(), compact_media_value(v, max_data_url_len));
+                }
+            }
+            JsonValue::Object(out)
+        }
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .iter()
+                .map(|item| compact_media_value(item, max_data_url_len))
+                .collect(),
+        ),
+        _ => val.clone(),
+    }
+}
+
+fn format_edit_rev(edits: &[&LogMessage]) -> String {
+    if let Some(last) = edits.last() {
+        format!("{}:{}:{}", last.lamport, edits.len(), last.id)
+    } else {
+        "0".to_owned()
+    }
+}
+
+fn write_folded_message_json(
+    m: &LogMessage,
+    base_payload: &JsonValue,
+    edits: &[&LogMessage],
+    out: &mut String,
+) {
+    let mut current_payload = base_payload.clone();
+    let mut step_snapshots: Vec<(&LogMessage, JsonValue)> = Vec::with_capacity(edits.len());
+    for edit_msg in edits {
+        if let Some(edit_val) = extract_edit_payload(edit_msg) {
+            current_payload = apply_edit_payload(&m.msg_type, &current_payload, edit_val);
+            step_snapshots.push((edit_msg, compact_media_value(&current_payload, 2048)));
+        }
+    }
+
+    let Some((last_edit, _)) = step_snapshots.last() else {
+        m.write_json(out);
+        return;
+    };
+
+    out.push_str("{\"id\":");
+    write_json_string(out, &m.id);
+    out.push_str(",\"type\":");
+    write_json_string(out, &m.msg_type);
+    let _ = write!(out, ",\"lamport\":{},\"ts\":{},\"author\":", m.lamport, m.ts);
+    write_json_string(out, &m.author);
+    out.push_str(",\"authorName\":");
+    write_json_string(out, &m.author_name);
+    out.push_str(",\"payload\":");
+    write_json_value(out, &current_payload);
+    let _ = write!(
+        out,
+        ",\"updatedLamport\":{},\"updatedTs\":{},\"editedBy\":",
+        last_edit.lamport, last_edit.ts
+    );
+    write_json_string(out, &last_edit.author);
+    out.push_str(",\"editedByName\":");
+    write_json_string(out, &last_edit.author_name);
+    let _ = write!(out, ",\"editCount\":{},\"originalPayload\":", step_snapshots.len());
+    let compact_orig = compact_media_value(base_payload, 2048);
+    write_json_value(out, &compact_orig);
+    out.push_str(",\"edits\":[");
+    for (idx, (em, snap)) in step_snapshots.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"id\":");
+        write_json_string(out, &em.id);
+        let _ = write!(out, ",\"lamport\":{},\"ts\":{},\"author\":", em.lamport, em.ts);
+        write_json_string(out, &em.author);
+        out.push_str(",\"authorName\":");
+        write_json_string(out, &em.author_name);
+        out.push_str(",\"payload\":");
+        write_json_value(out, snap);
+        out.push('}');
+    }
+    out.push_str("]}");
+}
+
 #[derive(Debug, Clone)]
 struct StoredEntry {
     message: LogMessage,
@@ -289,9 +417,11 @@ struct StoredEntry {
     payload_deferred: bool,
 }
 
-/// Deterministic append-only replicated log ordered strictly by `(lamport, ts, id)`,
-/// supporting authenticated CRDT deletion tombstones (`msg-delete`) that scrub deleted
-/// payloads from memory and live bot card updates (`bot-update`) folded deterministically.
+/// Deterministic append-only event-sourced replicated log ordered strictly by `(lamport, ts, id)`.
+///
+/// Original messages, edits (`msg-edit`, plus legacy `bot-update`), and deletions (`msg-delete`)
+/// are all stored immutably in the raw event log so Raw JSON inspection shows the full history.
+/// The parsed view deterministically folds edits (tracking who edited what) and hides deleted targets.
 #[derive(Debug, Clone, Default)]
 pub struct ReplicatedLog {
     entries: BTreeMap<LogOrderKey, StoredEntry>,
@@ -305,15 +435,18 @@ impl ReplicatedLog {
         Self::default()
     }
 
-    /// Count of visible (non-deleted, non-internal) messages in the log.
+    /// Count of parsed visible (non-deleted, non-mutation) messages in the log.
     pub fn len(&self) -> usize {
         self.entries
             .values()
-            .filter(|e| !is_internal_log_type(&e.message.msg_type))
+            .filter(|e| {
+                !is_internal_log_type(&e.message.msg_type)
+                    && !self.tombstones.contains(&e.message.id)
+            })
             .count()
     }
 
-    /// Count of all stored records including deletion tombstones and bot updates (for sync).
+    /// Count of all raw stored records including originals, `msg-edit`, `bot-update`, and `msg-delete`.
     pub fn stored_len(&self) -> usize {
         self.entries.len()
     }
@@ -340,7 +473,7 @@ impl ReplicatedLog {
         self.tombstones.contains(id)
     }
 
-    /// Returns true if `id` is currently stored OR has been deleted via a tombstone.
+    /// Returns true if `id` is stored in the raw log OR has been marked deleted via a tombstone.
     pub fn contains_or_deleted(&self, id: &str) -> bool {
         self.by_id.contains_key(id) || self.tombstones.contains(id)
     }
@@ -355,37 +488,15 @@ impl ReplicatedLog {
         self.entries.get(key)?.sealed.as_ref()
     }
 
-    /// Scrubs a deleted target message (and any `bot-update` records targeting it) from RAM.
-    fn scrub_target(&mut self, target_id: &str) {
-        if let Some(old_key) = self.by_id.remove(target_id) {
-            self.entries.remove(&old_key);
-        }
-        let orphan_updates: Vec<(String, LogOrderKey)> = self
-            .entries
-            .iter()
-            .filter_map(|(k, e)| {
-                if e.message.msg_type == MSG_TYPE_BOT_UPDATE
-                    && extract_target_id(&e.message.payload) == Some(target_id)
-                {
-                    Some((e.message.id.clone(), k.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for (upd_id, upd_key) in orphan_updates {
-            self.entries.remove(&upd_key);
-            self.by_id.remove(&upd_id);
-            self.tombstones.insert(upd_id);
-        }
-    }
-
     /// Inserts a message idempotently (without a sealed copy). Returns `Ok(true)` if newly added.
     pub fn insert(&mut self, msg: LogMessage) -> Result<bool, String> {
         self.insert_with_sealed(msg, None)
     }
 
     /// Inserts a message alongside its authenticated AEAD-sealed record.
+    ///
+    /// Append-only invariant: original messages, `msg-edit` records, and `msg-delete` records
+    /// are all retained in `entries` so raw log views and late joiners converge identically.
     pub fn insert_with_sealed(
         &mut self,
         msg: LogMessage,
@@ -402,7 +513,7 @@ impl ReplicatedLog {
         }
 
         self.observe_lamport(msg.lamport);
-        if self.by_id.contains_key(&msg.id) || self.tombstones.contains(&msg.id) {
+        if self.by_id.contains_key(&msg.id) {
             return Ok(false);
         }
 
@@ -413,16 +524,19 @@ impl ReplicatedLog {
             if target_id == msg.id {
                 return Err("msg-delete record cannot target itself".to_owned());
             }
-            self.tombstones.insert(target_id.clone());
-            self.scrub_target(&target_id);
-        } else if msg.msg_type == MSG_TYPE_BOT_UPDATE {
+            self.tombstones.insert(target_id);
+        } else if is_edit_log_type(&msg.msg_type) {
             let Some(target_id) = extract_target_id(&msg.payload) else {
-                return Err("bot-update record missing non-empty payload.targetId".to_owned());
+                return Err(format!(
+                    "{} record missing non-empty payload.targetId",
+                    msg.msg_type
+                ));
             };
-            if self.tombstones.contains(target_id) {
-                // Target message was already deleted; record update ID as tombstoned and ignore.
-                self.tombstones.insert(msg.id);
-                return Ok(false);
+            if target_id == msg.id {
+                return Err(format!("{} record cannot target itself", msg.msg_type));
+            }
+            if extract_edit_payload(&msg).is_none() {
+                return Err(format!("{} record missing edited payload", msg.msg_type));
             }
         }
 
@@ -459,7 +573,7 @@ impl ReplicatedLog {
             return Err("deferred sealed metadata mismatch".to_owned());
         }
         self.observe_lamport(meta_msg.lamport);
-        if self.by_id.contains_key(&meta_msg.id) || self.tombstones.contains(&meta_msg.id) {
+        if self.by_id.contains_key(&meta_msg.id) {
             return Ok(false);
         }
         let key = meta_msg.order_key();
@@ -495,7 +609,7 @@ impl ReplicatedLog {
         record: SealedLogRecord,
         log_key: &[u8; KEY_LEN],
     ) -> Result<Option<LogMessage>, String> {
-        if self.contains_or_deleted(&record.id) {
+        if self.contains_id(&record.id) {
             self.observe_lamport(record.lamport);
             return Ok(None);
         }
@@ -529,7 +643,7 @@ impl ReplicatedLog {
         if id.trim().is_empty() {
             return Err("local message id must not be empty".to_owned());
         }
-        if self.by_id.contains_key(&id) || self.tombstones.contains(&id) {
+        if self.by_id.contains_key(&id) {
             return Err(format!("duplicate local message id '{id}'"));
         }
         let next_lamport = self.lamport.saturating_add(1);
@@ -565,7 +679,7 @@ impl ReplicatedLog {
         if id.trim().is_empty() {
             return Err("local message id must not be empty".to_owned());
         }
-        if self.by_id.contains_key(&id) || self.tombstones.contains(&id) {
+        if self.by_id.contains_key(&id) {
             return Err(format!("duplicate local message id '{id}'"));
         }
         let next_lamport = self.lamport.saturating_add(1);
@@ -586,15 +700,24 @@ impl ReplicatedLog {
         Ok((msg, sealed))
     }
 
-    /// Iterates visible (non-deleted, non-internal) log messages in deterministic `(lamport, ts, id)` order.
+    /// Iterates parsed visible (non-deleted, non-mutation) log messages in deterministic `(lamport, ts, id)` order.
     pub fn ordered(&self) -> impl Iterator<Item = &LogMessage> {
         self.entries
             .values()
-            .filter(|e| !is_internal_log_type(&e.message.msg_type))
+            .filter(|e| {
+                !is_internal_log_type(&e.message.msg_type)
+                    && !self.tombstones.contains(&e.message.id)
+            })
             .map(|e| &e.message)
     }
 
-    /// Returns all stored record IDs (including tombstones and updates for sync) in deterministic order.
+    /// Iterates ALL raw stored records (originals, `msg-edit`, `bot-update`, and `msg-delete`)
+    /// in deterministic `(lamport, ts, id)` order.
+    pub fn raw_ordered(&self) -> impl Iterator<Item = &LogMessage> {
+        self.entries.values().map(|e| &e.message)
+    }
+
+    /// Returns all stored record IDs (including tombstones and edits for sync) in deterministic order.
     pub fn ids_ordered(&self) -> Vec<String> {
         self.entries.values().map(|e| e.message.id.clone()).collect()
     }
@@ -668,9 +791,25 @@ impl ReplicatedLog {
         out
     }
 
-    /// Serializes visible decrypted log messages as a JSON array in canonical order,
-    /// omitting deletion tombstones and deterministically folding the latest `bot-update`
-    /// onto its target message while preserving original chronological position.
+    fn collect_edits_by_target(&self) -> HashMap<&str, Vec<&LogMessage>> {
+        let mut edits_by_target: HashMap<&str, Vec<&LogMessage>> = HashMap::new();
+        for entry in self.entries.values() {
+            if is_edit_log_type(&entry.message.msg_type)
+                && let Some(target_id) = extract_target_id(&entry.message.payload)
+                && extract_edit_payload(&entry.message).is_some()
+            {
+                edits_by_target
+                    .entry(target_id)
+                    .or_default()
+                    .push(&entry.message);
+            }
+        }
+        edits_by_target
+    }
+
+    /// Serializes parsed visible decrypted log messages as a JSON array in canonical order,
+    /// omitting deleted messages and mutation records while deterministically folding all
+    /// `msg-edit` / `bot-update` revisions onto their target message with full attribution.
     pub fn write_messages_json_array(&self, out: &mut String) {
         self.write_messages_json_array_with_key(None, out);
     }
@@ -681,52 +820,29 @@ impl ReplicatedLog {
         log_key: Option<&[u8; KEY_LEN]>,
         out: &mut String,
     ) {
-        let mut latest_bot_updates: HashMap<&str, (&LogMessage, &JsonValue)> = HashMap::new();
-        for entry in self.entries.values() {
-            if entry.message.msg_type == MSG_TYPE_BOT_UPDATE
-                && let Some(target_id) = extract_target_id(&entry.message.payload)
-            {
-                let card = entry
-                    .message
-                    .payload
-                    .get("card")
-                    .unwrap_or(&entry.message.payload);
-                latest_bot_updates.insert(target_id, (&entry.message, card));
-            }
-        }
+        let edits_by_target = self.collect_edits_by_target();
 
         out.push('[');
         let mut first = true;
         for entry in self.entries.values() {
-            if is_internal_log_type(&entry.message.msg_type) {
+            if is_internal_log_type(&entry.message.msg_type)
+                || self.tombstones.contains(&entry.message.id)
+            {
                 continue;
             }
             if !first {
                 out.push(',');
             }
             first = false;
-            if let Some((upd_msg, card_payload)) = latest_bot_updates.get(entry.message.id.as_str())
-            {
-                let m = &entry.message;
-                out.push_str("{\"id\":");
-                write_json_string(out, &m.id);
-                out.push_str(",\"type\":");
-                write_json_string(out, &m.msg_type);
-                let _ = write!(
-                    out,
-                    ",\"lamport\":{},\"ts\":{},\"author\":",
-                    m.lamport, m.ts
-                );
-                write_json_string(out, &m.author);
-                out.push_str(",\"authorName\":");
-                write_json_string(out, &m.author_name);
-                out.push_str(",\"payload\":");
-                write_json_value(out, card_payload);
-                let _ = write!(
-                    out,
-                    ",\"updatedLamport\":{},\"updatedTs\":{}}}",
-                    upd_msg.lamport, upd_msg.ts
-                );
+            if let Some(edits) = edits_by_target.get(entry.message.id.as_str()) {
+                if entry.payload_deferred
+                    && let (Some(key), Some(sealed)) = (log_key, entry.sealed.as_ref())
+                    && let Ok(full_msg) = sealed.open(key)
+                {
+                    write_folded_message_json(&full_msg, &full_msg.payload, edits, out);
+                } else {
+                    write_folded_message_json(&entry.message, &entry.message.payload, edits, out);
+                }
             } else if entry.payload_deferred
                 && let (Some(key), Some(sealed)) = (log_key, entry.sealed.as_ref())
                 && let Ok(full_msg) = sealed.open(key)
@@ -739,15 +855,47 @@ impl ReplicatedLog {
         out.push(']');
     }
 
+    /// Serializes EVERY raw append-only event record (originals, `msg-edit`, `bot-update`, `msg-delete`)
+    /// in strict canonical `(lamport, ts, id)` order.
+    pub fn write_raw_messages_json_array_with_key(
+        &self,
+        log_key: Option<&[u8; KEY_LEN]>,
+        compact_media: bool,
+        out: &mut String,
+    ) {
+        out.push('[');
+        for (idx, entry) in self.entries.values().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            let opened = if entry.payload_deferred
+                && let (Some(key), Some(sealed)) = (log_key, entry.sealed.as_ref())
+            {
+                sealed.open(key).ok()
+            } else {
+                None
+            };
+            let msg = opened.as_ref().unwrap_or(&entry.message);
+            if compact_media {
+                let mut compact_msg = msg.clone();
+                compact_msg.payload = compact_media_value(&msg.payload, 2048);
+                compact_msg.write_json(out);
+            } else {
+                msg.write_json(out);
+            }
+        }
+        out.push(']');
+    }
+
     /// Serializes an incremental log delta (`{"order":[...],"changed":[...]}`) containing ONLY
-    /// messages whose ID is absent from `known_versions` or whose bot-update lamport changed.
+    /// messages whose ID is absent from `known_versions` or whose edit revision changed.
     /// Eliminates re-serializing multi-megabyte GIF/video attachments already cached in JS.
     pub fn write_messages_delta_json(
         &self,
         known_versions: &HashMap<&str, u64>,
         out: &mut String,
     ) {
-        self.write_messages_delta_json_with_key(known_versions, None, out);
+        self.write_messages_delta_json_with_revs(known_versions, None, None, out);
     }
 
     /// Same as `write_messages_delta_json`, transparently opening any unknown deferred bulk records.
@@ -757,24 +905,26 @@ impl ReplicatedLog {
         log_key: Option<&[u8; KEY_LEN]>,
         out: &mut String,
     ) {
-        let mut latest_bot_updates: HashMap<&str, (&LogMessage, &JsonValue)> = HashMap::new();
-        for entry in self.entries.values() {
-            if entry.message.msg_type == MSG_TYPE_BOT_UPDATE
-                && let Some(target_id) = extract_target_id(&entry.message.payload)
-            {
-                let card = entry
-                    .message
-                    .payload
-                    .get("card")
-                    .unwrap_or(&entry.message.payload);
-                latest_bot_updates.insert(target_id, (&entry.message, card));
-            }
-        }
+        self.write_messages_delta_json_with_revs(known_versions, None, log_key, out);
+    }
+
+    /// Incremental log delta supporting exact string edit revisions (`"<lamport>:<count>:<lastEditId>"`)
+    /// so even concurrent same-Lamport edits are never missed, plus backwards-compatible numeric `known_versions`.
+    pub fn write_messages_delta_json_with_revs(
+        &self,
+        known_versions: &HashMap<&str, u64>,
+        known_revs: Option<&HashMap<&str, &str>>,
+        log_key: Option<&[u8; KEY_LEN]>,
+        out: &mut String,
+    ) {
+        let edits_by_target = self.collect_edits_by_target();
 
         out.push_str("{\"order\":[");
         let mut first_order = true;
         for entry in self.entries.values() {
-            if is_internal_log_type(&entry.message.msg_type) {
+            if is_internal_log_type(&entry.message.msg_type)
+                || self.tombstones.contains(&entry.message.id)
+            {
                 continue;
             }
             if !first_order {
@@ -786,43 +936,42 @@ impl ReplicatedLog {
         out.push_str("],\"changed\":[");
         let mut first_changed = true;
         for entry in self.entries.values() {
-            if is_internal_log_type(&entry.message.msg_type) {
+            if is_internal_log_type(&entry.message.msg_type)
+                || self.tombstones.contains(&entry.message.id)
+            {
                 continue;
             }
-            let upd = latest_bot_updates.get(entry.message.id.as_str());
-            let effective_ver = upd.map(|(u, _)| u.lamport).unwrap_or(0);
-            if known_versions
-                .get(entry.message.id.as_str())
-                .copied()
-                == Some(effective_ver)
-            {
+            let edits = edits_by_target.get(entry.message.id.as_str());
+            let unchanged = if let Some(revs) = known_revs {
+                let current_rev = edits.map(|v| format_edit_rev(v)).unwrap_or_else(|| "0".to_owned());
+                revs.get(entry.message.id.as_str())
+                    .is_some_and(|known| *known == current_rev.as_str())
+            } else {
+                let effective_ver = edits
+                    .and_then(|v| v.last())
+                    .map(|u| u.lamport)
+                    .unwrap_or(0);
+                known_versions
+                    .get(entry.message.id.as_str())
+                    .copied()
+                    == Some(effective_ver)
+            };
+            if unchanged {
                 continue;
             }
             if !first_changed {
                 out.push(',');
             }
             first_changed = false;
-            if let Some((upd_msg, card_payload)) = upd {
-                let m = &entry.message;
-                out.push_str("{\"id\":");
-                write_json_string(out, &m.id);
-                out.push_str(",\"type\":");
-                write_json_string(out, &m.msg_type);
-                let _ = write!(
-                    out,
-                    ",\"lamport\":{},\"ts\":{},\"author\":",
-                    m.lamport, m.ts
-                );
-                write_json_string(out, &m.author);
-                out.push_str(",\"authorName\":");
-                write_json_string(out, &m.author_name);
-                out.push_str(",\"payload\":");
-                write_json_value(out, card_payload);
-                let _ = write!(
-                    out,
-                    ",\"updatedLamport\":{},\"updatedTs\":{}}}",
-                    upd_msg.lamport, upd_msg.ts
-                );
+            if let Some(edits_vec) = edits {
+                if entry.payload_deferred
+                    && let (Some(key), Some(sealed)) = (log_key, entry.sealed.as_ref())
+                    && let Ok(full_msg) = sealed.open(key)
+                {
+                    write_folded_message_json(&full_msg, &full_msg.payload, edits_vec, out);
+                } else {
+                    write_folded_message_json(&entry.message, &entry.message.payload, edits_vec, out);
+                }
             } else if entry.payload_deferred
                 && let (Some(key), Some(sealed)) = (log_key, entry.sealed.as_ref())
                 && let Ok(full_msg) = sealed.open(key)
@@ -835,19 +984,22 @@ impl ReplicatedLog {
         out.push_str("]}");
     }
 
-    /// Serializes a plaintext JSON snapshot (for explicit user decrypted export).
+    /// Serializes a plaintext JSON snapshot (for explicit user decrypted export),
+    /// containing both parsed `messages` and the full immutable `rawMessages` event log.
     pub fn export_snapshot_json(&self) -> String {
         self.export_snapshot_json_with_key(None)
     }
 
     pub fn export_snapshot_json_with_key(&self, log_key: Option<&[u8; KEY_LEN]>) -> String {
-        let mut out = String::with_capacity(self.entries.len().saturating_mul(160) + 64);
+        let mut out = String::with_capacity(self.entries.len().saturating_mul(256) + 96);
         let _ = write!(
             out,
             "{{\"version\":1,\"lamport\":{},\"messages\":",
             self.lamport
         );
         self.write_messages_json_array_with_key(log_key, &mut out);
+        out.push_str(",\"rawMessages\":");
+        self.write_raw_messages_json_array_with_key(log_key, false, &mut out);
         out.push('}');
         out
     }
@@ -884,14 +1036,15 @@ impl ReplicatedLog {
         out
     }
 
-    /// Merges a plaintext v1 snapshot into this log.
+    /// Merges a plaintext v1 snapshot into this log (preferring full `rawMessages` when present).
     pub fn import_snapshot_value(&mut self, val: &JsonValue) -> Result<usize, String> {
         if let Some(lp) = val.get_u64("lamport") {
             self.observe_lamport(lp);
         }
         let msgs = val
-            .get("messages")
+            .get("rawMessages")
             .and_then(JsonValue::as_array)
+            .or_else(|| val.get("messages").and_then(JsonValue::as_array))
             .ok_or_else(|| "snapshot missing 'messages' array".to_owned())?;
         let mut added = 0usize;
         for item in msgs {

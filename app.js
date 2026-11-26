@@ -635,6 +635,15 @@ const LINK_ARROW_SVG =
   '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><path d="M18 13v6H5V6h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
 const TRASH_SVG =
   '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><line x1="10" y1="11" x2="10" y2="16"/><line x1="14" y1="11" x2="14" y2="16"/></svg>';
+const PENCIL_SVG =
+  '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+
+function messageEditRev(m) {
+  if (!m || !m.updatedLamport) return "0";
+  const lastId =
+    Array.isArray(m.edits) && m.edits.length > 0 ? m.edits[m.edits.length - 1].id : "";
+  return `${m.updatedLamport}:${m.editCount || 1}:${lastId}`;
+}
 
 function isSafeImageDataUrl(src) {
   if (typeof src !== "string") return false;
@@ -1317,6 +1326,8 @@ class P2PDirectApp {
     };
     this.advancedMode = false;
     this.rawJsonMode = false;
+    this.editingMessageId = null;
+    this.expandedEditHistory = new Set();
     this.composerMode = "chat";
     this.pendingImages = [];
     this.mediaBlobRegistry = new Map(); // msgId -> Set<blobUrl>
@@ -2586,6 +2597,7 @@ class P2PDirectApp {
       this.rawJsonMode = !this.rawJsonMode;
       this.el["btn-toggle-raw"].textContent = this.rawJsonMode ? "Chat View" : "Raw JSON";
       this.el["btn-toggle-raw"].classList.toggle("is-active", this.rawJsonMode);
+      this.renderTypeFilterOptions();
       this.renderLog();
     });
 
@@ -5929,6 +5941,7 @@ class P2PDirectApp {
   publishMessage(msgType, payload) {
     const hasBulkMedia =
       msgType !== "msg-delete" &&
+      msgType !== "msg-edit" &&
       msgType !== "bot-update" &&
       payload &&
       typeof payload === "object" &&
@@ -5945,13 +5958,15 @@ class P2PDirectApp {
     const existing = Array.isArray(this.logMessages) ? this.logMessages : [];
     const byId = new Map();
     const knownVersions = {};
+    const knownRevs = {};
     for (const m of existing) {
       if (m && m.id) {
         byId.set(m.id, m);
         knownVersions[m.id] = Number(m.updatedLamport) || 0;
+        knownRevs[m.id] = messageEditRev(m);
       }
     }
-    const res = this.wasm.call({ cmd: "get_log_delta", knownVersions });
+    const res = this.wasm.call({ cmd: "get_log_delta", knownVersions, knownRevs });
     this.status = res.status;
     const delta = res.delta;
     if (!delta || !Array.isArray(delta.order)) {
@@ -11752,13 +11767,19 @@ class P2PDirectApp {
       applyPeerColorToElement(nameTag, selfSpec);
     }
 
-    // 2. Update all existing chat message stripes in place (never rebuilds video/GIF DOM nodes)
+    // 2. Update all existing chat message stripes & editor swatches in place (never rebuilds video/GIF DOM nodes)
     const logFeed = this.el["log-feed"];
     if (logFeed) {
       for (const stripe of logFeed.querySelectorAll(".msg-stripe[data-msg-author]")) {
         const authorId = stripe.getAttribute("data-msg-author");
         if (authorId) {
           applyPeerColorToElement(stripe, this.getPeerColorSpec(authorId));
+        }
+      }
+      for (const sw of logFeed.querySelectorAll(".msg-editor-swatch[data-peer-color-id]")) {
+        const pid = sw.getAttribute("data-peer-color-id");
+        if (pid) {
+          applyPeerColorToElement(sw, this.getPeerColorSpec(pid));
         }
       }
     }
@@ -13260,7 +13281,18 @@ class P2PDirectApp {
   renderTypeFilterOptions() {
     const select = this.el["log-type-filter"];
     const current = select.value;
-    const types = Array.from(new Set(this.logMessages.map((m) => m.type))).sort();
+    const typeSet = new Set(this.logMessages.map((m) => m.type));
+    if (this.advancedMode && this.rawJsonMode && this.wasm) {
+      try {
+        const rawRes = this.wasm.call({ cmd: "get_raw_log", compactMedia: true });
+        for (const rm of rawRes.rawLog || []) {
+          if (rm && rm.type) typeSet.add(rm.type);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const types = Array.from(typeSet).sort();
     const opts = ['<option value="">All types</option>'];
     for (const t of types) {
       opts.push(`<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`);
@@ -13285,8 +13317,171 @@ class P2PDirectApp {
     return this.knownBotPeerIds.has(peerId);
   }
 
+  startEditMessage(msgId) {
+    if (!msgId) return;
+    this.editingMessageId = msgId;
+    this.renderLog();
+    const input = this.el["log-feed"]?.querySelector(
+      `.log-entry[data-msg-id="${CSS.escape(msgId)}"] .msg-edit-input`
+    );
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  }
+
+  cancelEditMessage() {
+    if (!this.editingMessageId) return;
+    this.editingMessageId = null;
+    this.renderLog();
+  }
+
+  submitEditMessage(msgId, newPayload) {
+    if (!msgId || !this.wasm) return;
+    try {
+      const res = this.wasm.call({
+        cmd: "edit_message",
+        targetId: msgId,
+        payload: newPayload,
+        ts: Date.now(),
+        entropy: randomBase64Url(16),
+      });
+      this.editingMessageId = null;
+      this.status = res.status;
+      this.executeActions(res.actions);
+      this.renderAll();
+      this.showToast("Message edited for room");
+    } catch (err) {
+      this.addTelemetry("error", `Edit failed: ${err.message}`);
+      this.showToast(`Could not edit message: ${err.message}`);
+    }
+  }
+
+  toggleEditHistory(msgId) {
+    if (!msgId) return;
+    if (this.expandedEditHistory.has(msgId)) {
+      this.expandedEditHistory.delete(msgId);
+    } else {
+      this.expandedEditHistory.add(msgId);
+    }
+    this.renderLog();
+  }
+
+  _formatPayloadPreview(msgType, payload) {
+    if (!payload || typeof payload !== "object") {
+      return String(payload ?? "");
+    }
+    if (msgType === "chat") {
+      const text = typeof payload.text === "string" ? payload.text : "";
+      const imgCount = Array.isArray(payload.images) ? payload.images.length : 0;
+      const vidCount = Array.isArray(payload.videos) ? payload.videos.length : 0;
+      if (text) return text;
+      const parts = [];
+      if (imgCount > 0) parts.push(`${imgCount} image${imgCount === 1 ? "" : "s"}`);
+      if (vidCount > 0) parts.push(`${vidCount} video${vidCount === 1 ? "" : "s"}`);
+      return parts.length > 0 ? `[${parts.join(", ")}]` : "(empty)";
+    }
+    return JSON.stringify(payload);
+  }
+
+  _buildEditStepDiffHtml(msgType, prevPayload, nextPayload) {
+    if (msgType === "chat") {
+      const oldText = this._formatPayloadPreview("chat", prevPayload);
+      const newText = this._formatPayloadPreview("chat", nextPayload);
+      return `
+        <div class="edit-diff-old">− ${escapeHtml(oldText)}</div>
+        <div class="edit-diff-new">+ ${escapeHtml(newText)}</div>
+      `;
+    }
+    if (
+      prevPayload &&
+      nextPayload &&
+      typeof prevPayload === "object" &&
+      typeof nextPayload === "object" &&
+      !Array.isArray(prevPayload) &&
+      !Array.isArray(nextPayload)
+    ) {
+      const keys = Array.from(new Set([...Object.keys(prevPayload), ...Object.keys(nextPayload)]));
+      const lines = [];
+      for (const k of keys) {
+        const a = JSON.stringify(prevPayload[k]);
+        const b = JSON.stringify(nextPayload[k]);
+        if (a !== b) {
+          if (a !== undefined) {
+            lines.push(`<div class="edit-diff-old">− ${escapeHtml(k)}: ${escapeHtml(a)}</div>`);
+          }
+          if (b !== undefined) {
+            lines.push(`<div class="edit-diff-new">+ ${escapeHtml(k)}: ${escapeHtml(b)}</div>`);
+          }
+        }
+      }
+      if (lines.length > 0) {
+        return lines.join("");
+      }
+    }
+    return `
+      <div class="edit-diff-old">− ${escapeHtml(this._formatPayloadPreview(msgType, prevPayload))}</div>
+      <div class="edit-diff-new">+ ${escapeHtml(this._formatPayloadPreview(msgType, nextPayload))}</div>
+    `;
+  }
+
+  _renderEditHistoryHtml(m) {
+    const edits = Array.isArray(m.edits) ? m.edits : [];
+    if (edits.length === 0) return "";
+    const origPayload = m.originalPayload !== undefined ? m.originalPayload : m.payload;
+    const origSpec = this.getPeerColorSpec(m.author);
+    const origStyle = origSpec.styleAttr ? ` style="${origSpec.styleAttr}"` : "";
+    const rows = [
+      `
+        <div class="edit-hist-row">
+          <div class="edit-hist-meta">
+            <span class="msg-editor-swatch ${origSpec.className}" data-peer-color-id="${escapeHtml(m.author)}"${origStyle} aria-hidden="true"></span>
+            <span class="edit-hist-who">${escapeHtml(m.authorName)}</span>
+            <span class="edit-hist-kind">Original</span>
+            <span class="edit-hist-time">${escapeHtml(formatTime(m.ts))}</span>
+          </div>
+          <div class="edit-hist-diff">
+            <div class="edit-diff-orig">${escapeHtml(this._formatPayloadPreview(m.type, origPayload))}</div>
+          </div>
+        </div>
+      `,
+    ];
+
+    let prev = origPayload;
+    for (let i = 0; i < edits.length; i++) {
+      const ed = edits[i];
+      const edSpec = this.getPeerColorSpec(ed.author);
+      const edStyle = edSpec.styleAttr ? ` style="${edSpec.styleAttr}"` : "";
+      rows.push(`
+        <div class="edit-hist-row" data-edit-step="${i + 1}">
+          <div class="edit-hist-meta">
+            <span class="msg-editor-swatch ${edSpec.className}" data-peer-color-id="${escapeHtml(ed.author)}"${edStyle} aria-hidden="true"></span>
+            <span class="edit-hist-who">${escapeHtml(ed.authorName)}</span>
+            <span class="edit-hist-kind">Edit #${i + 1}</span>
+            <span class="edit-hist-time">${escapeHtml(formatTime(ed.ts))}</span>
+          </div>
+          <div class="edit-hist-diff">
+            ${this._buildEditStepDiffHtml(m.type, prev, ed.payload)}
+          </div>
+        </div>
+      `);
+      prev = ed.payload;
+    }
+
+    return `
+      <div class="msg-edit-history" data-edit-history="${escapeHtml(m.id)}">
+        <div class="msg-edit-history-title">Edit History (${edits.length} ${edits.length === 1 ? "edit" : "edits"})</div>
+        ${rows.join("")}
+      </div>
+    `;
+  }
+
   deleteLogMessage(msgId) {
     if (!msgId || !this.wasm) return;
+    if (this.editingMessageId === msgId) {
+      this.editingMessageId = null;
+    }
+    this.expandedEditHistory.delete(msgId);
     try {
       const res = this.wasm.call({
         cmd: "delete_message",
@@ -13727,6 +13922,8 @@ class P2PDirectApp {
       (typeof m.payload.text === "string" ||
         Array.isArray(m.payload.images) ||
         Array.isArray(m.payload.videos));
+    const isEditing = this.editingMessageId === m.id;
+    const isHistOpen = Boolean(m.updatedLamport && this.expandedEditHistory.has(m.id));
 
     let bodyHtml;
     let botButtons = [];
@@ -13745,18 +13942,74 @@ class P2PDirectApp {
       bodyHtml = `<pre class="log-json-pre">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
     }
 
+    let editFormHtml = "";
+    if (isEditing) {
+      const hasMedia =
+        isChat &&
+        m.payload &&
+        ((Array.isArray(m.payload.images) && m.payload.images.length > 0) ||
+          (Array.isArray(m.payload.videos) && m.payload.videos.length > 0));
+      const initialValue = isChat
+        ? String(m.payload?.text ?? "")
+        : JSON.stringify(m.payload ?? {}, null, 2);
+      const hintText = isChat
+        ? hasMedia
+          ? "Enter to save · Esc to cancel · Attached media is preserved"
+          : "Enter to save · Shift+Enter for newline · Esc to cancel"
+        : "Ctrl/Cmd+Enter to save JSON · Esc to cancel";
+      editFormHtml = `
+        <form class="msg-edit-form" data-edit-form="${escapeHtml(m.id)}">
+          <textarea
+            class="msg-edit-input${isChat ? "" : " is-json"}"
+            aria-label="Edit message content"
+          >${escapeHtml(initialValue)}</textarea>
+          <div class="msg-edit-error hidden" data-edit-error></div>
+          <div class="msg-edit-bar">
+            <span class="msg-edit-hint">${escapeHtml(hintText)}</span>
+            <div class="msg-edit-actions">
+              <button type="button" class="btn btn-sm" data-edit-cancel>Cancel</button>
+              <button type="submit" class="btn btn-sm btn-primary" data-edit-save>Save Edit</button>
+            </div>
+          </div>
+        </form>
+      `;
+    }
+
     const showBotTag = isBotMsg || this.isPeerBot(m.author);
     const botTagHtml = showBotTag ? '<span class="bot-tag">BOT</span>' : "";
     const typeTag =
       isChat || isBotMsg ? "" : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
-    const updatedTag = m.updatedLamport
-      ? '<span class="bot-updated-tag" title="Updated live by bot">edited</span>'
-      : "";
+
+    let updatedTag = "";
+    if (m.updatedLamport) {
+      const editorId = m.editedBy || m.author;
+      const editorName = m.editedByName || m.authorName || "Peer";
+      const editorSpec = this.getPeerColorSpec(editorId);
+      const editorStyle = editorSpec.styleAttr ? ` style="${editorSpec.styleAttr}"` : "";
+      const editCount = Number(m.editCount) || (Array.isArray(m.edits) ? m.edits.length : 1);
+      const countLabel = editCount > 1 ? ` · ${editCount} edits` : "";
+      updatedTag = `
+        <button
+          type="button"
+          class="bot-updated-tag msg-edited-pill${isHistOpen ? " is-open" : ""}"
+          data-toggle-edit-history="${escapeHtml(m.id)}"
+          aria-expanded="${isHistOpen ? "true" : "false"}"
+          title="Edited by ${escapeHtml(editorName)} — click to view edit history"
+        >
+          <span class="msg-editor-swatch ${editorSpec.className}" data-peer-color-id="${escapeHtml(editorId)}"${editorStyle} aria-hidden="true"></span>
+          <span>edited by ${escapeHtml(editorName)}${escapeHtml(countLabel)}</span>
+          <span class="msg-edited-chevron" aria-hidden="true">${isHistOpen ? "▴" : "▾"}</span>
+        </button>
+      `;
+    }
+
+    const historyHtml = isHistOpen ? this._renderEditHistoryHtml(m) : "";
+    const effectiveRev = `${messageEditRev(m)}:${isEditing ? "edit" : "view"}:${isHistOpen ? "h1" : "h0"}`;
 
     const article = document.createElement("article");
-    article.className = `log-entry${isSelf ? " is-self" : ""}${isBotMsg ? " is-bot-entry" : ""}${isNew ? " is-new" : ""}`;
+    article.className = `log-entry${isSelf ? " is-self" : ""}${isBotMsg ? " is-bot-entry" : ""}${isEditing ? " is-editing" : ""}${isNew ? " is-new" : ""}`;
     article.dataset.msgId = m.id;
-    article.dataset.rev = String(m.updatedLamport || 0);
+    article.dataset.rev = effectiveRev;
     article.innerHTML = `
       <div class="msg-stripe ${stripeColor.className}" data-msg-author="${escapeHtml(m.author)}"${stripeStyle} aria-hidden="true"></div>
       <div class="log-entry-main">
@@ -13773,6 +14026,13 @@ class P2PDirectApp {
             </span>
             <button
               type="button"
+              class="msg-edit-btn"
+              data-edit-msg="${escapeHtml(m.id)}"
+              title="Edit message (appends a new edit event visible in raw log)"
+              aria-label="Edit message"
+            >${PENCIL_SVG}</button>
+            <button
+              type="button"
               class="msg-delete-btn"
               data-delete-msg="${escapeHtml(m.id)}"
               title="Delete message for everyone in room"
@@ -13780,9 +14040,92 @@ class P2PDirectApp {
             >${TRASH_SVG}</button>
           </div>
         </div>
-        ${bodyHtml}
+        ${isEditing ? editFormHtml : bodyHtml}
+        ${historyHtml}
       </div>
     `;
+
+    const histBtn = article.querySelector("[data-toggle-edit-history]");
+    if (histBtn) {
+      histBtn.addEventListener("click", () => this.toggleEditHistory(m.id));
+    }
+
+    const editBtn = article.querySelector("[data-edit-msg]");
+    if (editBtn) {
+      editBtn.addEventListener("click", () => {
+        if (this.editingMessageId === m.id) {
+          this.cancelEditMessage();
+        } else {
+          this.startEditMessage(m.id);
+        }
+      });
+    }
+
+    if (isEditing) {
+      const formEl = article.querySelector("[data-edit-form]");
+      const inputEl = formEl?.querySelector(".msg-edit-input");
+      const errEl = formEl?.querySelector("[data-edit-error]");
+      const cancelBtn = formEl?.querySelector("[data-edit-cancel]");
+      const showEditError = (msgText) => {
+        if (!errEl) return;
+        errEl.textContent = msgText;
+        errEl.classList.remove("hidden");
+      };
+      const commitInlineEdit = () => {
+        if (!inputEl) return;
+        const rawVal = inputEl.value;
+        if (isChat) {
+          const trimmed = rawVal.trim();
+          const hasMedia =
+            m.payload &&
+            ((Array.isArray(m.payload.images) && m.payload.images.length > 0) ||
+              (Array.isArray(m.payload.videos) && m.payload.videos.length > 0));
+          if (!trimmed && !hasMedia) {
+            showEditError("Message text cannot be empty (use delete instead).");
+            return;
+          }
+          if (trimmed === String(m.payload?.text ?? "").trim()) {
+            this.cancelEditMessage();
+            return;
+          }
+          this.submitEditMessage(m.id, { text: trimmed });
+        } else {
+          let parsed;
+          try {
+            parsed = JSON.parse(rawVal);
+          } catch (err) {
+            showEditError(`Invalid JSON: ${err.message}`);
+            return;
+          }
+          if (parsed === null || typeof parsed !== "object") {
+            showEditError("Edited payload must be a valid JSON object or array.");
+            return;
+          }
+          this.submitEditMessage(m.id, parsed);
+        }
+      };
+
+      if (cancelBtn) {
+        cancelBtn.addEventListener("click", () => this.cancelEditMessage());
+      }
+      if (inputEl) {
+        inputEl.addEventListener("keydown", (ev) => {
+          if (ev.key === "Escape") {
+            ev.preventDefault();
+            this.cancelEditMessage();
+          } else if (ev.key === "Enter" && ((isChat && !ev.shiftKey) || (!isChat && (ev.ctrlKey || ev.metaKey)))) {
+            ev.preventDefault();
+            commitInlineEdit();
+          }
+        });
+      }
+      if (formEl) {
+        formEl.addEventListener("submit", (ev) => {
+          ev.preventDefault();
+          commitInlineEdit();
+        });
+      }
+    }
 
     const delBtn = article.querySelector("[data-delete-msg]");
     if (delBtn) {
@@ -14194,6 +14537,87 @@ class P2PDirectApp {
     const query = this.advancedMode ? this.el["log-search-input"].value.trim().toLowerCase() : "";
     const typeFilter = this.advancedMode ? this.el["log-type-filter"].value : "";
 
+    // Raw JSON mode renders the COMPLETE immutable append-only event log (originals + msg-edit + msg-delete)
+    if (this.advancedMode && this.rawJsonMode) {
+      let rawEvents = [];
+      if (this.wasm) {
+        try {
+          const rawRes = this.wasm.call({ cmd: "get_raw_log", compactMedia: true });
+          rawEvents = Array.isArray(rawRes.rawLog) ? rawRes.rawLog : [];
+        } catch {
+          rawEvents = this.logMessages;
+        }
+      }
+      const rawKey = `raw:${this.status?.rawLogCount || rawEvents.length}:${this.status?.lamport || 0}:${typeFilter}:${query}:${rawEvents.map((m) => m.id).join(",")}`;
+      if (this.logRenderState.mode === "raw" && this.logRenderState.key === rawKey) {
+        return;
+      }
+      this._revokeAllMediaUrls();
+
+      const deletedTargets = new Set();
+      let editEventsCount = 0;
+      let deleteEventsCount = 0;
+      let rootEventsCount = 0;
+      for (const ev of rawEvents) {
+        if (ev.type === "msg-delete") {
+          deleteEventsCount++;
+          if (ev.payload && typeof ev.payload.targetId === "string") {
+            deletedTargets.add(ev.payload.targetId);
+          }
+        } else if (ev.type === "msg-edit" || ev.type === "bot-update") {
+          editEventsCount++;
+        } else {
+          rootEventsCount++;
+        }
+      }
+
+      const rawFiltered = rawEvents.filter((m) => {
+        if (typeFilter && m.type !== typeFilter) return false;
+        if (!query) return true;
+        return JSON.stringify(m).toLowerCase().includes(query);
+      });
+
+      if (rawFiltered.length === 0) {
+        const emptyText =
+          rawEvents.length === 0
+            ? "No raw events recorded yet."
+            : "No raw events match your current filter.";
+        feed.innerHTML = `<div class="empty-state">${emptyText}</div>`;
+        this.logRenderState = { mode: "raw", key: rawKey };
+        return;
+      }
+
+      const linesHtml = rawFiltered
+        .map((m) => {
+          let cls = "raw-event-line";
+          if (m.type === "msg-edit" || m.type === "bot-update") {
+            cls += " is-edit";
+          } else if (m.type === "msg-delete") {
+            cls += " is-delete";
+          } else if (deletedTargets.has(m.id)) {
+            cls += " is-deleted-target";
+          }
+          return `<span class="${cls}" data-raw-type="${escapeHtml(m.type)}" data-raw-id="${escapeHtml(m.id)}">${escapeHtml(JSON.stringify(m))}</span>`;
+        })
+        .join("\n");
+
+      feed.innerHTML = `
+        <div class="raw-jsonl-shell">
+          <div class="raw-jsonl-banner">
+            <span>Raw Append-Only Event Log · ${rawEvents.length} ${rawEvents.length === 1 ? "event" : "events"}</span>
+            <span class="raw-jsonl-counts">
+              <span class="raw-pill">${rootEventsCount} orig</span>
+              <span class="raw-pill is-edit">${editEventsCount} ${editEventsCount === 1 ? "edit" : "edits"}</span>
+              <span class="raw-pill is-delete">${deleteEventsCount} ${deleteEventsCount === 1 ? "delete" : "deletes"}</span>
+            </span>
+          </div>
+          <pre class="raw-jsonl-view">${linesHtml}</pre>
+        </div>
+      `;
+      this.logRenderState = { mode: "raw", key: rawKey };
+      return;
+    }
+
     const filtered = this.logMessages.filter((m) => {
       if (typeFilter && m.type !== typeFilter) return false;
       if (!query) return true;
@@ -14207,6 +14631,8 @@ class P2PDirectApp {
         type: m.type,
         author: m.author,
         authorName: m.authorName,
+        editedBy: m.editedBy || "",
+        editedByName: m.editedByName || "",
         payload: hasMedia
           ? {
               text: m.payload.text || "",
@@ -14243,20 +14669,13 @@ class P2PDirectApp {
       return;
     }
 
-    if (this.advancedMode && this.rawJsonMode) {
-      const rawKey = `raw:${filtered.map((m) => `${m.id}:${m.updatedLamport || 0}`).join(",")}`;
-      if (this.logRenderState.mode === "raw" && this.logRenderState.key === rawKey) {
-        return;
-      }
-      this._revokeAllMediaUrls();
-      const jsonl = filtered.map((m) => JSON.stringify(m)).join("\n");
-      feed.innerHTML = `<pre class="raw-jsonl-view">${escapeHtml(jsonl)}</pre>`;
-      this.logRenderState = { mode: "raw", key: rawKey };
-      return;
-    }
-
     const myId = this.status?.peerId || "";
-    const chatKey = `chat:${myId}:${filtered.map((m) => `${m.id}:${m.updatedLamport || 0}`).join(",")}`;
+    const msgDomRev = (m) => {
+      const isEditing = this.editingMessageId === m.id;
+      const isHistOpen = Boolean(m.updatedLamport && this.expandedEditHistory.has(m.id));
+      return `${messageEditRev(m)}:${isEditing ? "edit" : "view"}:${isHistOpen ? "h1" : "h0"}`;
+    };
+    const chatKey = `chat:${myId}:${filtered.map((m) => `${m.id}|${msgDomRev(m)}`).join(",")}`;
     if (this.logRenderState.mode === "chat" && this.logRenderState.key === chatKey) {
       return;
     }
@@ -14293,13 +14712,13 @@ class P2PDirectApp {
     for (let i = 0; i < filtered.length; i++) {
       const m = filtered[i];
       const isSelf = m.author === myId;
-      const rev = String(m.updatedLamport || 0);
+      const rev = msgDomRev(m);
       let node = existingNodes.get(m.id);
       if (!node) {
         node = this.buildLogEntryElement(m, isSelf, animateNew);
         if (isSelf) addedSelfMessage = true;
       } else if (node.dataset.rev !== rev) {
-        // Live bot card update: replace ONLY this message node in place (zero flicker on others)
+        // Live edit, history toggle, or bot card update: replace ONLY this message node in place
         this._revokeMessageMediaUrls(m.id);
         const updatedNode = this.buildLogEntryElement(m, isSelf, false);
         feed.replaceChild(updatedNode, node);

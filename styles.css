@@ -2288,9 +2288,57 @@ html[data-advanced="false"][data-in-room="true"][data-has-pinned="true"] .workbe
   word-break: break-word;
 }
 
+.raw-jsonl-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--code-dark-bg);
+}
+
+.raw-jsonl-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 9px 18px;
+  background: #14171f;
+  border-bottom: 2px solid #2b3040;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #c8cdd9;
+}
+
+.raw-jsonl-counts {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.raw-pill {
+  padding: 2px 7px;
+  border: 1.5px solid #353c4f;
+  color: #f5f4ef;
+}
+
+.raw-pill.is-edit {
+  border-color: var(--ochre);
+  color: var(--ochre);
+}
+
+.raw-pill.is-delete {
+  border-color: var(--coral);
+  color: var(--coral);
+}
+
 .raw-jsonl-view {
   margin: 0;
-  padding: 16px 22px;
+  padding: 14px 18px;
   background: var(--code-dark-bg);
   color: var(--code-dark-ink);
   font-family: var(--font-mono);
@@ -2300,6 +2348,28 @@ html[data-advanced="false"][data-in-room="true"][data-has-pinned="true"] .workbe
   white-space: pre-wrap;
   word-break: break-all;
   flex: 1;
+}
+
+.raw-event-line {
+  display: block;
+  padding: 4px 10px;
+  border-left: 3px solid transparent;
+  margin-bottom: 3px;
+}
+
+.raw-event-line.is-edit {
+  border-left-color: var(--ochre);
+  background: rgba(255, 194, 26, 0.08);
+}
+
+.raw-event-line.is-delete {
+  border-left-color: var(--coral);
+  background: rgba(255, 69, 58, 0.1);
+}
+
+.raw-event-line.is-deleted-target {
+  border-left-color: #6b7280;
+  opacity: 0.72;
 }
 
 /* ================= Inline Badges Flat Chat Composer ================= */
@@ -4702,14 +4772,15 @@ input[type="checkbox"].metro-switch:checked::after {
   background: #0e0f12;
 }
 
-/* ================= Message Deletion Action ================= */
+/* ================= Message Edit & Delete Actions ================= */
 .log-head-right {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-left: auto;
 }
 
+.msg-edit-btn,
 .msg-delete-btn {
   display: inline-flex;
   align-items: center;
@@ -4726,10 +4797,21 @@ input[type="checkbox"].metro-switch:checked::after {
   transition: opacity 110ms ease, background-color 110ms ease, color 110ms ease, border-color 110ms ease;
 }
 
+.log-entry:hover .msg-edit-btn,
+.log-entry:focus-within .msg-edit-btn,
+.msg-edit-btn:focus-visible,
 .log-entry:hover .msg-delete-btn,
 .log-entry:focus-within .msg-delete-btn,
 .msg-delete-btn:focus-visible {
   opacity: 1;
+}
+
+.msg-edit-btn:hover,
+.msg-edit-btn:focus-visible {
+  background: var(--cobalt);
+  border-color: var(--rule);
+  color: #ffffff;
+  outline: none;
 }
 
 .msg-delete-btn:hover,
@@ -4767,13 +4849,222 @@ input[type="checkbox"].metro-switch:checked::after {
   flex-shrink: 0;
 }
 
-.bot-updated-tag {
+.bot-updated-tag,
+.msg-edited-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border: 1.5px solid var(--rule);
+  border-radius: 0;
+  background: var(--bg-subtle);
   font-family: var(--font-mono);
   font-size: 9.5px;
   font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-secondary);
+  cursor: pointer;
+  line-height: 1.2;
+  transition: border-color 110ms ease, background-color 110ms ease, color 110ms ease;
+}
+
+.msg-edited-pill:hover,
+.msg-edited-pill:focus-visible,
+.msg-edited-pill.is-open {
+  border-color: var(--cobalt);
+  background: var(--accent-action-bg);
+  color: var(--ink-primary);
+  outline: none;
+}
+
+.msg-edited-chevron {
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.75;
+}
+
+.msg-editor-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border: 1px solid var(--rule);
+  background: var(--cobalt);
+}
+
+.msg-editor-swatch.tile-mint { background: var(--mint); }
+.msg-editor-swatch.tile-cobalt { background: var(--cobalt); }
+.msg-editor-swatch.tile-coral { background: var(--coral); }
+.msg-editor-swatch.tile-ochre { background: var(--ochre); }
+.msg-editor-swatch.tile-cyan { background: var(--cyan); }
+.msg-editor-swatch.tile-magenta { background: var(--magenta); }
+.msg-editor-swatch.tile-violet { background: var(--violet); }
+.msg-editor-swatch.tile-tangerine { background: var(--tangerine); }
+.msg-editor-swatch.tile-lime { background: var(--lime); }
+.msg-editor-swatch.tile-teal { background: var(--teal); }
+.msg-editor-swatch.tile-indigo { background: var(--indigo); }
+.msg-editor-swatch.tile-crimson { background: var(--crimson); }
+.msg-editor-swatch.tile-custom { background: var(--tile-bg, var(--cobalt)); }
+
+/* Expandable Who-Edited-What Audit Trail */
+.msg-edit-history {
+  margin-top: 8px;
+  border: 2px solid var(--rule);
+  border-left: 5px solid var(--ochre);
+  background: var(--bg-subtle);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.msg-edit-history-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-secondary);
+}
+
+.edit-hist-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 7px;
+  border-top: 1px solid var(--rule-soft);
+}
+
+.edit-hist-row:first-of-type {
+  padding-top: 0;
+  border-top: none;
+}
+
+.edit-hist-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-secondary);
+}
+
+.edit-hist-who {
+  font-weight: 700;
+  color: var(--ink-primary);
+}
+
+.edit-hist-kind {
+  padding: 1px 5px;
+  border: 1px solid var(--rule);
+  background: var(--bg-surface);
+  font-size: 9px;
+  font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  color: var(--ink-primary);
+}
+
+.edit-hist-time {
+  margin-left: auto;
+  font-size: 10px;
   color: var(--ink-muted);
+}
+
+.edit-hist-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.edit-diff-orig {
+  padding: 4px 8px;
+  background: var(--bg-surface);
+  border-left: 3px solid var(--rule);
+  color: var(--ink-secondary);
+  white-space: pre-wrap;
+}
+
+.edit-diff-old {
+  padding: 4px 8px;
+  background: var(--accent-danger-bg);
+  border-left: 3px solid var(--coral);
+  color: var(--accent-danger-ink);
+  text-decoration: line-through;
+  white-space: pre-wrap;
+}
+
+.edit-diff-new {
+  padding: 4px 8px;
+  background: var(--accent-live-bg);
+  border-left: 3px solid var(--mint-deep);
+  color: var(--accent-live-ink);
+  white-space: pre-wrap;
+}
+
+/* Inline Message Editor */
+.msg-edit-form {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.msg-edit-input {
+  width: 100%;
+  min-height: 58px;
+  padding: 9px 11px;
+  border: 2px solid var(--cobalt);
+  border-radius: 0;
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  resize: vertical;
+  outline: none;
+}
+
+.msg-edit-input.is-json {
+  min-height: 112px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.msg-edit-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.msg-edit-hint {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-muted);
+}
+
+.msg-edit-error {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-danger-ink);
+  background: var(--accent-danger-bg);
+  border-left: 3px solid var(--coral);
+  padding: 4px 8px;
+}
+
+.msg-edit-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .bot-card {
@@ -5072,6 +5363,7 @@ input[type="checkbox"].metro-switch:checked::after {
     grid-template-columns: 1fr;
   }
 
+  .msg-edit-btn,
   .msg-delete-btn {
     opacity: 1;
   }

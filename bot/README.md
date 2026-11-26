@@ -98,5 +98,5 @@ bot.on("voiceAudio", ({ peerId, rms, pcm }) => { /* Int16Array @ 16 kHz */ });
 Connect any WebSocket client to `ws://127.0.0.1:8765`:
 
 - **Events received (JSON)**: `ready`, `message`, `message_update`, `message_delete`, `interaction`, `peer_join`, `peer_leave`, `voice_state`, `audio_end`, `voice_audio` (opt-in), `reply`.
-- **Commands sent (JSON text frame)**: `send_text`, `send_bot_message`, `update_bot_message`, `delete_message`, `join_voice`, `leave_voice`, `set_voice_muted`, `set_audio_gain`, `play_audio_file`, `play_tone`, `pause_audio`, `resume_audio`, `stop_audio`, `subscribe_voice_audio`, `get_status`.
+- **Commands sent (JSON text frame)**: `send_text`, `send_bot_message`, `edit_message`, `update_bot_message`, `delete_message`, `get_raw_log`, `join_voice`, `leave_voice`, `set_voice_muted`, `set_audio_gain`, `play_audio_file`, `play_tone`, `pause_audio`, `resume_audio`, `stop_audio`, `subscribe_voice_audio`, `get_status`.
 - **Audio streaming (binary WebSocket frame)**: send raw 16 kHz mono `Int16LE` PCM bytes directly as binary WebSocket frames and the bridge paces and encrypts them into the room's voice channel automatically.
