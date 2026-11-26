@@ -1345,6 +1345,10 @@ export const WATCH_SYNC_DEFAULTS = Object.freeze({
   MILD_DRIFT_SC_MS: 1500,
   MILD_DRIFT_TWITCH_MS: 1300,
   MILD_DRIFT_SPOTIFY_MS: 2200,
+  YT_SEEK_JUMP_FORWARD_MS: 1150,
+  YT_SEEK_JUMP_BACKWARD_MS: 1000,
+  YT_SEEK_JUMP_PAUSED_MS: 900,
+  YT_REBUFFER_POS_TOLERANCE_MS: 1100,
   RATE_MISMATCH_MILLI: 100,
   CONFIRM_POLLS: 2,
   GRACE_LOCAL_EMBED_MS: 350,
@@ -1827,9 +1831,21 @@ export class WatchTogetherPlayer {
     this._hasEverPlayedLocally = false;
     this._lastAppliedEpoch = 0;
 
-    // YouTube rebuffer-vs-scrub tracking
+    // YouTube rebuffer-vs-scrub & continuous playhead tracking
     this._ytWasBuffering = false;
     this._ytBufferingFromPosMs = 0;
+    this._ytBufferWasSeek = false;
+    this._ytObsValid = false;
+    this._ytObsPosMs = 0;
+    this._ytObsPerf = 0;
+    this._ytObsPlaying = false;
+    this._ytObsRateMilli = 1000;
+
+    // Twitch VOD continuous playhead tracking (guards correctDrift against silent/buffered seeks)
+    this._twObsValid = false;
+    this._twObsPosMs = 0;
+    this._twObsPerf = 0;
+    this._twObsPlaying = false;
 
     // SoundCloud async action & polling race guards
     this._scActionSeq = 0;
@@ -1841,6 +1857,7 @@ export class WatchTogetherPlayer {
     this._scLastProgressMoveAt = 0;
     this._spPrevPollPosMs = -1;
     this._spLastPosMoveAt = 0;
+    this._spLastUpdatePerf = 0;
 
     // Periodic 3 Hz divergence detector & multi-peer state negotiator
     this.negotiator = new WatchSyncNegotiator({
@@ -1903,6 +1920,88 @@ export class WatchTogetherPlayer {
     this._autoplayTimerId = null;
   }
 
+  _resetYouTubePlayheadTracking() {
+    this._ytWasBuffering = false;
+    this._ytBufferingFromPosMs = 0;
+    this._ytBufferWasSeek = false;
+    this._ytObsValid = false;
+    this._ytObsPosMs = 0;
+    this._ytObsPerf = 0;
+    this._ytObsPlaying = false;
+    this._ytObsRateMilli = 1000;
+  }
+
+  _recordYouTubeObservation(posMs, nowPerf, playing, rateMilli = 1000) {
+    this._ytObsValid = true;
+    this._ytObsPosMs = Math.max(0, Math.round(Number(posMs) || 0));
+    this._ytObsPerf = Number(nowPerf) || 0;
+    this._ytObsPlaying = Boolean(playing);
+    this._ytObsRateMilli = Math.max(250, Math.min(4000, Math.round(Number(rateMilli) || 1000)));
+  }
+
+  _classifyYouTubePositionJump(curMs, nowPerf, isPlaying, rateMilli = 1000) {
+    if (!this._ytObsValid) {
+      return { jumped: false, expectedPosMs: curMs, rawDeltaMs: 0, stepErrorMs: 0, dtMs: 0 };
+    }
+    const dtMs = Math.max(0, (Number(nowPerf) || 0) - this._ytObsPerf);
+    const effectiveRate =
+      Math.max(250, Math.min(4000, Number(this._ytObsRateMilli) || Number(rateMilli) || 1000)) / 1000;
+    const expectedPosMs = this._ytObsPlaying
+      ? Math.max(0, Math.round(this._ytObsPosMs + dtMs * effectiveRate))
+      : this._ytObsPosMs;
+    const rawDeltaMs = curMs - this._ytObsPosMs;
+    const stepErrorMs = curMs - expectedPosMs;
+
+    if (!this._ytObsPlaying && !isPlaying) {
+      const jumped = Math.abs(rawDeltaMs) >= WATCH_SYNC_DEFAULTS.YT_SEEK_JUMP_PAUSED_MS;
+      return { jumped, expectedPosMs, rawDeltaMs, stepErrorMs, dtMs };
+    }
+
+    const forwardThreshold = Math.max(
+      WATCH_SYNC_DEFAULTS.YT_SEEK_JUMP_FORWARD_MS,
+      Math.round(effectiveRate * 600)
+    );
+    if (stepErrorMs >= forwardThreshold) {
+      return { jumped: true, expectedPosMs, rawDeltaMs, stepErrorMs, dtMs };
+    }
+    if (rawDeltaMs <= -WATCH_SYNC_DEFAULTS.YT_SEEK_JUMP_BACKWARD_MS) {
+      return { jumped: true, expectedPosMs, rawDeltaMs, stepErrorMs, dtMs };
+    }
+    if (dtMs <= 800 && rawDeltaMs <= -650 && stepErrorMs <= -1100) {
+      return { jumped: true, expectedPosMs, rawDeltaMs, stepErrorMs, dtMs };
+    }
+    return { jumped: false, expectedPosMs, rawDeltaMs, stepErrorMs, dtMs };
+  }
+
+  _resetTwitchPlayheadTracking() {
+    this._twObsValid = false;
+    this._twObsPosMs = 0;
+    this._twObsPerf = 0;
+    this._twObsPlaying = false;
+  }
+
+  _recordTwitchObservation(posMs, nowPerf, playing) {
+    this._twObsValid = true;
+    this._twObsPosMs = Math.max(0, Math.round(Number(posMs) || 0));
+    this._twObsPerf = Number(nowPerf) || 0;
+    this._twObsPlaying = Boolean(playing);
+  }
+
+  _isTwitchPositionJump(curMs, nowPerf, isPlaying) {
+    if (!this._twObsValid) return false;
+    const dtMs = Math.max(0, (Number(nowPerf) || 0) - this._twObsPerf);
+    const expectedPosMs = this._twObsPlaying ? Math.max(0, Math.round(this._twObsPosMs + dtMs)) : this._twObsPosMs;
+    const rawDeltaMs = curMs - this._twObsPosMs;
+    const stepErrorMs = curMs - expectedPosMs;
+    if (!this._twObsPlaying && !isPlaying) {
+      return Math.abs(rawDeltaMs) >= 900;
+    }
+    if (stepErrorMs >= 1200) return true;
+    if (rawDeltaMs <= -1000) return true;
+    if (dtMs <= 800 && rawDeltaMs <= -650 && stepErrorMs <= -1100) return true;
+    return false;
+  }
+
   _setExpectedCommand(spec, windowMs = 950) {
     const now = this._perfNow();
     this.expectedCommand = {
@@ -1917,6 +2016,10 @@ export class WatchTogetherPlayer {
       playEchoSeen: false,
       expectSeek: Boolean(spec.expectSeek),
       targetPosMs: Number(spec.targetPosMs) || 0,
+      prePosMs:
+        typeof spec.prePosMs === "number" && Number.isFinite(spec.prePosMs)
+          ? Math.max(0, Math.round(spec.prePosMs))
+          : null,
       seekEchoSeen: false,
       expectRate: Boolean(spec.expectRate),
       targetRateMilli: Number(spec.targetRateMilli) || 1000,
@@ -1926,10 +2029,38 @@ export class WatchTogetherPlayer {
     return this.expectedCommand;
   }
 
+  _expectedCommandPosMs(cmd, now) {
+    const elapsed = Math.max(0, now - cmd.issuedAt);
+    if (!cmd.targetPlaying) return cmd.targetPosMs;
+    const rate = Math.max(250, Math.min(4000, Number(cmd.targetRateMilli) || 1000)) / 1000;
+    return Math.max(0, Math.round(cmd.targetPosMs + elapsed * rate));
+  }
+
+  _matchesCommandPrePos(cmd, posMs, now) {
+    if (cmd.prePosMs === null) return false;
+    const elapsed = Math.max(0, now - cmd.issuedAt);
+    const rate = Math.max(250, Math.min(4000, Number(cmd.targetRateMilli) || 1000)) / 1000;
+    const rawDiff = Math.abs(posMs - cmd.prePosMs);
+    const advDiff = Math.abs(posMs - Math.round(cmd.prePosMs + elapsed * rate));
+    return Math.min(rawDiff, advDiff) <= 2200;
+  }
+
+  _isExpectedProgrammaticSeekPos(posMs, now) {
+    const cmd = this.expectedCommand;
+    if (!cmd || now >= cmd.expiresAt) return false;
+    if (cmd.expectTrackSwitch && !cmd.trackSwitchSettled) return true;
+    if (!cmd.expectSeek) return false;
+    const expectedCmdPos = this._expectedCommandPosMs(cmd, now);
+    const tol = cmd.seekEchoSeen ? 1200 : 2200;
+    if (Math.abs(posMs - expectedCmdPos) <= tol) return true;
+    if (!cmd.seekEchoSeen && this._matchesCommandPrePos(cmd, posMs, now)) return true;
+    return false;
+  }
+
   /**
    * Command-aware echo filter: suppresses ONLY the expected echo of a programmatic command
    * we actually issued, while allowing rapid opposite-direction user clicks (e.g., fast
-   * Pause -> Resume inside SoundCloud/YouTube) to propagate immediately.
+   * Pause -> Resume inside SoundCloud/YouTube) and user seeks to a new timestamp to propagate immediately.
    */
   _shouldSuppressEmbedEvent(event) {
     const cmd = this.expectedCommand;
@@ -1946,12 +2077,30 @@ export class WatchTogetherPlayer {
       }
       if (Boolean(event.playing) === cmd.targetPlaying) {
         if (cmd.expectPlayState || cmd.expectSeek || cmd.expectTrackSwitch || cmd.isInitial) {
-          cmd.playEchoSeen = true;
+          const hasPos = typeof event.positionMs === "number" && Number.isFinite(event.positionMs);
+          const expectedCmdPos = this._expectedCommandPosMs(cmd, now);
+          const posTolerance = cmd.seekEchoSeen || (!cmd.expectSeek && cmd.playEchoSeen) ? 1200 : 2200;
+          const posMatchesTarget = !hasPos || Math.abs(event.positionMs - expectedCmdPos) <= posTolerance;
+
+          // A genuine user seek to a new timestamp (neither the programmatic target nor the
+          // pre-command residual position) must never be swallowed as a playstate echo.
           if (
-            cmd.expectSeek &&
-            typeof event.positionMs === "number" &&
-            Math.abs(event.positionMs - cmd.targetPosMs) <= 2200
+            event.isSeek &&
+            hasPos &&
+            !posMatchesTarget &&
+            (cmd.seekEchoSeen ||
+              (!cmd.expectSeek && (cmd.playEchoSeen || elapsed >= 180)) ||
+              (!cmd.isInitial &&
+                !this._matchesCommandPrePos(cmd, event.positionMs, now) &&
+                (cmd.prePosMs !== null || elapsed >= 220)))
           ) {
+            this.expectedCommand = null;
+            this._clearSyncTimers();
+            return false;
+          }
+
+          cmd.playEchoSeen = true;
+          if (cmd.expectSeek && hasPos && Math.abs(event.positionMs - expectedCmdPos) <= 2200) {
             cmd.seekEchoSeen = true;
           }
           return true;
@@ -1974,11 +2123,17 @@ export class WatchTogetherPlayer {
         return true;
       }
       if (cmd.expectSeek) {
-        if (Math.abs((Number(event.positionMs) || 0) - cmd.targetPosMs) <= 2200) {
+        const posMs = Number(event.positionMs) || 0;
+        const expectedCmdPos = this._expectedCommandPosMs(cmd, now);
+        const posTolerance = cmd.seekEchoSeen ? 1200 : 2200;
+        if (Math.abs(posMs - expectedCmdPos) <= posTolerance) {
           cmd.seekEchoSeen = true;
           return true;
         }
-        if (cmd.seekEchoSeen || elapsed >= 220) {
+        if (!cmd.seekEchoSeen && this._matchesCommandPrePos(cmd, posMs, now)) {
+          return true;
+        }
+        if (cmd.seekEchoSeen || (!cmd.isInitial && cmd.prePosMs !== null) || elapsed >= 220) {
           this.expectedCommand = null;
           this._clearSyncTimers();
           return false;
@@ -2150,7 +2305,7 @@ export class WatchTogetherPlayer {
     if (!st || !st.active || st.provider !== "spotify") return false;
     if (Boolean(playing) !== Boolean(st.playing)) return false;
     const expectedMs = projectMediaPositionMs(st, this._wallNow());
-    if (Math.abs(posMs - expectedMs) > 2500) return false;
+    if (Math.abs(posMs - expectedMs) > 1800) return false;
     if (this.playlistId && playingUri && st.trackUri && playingUri !== st.trackUri) {
       return false;
     }
@@ -2221,11 +2376,22 @@ export class WatchTogetherPlayer {
         this._clearSyncTimers();
         this.expectedCommand = null;
         this.suppressUntilMs = 0;
-        if (isYouTubeFamily(this.provider) && this.playlistId && this.ytPlayer) {
-          try {
-            this.ytPlayer.setLoop?.(Boolean(state.loop));
-          } catch {
-            // ignore
+        if (isYouTubeFamily(this.provider) && this.ytPlayer) {
+          if (this.playlistId) {
+            try {
+              this.ytPlayer.setLoop?.(Boolean(state.loop));
+            } catch {
+              // ignore
+            }
+          }
+          if (source === "negotiated") {
+            const projMs = projectMediaPositionMs(state, nowMs);
+            this._recordYouTubeObservation(
+              projMs,
+              this._perfNow(),
+              Boolean(state.playing),
+              Number(state.rateMilli) || 1000
+            );
           }
         }
         this.negotiator.onSharedStateApplied(state, this._perfNow(), {
@@ -2279,13 +2445,14 @@ export class WatchTogetherPlayer {
     this.twitchEpoch = Number(state.epoch) || 0;
     this._lastAppliedEpoch = Number(state.epoch) || 0;
     this._hasEverPlayedLocally = false;
-    this._ytWasBuffering = false;
-    this._ytBufferingFromPosMs = 0;
+    this._resetYouTubePlayheadTracking();
+    this._resetTwitchPlayheadTracking();
     this._scPrevPollPlaying = false;
     this._scPrevPollPosMs = -1;
     this._scLastProgressMoveAt = 0;
     this._spPrevPollPosMs = -1;
     this._spLastPosMoveAt = 0;
+    this._spLastUpdatePerf = 0;
     this.negotiator.reset();
 
     if (!this.mountEl) return;
@@ -2408,8 +2575,14 @@ export class WatchTogetherPlayer {
               }
             }
 
-            if (this.ytPlayer.getPlayerState?.() === 1) {
+            const readyState = this.ytPlayer.getPlayerState?.();
+            if (readyState === 1) {
               this._hasEverPlayedLocally = true;
+            }
+            if (readyState === 1 || readyState === 2) {
+              const readyPosMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
+              const readyRateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
+              this._recordYouTubeObservation(readyPosMs, this._perfNow(), readyState === 1, readyRateMilli);
             }
 
             const dur = Number(this.ytPlayer.getDuration?.() || 0);
@@ -2435,12 +2608,23 @@ export class WatchTogetherPlayer {
           onStateChange: (ev) => {
             if (gen !== this.generation) return;
             const code = ev.data;
+            const nowPerf = this._perfNow();
+            const wallNow = this._wallNow();
             const curMs = Math.max(0, Math.round((this.ytPlayer?.getCurrentTime?.() || 0) * 1000));
             const dur = Number(this.ytPlayer?.getDuration?.() || 0);
             if (dur > 0) this.durationMs = Math.round(dur * 1000);
             const rateMilli = Math.round((this.ytPlayer?.getPlaybackRate?.() || 1) * 1000);
             const vdata = this.ytPlayer?.getVideoData?.() || {};
             const prevPlaying = this.lastKnownPlaying;
+            // Classify jump BEFORE updating lastKnownPosMs / continuous playhead tracking so a
+            // YouTube click-seek (where getCurrentTime() updates BEFORE BUFFERING=3 fires) is
+            // never misrecorded as preBufferPos.
+            const jumpInfo = this._classifyYouTubePositionJump(
+              curMs,
+              nowPerf,
+              code === 1 || (code === 3 && prevPlaying),
+              rateMilli
+            );
             this.lastKnownPosMs = curMs;
 
             let trackChanged = false;
@@ -2489,7 +2673,26 @@ export class WatchTogetherPlayer {
             if (code === 3) {
               if (!this._ytWasBuffering) {
                 this._ytWasBuffering = true;
-                this._ytBufferingFromPosMs = curMs;
+                const isProgrammaticSeekPos = this._isExpectedProgrammaticSeekPos(curMs, nowPerf);
+                if (jumpInfo.jumped && !isProgrammaticSeekPos) {
+                  // YouTube jumped getCurrentTime() to the seek target before firing BUFFERING(3).
+                  // Preserve the pre-seek continuous position so 3 -> 1 never mistakes it for a stall!
+                  this._ytBufferWasSeek = true;
+                  this._ytBufferingFromPosMs = jumpInfo.expectedPosMs;
+                } else {
+                  this._ytBufferWasSeek = false;
+                  this._ytBufferingFromPosMs =
+                    isProgrammaticSeekPos && this.expectedCommand?.expectSeek
+                      ? this._expectedCommandPosMs(this.expectedCommand, nowPerf)
+                      : curMs;
+                }
+              } else if (
+                !this._ytBufferWasSeek &&
+                Math.abs(curMs - this._ytBufferingFromPosMs) >=
+                  WATCH_SYNC_DEFAULTS.YT_REBUFFER_POS_TOLERANCE_MS &&
+                !this._isExpectedProgrammaticSeekPos(curMs, nowPerf)
+              ) {
+                this._ytBufferWasSeek = true;
               }
               if (
                 trackChanged &&
@@ -2501,6 +2704,7 @@ export class WatchTogetherPlayer {
               ) {
                 this.expectedCommand = null;
                 this._clearSyncTimers();
+                this._recordYouTubeObservation(curMs, nowPerf, true, rateMilli);
                 this.onUserAction({
                   playing: true,
                   positionMs: curMs,
@@ -2515,9 +2719,12 @@ export class WatchTogetherPlayer {
 
             const wasBuffering = this._ytWasBuffering;
             const bufferingFromPosMs = this._ytBufferingFromPosMs;
+            const bufferWasSeek = this._ytBufferWasSeek;
             this._ytWasBuffering = false;
+            this._ytBufferWasSeek = false;
 
             if (code === 0) {
+              this._ytObsValid = false;
               if (this.providerNotice?.blocksSync) {
                 this.lastKnownPlaying = false;
                 return;
@@ -2548,12 +2755,20 @@ export class WatchTogetherPlayer {
               this.lastKnownPlaying = true;
               this._hasEverPlayedLocally = true;
               this._clearAutoplayTimer();
+              const isUserSeekFromBuffer =
+                wasBuffering &&
+                (bufferWasSeek ||
+                  Math.abs(curMs - bufferingFromPosMs) >=
+                    WATCH_SYNC_DEFAULTS.YT_REBUFFER_POS_TOLERANCE_MS);
+              const isSeek = Boolean(isUserSeekFromBuffer || jumpInfo.jumped);
+              this._recordYouTubeObservation(curMs, nowPerf, true, rateMilli);
               if (
                 this._shouldSuppressEmbedEvent({
                   kind: "playstate",
                   playing: true,
                   positionMs: curMs,
                   trackChanged,
+                  isSeek,
                 })
               ) {
                 return;
@@ -2561,45 +2776,124 @@ export class WatchTogetherPlayer {
               // If browser blocked autoplay on initial mount / local reload, or player just recovered
               // from a local error, locally align to an already-playing room instead of rewinding peers.
               if ((wasFirstLocalPlay || clearedNotice) && !trackChanged && this.pendingState?.playing) {
-                const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+                const expectedMs = projectMediaPositionMs(this.pendingState, wallNow);
                 if (Math.abs(curMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS) {
                   try {
                     this._setExpectedCommand(
-                      { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                      {
+                        expectSeek: true,
+                        targetPosMs: expectedMs,
+                        targetPlaying: true,
+                        targetRateMilli: Number(this.pendingState.rateMilli) || 1000,
+                        prePosMs: curMs,
+                      },
                       850
                     );
                     this.ytPlayer.seekTo?.(expectedMs / 1000, true);
-                    this.negotiator.onLocalDriftSeek(this._perfNow());
+                    const actualMs = Math.max(
+                      0,
+                      Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000)
+                    );
+                    this._recordYouTubeObservation(actualMs, nowPerf, true, rateMilli);
+                    this.negotiator.onLocalDriftSeek(nowPerf);
                   } catch {
                     // ignore
                   }
                 }
                 return;
               }
-              // Distinguish brief local network rebuffering (3 -> 1 at the same spot while already
-              // playing) from a user resume or scrubber seek so slow WiFi doesn't drag other peers back.
+              // Late-landing convergence of an unconverged remote seek/play (e.g., async iframe
+              // settled onto the room's projected state after the 950ms expectedCommand window).
               if (
-                wasBuffering &&
-                prevPlaying &&
+                !this.negotiator.convergedToRev &&
                 !trackChanged &&
-                this.pendingState?.playing &&
-                Math.abs(curMs - bufferingFromPosMs) < 1500
+                this.pendingState?.playing
               ) {
-                const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+                const expectedMs = projectMediaPositionMs(this.pendingState, wallNow);
                 const rateDiff = Math.abs(rateMilli - (Number(this.pendingState.rateMilli) || 1000));
-                if (rateDiff < 50) {
+                if (
+                  rateDiff < 50 &&
+                  Math.abs(curMs - expectedMs) <= WATCH_SYNC_DEFAULTS.CONVERGENCE_POS_TOLERANCE_MS
+                ) {
                   if (Math.abs(curMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS) {
                     try {
                       this._setExpectedCommand(
-                        { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                        {
+                          expectSeek: true,
+                          targetPosMs: expectedMs,
+                          targetPlaying: true,
+                          targetRateMilli: Number(this.pendingState.rateMilli) || 1000,
+                          prePosMs: curMs,
+                        },
                         850
                       );
                       this.ytPlayer.seekTo?.(expectedMs / 1000, true);
-                      this.negotiator.onLocalDriftSeek(this._perfNow());
+                      const actualMs = Math.max(
+                        0,
+                        Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000)
+                      );
+                      this._recordYouTubeObservation(actualMs, nowPerf, true, rateMilli);
+                      this.negotiator.onLocalDriftSeek(nowPerf);
                     } catch {
                       // ignore
                     }
                   }
+                  return;
+                }
+              }
+              // Distinguish brief local network rebuffering (3 -> 1 at the same spot while already
+              // playing, with no pre-buffer or mid-buffer user jump) from a user resume or scrubber
+              // seek so slow WiFi doesn't drag other peers back.
+              if (
+                wasBuffering &&
+                !isUserSeekFromBuffer &&
+                prevPlaying &&
+                !trackChanged &&
+                this.pendingState?.playing
+              ) {
+                const expectedMs = projectMediaPositionMs(this.pendingState, wallNow);
+                const rateDiff = Math.abs(rateMilli - (Number(this.pendingState.rateMilli) || 1000));
+                // True network stalls pause playback in place so curMs falls behind expectedMs,
+                // never jumping significantly ahead of the live room position.
+                if (rateDiff < 50 && curMs <= expectedMs + 1500) {
+                  if (Math.abs(curMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS) {
+                    try {
+                      this._setExpectedCommand(
+                        {
+                          expectSeek: true,
+                          targetPosMs: expectedMs,
+                          targetPlaying: true,
+                          targetRateMilli: Number(this.pendingState.rateMilli) || 1000,
+                          prePosMs: curMs,
+                        },
+                        850
+                      );
+                      this.ytPlayer.seekTo?.(expectedMs / 1000, true);
+                      const actualMs = Math.max(
+                        0,
+                        Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000)
+                      );
+                      this._recordYouTubeObservation(actualMs, nowPerf, true, rateMilli);
+                      this.negotiator.onLocalDriftSeek(nowPerf);
+                    } catch {
+                      // ignore
+                    }
+                  }
+                  return;
+                }
+              }
+              // Deduplicate pure no-op PLAYING(1) events (e.g. already playing at the exact synced
+              // position/rate/track with no seek or buffering transition).
+              if (
+                !wasBuffering &&
+                !isSeek &&
+                prevPlaying &&
+                !trackChanged &&
+                this.pendingState?.playing
+              ) {
+                const expectedMs = projectMediaPositionMs(this.pendingState, wallNow);
+                const rateDiff = Math.abs(rateMilli - (Number(this.pendingState.rateMilli) || 1000));
+                if (rateDiff < 50 && Math.abs(curMs - expectedMs) <= WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS) {
                   return;
                 }
               }
@@ -2615,9 +2909,18 @@ export class WatchTogetherPlayer {
               });
             } else if (code === 2) {
               this.lastKnownPlaying = false;
+              const isUserSeek = Boolean(
+                (wasBuffering &&
+                  (bufferWasSeek ||
+                    Math.abs(curMs - bufferingFromPosMs) >=
+                      WATCH_SYNC_DEFAULTS.YT_REBUFFER_POS_TOLERANCE_MS)) ||
+                  jumpInfo.jumped
+              );
               if (this.providerNotice?.blocksSync) {
+                this._resetYouTubePlayheadTracking();
                 return;
               }
+              this._recordYouTubeObservation(curMs, nowPerf, false, rateMilli);
               // Autoplay-blocked guard: a newly mounted/reloaded iframe that has never started
               // playing locally must never emit Pause to pause an already-playing room.
               if (this.pendingState?.playing && !this._hasEverPlayedLocally) {
@@ -2629,9 +2932,21 @@ export class WatchTogetherPlayer {
                   playing: false,
                   positionMs: curMs,
                   trackChanged,
+                  isSeek: isUserSeek,
                 })
               ) {
                 return;
+              }
+              if (
+                !this.negotiator.convergedToRev &&
+                !trackChanged &&
+                this.pendingState &&
+                !this.pendingState.playing
+              ) {
+                const expectedMs = projectMediaPositionMs(this.pendingState, wallNow);
+                if (Math.abs(curMs - expectedMs) <= WATCH_SYNC_DEFAULTS.CONVERGENCE_POS_TOLERANCE_MS) {
+                  return;
+                }
               }
               this.expectedCommand = null;
               this._clearSyncTimers();
@@ -2643,26 +2958,29 @@ export class WatchTogetherPlayer {
                 trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
                 trackTitle: vdata.title || undefined,
               });
-            } else if (trackChanged && code === 5) {
-              if (
-                this._shouldSuppressEmbedEvent({
-                  kind: "track",
+            } else if (code === 5) {
+              this._ytObsValid = false;
+              if (trackChanged) {
+                if (
+                  this._shouldSuppressEmbedEvent({
+                    kind: "track",
+                    playlistIndex: this.lastKnownPlaylistIndex,
+                    trackUri: this.lastKnownTrackUri,
+                  })
+                ) {
+                  return;
+                }
+                this.expectedCommand = null;
+                this._clearSyncTimers();
+                this.onUserAction({
+                  playing: this.lastKnownPlaying,
+                  positionMs: curMs,
+                  rateMilli,
                   playlistIndex: this.lastKnownPlaylistIndex,
                   trackUri: this.lastKnownTrackUri,
-                })
-              ) {
-                return;
+                  trackTitle: vdata.title || undefined,
+                });
               }
-              this.expectedCommand = null;
-              this._clearSyncTimers();
-              this.onUserAction({
-                playing: this.lastKnownPlaying,
-                positionMs: curMs,
-                rateMilli,
-                playlistIndex: this.lastKnownPlaylistIndex,
-                trackUri: this.lastKnownTrackUri,
-                trackTitle: vdata.title || undefined,
-              });
             }
           },
           onPlaybackRateChange: (ev) => {
@@ -2670,6 +2988,7 @@ export class WatchTogetherPlayer {
             if (this.providerNotice?.blocksSync) return;
             const curMs = Math.max(0, Math.round((this.ytPlayer?.getCurrentTime?.() || 0) * 1000));
             const rateMilli = Math.round((Number(ev.data) || 1) * 1000);
+            this._recordYouTubeObservation(curMs, this._perfNow(), this.lastKnownPlaying, rateMilli);
             if (this._shouldSuppressEmbedEvent({ kind: "rate", rateMilli })) return;
             this.onUserAction({
               playing: this.lastKnownPlaying,
@@ -2686,6 +3005,7 @@ export class WatchTogetherPlayer {
             this._ytErrorCode = Number.isFinite(code) ? code : 0;
             this.providerNotice = notice;
             this.lastKnownPlaying = false;
+            this._resetYouTubePlayheadTracking();
             this._clearSyncTimers();
             this.expectedCommand = null;
             this.onTelemetry({
@@ -2905,9 +3225,11 @@ export class WatchTogetherPlayer {
               spotifySession: updateSpotifySession(this.durationMs),
             });
 
+            const nowPerf = this._perfNow();
             if (!this.ready || this._isSuppressed()) {
               this.spotifyLastIsPaused = Boolean(d.isPaused);
               this.spotifyLastPosMs = posMs;
+              this._spLastUpdatePerf = nowPerf;
               // Clear initial-settle gate once the embed reaches the expected play/pause state
               // (preserving it when autoplay-blocked paused on a playing room so post-suppress
               // hydration updates are still absorbed without pausing the room).
@@ -2932,6 +3254,7 @@ export class WatchTogetherPlayer {
               ) {
                 this.spotifyLastIsPaused = Boolean(d.isPaused);
                 this.spotifyLastPosMs = posMs;
+                this._spLastUpdatePerf = nowPerf;
                 if (!d.isBuffering) {
                   this.spotifyAwaitingInitialSettle = false;
                 }
@@ -2940,9 +3263,19 @@ export class WatchTogetherPlayer {
               this.spotifyAwaitingInitialSettle = false;
             }
             const stateChanged = Boolean(d.isPaused) !== this.spotifyLastIsPaused;
-            const jumped = Math.abs(posMs - this.spotifyLastPosMs) > 2200;
+            const dtMs = this._spLastUpdatePerf > 0 ? Math.max(0, nowPerf - this._spLastUpdatePerf) : 0;
+            const projectedLastMs = !this.spotifyLastIsPaused
+              ? this.spotifyLastPosMs + Math.min(dtMs, WATCH_SYNC_DEFAULTS.TAB_WAKE_POLL_GAP_MS)
+              : this.spotifyLastPosMs;
+            const rawDeltaMs = posMs - this.spotifyLastPosMs;
+            const stepErrorMs = posMs - projectedLastMs;
+            const jumped =
+              Math.abs(rawDeltaMs) > 2200 ||
+              rawDeltaMs <= -1500 ||
+              (dtMs <= WATCH_SYNC_DEFAULTS.TAB_WAKE_POLL_GAP_MS && stepErrorMs >= 1800);
             this.spotifyLastIsPaused = Boolean(d.isPaused);
             this.spotifyLastPosMs = posMs;
+            this._spLastUpdatePerf = nowPerf;
 
             if (durMs > 0 && d.isPaused && posMs >= durMs - 400 && !this.playlistId) {
               this.onUserAction({ playing: false, positionMs: posMs, ended: true });
@@ -3654,9 +3987,14 @@ export class WatchTogetherPlayer {
           const curVid = readVid();
           if (curVid) this.lastKnownTrackUri = curVid;
         }
+        const readyPosMs = readPosMs();
+        if (this.twitchKind === "video" || this.twitchKind === "collection") {
+          const isPlayingReady = typeof player.isPaused === "function" ? !player.isPaused() : false;
+          this._recordTwitchObservation(readyPosMs, this._perfNow(), isPlayingReady);
+        }
         this.onTelemetry({
           durationMs: this.durationMs,
-          positionMs: readPosMs(),
+          positionMs: readyPosMs,
           ready: true,
           trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
           providerNotice: this.providerNotice,
@@ -3671,6 +4009,7 @@ export class WatchTogetherPlayer {
 
       const handlePlayEvent = () => {
         if (gen !== this.generation) return;
+        const nowPerf = this._perfNow();
         const posMs = readPosMs();
         const durMs = readDurMs();
         if (durMs > 0) this.durationMs = durMs;
@@ -3687,6 +4026,9 @@ export class WatchTogetherPlayer {
         const wasPlaying = this.lastKnownPlaying;
         this.lastKnownPlaying = true;
         this._hasEverPlayedLocally = true;
+        if (this.twitchKind === "video" || this.twitchKind === "collection") {
+          this._recordTwitchObservation(posMs, nowPerf, true);
+        }
         this.onTelemetry({
           durationMs: this.durationMs,
           positionMs: posMs,
@@ -3709,11 +4051,12 @@ export class WatchTogetherPlayer {
             if (Math.abs(posMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_TWITCH_MS) {
               try {
                 this._setExpectedCommand(
-                  { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                  { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true, prePosMs: posMs },
                   850
                 );
                 this.twitchPlayer?.seek?.(expectedMs / 1000);
-                this.negotiator.onLocalDriftSeek(this._perfNow());
+                this._recordTwitchObservation(readPosMs(), nowPerf, true);
+                this.negotiator.onLocalDriftSeek(nowPerf);
               } catch {
                 // ignore
               }
@@ -3742,6 +4085,9 @@ export class WatchTogetherPlayer {
         this.lastKnownPosMs = posMs;
         const wasPlaying = this.lastKnownPlaying;
         this.lastKnownPlaying = false;
+        if (this.twitchKind === "video" || this.twitchKind === "collection") {
+          this._recordTwitchObservation(posMs, this._perfNow(), false);
+        }
         if (this.providerNotice?.blocksSync) {
           return;
         }
@@ -3775,7 +4121,11 @@ export class WatchTogetherPlayer {
         const sec =
           typeof ev?.position === "number" ? ev.position : Number(player.getCurrentTime?.() || 0);
         const posMs = Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : 0;
+        const isPlayingNow =
+          typeof player.isPaused === "function" ? !player.isPaused() : this.lastKnownPlaying;
         this.lastKnownPosMs = posMs;
+        this.lastKnownPlaying = isPlayingNow;
+        this._recordTwitchObservation(posMs, this._perfNow(), isPlayingNow);
         this.onTelemetry({
           durationMs: this.durationMs,
           positionMs: posMs,
@@ -3786,7 +4136,7 @@ export class WatchTogetherPlayer {
           this.expectedCommand = null;
           this._clearSyncTimers();
           this.onUserAction({
-            playing: this.lastKnownPlaying,
+            playing: isPlayingNow,
             positionMs: posMs,
             trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
           });
@@ -3928,6 +4278,7 @@ export class WatchTogetherPlayer {
               : this.lastKnownPlaylistIndex;
           if (curIdx !== desiredIdx && desiredIdx >= 0) {
             this._clearSyncTimers();
+            this._resetYouTubePlayheadTracking();
             const syncSeq = ++this._syncSeq;
             const checkGen = this.generation;
             this._lastAppliedEpoch = Number(state.epoch) || 0;
@@ -3938,6 +4289,7 @@ export class WatchTogetherPlayer {
                 targetPlaying: Boolean(state.playing),
                 expectSeek: targetSec > 1.5,
                 targetPosMs: targetMs,
+                prePosMs: this.lastKnownPosMs,
                 targetPlaylistIndex: desiredIdx,
                 targetTrackUri: state.trackUri || "",
                 isInitial,
@@ -4022,6 +4374,7 @@ export class WatchTogetherPlayer {
 
         const curRate = Number(this.ytPlayer.getPlaybackRate?.() || 1);
         const curSec = Number(this.ytPlayer.getCurrentTime?.() || 0);
+        const curMs = Math.max(0, Math.round(curSec * 1000));
         const ytState = this.ytPlayer.getPlayerState?.();
         const driftThreshold = isInitial ? 0.5 : 0.9;
         const needRateChange = Math.abs(curRate - rate) > 0.02;
@@ -4033,11 +4386,15 @@ export class WatchTogetherPlayer {
           (state.playing
             ? !isPlayingOrBuffering || isEpochReplay
             : isPlayingOrBuffering || (needSeek && (ytState === -1 || ytState === 5)));
+        const nowPerf = this._perfNow();
 
         this._lastAppliedEpoch = Number(state.epoch) || 0;
         if (!needRateChange && !needSeek && !needPlayChange) {
+          if (ytState === 1 || ytState === 2) {
+            this._recordYouTubeObservation(curMs, nowPerf, ytState === 1, Math.round(curRate * 1000));
+          }
           if (source !== "resync-local") {
-            this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+            this.negotiator.onSharedStateApplied(state, nowPerf, {
               source,
               didMutate: false,
               isInitial,
@@ -4056,6 +4413,7 @@ export class WatchTogetherPlayer {
             targetPlaying: Boolean(state.playing),
             expectSeek: needSeek,
             targetPosMs: targetMs,
+            prePosMs: curMs,
             expectRate: needRateChange,
             targetRateMilli: Number(state.rateMilli) || 1000,
             isInitial,
@@ -4063,7 +4421,7 @@ export class WatchTogetherPlayer {
           isInitial ? 1400 : 950
         );
         if (source !== "resync-local") {
-          this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+          this.negotiator.onSharedStateApplied(state, nowPerf, {
             source,
             didMutate: true,
             isInitial,
@@ -4072,11 +4430,23 @@ export class WatchTogetherPlayer {
           });
         }
 
+        const effectiveRateMilli = needRateChange
+          ? Number(state.rateMilli) || 1000
+          : Math.round(curRate * 1000);
+        const expectedPlayingAfter =
+          isInitial && state.playing && !this._hasEverPlayedLocally ? ytState === 1 : Boolean(state.playing);
         if (needRateChange) {
           this.ytPlayer.setPlaybackRate?.(rate);
         }
         if (needSeek) {
           this.ytPlayer.seekTo?.(targetSec, true);
+          // Observe the actual post-seekTo position (sync mocks reflect targetSec immediately;
+          // async iframes stay on their real playhead until the seek lands, preventing false
+          // local-seek reverts if a remote seek is slow or ignored past expectedCommand).
+          const actualMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
+          this._recordYouTubeObservation(actualMs, nowPerf, expectedPlayingAfter, effectiveRateMilli);
+        } else if (ytState === 1 || ytState === 2 || needPlayChange) {
+          this._recordYouTubeObservation(curMs, nowPerf, expectedPlayingAfter, effectiveRateMilli);
         }
         if (state.playing && needPlayChange) {
           this.ytPlayer.playVideo?.();
@@ -4337,6 +4707,7 @@ export class WatchTogetherPlayer {
             targetPlaying: Boolean(state.playing),
             expectSeek: needSeek,
             targetPosMs: targetMs,
+            prePosMs: isInitial ? 0 : this.lastKnownPosMs,
             isInitial,
           },
           isInitial ? 1500 : 1100
@@ -4467,12 +4838,14 @@ export class WatchTogetherPlayer {
 
         this._clearSyncTimers();
         this._syncSeq += 1;
+        const curMs = Math.max(0, Math.round(curSec * 1000));
         this._setExpectedCommand(
           {
             expectPlayState: needPlayChange || isInitial,
             targetPlaying: Boolean(state.playing),
             expectSeek: needSeek,
             targetPosMs: targetMs,
+            prePosMs: curMs,
             isInitial,
           },
           isInitial ? 1400 : 950
@@ -4489,6 +4862,11 @@ export class WatchTogetherPlayer {
 
         if (needSeek) {
           this.twitchPlayer.seek?.(targetSec);
+          if (isSeekable) {
+            const actualSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
+            const actualMs = Number.isFinite(actualSec) && actualSec > 0 ? Math.round(actualSec * 1000) : 0;
+            this._recordTwitchObservation(actualMs, this._perfNow(), Boolean(state.playing));
+          }
         }
         if (needPlayChange) {
           if (state.playing) {
@@ -4535,19 +4913,36 @@ export class WatchTogetherPlayer {
     if (isYouTubeFamily(this.provider) && this.ytPlayer) {
       try {
         if (this.ytPlayer.getPlayerState?.() !== 1) return;
-        const curMs = Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000);
+        const nowPerf = this._perfNow();
+        const curMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
+        const rateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
+        // Never yank back a sudden local user seek (buffered seek or pre-BUFFERING jump)
+        // before onStateChange or the 3 Hz poll loop can broadcast it.
+        const jumpInfo = this._classifyYouTubePositionJump(curMs, nowPerf, true, rateMilli);
+        if (jumpInfo.jumped) {
+          return;
+        }
         this.lastKnownPosMs = curMs;
+        this._recordYouTubeObservation(curMs, nowPerf, true, rateMilli);
         const drift = Math.abs(curMs - targetMs);
         if (
           drift > WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS &&
           drift < WATCH_SYNC_DEFAULTS.DRASTIC_DRIFT_PLAYING_MS
         ) {
           this._setExpectedCommand(
-            { expectSeek: true, targetPosMs: targetMs, targetPlaying: true },
+            {
+              expectSeek: true,
+              targetPosMs: targetMs,
+              targetPlaying: true,
+              targetRateMilli: Number(state.rateMilli) || 1000,
+              prePosMs: curMs,
+            },
             850
           );
           this.ytPlayer.seekTo?.(targetMs / 1000, true);
-          this.negotiator.onLocalDriftSeek(this._perfNow());
+          const actualMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
+          this._recordYouTubeObservation(actualMs, nowPerf, true, rateMilli);
+          this.negotiator.onLocalDriftSeek(nowPerf);
         }
       } catch {
         // ignore
@@ -4579,7 +4974,12 @@ export class WatchTogetherPlayer {
           drift < WATCH_SYNC_DEFAULTS.DRASTIC_DRIFT_PLAYING_MS
         ) {
           this._setExpectedCommand(
-            { expectSeek: true, targetPosMs: liveTargetMs, targetPlaying: true },
+            {
+              expectSeek: true,
+              targetPosMs: liveTargetMs,
+              targetPlaying: true,
+              prePosMs: posMs,
+            },
             900
           );
           try {
@@ -4626,22 +5026,35 @@ export class WatchTogetherPlayer {
     ) {
       try {
         if (this.twitchPlayer.isPaused?.()) return;
+        const nowPerf = this._perfNow();
         const curMs = Math.max(
           0,
           Math.round((Number(this.twitchPlayer.getCurrentTime?.()) || 0) * 1000)
         );
+        if (this._isTwitchPositionJump(curMs, nowPerf, true)) {
+          return;
+        }
         this.lastKnownPosMs = curMs;
+        this._recordTwitchObservation(curMs, nowPerf, true);
         const drift = Math.abs(curMs - targetMs);
         if (
           drift > WATCH_SYNC_DEFAULTS.MILD_DRIFT_TWITCH_MS &&
           drift < WATCH_SYNC_DEFAULTS.DRASTIC_DRIFT_PLAYING_MS
         ) {
           this._setExpectedCommand(
-            { expectSeek: true, targetPosMs: targetMs, targetPlaying: true },
+            {
+              expectSeek: true,
+              targetPosMs: targetMs,
+              targetPlaying: true,
+              prePosMs: curMs,
+            },
             850
           );
           this.twitchPlayer.seek?.(targetMs / 1000);
-          this.negotiator.onLocalDriftSeek(this._perfNow());
+          const actualSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
+          const actualMs = Number.isFinite(actualSec) && actualSec > 0 ? Math.round(actualSec * 1000) : 0;
+          this._recordTwitchObservation(actualMs, nowPerf, true);
+          this.negotiator.onLocalDriftSeek(nowPerf);
         }
       } catch {
         // ignore
@@ -4683,12 +5096,18 @@ export class WatchTogetherPlayer {
 
     if (isYouTubeFamily(this.provider) && this.ytPlayer) {
       try {
+        const nowPerf = this._perfNow();
+        const wallNow = this._wallNow();
         const ytState = this.ytPlayer.getPlayerState?.();
         const curMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
         const dur = Number(this.ytPlayer.getDuration?.() || 0);
         if (dur > 0) this.durationMs = Math.round(dur * 1000);
         const rateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
-        this.lastKnownPosMs = curMs;
+        const prevObsValid = this._ytObsValid;
+        const prevObsPlaying = this._ytObsPlaying;
+        const prevPlaylistIdx = this.lastKnownPlaylistIndex;
+        const prevTrackUri = this.lastKnownTrackUri;
+
         let clearedNotice = false;
         if (ytState === 1) {
           this.lastKnownPlaying = true;
@@ -4704,14 +5123,95 @@ export class WatchTogetherPlayer {
         }
 
         let vdata = null;
+        let trackChanged = false;
         if (this.playlistId) {
           this._refreshYouTubePlaylistInfo();
           const curIdx = this.ytPlayer.getPlaylistIndex?.();
           vdata = this.ytPlayer.getVideoData?.() || {};
           if (typeof curIdx === "number" && curIdx >= 0) {
+            if (curIdx !== prevPlaylistIdx) trackChanged = true;
             this.lastKnownPlaylistIndex = curIdx;
           }
-          if (vdata.video_id) this.lastKnownTrackUri = vdata.video_id;
+          if (vdata.video_id) {
+            if (prevTrackUri && vdata.video_id !== prevTrackUri) trackChanged = true;
+            this.lastKnownTrackUri = vdata.video_id;
+          }
+        }
+
+        const isPlayingOrPaused = ytState === 1 || ytState === 2;
+        const playStateUnchanged =
+          prevObsValid && ((ytState === 1 && prevObsPlaying) || (ytState === 2 && !prevObsPlaying));
+        const jumpInfo =
+          isPlayingOrPaused && prevObsValid
+            ? this._classifyYouTubePositionJump(curMs, nowPerf, ytState === 1, rateMilli)
+            : { jumped: false, expectedPosMs: curMs, rawDeltaMs: 0, stepErrorMs: 0, dtMs: 0 };
+
+        this.lastKnownPosMs = curMs;
+
+        // Detect buffered-region seeks (playing 1 -> 1) and paused seeks (paused 2 -> 2) where
+        // YouTube fires NO onStateChange event at all!
+        const canEmitSilentSeek = Boolean(
+          isPlayingOrPaused &&
+            playStateUnchanged &&
+            jumpInfo.jumped &&
+            !trackChanged &&
+            !clearedNotice &&
+            !this.providerNotice?.blocksSync &&
+            this.pendingState?.active &&
+            (ytState === 1 || this._hasEverPlayedLocally || !this.pendingState.playing) &&
+            jumpInfo.dtMs <= WATCH_SYNC_DEFAULTS.TAB_WAKE_POLL_GAP_MS
+        );
+
+        let emittedLocalSeek = false;
+        if (canEmitSilentSeek) {
+          const suppressed = this._shouldSuppressEmbedEvent({
+            kind: "seek",
+            positionMs: curMs,
+          });
+          const expectedRoomMs = projectMediaPositionMs(this.pendingState, wallNow);
+          const roomMatchTol = this.negotiator.convergedToRev
+            ? 900
+            : WATCH_SYNC_DEFAULTS.CONVERGENCE_POS_TOLERANCE_MS;
+          const alreadyMatchesRoom = Math.abs(curMs - expectedRoomMs) <= roomMatchTol;
+          // While unconverged on a remote apply, a playhead still sitting near preApplySnapshot
+          // is an unconverged/slow remote seek — let WatchSyncNegotiator run resync-local instead
+          // of reverting the room via onUserAction.
+          const preSnap = !this.negotiator.convergedToRev ? this.negotiator.preApplySnapshot : null;
+          const matchesUnconvergedPre = Boolean(
+            preSnap &&
+              typeof preSnap.positionMs === "number" &&
+              Math.abs(curMs - preSnap.positionMs) <= WATCH_SYNC_DEFAULTS.CONVERGENCE_POS_TOLERANCE_MS
+          );
+          if (!suppressed && !alreadyMatchesRoom && !matchesUnconvergedPre) {
+            this.expectedCommand = null;
+            this._clearSyncTimers();
+            this._recordYouTubeObservation(curMs, nowPerf, ytState === 1, rateMilli);
+            this.onUserAction({
+              playing: ytState === 1,
+              positionMs: curMs,
+              rateMilli,
+              playlistIndex: this.playlistId ? this.lastKnownPlaylistIndex : undefined,
+              trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
+              trackTitle: vdata?.title || undefined,
+            });
+            emittedLocalSeek = true;
+          }
+        }
+
+        if (!emittedLocalSeek) {
+          if (ytState === 1 || ytState === 2) {
+            const cmd =
+              this.expectedCommand && nowPerf < this.expectedCommand.expiresAt
+                ? this.expectedCommand
+                : null;
+            const expectedCmdPos = cmd ? this._expectedCommandPosMs(cmd, nowPerf) : 0;
+            if (cmd && cmd.expectSeek && Math.abs(curMs - expectedCmdPos) <= 1500) {
+              cmd.seekEchoSeen = true;
+            }
+            this._recordYouTubeObservation(curMs, nowPerf, ytState === 1, rateMilli);
+          } else if (ytState === -1 || ytState === 0 || ytState === 5) {
+            this._ytObsValid = false;
+          }
         }
 
         this.onTelemetry({
@@ -4746,8 +5246,8 @@ export class WatchTogetherPlayer {
           playlistIndex: this.playlistId ? this.lastKnownPlaylistIndex : undefined,
           trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
           trackTitle: vdata?.title || undefined,
-          observedAt: this._perfNow(),
-          wallNowMs: this._wallNow(),
+          observedAt: nowPerf,
+          wallNowMs: wallNow,
         });
       } catch {
         // ignore
@@ -4943,6 +5443,8 @@ export class WatchTogetherPlayer {
         if (playing) this._hasEverPlayedLocally = true;
         this.lastKnownPlaying = playing;
 
+        const nowPerf = this._perfNow();
+        const wallNow = this._wallNow();
         let curMs = 0;
         if (!isLive) {
           const curSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
@@ -4951,10 +5453,67 @@ export class WatchTogetherPlayer {
           if (Number.isFinite(durSec) && durSec > 0) {
             this.durationMs = Math.round(durSec * 1000);
           }
+          const prevTwObsValid = this._twObsValid;
+          const prevTwObsPlaying = this._twObsPlaying;
+          const prevTwVid = this.lastKnownTrackUri;
+          let twVidChanged = false;
+          if (this.twitchKind === "collection") {
+            const curVid = normalizeTwitchVideoId(this.twitchPlayer.getVideo?.() || "");
+            if (curVid) {
+              if (prevTwVid && curVid !== prevTwVid) twVidChanged = true;
+              this.lastKnownTrackUri = curVid;
+            }
+          }
+          const twJump =
+            prevTwObsValid &&
+            playing === prevTwObsPlaying &&
+            !twVidChanged &&
+            this._isTwitchPositionJump(curMs, nowPerf, playing);
           this.lastKnownPosMs = curMs;
-        }
-
-        if (this.twitchKind === "collection") {
+          const dtMs = prevTwObsValid ? Math.max(0, nowPerf - this._twObsPerf) : 0;
+          let emittedTwSeek = false;
+          if (
+            twJump &&
+            !this.providerNotice?.blocksSync &&
+            this.pendingState?.active &&
+            (playing || this._hasEverPlayedLocally || !this.pendingState.playing) &&
+            dtMs <= WATCH_SYNC_DEFAULTS.TAB_WAKE_POLL_GAP_MS
+          ) {
+            const suppressed = this._shouldSuppressEmbedEvent({ kind: "seek", positionMs: curMs });
+            const expectedRoomMs = projectMediaPositionMs(this.pendingState, wallNow);
+            const roomMatchTol = this.negotiator.convergedToRev
+              ? 900
+              : WATCH_SYNC_DEFAULTS.CONVERGENCE_POS_TOLERANCE_MS;
+            const preSnap = !this.negotiator.convergedToRev ? this.negotiator.preApplySnapshot : null;
+            const matchesUnconvergedPre = Boolean(
+              preSnap &&
+                typeof preSnap.positionMs === "number" &&
+                Math.abs(curMs - preSnap.positionMs) <= WATCH_SYNC_DEFAULTS.CONVERGENCE_POS_TOLERANCE_MS
+            );
+            if (!suppressed && Math.abs(curMs - expectedRoomMs) > roomMatchTol && !matchesUnconvergedPre) {
+              this.expectedCommand = null;
+              this._clearSyncTimers();
+              this._recordTwitchObservation(curMs, nowPerf, playing);
+              this.onUserAction({
+                playing,
+                positionMs: curMs,
+                trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+              });
+              emittedTwSeek = true;
+            }
+          }
+          if (!emittedTwSeek) {
+            const cmd =
+              this.expectedCommand && nowPerf < this.expectedCommand.expiresAt
+                ? this.expectedCommand
+                : null;
+            const expectedCmdPos = cmd ? this._expectedCommandPosMs(cmd, nowPerf) : 0;
+            if (cmd && cmd.expectSeek && Math.abs(curMs - expectedCmdPos) <= 1500) {
+              cmd.seekEchoSeen = true;
+            }
+            this._recordTwitchObservation(curMs, nowPerf, playing);
+          }
+        } else if (this.twitchKind === "collection") {
           const curVid = normalizeTwitchVideoId(this.twitchPlayer.getVideo?.() || "");
           if (curVid) this.lastKnownTrackUri = curVid;
         }
@@ -4986,8 +5545,8 @@ export class WatchTogetherPlayer {
           playlistCount: 0,
           playlistIndex: undefined,
           trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
-          observedAt: this._perfNow(),
-          wallNowMs: this._wallNow(),
+          observedAt: nowPerf,
+          wallNowMs: wallNow,
         });
       } catch {
         // ignore
@@ -5085,6 +5644,8 @@ export class WatchTogetherPlayer {
     this._scPollInFlight = false;
     this.expectedCommand = null;
     this.suppressUntilMs = 0;
+    this._resetYouTubePlayheadTracking();
+    this._resetTwitchPlayheadTracking();
     if (this.ytPlayer) {
       try {
         this.ytPlayer.destroy?.();
@@ -5157,13 +5718,14 @@ export class WatchTogetherPlayer {
     this.twitchEpoch = 0;
     this._lastAppliedEpoch = 0;
     this._hasEverPlayedLocally = false;
-    this._ytWasBuffering = false;
-    this._ytBufferingFromPosMs = 0;
+    this._resetYouTubePlayheadTracking();
+    this._resetTwitchPlayheadTracking();
     this._scPrevPollPlaying = false;
     this._scPrevPollPosMs = -1;
     this._scLastProgressMoveAt = 0;
     this._spPrevPollPosMs = -1;
     this._spLastPosMoveAt = 0;
+    this._spLastUpdatePerf = 0;
     if (this.mountEl) {
       this.mountEl.innerHTML = "";
     }

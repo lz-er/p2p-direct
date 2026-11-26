@@ -2024,3 +2024,889 @@ test("Autoplay-blocked mid-track reloadSpotifySession() with 3 Hz polling emits 
   assert.equal(negotiated.length, 1, "After converging post-reload, genuine diverged pause must negotiate");
   assert.equal(negotiated[0].playing, false);
 });
+
+/* ==================== YouTube Seek Jump-Back & Cross-Provider Seek Regressions ==================== */
+
+test("YouTube click-seek while playing where getCurrentTime() jumps BEFORE BUFFERING(3) -> PLAYING(1) never jumps back", async (t) => {
+  const mocks = setupMockDomAndApis();
+  let perf = 1000;
+  let wall = 1_700_000_000_000;
+  const published = [];
+  const negotiated = [];
+
+  const mountEl = createMockElement("div");
+  let currentState = {
+    targetId: "watch",
+    kind: "watch",
+    rev: 1,
+    actor: "alice",
+    active: true,
+    playing: true,
+    positionMs: 25000,
+    rateMilli: 1000,
+    epoch: 1,
+    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    provider: "youtube",
+    mediaId: "dQw4w9WgXcQ",
+    anchorMs: wall,
+  };
+
+  const player = new WatchTogetherPlayer(mountEl, {
+    localPeerId: "alice",
+    peerStaggerMs: 0,
+    perfNow: () => perf,
+    wallNow: () => wall,
+    onUserAction: (ev) => {
+      published.push({ ...ev, t: perf });
+      currentState = {
+        ...currentState,
+        rev: currentState.rev + 1,
+        playing: ev.playing,
+        positionMs: ev.positionMs,
+        rateMilli: ev.rateMilli || currentState.rateMilli,
+        anchorMs: wall,
+      };
+      player.applyState(currentState, wall, { source: "local-embed" });
+    },
+    onNegotiateState: (ev) => {
+      negotiated.push({ ...ev, t: perf });
+      currentState = {
+        ...currentState,
+        rev: currentState.rev + 1,
+        playing: ev.playing,
+        positionMs: ev.positionMs,
+        anchorMs: wall,
+      };
+      player.applyState(currentState, wall, { source: "negotiated" });
+    },
+  });
+  t.after(() => player.destroy());
+
+  await player.applyState(currentState, wall, { source: "remote" });
+  const yt = mocks.ytPlayers[0];
+  yt.currentTimeSec = 25;
+  yt.state = 1;
+  yt.triggerReady();
+  yt.triggerState(1);
+
+  // Play normally for 2 seconds with 3 Hz polling
+  for (let i = 0; i < 6; i++) {
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+  assert.equal(published.length, 0);
+
+  // Test all 5 click-seek cases where YouTube updates getCurrentTime() BEFORE firing BUFFERING(3) -> PLAYING(1):
+  // forward +5s, forward +60s, backward -5s, backward -60s, and jump to 0:00
+  const cases = [
+    { label: "forward +5s", targetSec: yt.currentTimeSec + 5 },
+    { label: "forward +60s", targetSec: yt.currentTimeSec + 65 },
+    { label: "backward -5s", targetSec: yt.currentTimeSec + 60 },
+    { label: "backward -60s", targetSec: yt.currentTimeSec },
+    { label: "seek to 0:00", targetSec: 0 },
+  ];
+
+  for (const c of cases) {
+    const prevPubCount = published.length;
+    yt.calls.length = 0;
+
+    // 150ms of normal playback before user clicks progress bar
+    perf += 150;
+    wall += 150;
+    // Real YouTube behavior: getCurrentTime() ALREADY equals new target when BUFFERING(3) fires!
+    yt.currentTimeSec = c.targetSec;
+    yt.triggerState(3);
+
+    // Intermediate 3 Hz poll & correctDrift while buffering must NOT disrupt or revert
+    perf += 150;
+    wall += 150;
+    player._pollPlayerStateOnce();
+    player.correctDrift(currentState, wall);
+
+    // A few frames later, PLAYING(1) fires near the new target
+    perf += 120;
+    wall += 120;
+    yt.currentTimeSec = c.targetSec + 0.05;
+    yt.triggerState(1);
+
+    assert.equal(
+      yt.calls.filter(([fn]) => fn === "seekTo").length,
+      0,
+      `${c.label}: YouTube click-seek must NEVER call seekTo() to yank player back`
+    );
+    assert.equal(published.length, prevPubCount + 1, `${c.label}: click-seek must publish immediately`);
+    assert.equal(published.at(-1).playing, true);
+    assert.ok(
+      Math.abs(published.at(-1).positionMs - Math.round((c.targetSec + 0.05) * 1000)) <= 50,
+      `${c.label}: published position must match seek target`
+    );
+
+    // Follow-up playback + correctDrift + 3 Hz polls must stay at the new position with zero jump-back
+    for (let i = 0; i < 4; i++) {
+      perf += 333;
+      wall += 333;
+      yt.currentTimeSec += 0.333;
+      player._pollPlayerStateOnce();
+      player.correctDrift(currentState, wall);
+    }
+    assert.equal(
+      yt.calls.filter(([fn]) => fn === "seekTo").length,
+      0,
+      `${c.label}: follow-up drift checks must not yank player back`
+    );
+  }
+  assert.equal(negotiated.length, 0, "All click-seeks should broadcast via onUserAction without fallback negotiation");
+});
+
+test("YouTube buffered-region seeks (no onStateChange) & small ±2s/±5s seeks while playing/paused never get yanked back by correctDrift", async (t) => {
+  const mocks = setupMockDomAndApis();
+  let perf = 1000;
+  let wall = 1_700_000_000_000;
+  const published = [];
+
+  const mountEl = createMockElement("div");
+  let currentState = {
+    targetId: "watch",
+    kind: "watch",
+    rev: 1,
+    actor: "alice",
+    active: true,
+    playing: true,
+    positionMs: 40000,
+    rateMilli: 1000,
+    epoch: 1,
+    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    provider: "youtube",
+    mediaId: "dQw4w9WgXcQ",
+    anchorMs: wall,
+  };
+
+  const player = new WatchTogetherPlayer(mountEl, {
+    localPeerId: "alice",
+    peerStaggerMs: 0,
+    perfNow: () => perf,
+    wallNow: () => wall,
+    onUserAction: (ev) => {
+      published.push({ ...ev, t: perf });
+      currentState = {
+        ...currentState,
+        rev: currentState.rev + 1,
+        playing: ev.playing,
+        positionMs: ev.positionMs,
+        anchorMs: wall,
+      };
+      player.applyState(currentState, wall, { source: "local-embed" });
+    },
+  });
+  t.after(() => player.destroy());
+
+  await player.applyState(currentState, wall, { source: "remote" });
+  const yt = mocks.ytPlayers[0];
+  yt.currentTimeSec = 40;
+  yt.state = 1;
+  yt.triggerReady();
+  yt.triggerState(1);
+
+  for (let i = 0; i < 6; i++) {
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+
+  // 1. Buffered seeks while playing (NO onStateChange at all!) with correctDrift() racing BEFORE the 3 Hz poll!
+  for (const deltaSec of [2.0, -2.0, 5.0, -5.0, 45.0]) {
+    const beforePub = published.length;
+    yt.calls.length = 0;
+    perf += 120;
+    wall += 120;
+    const expectedTargetSec = yt.currentTimeSec + 0.12 + deltaSec;
+    yt.currentTimeSec = expectedTargetSec; // state stays 1 (PLAYING), NO onStateChange!
+
+    // Worst-case race: correctDrift() fires BEFORE the next 3 Hz poll!
+    player.correctDrift(currentState, wall);
+    assert.equal(
+      yt.calls.filter(([fn]) => fn === "seekTo").length,
+      0,
+      `Buffered playing seek (${deltaSec}s) must NOT be yanked back by concurrent correctDrift()`
+    );
+
+    // Next 3 Hz poll detects the local jump and publishes immediately
+    perf += 213;
+    wall += 213;
+    yt.currentTimeSec += 0.213;
+    player._pollPlayerStateOnce();
+    assert.equal(published.length, beforePub + 1, `Buffered playing seek (${deltaSec}s) must sync on poll`);
+    assert.equal(published.at(-1).playing, true);
+    assert.ok(Math.abs(published.at(-1).positionMs - Math.round(yt.currentTimeSec * 1000)) <= 50);
+
+    // Subsequent correctDrift() stays clean
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player.correctDrift(currentState, wall);
+    assert.equal(yt.calls.filter(([fn]) => fn === "seekTo").length, 0);
+  }
+
+  // 2. Genuine gradual drift (-1.6s accumulated slowly without any sudden jump) STILL gets corrected by correctDrift!
+  yt.calls.length = 0;
+  for (let i = 0; i < 16; i++) {
+    perf += 333;
+    wall += 333;
+    // Play slightly slower (-100ms per 333ms poll) -> smooth gradual drift, NOT a user seek!
+    yt.currentTimeSec += 0.233;
+    player._pollPlayerStateOnce();
+  }
+  const pubBeforeDrift = published.length;
+  player.correctDrift(currentState, wall);
+  assert.ok(
+    yt.calls.some(([fn]) => fn === "seekTo"),
+    "Gradual playback lag (1.2s..3.0s) must still be caught up locally by correctDrift()"
+  );
+  assert.equal(published.length, pubBeforeDrift, "Gradual drift correction must not broadcast to room");
+
+  // 3. Seeks while PAUSED (NO onStateChange — stays PAUSED=2) for ±2s, ±5s, and +30s
+  perf += 1200;
+  wall += 1200;
+  yt.triggerState(2); // user pauses
+  const pausedStartPub = published.length;
+
+  for (const deltaSec of [2.0, -2.0, 5.0, -5.0, 30.0]) {
+    const beforePub = published.length;
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec = Math.max(0, yt.currentTimeSec + deltaSec);
+    player._pollPlayerStateOnce();
+    assert.equal(published.length, beforePub + 1, `Paused silent seek (${deltaSec}s) must sync promptly`);
+    assert.equal(published.at(-1).playing, false);
+    assert.ok(Math.abs(published.at(-1).positionMs - Math.round(yt.currentTimeSec * 1000)) <= 50);
+  }
+  assert.equal(published.length, pausedStartPub + 5, "All 5 rapid paused seeks must sync with zero cooldown");
+});
+
+test("YouTube drag-scrub (PAUSED -> BUFFERING -> PLAYING), rapid back-to-back seeks, post-command seek, and true 4s network rebuffer", async (t) => {
+  const mocks = setupMockDomAndApis();
+  let perf = 1000;
+  let wall = 1_700_000_000_000;
+  const published = [];
+
+  const mountEl = createMockElement("div");
+  let currentState = {
+    targetId: "watch",
+    kind: "watch",
+    rev: 1,
+    actor: "alice",
+    active: true,
+    playing: true,
+    positionMs: 30000,
+    rateMilli: 1000,
+    epoch: 1,
+    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    provider: "youtube",
+    mediaId: "dQw4w9WgXcQ",
+    anchorMs: wall,
+  };
+
+  const player = new WatchTogetherPlayer(mountEl, {
+    localPeerId: "alice",
+    peerStaggerMs: 0,
+    perfNow: () => perf,
+    wallNow: () => wall,
+    onUserAction: (ev) => {
+      published.push({ ...ev, t: perf });
+      currentState = {
+        ...currentState,
+        rev: currentState.rev + 1,
+        playing: ev.playing,
+        positionMs: ev.positionMs,
+        rateMilli: ev.rateMilli || currentState.rateMilli,
+        anchorMs: wall,
+      };
+      player.applyState(currentState, wall, { source: "local-embed" });
+    },
+  });
+  t.after(() => player.destroy());
+
+  await player.applyState(currentState, wall, { source: "remote" });
+  const yt = mocks.ytPlayers[0];
+  yt.currentTimeSec = 30;
+  yt.state = 1;
+  yt.triggerReady();
+  yt.triggerState(1);
+
+  for (let i = 0; i < 6; i++) {
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+
+  // 1. Drag-scrub while playing: PAUSED(2) -> drag -> BUFFERING(3) -> PLAYING(1)
+  yt.calls.length = 0;
+  perf += 100;
+  wall += 100;
+  yt.triggerState(2); // mousedown on scrubber pauses
+  perf += 200;
+  wall += 200;
+  yt.currentTimeSec = 95;
+  yt.triggerState(3); // release triggers buffering at 95s
+  perf += 180;
+  wall += 180;
+  yt.currentTimeSec = 95.05;
+  yt.triggerState(1); // resumes playing at 95.05s
+  assert.equal(yt.calls.filter(([fn]) => fn === "seekTo").length, 0, "Drag-scrub must not yank back");
+  assert.equal(published.at(-1).playing, true);
+  assert.ok(Math.abs(published.at(-1).positionMs - 95050) <= 50);
+
+  // 2. Rapid back-to-back seeks (6 seeks spaced 200ms apart — well inside old 1800ms cooldown / 4-in-15s cap!)
+  const rapidTargets = [120, 45, 180, 15, 75, 150];
+  const pubBeforeRapid = published.length;
+  yt.calls.length = 0;
+  for (const sec of rapidTargets) {
+    perf += 120;
+    wall += 120;
+    yt.currentTimeSec = sec;
+    yt.triggerState(3);
+    perf += 80;
+    wall += 80;
+    yt.currentTimeSec = sec + 0.04;
+    yt.triggerState(1);
+  }
+  assert.equal(published.length, pubBeforeRapid + rapidTargets.length, "All 6 rapid seeks must broadcast");
+  assert.equal(yt.calls.filter(([fn]) => fn === "seekTo").length, 0, "Rapid seeks must never jump back");
+  assert.ok(Math.abs(published.at(-1).positionMs - 150040) <= 50);
+
+  // 3. User seeks inside YouTube only 300ms AFTER a local-ui +10s seek (while 950ms expectedCommand is still active!)
+  perf += 300;
+  wall += 300;
+  const uiSeekState = {
+    ...currentState,
+    rev: currentState.rev + 1,
+    positionMs: 160000,
+    anchorMs: wall,
+  };
+  currentState = uiSeekState;
+  await player.applyState(uiSeekState, wall, { source: "local-ui" });
+  // Echo of local-ui seekTo(160) settles at +80ms -> suppressed
+  perf += 80;
+  wall += 80;
+  yt.currentTimeSec = 160.05;
+  yt.triggerState(1);
+  const pubAfterUiEcho = published.length;
+
+  // 220ms later (300ms total, still well inside 950ms window!), user clicks YouTube timeline at 55s
+  perf += 220;
+  wall += 220;
+  yt.calls.length = 0;
+  yt.currentTimeSec = 55;
+  yt.triggerState(3);
+  perf += 80;
+  wall += 80;
+  yt.currentTimeSec = 55.04;
+  yt.triggerState(1);
+  assert.equal(
+    published.length,
+    pubAfterUiEcho + 1,
+    "User YouTube seek 300ms after programmatic seek must NOT be swallowed by expectedCommand"
+  );
+  assert.ok(Math.abs(published.at(-1).positionMs - 55040) <= 50);
+  assert.equal(yt.calls.filter(([fn]) => fn === "seekTo").length, 0);
+
+  // 4. True network rebuffer stall (position does NOT jump before BUFFERING, stalls 4s, resumes with -250ms keyframe snap)
+  // Must locally catch up to live room position WITHOUT hijacking/rewinding the room!
+  for (let i = 0; i < 4; i++) {
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+  const stallPosSec = yt.currentTimeSec + 0.15;
+  perf += 150;
+  wall += 150;
+  yt.currentTimeSec = stallPosSec;
+  yt.triggerState(3); // true network stall right at current playback position!
+
+  // Stall for 4 full seconds while room continues advancing
+  for (let i = 0; i < 12; i++) {
+    perf += 333;
+    wall += 333;
+    player._pollPlayerStateOnce();
+  }
+  const pubBeforeResume = published.length;
+  yt.calls.length = 0;
+  yt.currentTimeSec = stallPosSec - 0.25; // DASH/HLS keyframe snap -250ms on resume
+  yt.triggerState(1);
+  assert.equal(
+    published.length,
+    pubBeforeResume,
+    "True 4s network rebuffer must NOT publish a rewind to the room"
+  );
+  const catchupSeek = yt.calls.find(([fn]) => fn === "seekTo");
+  assert.ok(catchupSeek, "True 4s network rebuffer must locally catch up via seekTo()");
+  const expectedRoomSec = projectMediaPositionMs(currentState, wall) / 1000;
+  assert.ok(
+    Math.abs(catchupSeek[1] - expectedRoomSec) < 0.3,
+    `Catch-up seek (${catchupSeek[1]}s) must land on live room position (${expectedRoomSec}s)`
+  );
+});
+
+test("Multi-peer YouTube click-seek syncs cleanly to remote peer without oscillation (even when remote seek buffers >1.5s)", async (t) => {
+  const mocks = setupMockDomAndApis();
+  let baseWall = 1_700_000_000_000;
+  let perf = 1000;
+
+  const specs = [
+    { id: "alice", clockOffsetMs: 0, rttMs: 60 },
+    { id: "bob", clockOffsetMs: 5000, rttMs: 80 },
+  ];
+  let mesh;
+  const players = {};
+  for (const s of specs) {
+    players[s.id] = new WatchTogetherPlayer(createMockElement("div"), {
+      localPeerId: s.id,
+      peerStaggerMs: 0,
+      perfNow: () => perf,
+      wallNow: () => baseWall + s.clockOffsetMs,
+      onUserAction: (ev) => mesh.publish(s.id, ev, baseWall, "local-embed"),
+      onNegotiateState: (ev) => mesh.publish(s.id, ev, baseWall, "negotiated"),
+    });
+  }
+  t.after(() => {
+    players.alice.destroy();
+    players.bob.destroy();
+  });
+  mesh = new SimulatedMediaMesh(specs.map((s) => ({ ...s, player: players[s.id] })));
+
+  mesh.publish(
+    "alice",
+    {
+      playing: true,
+      positionMs: 20000,
+      url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      provider: "youtube",
+      mediaId: "dQw4w9WgXcQ",
+      epoch: 1,
+    },
+    baseWall,
+    "local-ui"
+  );
+  baseWall += 100;
+  perf += 100;
+  mesh.deliverUpTo(baseWall);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const ytA = mocks.ytPlayers[0];
+  const ytB = mocks.ytPlayers[1];
+  ytA.currentTimeSec = 20.1;
+  ytA.state = 1;
+  ytA.triggerReady();
+  ytB.currentTimeSec = 20.1;
+  ytB.state = 1;
+  ytB.triggerReady();
+
+  for (let i = 0; i < 6; i++) {
+    perf += 333;
+    baseWall += 333;
+    ytA.currentTimeSec += 0.333;
+    ytB.currentTimeSec += 0.333;
+    players.alice._pollPlayerStateOnce();
+    players.bob._pollPlayerStateOnce();
+    mesh.deliverUpTo(baseWall);
+  }
+
+  // Model slow async seekTo on Bob: Bob stays at pre-seek pos briefly, enters BUFFERING(3) at old pos,
+  // then finishes buffering at new target 1.4s later (after 950ms expectedCommand expires!)
+  let pendingBobTarget = null;
+  ytB.seekTo = function slowSeek(sec, allow) {
+    this.calls.push(["seekTo", sec, allow]);
+    pendingBobTarget = sec;
+    // Emit BUFFERING(3) with pre-seek currentTimeSec (worst-case async iframe behavior)
+    this.triggerState(3);
+  };
+
+  // Alice clicks 110s while playing (getCurrentTime updates BEFORE BUFFERING=3 -> PLAYING=1)
+  ytA.calls.length = 0;
+  perf += 150;
+  baseWall += 150;
+  ytA.currentTimeSec = 110;
+  ytA.triggerState(3);
+  perf += 120;
+  baseWall += 120;
+  ytA.currentTimeSec = 110.05;
+  ytA.triggerState(1);
+
+  // Deliver Alice's seek to Bob
+  perf += 100;
+  baseWall += 100;
+  ytA.currentTimeSec += 0.1;
+  mesh.deliverUpTo(baseWall);
+  assert.ok(pendingBobTarget !== null && Math.abs(pendingBobTarget - 110.15) < 0.3);
+
+  // Bob takes 1.4s to finish buffering Alice's seek while Alice keeps playing
+  for (let i = 0; i < 4; i++) {
+    perf += 350;
+    baseWall += 350;
+    ytA.currentTimeSec += 0.35;
+    players.alice._pollPlayerStateOnce();
+    players.alice.correctDrift(mesh.peers.get("alice").state, baseWall);
+    players.bob._pollPlayerStateOnce();
+    mesh.deliverUpTo(baseWall);
+  }
+  // Bob finishes buffering at 110.15s (room is now at ~111.55s): Bob catches up locally without rewinding Alice!
+  const revBeforeBobResume = mesh.peers.get("alice").state.rev;
+  ytB.seekTo = function normalSeek(sec, allow) {
+    this.calls.push(["seekTo", sec, allow]);
+    this.currentTimeSec = sec;
+  };
+  ytB.currentTimeSec = pendingBobTarget;
+  ytB.triggerState(1);
+  perf += 100;
+  baseWall += 100;
+  ytA.currentTimeSec += 0.1;
+  ytB.currentTimeSec += 0.1;
+  mesh.deliverUpTo(baseWall);
+
+  assert.equal(
+    ytA.calls.filter(([fn]) => fn === "seekTo").length,
+    0,
+    "Alice must NEVER jump back after seeking"
+  );
+  assert.equal(
+    mesh.peers.get("alice").state.rev,
+    revBeforeBobResume,
+    "Bob finishing a slow remote seek must NOT broadcast a rewind back to Alice"
+  );
+  assert.ok(Math.abs(ytA.currentTimeSec - ytB.currentTimeSec) < 0.5, "Alice and Bob must stay in sync at ~111.6s");
+});
+
+test("Cross-provider seek-vs-correctDrift guards: Spotify ±2.4s seek, Twitch VOD silent +2s seek, SoundCloud rapid post-drift seek", async (t) => {
+  const mocks = setupMockDomAndApis();
+  let perf = 1000;
+  let wall = 1_700_000_000_000;
+  const published = [];
+
+  const mountEl = createMockElement("div");
+  let state = {
+    targetId: "watch",
+    kind: "watch",
+    rev: 1,
+    actor: "alice",
+    active: true,
+    playing: true,
+    positionMs: 40000,
+    rateMilli: 1000,
+    epoch: 1,
+    url: "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
+    provider: "spotify",
+    mediaId: "spotify:track:4cOdK2wGLETKBW3PvgPWqT",
+    anchorMs: wall,
+  };
+
+  const player = new WatchTogetherPlayer(mountEl, {
+    localPeerId: "alice",
+    peerStaggerMs: 0,
+    perfNow: () => perf,
+    wallNow: () => wall,
+    onUserAction: (ev) => {
+      published.push(ev);
+      state = {
+        ...state,
+        rev: state.rev + 1,
+        playing: ev.playing,
+        positionMs: ev.positionMs,
+        anchorMs: wall,
+      };
+      player.applyState(state, wall, { source: "local-embed" });
+    },
+  });
+  t.after(() => player.destroy());
+
+  // 1. Spotify: +2.4s seek must NOT fall into the 2200..2500ms dead zone where _spotifyMatchesPendingState
+  //    swallows it and correctDrift yanks it back!
+  await player.applyState(state, wall, { source: "remote" });
+  const sp = mocks.spotifyCtrls[0];
+  sp.emit("ready");
+  sp.emit("playback_update", {
+    data: { position: 40000, duration: 210000, isPaused: false, isBuffering: false, playingURI: state.mediaId },
+  });
+  perf += 2000;
+  wall += 2000;
+  sp.emit("playback_update", {
+    data: { position: 42000, duration: 210000, isPaused: false, isBuffering: false, playingURI: state.mediaId },
+  });
+  sp.calls.length = 0;
+
+  // User seeks +2.4s forward (42.0s -> 44.4s)
+  perf += 200;
+  wall += 200;
+  sp.emit("playback_update", {
+    data: { position: 44400, duration: 210000, isPaused: false, isBuffering: false, playingURI: state.mediaId },
+  });
+  player.correctDrift(state, wall);
+  assert.equal(published.length, 1, "Spotify +2.4s seek must broadcast instead of being swallowed");
+  assert.equal(published[0].positionMs, 44400);
+  assert.equal(sp.calls.filter(([fn]) => fn === "seek").length, 0, "correctDrift must not yank Spotify seek back");
+
+  // 2. Twitch VOD: silent/buffered +2.0s seek must NOT be yanked back by correctDrift and must sync on poll
+  state = {
+    ...state,
+    rev: 10,
+    epoch: 2,
+    positionMs: 50000,
+    url: "https://www.twitch.tv/videos/12345678",
+    provider: "twitch",
+    mediaId: "video:12345678",
+    anchorMs: wall,
+  };
+  await player.applyState(state, wall, { source: "remote" });
+  const tw = mocks.twitchPlayers[0];
+  tw.paused = false;
+  tw.currentTimeSec = 50;
+  tw.emit("ready");
+  perf += 2000;
+  wall += 2000;
+  tw.currentTimeSec = 52;
+  player._pollPlayerStateOnce();
+
+  tw.calls.length = 0;
+  perf += 120;
+  wall += 120;
+  tw.currentTimeSec = 54.12; // +2.0s jump without EV.SEEK
+  player.correctDrift(state, wall);
+  assert.equal(tw.calls.filter(([fn]) => fn === "seek").length, 0, "correctDrift must not yank back Twitch VOD +2s jump");
+  perf += 213;
+  wall += 213;
+  tw.currentTimeSec += 0.213;
+  player._pollPlayerStateOnce();
+  assert.equal(published.length, 2, "Twitch VOD silent +2s seek must broadcast on poll");
+  assert.ok(Math.abs(published[1].positionMs - 54333) <= 50);
+
+  // 3. SoundCloud: rapid user waveform seek 250ms after a mild-drift seekTo() must NOT be swallowed
+  state = {
+    ...state,
+    rev: 20,
+    epoch: 3,
+    positionMs: 30000,
+    url: "https://soundcloud.com/artist/track",
+    provider: "soundcloud",
+    mediaId: "https://soundcloud.com/artist/track",
+    anchorMs: wall,
+  };
+  await player.applyState(state, wall, { source: "remote" });
+  const sc = mocks.scWidgets[0];
+  sc.paused = false;
+  sc.positionMs = 30000;
+  sc.emit("ready");
+  sc.emit("play", { currentPosition: 30000 });
+  perf += 2000;
+  wall += 2000;
+  sc.positionMs = 30100; // 1.9s mild lag -> correctDrift seeks to 32000ms
+  player.correctDrift(state, wall);
+  // Echo of drift seek lands at +80ms
+  perf += 80;
+  wall += 80;
+  sc.positionMs = 32080;
+  sc.emit("seek", { currentPosition: 32080 });
+  const pubBeforeScUserSeek = published.length;
+  // 250ms later (well inside 900ms window!), user clicks waveform at 85s
+  perf += 250;
+  wall += 250;
+  sc.positionMs = 85000;
+  sc.emit("seek", { currentPosition: 85000 });
+  assert.equal(
+    published.length,
+    pubBeforeScUserSeek + 1,
+    "SoundCloud user seek shortly after drift seek must propagate immediately"
+  );
+  assert.equal(published.at(-1).positionMs, 85000);
+});
+
+test("Slow/ignored async remote seeks (>950ms) on YouTube (paused & playing) and Twitch VOD never revert room and retry via resync-local", async (t) => {
+  const mocks = setupMockDomAndApis();
+  let perf = 1000;
+  let wall = 1_700_000_000_000;
+  const userActions = [];
+  const negotiated = [];
+
+  const mountEl = createMockElement("div");
+  const player = new WatchTogetherPlayer(mountEl, {
+    localPeerId: "bob",
+    peerStaggerMs: 0,
+    perfNow: () => perf,
+    wallNow: () => wall,
+    onUserAction: (ev) => userActions.push(ev),
+    onNegotiateState: (ev) => negotiated.push(ev),
+  });
+  t.after(() => player.destroy());
+
+  // --- 1. YouTube PAUSED slow/ignored remote seek 25s -> 110s ---
+  let ytPaused = {
+    targetId: "watch",
+    kind: "watch",
+    rev: 1,
+    actor: "alice",
+    active: true,
+    playing: false,
+    positionMs: 25000,
+    rateMilli: 1000,
+    epoch: 1,
+    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    provider: "youtube",
+    mediaId: "dQw4w9WgXcQ",
+    anchorMs: wall,
+  };
+  await player.applyState(ytPaused, wall, { source: "remote" });
+  const yt = mocks.ytPlayers[0];
+  yt.state = 2;
+  yt.currentTimeSec = 25;
+  yt.triggerReady();
+  for (let i = 0; i < 4; i++) {
+    perf += 333;
+    wall += 333;
+    player._pollPlayerStateOnce();
+  }
+
+  // First seekTo(110) is ignored/dropped by async iframe; second seekTo (from resync-local retry) succeeds!
+  let ytSeekAttempts = 0;
+  yt.calls.length = 0;
+  yt.seekTo = function flakySeek(sec, allow) {
+    this.calls.push(["seekTo", sec, allow]);
+    ytSeekAttempts += 1;
+    if (ytSeekAttempts >= 2) {
+      this.currentTimeSec = sec;
+    }
+  };
+
+  ytPaused = { ...ytPaused, rev: 2, positionMs: 110000, anchorMs: wall };
+  await player.applyState(ytPaused, wall, { source: "remote" });
+  assert.equal(ytSeekAttempts, 1, "Initial remote apply issues first seekTo(110)");
+  assert.equal(yt.currentTimeSec, 25, "Async iframe stays stuck at 25s initially");
+
+  // Poll past 950ms expectedCommand window through GRACE_REMOTE_APPLY_MS (1450ms) + 2 confirm polls (~2.1s)
+  for (let i = 0; i < 8; i++) {
+    perf += 333;
+    wall += 333;
+    player._pollPlayerStateOnce();
+  }
+  assert.equal(userActions.length, 0, "Slow/ignored remote paused YouTube seek must emit ZERO onUserAction");
+  assert.equal(negotiated.length, 0, "Slow/ignored remote paused YouTube seek must emit ZERO onNegotiateState");
+  assert.equal(ytSeekAttempts, 2, "WatchSyncNegotiator must retry locally via resync-local");
+  assert.equal(yt.currentTimeSec, 110, "Local resync retry must move YouTube player to 110s");
+
+  // --- 2. YouTube PLAYING slow/ignored remote seek 25s -> 110s (no BUFFERING event) + late-landing seek ---
+  yt.seekTo = function normalSeek(sec, allow) {
+    this.calls.push(["seekTo", sec, allow]);
+    this.currentTimeSec = sec;
+  };
+  let ytPlaying = { ...ytPaused, rev: 3, playing: true, positionMs: 25000, anchorMs: wall };
+  await player.applyState(ytPlaying, wall, { source: "remote" });
+  yt.state = 1;
+  yt.currentTimeSec = 25;
+  for (let i = 0; i < 6; i++) {
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+
+  let ytPlaySeekAttempts = 0;
+  yt.seekTo = function flakyPlaySeek(sec, allow) {
+    this.calls.push(["seekTo", sec, allow]);
+    ytPlaySeekAttempts += 1;
+    if (ytPlaySeekAttempts >= 2) {
+      this.currentTimeSec = sec;
+    }
+  };
+  ytPlaying = { ...ytPlaying, rev: 4, positionMs: 110000, anchorMs: wall };
+  await player.applyState(ytPlaying, wall, { source: "remote" });
+
+  // Async iframe keeps playing from ~27s past 950ms without seeking until resync-local fires
+  for (let i = 0; i < 8; i++) {
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+  assert.equal(userActions.length, 0, "Slow/ignored remote playing YouTube seek must emit ZERO onUserAction");
+  assert.equal(negotiated.length, 0, "Slow/ignored remote playing YouTube seek must emit ZERO onNegotiateState");
+  assert.equal(ytPlaySeekAttempts, 2, "Playing unconverged remote seek must trigger resync-local retry");
+  assert.ok(
+    Math.abs(yt.currentTimeSec - projectMediaPositionMs(ytPlaying, wall) / 1000) < 0.5,
+    "Playing resync-local retry must converge to live room position"
+  );
+
+  // Also test late-landing remote seek (iframe ignores seekTo until t=+1200ms, then jumps to live target!)
+  yt.seekTo = function delayedSeek(sec, allow) {
+    this.calls.push(["seekTo", sec, allow]);
+  };
+  ytPlaying = { ...ytPlaying, rev: 5, positionMs: 180000, anchorMs: wall };
+  await player.applyState(ytPlaying, wall, { source: "remote" });
+  for (let i = 0; i < 3; i++) {
+    perf += 333;
+    wall += 333;
+    yt.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+  // At +1332ms (after 950ms expectedCommand expired), iframe finally lands at 181.33s!
+  perf += 333;
+  wall += 333;
+  yt.currentTimeSec = projectMediaPositionMs(ytPlaying, wall) / 1000;
+  player._pollPlayerStateOnce();
+  assert.equal(userActions.length, 0, "Late-landing remote YouTube seek must converge silently without onUserAction");
+  assert.equal(negotiated.length, 0);
+
+  // --- 3. Twitch VOD PLAYING slow/ignored remote seek 25s -> 110s ---
+  let twPlaying = {
+    targetId: "watch",
+    kind: "watch",
+    rev: 10,
+    actor: "alice",
+    active: true,
+    playing: true,
+    positionMs: 25000,
+    rateMilli: 1000,
+    epoch: 2,
+    url: "https://www.twitch.tv/videos/12345678",
+    provider: "twitch",
+    mediaId: "video:12345678",
+    anchorMs: wall,
+  };
+  await player.applyState(twPlaying, wall, { source: "remote" });
+  const tw = mocks.twitchPlayers[0];
+  tw.paused = false;
+  tw.currentTimeSec = 25;
+  tw.emit("ready");
+  for (let i = 0; i < 6; i++) {
+    perf += 333;
+    wall += 333;
+    tw.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+
+  let twSeekAttempts = 0;
+  tw.seek = function flakyTwSeek(sec) {
+    this.calls.push(["seek", sec]);
+    twSeekAttempts += 1;
+    if (twSeekAttempts >= 2) {
+      this.currentTimeSec = sec;
+    }
+  };
+  twPlaying = { ...twPlaying, rev: 11, positionMs: 110000, anchorMs: wall };
+  await player.applyState(twPlaying, wall, { source: "remote" });
+  for (let i = 0; i < 8; i++) {
+    perf += 333;
+    wall += 333;
+    tw.currentTimeSec += 0.333;
+    player._pollPlayerStateOnce();
+  }
+  assert.equal(userActions.length, 0, "Slow/ignored remote Twitch VOD seek must emit ZERO onUserAction");
+  assert.equal(negotiated.length, 0, "Slow/ignored remote Twitch VOD seek must emit ZERO onNegotiateState");
+  assert.equal(twSeekAttempts, 2, "Twitch VOD unconverged remote seek must trigger resync-local retry");
+  assert.ok(
+    Math.abs(tw.currentTimeSec - projectMediaPositionMs(twPlaying, wall) / 1000) < 0.5,
+    "Twitch VOD resync-local retry must converge to live room position"
+  );
+});
