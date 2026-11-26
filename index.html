@@ -93,6 +93,15 @@
           <div class="stat-chip chip-secondary advanced-only" title="Messages">
             Msgs <strong id="log-count-display">0</strong>
           </div>
+          <button
+            type="button"
+            class="stat-chip chip-version advanced-only"
+            id="app-version-chip"
+            title="App version &amp; Service Worker cache status (click to check for updates)"
+          >
+            <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
+            <strong id="app-version-display">v24</strong>
+          </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
             type="button"
@@ -1535,6 +1544,32 @@
               </div>
             </div>
           </section>
+
+          <!-- App Version & Service Worker Build Footer (Advanced Mode Only — Desktop & Mobile) -->
+          <footer
+            id="adv-version-footer"
+            class="adv-version-footer advanced-only"
+            aria-label="App version and build status"
+          >
+            <div class="adv-version-meta">
+              <span class="adv-version-pill">
+                <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
+                <span id="adv-version-number">v24</span>
+              </span>
+              <span class="adv-version-sep" aria-hidden="true">·</span>
+              <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>
+              <span class="adv-version-sep" aria-hidden="true">·</span>
+              <span class="adv-version-runtime" id="adv-version-runtime">WASM</span>
+            </div>
+            <button
+              type="button"
+              id="btn-version-action"
+              class="adv-version-btn"
+              title="Check for app update via Service Worker"
+            >
+              Check
+            </button>
+          </footer>
         </aside>
       </main>
     </div>

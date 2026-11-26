@@ -2,7 +2,8 @@
 // Caches ONLY immutable public static shell assets (HTML, CSS, JS, WASM, fonts, icons).
 // Never caches chat messages, room secrets, URL fragments, or cross-origin traffic.
 
-const CACHE_NAME = "p2p-direct-shell-v23";
+const CACHE_NAME = "p2p-direct-shell-v24";
+const SW_VERSION = CACHE_NAME.replace(/^p2p-direct-shell-/, "");
 
 const SHELL_ASSETS = [
   "./",
@@ -46,6 +47,25 @@ self.addEventListener("activate", (event) => {
       )
       .then(() => self.clients.claim())
   );
+});
+
+self.addEventListener("message", (event) => {
+  const data = event.data;
+  if (!data || typeof data !== "object") return;
+  if (data.type === "p2p-get-version") {
+    const reply = {
+      type: "p2p-sw-version",
+      version: SW_VERSION,
+      cacheName: CACHE_NAME,
+    };
+    if (event.ports && event.ports[0]) {
+      event.ports[0].postMessage(reply);
+    } else if (event.source && typeof event.source.postMessage === "function") {
+      event.source.postMessage(reply);
+    }
+  } else if (data.type === "p2p-skip-waiting") {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener("fetch", (event) => {

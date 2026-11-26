@@ -41,6 +41,256 @@ import {
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
+// Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
+export const APP_VERSION = "v24";
+export const APP_CACHE_PREFIX = "p2p-direct-shell-";
+export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
+
+export function parseAppVersionNumber(version) {
+  if (typeof version !== "string") return null;
+  const m = version.trim().match(/^v(\d+)(?:\.(\d+))?(?:\.(\d+))?$/i);
+  if (!m) return null;
+  const major = Number(m[1]);
+  const minor = m[2] ? Number(m[2]) : 0;
+  const patch = m[3] ? Number(m[3]) : 0;
+  return major * 1_000_000 + minor * 1_000 + patch;
+}
+
+export function extractShellCacheVersions(cacheKeys, prefix = APP_CACHE_PREFIX) {
+  if (!Array.isArray(cacheKeys)) return [];
+  const versions = [];
+  const seen = new Set();
+  for (const key of cacheKeys) {
+    if (typeof key !== "string" || !key.startsWith(prefix)) continue;
+    const ver = key.slice(prefix.length).trim();
+    if (!ver || !/^v\d+(?:\.\d+)*$/i.test(ver) || seen.has(ver)) continue;
+    seen.add(ver);
+    versions.push(ver);
+  }
+  versions.sort((a, b) => (parseAppVersionNumber(b) ?? -1) - (parseAppVersionNumber(a) ?? -1));
+  return versions;
+}
+
+export function resolveSwVersionState({
+  appVersion = APP_VERSION,
+  supported = false,
+  hasController = false,
+  controllerVersion = null,
+  waitingVersion = null,
+  hasWaiting = false,
+  hasInstalling = false,
+  cacheVersions = [],
+} = {}) {
+  const normalizedCaches = Array.isArray(cacheVersions)
+    ? cacheVersions
+        .filter((v) => typeof v === "string" && /^v\d+(?:\.\d+)*$/i.test(v.trim()))
+        .map((v) => v.trim())
+        .sort((a, b) => (parseAppVersionNumber(b) ?? -1) - (parseAppVersionNumber(a) ?? -1))
+    : [];
+  const appNum = parseAppVersionNumber(appVersion);
+
+  if (!supported) {
+    return {
+      state: "unavailable",
+      badge: "SW off",
+      detail: `App ${appVersion} · Direct load (no Service Worker)`,
+      swVersion: null,
+      needsReload: false,
+      severity: "muted",
+      supported: false,
+    };
+  }
+
+  if (hasWaiting) {
+    const nextVer = typeof waitingVersion === "string" && waitingVersion.trim() ? waitingVersion.trim() : null;
+    return {
+      state: "update-ready",
+      badge: nextVer ? `Update ${nextVer}` : "Update ready",
+      detail: nextVer
+        ? `Loaded ${appVersion} · ${nextVer} ready in Service Worker — reload to update`
+        : `Loaded ${appVersion} · New Service Worker ready — reload to update`,
+      swVersion: nextVer,
+      needsReload: true,
+      severity: "warn",
+      supported: true,
+    };
+  }
+
+  if (hasInstalling) {
+    return {
+      state: "installing",
+      badge: "SW updating…",
+      detail: `App ${appVersion} · Installing Service Worker shell cache…`,
+      swVersion: null,
+      needsReload: false,
+      severity: "muted",
+      supported: true,
+    };
+  }
+
+  const ctrlVer =
+    typeof controllerVersion === "string" && controllerVersion.trim() ? controllerVersion.trim() : null;
+  if (ctrlVer) {
+    if (ctrlVer === appVersion) {
+      return {
+        state: "synced",
+        badge: `SW ${ctrlVer}`,
+        detail: `App ${appVersion} · Cache ${APP_CACHE_PREFIX}${ctrlVer} active (up to date)`,
+        swVersion: ctrlVer,
+        needsReload: false,
+        severity: "ok",
+        supported: true,
+      };
+    }
+    const ctrlNum = parseAppVersionNumber(ctrlVer);
+    if (ctrlNum !== null && appNum !== null && ctrlNum > appNum) {
+      return {
+        state: "update-ready",
+        badge: `Update ${ctrlVer}`,
+        detail: `Loaded ${appVersion} · Active Service Worker is ${ctrlVer} — reload to update`,
+        swVersion: ctrlVer,
+        needsReload: true,
+        severity: "warn",
+        supported: true,
+      };
+    }
+    return {
+      state: "mismatch",
+      badge: `SW ${ctrlVer}`,
+      detail: `Loaded ${appVersion} · Controlling Service Worker is ${ctrlVer} — reload to sync`,
+      swVersion: ctrlVer,
+      needsReload: true,
+      severity: "warn",
+      supported: true,
+    };
+  }
+
+  const highestCache = normalizedCaches[0] || null;
+  const highestNum = parseAppVersionNumber(highestCache);
+  if (highestCache && highestNum !== null && appNum !== null && highestNum > appNum) {
+    return {
+      state: "update-ready",
+      badge: `Update ${highestCache}`,
+      detail: `Loaded ${appVersion} · Cache ${APP_CACHE_PREFIX}${highestCache} ready — reload to update`,
+      swVersion: highestCache,
+      needsReload: true,
+      severity: "warn",
+      supported: true,
+    };
+  }
+
+  if (hasController) {
+    if (normalizedCaches.includes(appVersion)) {
+      return {
+        state: "synced",
+        badge: `SW ${appVersion}`,
+        detail: `App ${appVersion} · Cache ${APP_CACHE_PREFIX}${appVersion} active (up to date)`,
+        swVersion: appVersion,
+        needsReload: false,
+        severity: "ok",
+        supported: true,
+      };
+    }
+    if (highestCache) {
+      return {
+        state: "mismatch",
+        badge: `SW ${highestCache}`,
+        detail: `Loaded ${appVersion} · Older Service Worker cache ${highestCache} active — reload to sync`,
+        swVersion: highestCache,
+        needsReload: true,
+        severity: "warn",
+        supported: true,
+      };
+    }
+    return {
+      state: "active",
+      badge: "SW active",
+      detail: `App ${appVersion} · Service Worker controlling page`,
+      swVersion: null,
+      needsReload: false,
+      severity: "muted",
+      supported: true,
+    };
+  }
+
+  if (normalizedCaches.includes(appVersion)) {
+    return {
+      state: "synced",
+      badge: `SW ${appVersion}`,
+      detail: `App ${appVersion} · Cache ${APP_CACHE_PREFIX}${appVersion} ready`,
+      swVersion: appVersion,
+      needsReload: false,
+      severity: "ok",
+      supported: true,
+    };
+  }
+
+  return {
+    state: "registering",
+    badge: "SW ready",
+    detail: `App ${appVersion} · Service Worker registered`,
+    swVersion: null,
+    needsReload: false,
+    severity: "muted",
+    supported: true,
+  };
+}
+
+export function formatAppRuntimeSummary({
+  wasmReady = false,
+  opusSupported = false,
+  isStandalone = false,
+} = {}) {
+  const parts = [];
+  parts.push(wasmReady ? "WASM" : "Init");
+  if (wasmReady) {
+    parts.push(opusSupported ? "Opus 48k" : "ADPCM");
+  }
+  if (isStandalone) {
+    parts.push("PWA");
+  }
+  return parts.join(" · ");
+}
+
+function queryServiceWorkerVersion(worker, timeoutMs = 600) {
+  if (!worker || typeof worker.postMessage !== "function" || typeof MessageChannel === "undefined") {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const channel = new MessageChannel();
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        channel.port1.onmessage = null;
+        channel.port1.close();
+      } catch {
+        // ignore
+      }
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    channel.port1.onmessage = (ev) => {
+      const data = ev?.data;
+      if (data && typeof data === "object" && typeof data.version === "string" && data.version) {
+        finish({
+          version: data.version,
+          cacheName: typeof data.cacheName === "string" ? data.cacheName : "",
+        });
+      } else {
+        finish(null);
+      }
+    };
+    try {
+      worker.postMessage({ type: "p2p-get-version" }, [channel.port2]);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
 const BASE_STUN_SERVERS = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
@@ -1577,6 +1827,13 @@ class P2PDirectApp {
     };
 
     this.iceConfig = ICE_CONFIG;
+    this.appVersion = APP_VERSION;
+    this.swRegistration = null;
+    this.appVersionState = resolveSwVersionState({
+      appVersion: APP_VERSION,
+      supported: false,
+    });
+    this._checkingAppUpdate = false;
     this.el = {};
   }
 
@@ -1638,6 +1895,15 @@ class P2PDirectApp {
       "voice-header-chip",
       "voice-header-count",
       "log-count-display",
+      "app-version-chip",
+      "app-version-dot",
+      "app-version-display",
+      "adv-version-footer",
+      "adv-version-dot",
+      "adv-version-number",
+      "adv-version-sw",
+      "adv-version-runtime",
+      "btn-version-action",
       "btn-pwa-install",
       "btn-advanced-toggle",
       "btn-theme-toggle",
@@ -1904,6 +2170,18 @@ class P2PDirectApp {
     this.el["btn-advanced-toggle"].addEventListener("click", () => this.toggleAdvancedMode());
     if (this.el["btn-pwa-install"]) {
       this.el["btn-pwa-install"].addEventListener("click", () => this.promptPwaInstall());
+    }
+    if (this.el["app-version-chip"]) {
+      this.el["app-version-chip"].addEventListener("click", () => this.checkForAppUpdate());
+    }
+    if (this.el["btn-version-action"]) {
+      this.el["btn-version-action"].addEventListener("click", () => {
+        if (this.appVersionState?.needsReload || !this.appVersionState?.supported) {
+          this.applyAppUpdateReload();
+        } else {
+          this.checkForAppUpdate();
+        }
+      });
     }
     if (this.el["btn-turn-test"]) {
       this.el["btn-turn-test"].addEventListener("click", () => this.runIceSelfTest());
@@ -2830,6 +3108,7 @@ class P2PDirectApp {
   }
 
   async init() {
+    document.documentElement.setAttribute("data-app-version", APP_VERSION);
     this.bindElements();
     this.initTheme();
     this.initAdvPanels();
@@ -2848,9 +3127,10 @@ class P2PDirectApp {
     this.iceConfig = buildIceConfig();
     await this.probeVoiceOpusSupport();
     this.updateVoiceCodecMeta();
+    this.renderAppVersion();
     this.addTelemetry(
       "engine",
-      `In-memory encrypted session ready (Direct P2P STUN + E2EE Relay fallback · ${this.voice.opusSupported ? "48 kHz Opus HD" : "16 kHz ADPCM fallback"})`
+      `App ${APP_VERSION} · In-memory encrypted session ready (Direct P2P STUN + E2EE Relay fallback · ${this.voice.opusSupported ? "48 kHz Opus HD" : "16 kHz ADPCM fallback"})`
     );
 
     const initRes = this.wasm.call({
@@ -2974,6 +3254,7 @@ class P2PDirectApp {
           this.pwa.isStandalone ? "standalone" : "browser"
         );
         this.updatePwaInstallButton();
+        this.renderAppVersion();
       });
     }
 
@@ -2988,6 +3269,7 @@ class P2PDirectApp {
       this.pwa.isStandalone = true;
       document.documentElement.setAttribute("data-pwa", "standalone");
       this.updatePwaInstallButton();
+      this.renderAppVersion();
       this.showToast("App installed");
     });
 
@@ -2999,11 +3281,212 @@ class P2PDirectApp {
       (window.isSecureContext ||
         window.location.hostname === "localhost" ||
         window.location.hostname === "127.0.0.1");
+
+    this.appVersionState = resolveSwVersionState({
+      appVersion: APP_VERSION,
+      supported: canRegisterSw,
+      hasController: Boolean(canRegisterSw && navigator.serviceWorker?.controller),
+    });
+    this.renderAppVersion();
+
     if (canRegisterSw) {
-      navigator.serviceWorker.register("./sw.js", { scope: "./" }).catch(() => {
-        // Ignore registration errors in restricted/private browsing contexts
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        this.refreshAppVersionStatus();
       });
+
+      const watchWorker = (worker) => {
+        if (!worker) return;
+        worker.addEventListener("statechange", () => {
+          this.refreshAppVersionStatus();
+        });
+      };
+
+      navigator.serviceWorker
+        .register("./sw.js", { scope: "./" })
+        .then((reg) => {
+          this.swRegistration = reg;
+          if (reg.installing) watchWorker(reg.installing);
+          if (reg.waiting) watchWorker(reg.waiting);
+          reg.addEventListener("updatefound", () => {
+            watchWorker(reg.installing);
+            this.refreshAppVersionStatus();
+          });
+          return this.refreshAppVersionStatus();
+        })
+        .catch(() => {
+          // Ignore registration errors in restricted/private browsing contexts
+          this.swRegistration = null;
+          this.appVersionState = resolveSwVersionState({
+            appVersion: APP_VERSION,
+            supported: false,
+          });
+          this.renderAppVersion();
+        });
     }
+  }
+
+  async refreshAppVersionStatus() {
+    const canSw =
+      typeof navigator !== "undefined" &&
+      "serviceWorker" in navigator &&
+      (window.isSecureContext ||
+        window.location.hostname === "localhost" ||
+        window.location.hostname === "127.0.0.1");
+
+    if (!canSw) {
+      this.appVersionState = resolveSwVersionState({
+        appVersion: APP_VERSION,
+        supported: false,
+      });
+      this.renderAppVersion();
+      return this.appVersionState;
+    }
+
+    const reg = this.swRegistration || (await navigator.serviceWorker.getRegistration?.().catch(() => null));
+    if (reg && !this.swRegistration) {
+      this.swRegistration = reg;
+    }
+
+    const controller = navigator.serviceWorker.controller || null;
+    const waiting = reg?.waiting || null;
+    const installing = reg?.installing || null;
+
+    const [ctrlInfo, waitInfo, cacheKeys] = await Promise.all([
+      controller ? queryServiceWorkerVersion(controller) : Promise.resolve(null),
+      waiting ? queryServiceWorkerVersion(waiting) : Promise.resolve(null),
+      typeof caches !== "undefined" && typeof caches.keys === "function"
+        ? caches.keys().catch(() => [])
+        : Promise.resolve([]),
+    ]);
+
+    this.appVersionState = resolveSwVersionState({
+      appVersion: APP_VERSION,
+      supported: true,
+      hasController: Boolean(controller),
+      controllerVersion: ctrlInfo?.version || null,
+      waitingVersion: waitInfo?.version || null,
+      hasWaiting: Boolean(waiting),
+      hasInstalling: Boolean(installing),
+      cacheVersions: extractShellCacheVersions(cacheKeys),
+    });
+    this.renderAppVersion();
+    return this.appVersionState;
+  }
+
+  renderAppVersion() {
+    const info =
+      this.appVersionState ||
+      resolveSwVersionState({
+        appVersion: APP_VERSION,
+        supported: false,
+      });
+    const runtimeText = formatAppRuntimeSummary({
+      wasmReady: Boolean(this.wasm),
+      opusSupported: Boolean(this.voice?.opusSupported),
+      isStandalone: Boolean(this.pwa?.isStandalone),
+    });
+    const fullTitle = `${info.detail} · ${runtimeText}`;
+    const dotClass =
+      info.severity === "ok" ? "is-synced" : info.severity === "warn" ? "is-warn" : "is-muted";
+
+    const chip = this.el["app-version-chip"];
+    const chipDot = this.el["app-version-dot"];
+    const chipVer = this.el["app-version-display"];
+    if (chipVer) chipVer.textContent = APP_VERSION;
+    if (chipDot) chipDot.className = `status-dot version-dot ${dotClass}`;
+    if (chip) {
+      chip.classList.toggle("is-warn", info.severity === "warn");
+      chip.classList.toggle("is-synced", info.severity === "ok");
+      chip.title = `${fullTitle} (click to check for updates)`;
+    }
+
+    const footer = this.el["adv-version-footer"];
+    const footDot = this.el["adv-version-dot"];
+    const footVer = this.el["adv-version-number"];
+    const footSw = this.el["adv-version-sw"];
+    const footRuntime = this.el["adv-version-runtime"];
+    const actionBtn = this.el["btn-version-action"];
+
+    if (footVer) footVer.textContent = APP_VERSION;
+    if (footDot) footDot.className = `status-dot version-dot ${dotClass}`;
+    if (footSw) footSw.textContent = info.badge;
+    if (footRuntime) footRuntime.textContent = runtimeText;
+    if (footer) {
+      footer.classList.toggle("is-warn", info.severity === "warn");
+      footer.classList.toggle("is-synced", info.severity === "ok");
+      footer.title = fullTitle;
+    }
+    if (actionBtn) {
+      actionBtn.disabled = Boolean(this._checkingAppUpdate);
+      if (this._checkingAppUpdate) {
+        actionBtn.textContent = "Checking…";
+        actionBtn.title = "Checking Service Worker for updates…";
+      } else if (info.needsReload) {
+        actionBtn.textContent = "Reload";
+        actionBtn.title = info.detail;
+      } else if (!info.supported) {
+        actionBtn.textContent = "Reload";
+        actionBtn.title = "Reload page to fetch the latest version";
+      } else {
+        actionBtn.textContent = "Check";
+        actionBtn.title = "Check for app updates via Service Worker";
+      }
+    }
+  }
+
+  async checkForAppUpdate() {
+    if (this._checkingAppUpdate) return;
+    this._checkingAppUpdate = true;
+    this.renderAppVersion();
+    try {
+      if (this.swRegistration && typeof this.swRegistration.update === "function") {
+        await Promise.race([
+          this.swRegistration.update().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 4000)),
+        ]);
+      }
+      const info = await this.refreshAppVersionStatus();
+      if (info.needsReload) {
+        const msg =
+          info.state === "update-ready"
+            ? `${info.badge} — click Reload in Advanced rail`
+            : `App ${APP_VERSION} / ${info.badge} mismatch — click Reload`;
+        this.addTelemetry("engine", info.detail);
+        this.showToast(msg);
+      } else if (info.state === "installing") {
+        this.showToast("Downloading app update…");
+      } else if (!info.supported) {
+        this.showToast(`App ${APP_VERSION} · direct load (no Service Worker)`);
+      } else {
+        this.showToast(`Up to date (${APP_VERSION} · ${info.badge})`);
+      }
+    } finally {
+      this._checkingAppUpdate = false;
+      this.renderAppVersion();
+    }
+  }
+
+  applyAppUpdateReload() {
+    const waiting = this.swRegistration?.waiting || null;
+    if (waiting && typeof waiting.postMessage === "function") {
+      try {
+        waiting.postMessage({ type: "p2p-skip-waiting" });
+      } catch {
+        // ignore
+      }
+      let reloaded = false;
+      const doReload = () => {
+        if (reloaded) return;
+        reloaded = true;
+        window.location.reload();
+      };
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.addEventListener("controllerchange", doReload, { once: true });
+      }
+      setTimeout(doReload, 450);
+      return;
+    }
+    window.location.reload();
   }
 
   updatePwaInstallButton() {
@@ -16450,11 +16933,13 @@ class P2PDirectApp {
   }
 }
 
-const app = new P2PDirectApp();
-app.init().catch((err) => {
-  const box = document.getElementById("telemetry-log");
-  if (box) {
-    box.innerHTML = `<div class="telemetry-entry event-err">Initialization error: ${escapeHtml(err.message)}</div>`;
-  }
-  console.error(err);
-});
+if (typeof document !== "undefined") {
+  const app = new P2PDirectApp();
+  app.init().catch((err) => {
+    const box = document.getElementById("telemetry-log");
+    if (box) {
+      box.innerHTML = `<div class="telemetry-entry event-err">Initialization error: ${escapeHtml(err.message)}</div>`;
+    }
+    console.error(err);
+  });
+}
