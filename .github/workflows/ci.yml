@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seeds:
+        description: "Number of chaos fuzz seeds for the deep fuzz job"
+        required: false
+        default: "10000"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  ci-gate:
+    name: Tier 1 Gate (Rust + Unit + Sim + Fuzz + Real Chrome E2E)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Rust stable + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: JS / MJS syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          files=( *.js tests/**/*.mjs )
+          echo "Checking syntax on ${#files[@]} JS/MJS files..."
+          for f in "${files[@]}"; do
+            node --check "$f"
+          done
+
+      - name: Rust unit & sync simulation tests
+        run: cargo test --quiet
+
+      - name: Rust clippy lint gate
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Node unit, SW assets, harness, sim & trace tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          test_files=(
+            tests/*.test.mjs
+            tests/harness/*.test.mjs
+            tests/sim/*.test.mjs
+            tests/traces/*.test.mjs
+          )
+          echo "Running ${#test_files[@]} Node test suites: ${test_files[*]}"
+          node --test "${test_files[@]}"
+
+      - name: PR chaos fuzz gate (500 seeds)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f tests/fuzz/watch_chaos.test.mjs ]; then
+            FUZZ_SEEDS=500 node --test tests/fuzz/watch_chaos.test.mjs
+          else
+            echo "tests/fuzz/watch_chaos.test.mjs not present yet — skipping PR fuzz gate."
+          fi
+
+      - name: Real Chromium E2E & 6-Viewport Layout Matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            echo "::error::No Chrome/Chromium binary found on runner"
+            exit 1
+          fi
+          export CHROME_BIN
+          echo "Using Chrome: $CHROME_BIN ($("$CHROME_BIN" --version))"
+          e2e_files=( tests/e2e/*.test.mjs )
+          node --test "${e2e_files[@]}"
+
+  nightly-fuzz:
+    name: Tier 2 Nightly Deep Chaos Fuzzing
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run deep Watch Together chaos fuzzer
+        shell: bash
+        env:
+          FUZZ_SEEDS: ${{ inputs.fuzz_seeds || '10000' }}
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz-artifacts
+          if [ ! -f tests/fuzz/watch_chaos.test.mjs ]; then
+            echo "tests/fuzz/watch_chaos.test.mjs not present yet — skipping nightly fuzz."
+            exit 0
+          fi
+          echo "Running watch_chaos.test.mjs with FUZZ_SEEDS=${FUZZ_SEEDS}..."
+          FUZZ_OUT_DIR=fuzz-artifacts node --test tests/fuzz/watch_chaos.test.mjs 2>&1 | tee fuzz-artifacts/watch_chaos.log
+
+      - name: Upload fuzz failure log & counterexamples
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-chaos-fuzz-failure-${{ github.run_id }}
+          path: |
+            fuzz-artifacts/
+            tests/fuzz/*counterexample*
+          if-no-files-found: warn
+          retention-days: 30
