@@ -16,13 +16,16 @@ import {
   SAVED_ROOMS_KEY,
   clearLastJoinedRoom,
   createEphemeralProfile,
+  extractLiveSplitTokens,
   loadLastJoinedRoom,
   loadSavedRooms,
   loadSessionAudioSettings,
   loadWarframeBotSettings,
   loadBuiltinBotsSettings,
+  mergeListEditorItems,
   purgeLegacyClientStorage,
   randomBase64Url,
+  removeListEditorItem,
   removeSavedRoom,
   renameSavedRoom,
   saveLastJoinedRoom,
@@ -30,6 +33,7 @@ import {
   saveSessionAuthorName,
   saveWarframeBotSettings,
   saveBuiltinBotsSettings,
+  splitAllListTokens,
   upsertSavedRoom,
 } from "./storage.js";
 import {
@@ -125,7 +129,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v27";
+export const APP_VERSION = "v28";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -2262,7 +2266,10 @@ export class P2PDirectApp {
       "setting-poll-enabled",
       "settings-poll-options",
       "setting-poll-question",
-      "setting-poll-choices",
+      "list-chips-poll",
+      "list-count-poll",
+      "setting-poll-choices-input",
+      "btn-list-add-poll",
       "btn-poll-post-now",
       "btn-poll-jump-msg",
       // Pomodoro
@@ -2279,14 +2286,20 @@ export class P2PDirectApp {
       "setting-checklist-enabled",
       "settings-checklist-options",
       "setting-checklist-title",
-      "setting-checklist-items",
+      "list-chips-checklist",
+      "list-count-checklist",
+      "setting-checklist-items-input",
+      "btn-list-add-checklist",
       "btn-checklist-post-now",
       "btn-checklist-jump-msg",
       // Randomizer
       "setting-randomizer-status-badge",
       "setting-randomizer-enabled",
       "settings-randomizer-options",
-      "setting-randomizer-choices",
+      "list-chips-randomizer",
+      "list-count-randomizer",
+      "setting-randomizer-choices-input",
+      "btn-list-add-randomizer",
       "btn-randomizer-post-now",
       "btn-randomizer-jump-msg",
       // Scoreboard
@@ -2301,8 +2314,11 @@ export class P2PDirectApp {
       "setting-weather-status-badge",
       "setting-weather-enabled",
       "settings-weather-options",
-      "setting-weather-cities",
       "setting-weather-unit",
+      "list-chips-weather",
+      "list-count-weather",
+      "setting-weather-cities-input",
+      "btn-list-add-weather",
       "btn-weather-post-now",
       "btn-weather-jump-msg",
       // Wikipedia
@@ -2922,30 +2938,19 @@ export class P2PDirectApp {
       ["setting-sts2-bracket", "defaultBracket", "str"],
       ["setting-sts2-inline", "inlineLookup", "bool"],
     ]);
-    bindBotControls(POLL_BOT_ID, [
-      ["setting-poll-question", "question", "str"],
-      ["setting-poll-choices", "options", "str"],
-    ]);
+    bindBotControls(POLL_BOT_ID, [["setting-poll-question", "question", "str"]]);
     bindBotControls(POMODORO_BOT_ID, [
       ["setting-pomodoro-focus", "focusMin", "num"],
       ["setting-pomodoro-break", "breakMin", "num"],
       ["setting-pomodoro-long", "longBreakMin", "num"],
     ]);
-    bindBotControls(CHECKLIST_BOT_ID, [
-      ["setting-checklist-title", "title", "str"],
-      ["setting-checklist-items", "items", "str"],
-    ]);
-    bindBotControls(RANDOMIZER_BOT_ID, [
-      ["setting-randomizer-choices", "options", "str"],
-    ]);
+    bindBotControls(CHECKLIST_BOT_ID, [["setting-checklist-title", "title", "str"]]);
+    bindBotControls(RANDOMIZER_BOT_ID, []);
     bindBotControls(SCOREBOARD_BOT_ID, [
       ["setting-scoreboard-mode", "mode", "str"],
       ["setting-scoreboard-title", "ratingTitle", "str"],
     ]);
-    bindBotControls(WEATHER_BOT_ID, [
-      ["setting-weather-cities", "cities", "str"],
-      ["setting-weather-unit", "unit", "str"],
-    ]);
+    bindBotControls(WEATHER_BOT_ID, [["setting-weather-unit", "unit", "str"]]);
     bindBotControls(WIKI_BOT_ID, [
       ["setting-wikipedia-tab", "defaultTab", "str"],
       ["setting-wikipedia-inline", "inlineLookup", "bool"],
@@ -2954,6 +2959,7 @@ export class P2PDirectApp {
       ["setting-github-repo", "repo", "str"],
       ["setting-github-tab", "defaultTab", "str"],
     ]);
+    this.bindSettingsListEditors();
 
     // Collapsible & pinnable Advanced rail section headers
     for (const btn of document.querySelectorAll("[data-toggle-panel]")) {
@@ -8365,6 +8371,224 @@ export class P2PDirectApp {
     return this._allManagedBuiltinBotIds().some((id) => Boolean(s[id]?.enabled));
   }
 
+  _getSettingsListEditorConfigs() {
+    return [
+      {
+        botId: POLL_BOT_ID,
+        prop: "options",
+        min: 2,
+        max: 6,
+        maxLen: 44,
+        itemWord: "options",
+        placeholder: "Add option… (comma-separated auto-splits)",
+        chipsId: "list-chips-poll",
+        countId: "list-count-poll",
+        inputId: "setting-poll-choices-input",
+        addBtnId: "btn-list-add-poll",
+      },
+      {
+        botId: CHECKLIST_BOT_ID,
+        prop: "items",
+        min: 1,
+        max: 12,
+        maxLen: 64,
+        itemWord: "items",
+        placeholder: "Add item… (comma-separated auto-splits)",
+        chipsId: "list-chips-checklist",
+        countId: "list-count-checklist",
+        inputId: "setting-checklist-items-input",
+        addBtnId: "btn-list-add-checklist",
+      },
+      {
+        botId: RANDOMIZER_BOT_ID,
+        prop: "options",
+        min: 1,
+        max: 12,
+        maxLen: 48,
+        itemWord: "options",
+        placeholder: "Add option… (comma-separated auto-splits)",
+        chipsId: "list-chips-randomizer",
+        countId: "list-count-randomizer",
+        inputId: "setting-randomizer-choices-input",
+        addBtnId: "btn-list-add-randomizer",
+      },
+      {
+        botId: WEATHER_BOT_ID,
+        prop: "cities",
+        min: 1,
+        max: 4,
+        maxLen: 48,
+        itemWord: "cities",
+        placeholder: "Add city… (comma-separated auto-splits)",
+        chipsId: "list-chips-weather",
+        countId: "list-count-weather",
+        inputId: "setting-weather-cities-input",
+        addBtnId: "btn-list-add-weather",
+      },
+    ];
+  }
+
+  _getSettingsListItems(cfg) {
+    const raw = this.builtinBots.settings?.[cfg.botId]?.[cfg.prop] || "";
+    return splitAllListTokens(raw);
+  }
+
+  bindSettingsListEditors() {
+    for (const cfg of this._getSettingsListEditorConfigs()) {
+      const inputEl = this.el[cfg.inputId];
+      const addBtn = this.el[cfg.addBtnId];
+
+      if (inputEl) {
+        // Live auto-split when typing `,` or `;` or newline
+        inputEl.addEventListener("input", (ev) => {
+          const val = inputEl.value;
+          if (!val) return;
+          if (!/\S/.test(val)) {
+            inputEl.value = "";
+            return;
+          }
+          if (!/[,;\n]/.test(val)) return;
+          if (ev.inputType === "insertFromPaste") {
+            this._commitSettingsListInput(cfg, val);
+            inputEl.value = "";
+            return;
+          }
+          const { ready, remainder } = extractLiveSplitTokens(val);
+          if (ready.length > 0) {
+            this._commitSettingsListTokens(cfg, ready);
+            inputEl.value = remainder;
+          }
+        });
+
+        // Instant auto-split on paste of comma- / semicolon- / newline-separated lists
+        inputEl.addEventListener("paste", (ev) => {
+          const text = ev.clipboardData?.getData("text") || "";
+          if (!/[,;\n]/.test(text)) return;
+          ev.preventDefault();
+          const start = inputEl.selectionStart ?? inputEl.value.length;
+          const end = inputEl.selectionEnd ?? inputEl.value.length;
+          const combined = `${inputEl.value.slice(0, start)}${text}${inputEl.value.slice(end)}`;
+          this._commitSettingsListInput(cfg, combined, { liveOnly: false });
+          inputEl.value = "";
+        });
+
+        // Enter commits (and auto-splits if comma-separated)
+        inputEl.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            if (inputEl.value.trim()) {
+              this._commitSettingsListInput(cfg, inputEl.value, { liveOnly: false });
+              inputEl.value = "";
+            }
+          }
+        });
+      }
+
+      if (addBtn && inputEl) {
+        addBtn.addEventListener("click", () => {
+          if (inputEl.value.trim()) {
+            this._commitSettingsListInput(cfg, inputEl.value, { liveOnly: false });
+            inputEl.value = "";
+            inputEl.focus();
+          }
+        });
+      }
+    }
+  }
+
+  _commitSettingsListInput(cfg, rawValue) {
+    const tokens = splitAllListTokens(rawValue);
+    if (tokens.length === 0) return;
+    this._commitSettingsListTokens(cfg, tokens);
+  }
+
+  _commitSettingsListTokens(cfg, tokens) {
+    const current = this._getSettingsListItems(cfg);
+    const { items, addedCount, skippedDupes, hitMax } = mergeListEditorItems(current, tokens, {
+      max: cfg.max,
+      maxLen: cfg.maxLen,
+      dedupe: true,
+    });
+    if (addedCount > 0) {
+      this.updateBuiltinBotSettings(cfg.botId, { [cfg.prop]: items.join(", ") }, { silent: true });
+    }
+    if (hitMax) {
+      this.showToast(`Max ${cfg.max} ${cfg.itemWord} reached`);
+    } else if (addedCount === 0 && skippedDupes > 0) {
+      this.showToast(`Already in list`);
+    }
+  }
+
+  _removeSettingsListItem(cfg, index) {
+    const current = this._getSettingsListItems(cfg);
+    const { items, removed, hitMin } = removeListEditorItem(current, index, { min: cfg.min });
+    if (hitMin) {
+      this.showToast(`At least ${cfg.min} ${cfg.itemWord} required`);
+      return;
+    }
+    if (removed) {
+      this.updateBuiltinBotSettings(cfg.botId, { [cfg.prop]: items.join(", ") }, { silent: true });
+    }
+  }
+
+  renderAllSettingsListEditors() {
+    for (const cfg of this._getSettingsListEditorConfigs()) {
+      this.renderSettingsListEditor(cfg);
+    }
+  }
+
+  renderSettingsListEditor(cfg) {
+    const chipsEl = this.el[cfg.chipsId];
+    const countEl = this.el[cfg.countId];
+    const inputEl = this.el[cfg.inputId];
+    const addBtn = this.el[cfg.addBtnId];
+    const items = this._getSettingsListItems(cfg);
+    const atMax = items.length >= cfg.max;
+    const atMin = items.length <= cfg.min;
+
+    if (countEl) {
+      countEl.textContent = `${items.length} / ${cfg.max}`;
+      countEl.classList.toggle("is-full", atMax);
+    }
+    if (inputEl) {
+      inputEl.disabled = atMax;
+      inputEl.placeholder = atMax
+        ? `Max ${cfg.max} ${cfg.itemWord} reached — remove one to add`
+        : cfg.placeholder;
+    }
+    if (addBtn) {
+      addBtn.disabled = atMax;
+    }
+    if (!chipsEl) return;
+
+    chipsEl.innerHTML = "";
+    items.forEach((item, idx) => {
+      const chip = document.createElement("span");
+      chip.className = "settings-list-chip";
+      chip.setAttribute("role", "listitem");
+      chip.dataset.listItemIdx = String(idx);
+
+      const label = document.createElement("span");
+      label.className = "settings-list-chip-text";
+      label.textContent = item;
+      chip.appendChild(label);
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "settings-list-chip-del";
+      delBtn.textContent = "×";
+      delBtn.disabled = atMin;
+      delBtn.setAttribute("aria-label", `Remove ${item}`);
+      delBtn.title = atMin
+        ? `At least ${cfg.min} ${cfg.itemWord} required`
+        : `Remove "${item}"`;
+      delBtn.addEventListener("click", () => this._removeSettingsListItem(cfg, idx));
+      chip.appendChild(delBtn);
+
+      chipsEl.appendChild(chip);
+    });
+  }
+
   syncBuiltinBotsSettingsControls() {
     const s = this.builtinBots.settings;
     const setVal = (id, val) => {
@@ -8389,7 +8613,6 @@ export class P2PDirectApp {
     // Room Tools (Pure P2P)
     setChk("setting-poll-enabled", s.poll.enabled);
     setVal("setting-poll-question", s.poll.question);
-    setVal("setting-poll-choices", s.poll.options);
     setDis(POLL_BOT_ID);
 
     setChk("setting-pomodoro-enabled", s.pomodoro.enabled);
@@ -8400,11 +8623,9 @@ export class P2PDirectApp {
 
     setChk("setting-checklist-enabled", s.checklist.enabled);
     setVal("setting-checklist-title", s.checklist.title);
-    setVal("setting-checklist-items", s.checklist.items);
     setDis(CHECKLIST_BOT_ID);
 
     setChk("setting-randomizer-enabled", s.randomizer.enabled);
-    setVal("setting-randomizer-choices", s.randomizer.options);
     setDis(RANDOMIZER_BOT_ID);
 
     setChk("setting-scoreboard-enabled", s.scoreboard.enabled);
@@ -8414,7 +8635,6 @@ export class P2PDirectApp {
 
     // Web Info
     setChk("setting-weather-enabled", s.weather.enabled);
-    setVal("setting-weather-cities", s.weather.cities);
     setVal("setting-weather-unit", s.weather.unit);
     setDis(WEATHER_BOT_ID);
 
@@ -8427,6 +8647,9 @@ export class P2PDirectApp {
     setVal("setting-github-repo", s.github.repo);
     setVal("setting-github-tab", s.github.defaultTab);
     setDis(GITHUB_BOT_ID);
+
+    // Render all 4 interactive chip-list editors
+    this.renderAllSettingsListEditors();
   }
 
   _summarizeBuiltinBotPill(botId, msg) {

@@ -9470,6 +9470,123 @@ html[data-watch-stage="true"] .join-listen-strip {
   }
 }
 
+/* ================= Settings Interactive Chip-List Editor ================= */
+
+.settings-list-editor {
+  gap: 7px;
+}
+
+.settings-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.settings-list-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border: 1.5px solid var(--rule);
+  background: var(--bg-surface);
+  color: var(--ink-secondary);
+}
+
+.settings-list-count.is-full {
+  background: var(--ochre);
+  border-color: var(--rule);
+  color: #0e0f12;
+}
+
+.settings-list-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 30px;
+  padding: 6px;
+  border: 2px solid var(--rule);
+  background: var(--bg-surface);
+}
+
+.settings-list-chip {
+  display: inline-flex;
+  align-items: stretch;
+  max-width: 100%;
+  border: 2px solid var(--rule);
+  background: var(--bg-subtle);
+  color: var(--ink-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.settings-list-chip-text {
+  padding: 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+
+.settings-list-chip-del {
+  appearance: none;
+  border: none;
+  border-left: 2px solid var(--rule);
+  background: transparent;
+  color: var(--ink-secondary);
+  min-width: 26px;
+  padding: 0 7px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-list-chip-del:hover:not(:disabled) {
+  background: var(--coral);
+  color: #ffffff;
+}
+
+.settings-list-chip-del:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.settings-list-add-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.settings-list-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings-list-add-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .settings-list-chip-text {
+    max-width: 185px;
+    font-size: 10.5px;
+  }
+
+  .settings-list-chip-del {
+    min-width: 30px;
+  }
+}
+
+
 
 
 

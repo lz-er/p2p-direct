@@ -571,3 +571,81 @@ export function saveBuiltinBotsSettings(settings) {
   }
   return clean;
 }
+
+const LIST_SPLIT_RE = /[,;\n]/;
+
+/**
+ * Live auto-split while typing: whenever the user types `,`, `;`, or newline,
+ * every completed token before the final delimiter becomes immediately ready to
+ * turn into a list chip, leaving any trailing unfinished text in the input box.
+ */
+export function extractLiveSplitTokens(rawValue) {
+  const str = String(rawValue ?? "");
+  if (!LIST_SPLIT_RE.test(str)) {
+    return { ready: [], remainder: str };
+  }
+  const parts = str.split(LIST_SPLIT_RE);
+  const remainder = parts.pop() ?? "";
+  const ready = parts.map((p) => p.trim()).filter(Boolean);
+  return { ready, remainder: remainder.trimStart() };
+}
+
+/**
+ * Splits a full submission / paste string on `,`, `;`, or newlines into trimmed non-empty tokens.
+ */
+export function splitAllListTokens(rawValue) {
+  return String(rawValue ?? "")
+    .split(LIST_SPLIT_RE)
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Appends candidate items into an existing Settings list with trimming, length caps,
+ * case-insensitive deduplication, and max-items enforcement.
+ */
+export function mergeListEditorItems(
+  existing,
+  candidates,
+  { max = 12, maxLen = 48, dedupe = true } = {}
+) {
+  const items = Array.isArray(existing) ? existing.map((s) => String(s).trim()).filter(Boolean) : [];
+  const seen = new Set(items.map((s) => s.toLowerCase()));
+  let addedCount = 0;
+  let skippedDupes = 0;
+  let hitMax = false;
+
+  for (const raw of Array.isArray(candidates) ? candidates : []) {
+    const clean = String(raw ?? "").trim().slice(0, maxLen);
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (dedupe && seen.has(key)) {
+      skippedDupes += 1;
+      continue;
+    }
+    if (items.length >= max) {
+      hitMax = true;
+      break;
+    }
+    items.push(clean);
+    seen.add(key);
+    addedCount += 1;
+  }
+
+  return { items, addedCount, skippedDupes, hitMax };
+}
+
+/**
+ * Removes an item at `index` from a Settings list while respecting `min` required items.
+ */
+export function removeListEditorItem(existing, index, { min = 1 } = {}) {
+  const items = Array.isArray(existing) ? [...existing] : [];
+  if (index < 0 || index >= items.length) {
+    return { items, removed: false, hitMin: false };
+  }
+  if (items.length <= min) {
+    return { items, removed: false, hitMin: true };
+  }
+  items.splice(index, 1);
+  return { items, removed: true, hitMin: false };
+}

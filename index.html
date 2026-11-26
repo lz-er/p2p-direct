@@ -100,7 +100,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v27</strong>
+            <strong id="app-version-display">v28</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -1616,7 +1616,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v27</span>
+                <span id="adv-version-number">v28</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>
@@ -1870,14 +1870,27 @@
                     <span class="audio-switch-desc">One-click voting with live bar meters, percentages, and voter names updated in place.</span>
                   </span>
                 </label>
-                <div class="settings-grid settings-grid-2" id="settings-poll-options">
+                <div class="settings-grid settings-grid-1" id="settings-poll-options">
                   <div class="settings-field">
                     <label class="settings-label" for="setting-poll-question">Question</label>
                     <input id="setting-poll-question" type="text" class="text-input" maxlength="120" value="What should we do tonight?" />
                   </div>
-                  <div class="settings-field">
-                    <label class="settings-label" for="setting-poll-choices">Options (comma-separated, 2–6)</label>
-                    <input id="setting-poll-choices" type="text" class="text-input" value="Slay the Spire 2, Warframe, Watch a Movie, Chill &amp; Chat" />
+                  <div class="settings-field settings-list-editor" id="list-editor-poll" data-list-bot="poll">
+                    <div class="settings-list-head">
+                      <label class="settings-label" for="setting-poll-choices-input">Options (2–6)</label>
+                      <span class="settings-list-count" id="list-count-poll">4 / 6</span>
+                    </div>
+                    <div class="settings-list-chips" id="list-chips-poll" role="list" aria-label="Poll options"></div>
+                    <div class="settings-list-add-row">
+                      <input
+                        id="setting-poll-choices-input"
+                        type="text"
+                        class="text-input settings-list-input"
+                        placeholder="Add option… (comma-separated auto-splits)"
+                        autocomplete="off"
+                      />
+                      <button type="button" id="btn-list-add-poll" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
+                    </div>
                   </div>
                 </div>
                 <div class="settings-wf-actions">
@@ -1936,14 +1949,27 @@
                     <span class="audio-switch-desc">Click items to check/uncheck in place. Type <code>+todo &lt;item&gt;</code> in chat to append new tasks.</span>
                   </span>
                 </label>
-                <div class="settings-grid settings-grid-2" id="settings-checklist-options">
+                <div class="settings-grid settings-grid-1" id="settings-checklist-options">
                   <div class="settings-field">
                     <label class="settings-label" for="setting-checklist-title">Checklist Title</label>
                     <input id="setting-checklist-title" type="text" class="text-input" maxlength="80" value="Room Checklist" />
                   </div>
-                  <div class="settings-field">
-                    <label class="settings-label" for="setting-checklist-items">Initial Items (comma-separated)</label>
-                    <input id="setting-checklist-items" type="text" class="text-input" value="Pick game or movie, Check mic &amp; audio, Grab snacks" />
+                  <div class="settings-field settings-list-editor" id="list-editor-checklist" data-list-bot="checklist">
+                    <div class="settings-list-head">
+                      <label class="settings-label" for="setting-checklist-items-input">Initial Items (1–12)</label>
+                      <span class="settings-list-count" id="list-count-checklist">3 / 12</span>
+                    </div>
+                    <div class="settings-list-chips" id="list-chips-checklist" role="list" aria-label="Checklist items"></div>
+                    <div class="settings-list-add-row">
+                      <input
+                        id="setting-checklist-items-input"
+                        type="text"
+                        class="text-input settings-list-input"
+                        placeholder="Add item… (comma-separated auto-splits)"
+                        autocomplete="off"
+                      />
+                      <button type="button" id="btn-list-add-checklist" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
+                    </div>
                   </div>
                 </div>
                 <div class="settings-wf-actions">
@@ -1968,9 +1994,22 @@
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-1" id="settings-randomizer-options">
-                  <div class="settings-field">
-                    <label class="settings-label" for="setting-randomizer-choices">Custom Options Pool (comma-separated)</label>
-                    <input id="setting-randomizer-choices" type="text" class="text-input" value="Pizza, Ramen, Burgers, Sushi" />
+                  <div class="settings-field settings-list-editor" id="list-editor-randomizer" data-list-bot="randomizer">
+                    <div class="settings-list-head">
+                      <label class="settings-label" for="setting-randomizer-choices-input">Custom Options Pool (1–12)</label>
+                      <span class="settings-list-count" id="list-count-randomizer">4 / 12</span>
+                    </div>
+                    <div class="settings-list-chips" id="list-chips-randomizer" role="list" aria-label="Randomizer options"></div>
+                    <div class="settings-list-add-row">
+                      <input
+                        id="setting-randomizer-choices-input"
+                        type="text"
+                        class="text-input settings-list-input"
+                        placeholder="Add option… (comma-separated auto-splits)"
+                        autocomplete="off"
+                      />
+                      <button type="button" id="btn-list-add-randomizer" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
+                    </div>
                   </div>
                 </div>
                 <div class="settings-wf-actions">
@@ -2031,17 +2070,30 @@
                     <span class="audio-switch-desc">Live conditions &amp; 3-day outlook across up to 4 pinned cities with in-card °C / °F toggle.</span>
                   </span>
                 </label>
-                <div class="settings-grid settings-grid-2" id="settings-weather-options">
-                  <div class="settings-field">
-                    <label class="settings-label" for="setting-weather-cities">Pinned Cities (up to 4, comma-separated)</label>
-                    <input id="setting-weather-cities" type="text" class="text-input" value="Berlin, Tokyo, New York" />
-                  </div>
+                <div class="settings-grid settings-grid-1" id="settings-weather-options">
                   <div class="settings-field">
                     <label class="settings-label" for="setting-weather-unit">Temperature Unit</label>
                     <select id="setting-weather-unit" class="select-input">
                       <option value="c">Celsius (°C)</option>
                       <option value="f">Fahrenheit (°F)</option>
                     </select>
+                  </div>
+                  <div class="settings-field settings-list-editor" id="list-editor-weather" data-list-bot="weather">
+                    <div class="settings-list-head">
+                      <label class="settings-label" for="setting-weather-cities-input">Pinned Cities (1–4)</label>
+                      <span class="settings-list-count" id="list-count-weather">3 / 4</span>
+                    </div>
+                    <div class="settings-list-chips" id="list-chips-weather" role="list" aria-label="Pinned weather cities"></div>
+                    <div class="settings-list-add-row">
+                      <input
+                        id="setting-weather-cities-input"
+                        type="text"
+                        class="text-input settings-list-input"
+                        placeholder="Add city… (comma-separated auto-splits)"
+                        autocomplete="off"
+                      />
+                      <button type="button" id="btn-list-add-weather" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
+                    </div>
                   </div>
                 </div>
                 <div class="settings-wf-actions">
