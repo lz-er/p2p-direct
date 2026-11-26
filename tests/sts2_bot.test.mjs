@@ -14,6 +14,7 @@ import {
   parseSts2Action,
   resolveSts2ImageUrl,
   sanitizeSts2Settings,
+  searchSts2Suggestions,
   summarizeSts2Pill,
 } from "../sts2_bot.js";
 
@@ -57,7 +58,7 @@ describe("sts2_bot settings & helpers", () => {
     assert.equal(extractSts2BracketQuery("Read [[wiki:Slay the Spire]]"), null);
   });
 
-  it("parses all StS2 action IDs accurately", () => {
+  it("parses all StS2 action IDs accurately including search and open", () => {
     assert.deepEqual(parseSts2Action("sts2:tab:encounters"), { kind: "tab", tab: "encounters" });
     assert.deepEqual(parseSts2Action("sts2:char:silent"), { kind: "char", character: "silent" });
     assert.deepEqual(parseSts2Action("sts2:bracket:2p"), { kind: "bracket", bracket: "2p" });
@@ -65,6 +66,9 @@ describe("sts2_bot settings & helpers", () => {
     assert.deepEqual(parseSts2Action("sts2:codex:upgrade"), { kind: "codex_upgrade" });
     assert.deepEqual(parseSts2Action("sts2:coop:fool"), { kind: "coop_claim", character: "fool" });
     assert.deepEqual(parseSts2Action("sts2:coop:leave"), { kind: "coop_leave" });
+    assert.deepEqual(parseSts2Action("sts2:search"), { kind: "search" });
+    assert.deepEqual(parseSts2Action("sts2:open:/cards/bash"), { kind: "open", entityPath: "/cards/bash" });
+    assert.equal(parseSts2Action("sts2:open:javascript:alert(1)"), null);
     assert.equal(parseSts2Action("wf:tab:cycles"), null);
   });
 });
@@ -82,13 +86,15 @@ describe("sts2_bot Co-op Party Picker & API cards", () => {
     assert.equal(card.builtinBot, STS2_BOT_ID);
     assert.equal(card.persistent, true);
     assert.equal(card.badge, "2/4 READY");
+    assert.equal(card.blocks[0].type, "input");
+    assert.equal(card.blocks[0].autocomplete, "sts2");
     assert.match(summarizeSts2Pill({ payload: card }), /CO-OP \(2\/4\)/);
 
     seats = applySts2CoopAction(seats, { kind: "coop_leave" }, { peerId: "p1", peerName: "Alice" });
     assert.equal(Object.keys(seats).length, 1);
   });
 
-  it("fetches Meta, Encounters, Codex (with Upgrade+ card art), and News cards via Spire Codex API", async () => {
+  it("fetches Meta, Encounters, Codex (with Upgrade+ card art), News, and autocomplete suggestions via Spire Codex API", async () => {
     clearSts2Cache();
     const mockFetch = async (url) => {
       const ok = (body) => ({ ok: true, status: 200, json: async () => body });
@@ -109,9 +115,22 @@ describe("sts2_bot Co-op Party Picker & API cards", () => {
           ],
         });
       }
-      if (url.includes("/api/search?q=Bash")) {
+      if (url.includes("/api/search?q=Ba")) {
         return ok({
-          categories: [{ kind: "card", items: [{ name: "Bash", path: "/cards/bash" }] }],
+          categories: [
+            {
+              kind: "card",
+              items: [
+                {
+                  name: "Bash",
+                  path: "/cards/bash",
+                  color: "ironclad",
+                  type: "Attack",
+                  image_url: "/static/images/cards/bash.webp",
+                },
+              ],
+            },
+          ],
         });
       }
       if (url.includes("/api/cards/bash")) {
@@ -140,9 +159,17 @@ describe("sts2_bot Co-op Party Picker & API cards", () => {
       throw new Error(`Unexpected URL ${url}`);
     };
 
+    const suggestions = await searchSts2Suggestions("Ba", { fetchImpl: mockFetch });
+    assert.equal(suggestions.length, 1);
+    assert.equal(suggestions[0].label, "Bash");
+    assert.equal(suggestions[0].actionId, "sts2:open:/cards/bash");
+    assert.match(suggestions[0].image, /^https:\/\/spire-codex\.com\/static\/images\/cards\/bash\.webp$/);
+
     const meta = await fetchSts2Card({ tab: "meta", character: "ironclad", bracket: "2p" }, { fetchImpl: mockFetch });
     assert.match(meta.title, /Top Ironclad Cards/);
     assert.match(meta.fields[0].label, /Offering/);
+    assert.match(meta.fields[0].value, /\[View\]\(action:sts2:open:\/cards\/offering\)/);
+    assert.equal(meta.blocks[0].id, "sts2:search");
 
     const enc = await fetchSts2Card({ tab: "encounters" }, { fetchImpl: mockFetch });
     assert.match(enc.fields[0].value, /42\.0% fatal/);

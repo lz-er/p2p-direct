@@ -335,11 +335,46 @@ export function parseWikiAction(actionId) {
   const rest = actionId.slice(WIKI_ACTION_PREFIX.length);
   if (rest === "refresh") return { kind: "refresh" };
   if (rest === "dismiss") return { kind: "dismiss" };
+  if (rest === "search") return { kind: "search" };
+  if (rest.startsWith("lookup:")) {
+    const query = rest.slice(7).trim();
+    if (query) return { kind: "lookup", query };
+  }
   if (rest.startsWith("tab:")) {
     const tab = rest.slice(4);
     if (VALID_WIKI_TABS.has(tab)) return { kind: "tab", tab };
   }
   return null;
+}
+
+export function buildWikiSearchBlock() {
+  return {
+    type: "input",
+    id: `${WIKI_ACTION_PREFIX}search`,
+    autocomplete: "wiki",
+    placeholder: "Search Wikipedia…",
+    submitLabel: "Go",
+  };
+}
+
+export async function searchWikiSuggestions(
+  query,
+  { fetchImpl = globalThis.fetch, limit = 6 } = {}
+) {
+  const q = String(query || "").trim();
+  if (q.length < 2 || typeof fetchImpl !== "function") return [];
+  const url = `https://en.wikipedia.org/w/api.php?action=opensearch&origin=*&limit=${limit}&search=${encodeURIComponent(q)}`;
+  const res = await fetchImpl(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) return [];
+  const data = await res.json();
+  const titles = Array.isArray(data?.[1]) ? data[1] : [];
+  const descs = Array.isArray(data?.[2]) ? data[2] : [];
+  return titles.slice(0, limit).map((title, idx) => ({
+    label: String(title),
+    sublabel: typeof descs[idx] === "string" ? descs[idx].slice(0, 70) : "",
+    value: String(title),
+    actionId: `${WIKI_ACTION_PREFIX}lookup:${title}`,
+  }));
 }
 
 export function summarizeWikiPill(msg) {
@@ -401,12 +436,13 @@ export async function fetchWikiCard(
         wikiTopic: `${mm}/${dd}`,
         wikiUpdatedAt: nowMs,
         subtitle: "WIKIPEDIA",
-        title: `On This Day — ${mm}/${dd}`,
+        title: `On This Day · ${mm}/${dd}`,
         badge: "HISTORY",
         color: "cobalt",
+        blocks: [buildWikiSearchBlock()],
         fields: fields.length > 0 ? fields : [{ label: "Events", value: "No events.", inline: false }],
         buttons: [wikiNavRow("onthisday"), baseControls(firstUrl)],
-        footer: `Lookup: [[wiki:Topic]] · ${formatClock(nowMs)}`,
+        footer: `Wikipedia · ${formatClock(nowMs)}`,
       };
     }
 
@@ -430,7 +466,11 @@ export async function fetchWikiCard(
         fields.push({
           label: "Trending",
           value: mostread
-            .map((a) => `**${a.titles?.normalized || a.title}** (${Number(a.views || 0).toLocaleString()} views)`)
+            .map((a) => {
+              const tName = a.titles?.normalized || a.title || "";
+              const safeAction = tName.replace(/[)\]]/g, "");
+              return `[${tName}](action:${WIKI_ACTION_PREFIX}lookup:${safeAction}) (${Number(a.views || 0).toLocaleString()})`;
+            })
             .join(" · "),
           inline: false,
         });
@@ -447,9 +487,10 @@ export async function fetchWikiCard(
         badge: "FEATURED",
         color: "cobalt",
         text: extract,
+        blocks: [buildWikiSearchBlock()],
         fields,
         buttons: [wikiNavRow("featured"), baseControls(articleUrl)],
-        footer: `Lookup: [[wiki:Topic]] · ${formatClock(nowMs)}`,
+        footer: `Wikipedia · ${formatClock(nowMs)}`,
       };
       if (thumb && /^https:\/\//i.test(thumb)) {
         payload.image = { url: thumb, alt: title };
@@ -494,6 +535,7 @@ export async function fetchWikiCard(
           badge: "NO MATCH",
           color: "ochre",
           text: `No article found for **${query}**.`,
+          blocks: [buildWikiSearchBlock()],
           buttons: [wikiNavRow("random"), baseControls()],
           footer: `Wikipedia · ${formatClock(nowMs)}`,
         };
@@ -523,9 +565,10 @@ export async function fetchWikiCard(
       badge: activeTab === "lookup" ? "LOOKUP" : "RANDOM",
       color: "cobalt",
       text: extract,
+      blocks: [buildWikiSearchBlock()],
       fields: summary?.description ? [{ label: "Summary", value: `**${summary.description}**`, inline: false }] : [],
       buttons: [wikiNavRow(activeTab), baseControls(articleUrl)],
-      footer: `Lookup: [[wiki:Topic]] · ${formatClock(nowMs)}`,
+      footer: `Wikipedia · ${formatClock(nowMs)}`,
     };
     if (thumb && /^https:\/\//i.test(thumb)) {
       payload.image = { url: thumb, alt: title };
@@ -543,6 +586,7 @@ export async function fetchWikiCard(
       badge: "OFFLINE",
       color: "coral",
       text: `Unavailable (${err?.message || "offline"}).`,
+      blocks: [buildWikiSearchBlock()],
       buttons: [wikiNavRow(activeTab), baseControls()],
       footer: `Wikipedia · ${formatClock(nowMs)}`,
     };

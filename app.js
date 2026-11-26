@@ -52,6 +52,7 @@ import {
   findPersistentSts2Message,
   parseSts2Action,
   pickRandomSpotlightPath,
+  searchSts2Suggestions,
   summarizeSts2Pill,
 } from "./sts2_bot.js";
 import {
@@ -66,6 +67,7 @@ import {
   parseGithubAction,
   parseWeatherAction,
   parseWikiAction,
+  searchWikiSuggestions,
   summarizeGithubPill,
   summarizeWeatherPill,
   summarizeWikiPill,
@@ -105,6 +107,11 @@ import {
   summarizePomodoroPill,
   summarizeRandomizerPill,
   summarizeScoreboardPill,
+  updateChecklistFromInlineEdit,
+  updatePollFromInlineEdit,
+  updatePomodoroFromInlineEdit,
+  updateRandomizerFromInlineEdit,
+  updateScoreboardFromInlineEdit,
 } from "./room_bots.js";
 import {
   MediaSyncController,
@@ -129,7 +136,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v30";
+export const APP_VERSION = "v31";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -1040,11 +1047,46 @@ function isSafeImageSrc(src) {
   return isSafeImageDataUrl(src) || /^https:\/\/[^\s<>"']+$/i.test(src);
 }
 
-function formatBotRichText(raw) {
-  const { html } = extractAndLinkify(String(raw || ""));
-  return html
+export function formatBotRichText(raw) {
+  const tokens = [];
+  const stash = (html) => {
+    const idx = tokens.length;
+    tokens.push(html);
+    return `\u0000BOTTOK${idx}\u0000`;
+  };
+  const src = String(raw || "").replace(
+    /\[([^\[\]\n]{1,120})\]\(([^()\n]{1,320})\)/g,
+    (full, label, target) => {
+      const cleanLabel = label.trim();
+      const cleanTarget = target.trim();
+      if (!cleanLabel || !cleanTarget) return full;
+      if (cleanTarget.startsWith("action:")) {
+        const actId = cleanTarget.slice(7).trim();
+        if (!actId) return full;
+        return stash(
+          `<button type="button" class="bot-inline-action" data-bot-inline-action="${escapeHtml(actId)}">${escapeHtml(cleanLabel)}</button>`
+        );
+      }
+      if (cleanTarget.startsWith("edit:")) {
+        const editSpec = cleanTarget.slice(5).trim();
+        if (!editSpec) return full;
+        return stash(
+          `<button type="button" class="bot-inline-action is-edit" data-bot-inline-edit="${escapeHtml(editSpec)}">${escapeHtml(cleanLabel)}</button>`
+        );
+      }
+      if (SAFE_HTTP_URL_RE.test(cleanTarget)) {
+        return stash(
+          `<a class="bot-inline-url" href="${escapeHtml(cleanTarget)}" target="_blank" rel="noopener noreferrer">${escapeHtml(cleanLabel)}</a>`
+        );
+      }
+      return full;
+    }
+  );
+  const { html } = extractAndLinkify(src);
+  const formatted = html
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  return formatted.replace(/\u0000BOTTOK(\d+)\u0000/g, (_, idx) => tokens[Number(idx)] || "");
 }
 
 function computeFloat32RmsI16Scale(float32Pcm) {
@@ -9084,7 +9126,12 @@ export class P2PDirectApp {
     return null;
   }
 
-  async handleBuiltinBotAction(botId, messageId, actionId, { actorPeerId = null, actorName = "Peer" } = {}) {
+  async handleBuiltinBotAction(
+    botId,
+    messageId,
+    actionId,
+    { actorPeerId = null, actorName = "Peer", value = null } = {}
+  ) {
     const existing =
       (messageId && this.logMessages.find((m) => m.id === messageId)) ||
       findPersistentBotMessage(this.logMessages, botId);
@@ -9116,7 +9163,7 @@ export class P2PDirectApp {
         const nextState = applyPomodoroAction(prevState, action, { nowMs });
         card = buildPomodoroCard(nextState, { nowMs });
       } else if (botId === CHECKLIST_BOT_ID) {
-        const nextState = applyChecklistAction(prevState, action, { peerName });
+        const nextState = applyChecklistAction(prevState, action, { peerName, value });
         card = buildChecklistCard(nextState, { nowMs });
       } else if (botId === RANDOMIZER_BOT_ID) {
         const nextState = applyRandomizerAction(prevState, action, {
@@ -9177,6 +9224,36 @@ export class P2PDirectApp {
       } else if (action.kind === "metric") {
         overrides.tab = "meta";
         overrides.metricKind = action.metricKind;
+      } else if (action.kind === "open" && action.entityPath) {
+        overrides.tab = "codex";
+        overrides.entityPath = action.entityPath;
+        overrides.lookupQuery = null;
+        overrides.upgraded = false;
+      } else if (action.kind === "search") {
+        const rawQ = String(value || "").trim();
+        if (!rawQ) return false;
+        overrides.tab = "codex";
+        overrides.upgraded = false;
+        if (/^\/(?:cards|relics|potions|events|monsters)\/[a-z0-9_-]+$/i.test(rawQ)) {
+          overrides.entityPath = rawQ;
+          overrides.lookupQuery = null;
+        } else {
+          const colonIdx = rawQ.indexOf(":");
+          const pfx = colonIdx > 0 ? rawQ.slice(0, colonIdx).trim().toLowerCase() : "";
+          if (
+            pfx === "card" ||
+            pfx === "relic" ||
+            pfx === "potion" ||
+            pfx === "event" ||
+            pfx === "monster"
+          ) {
+            overrides.lookupKind = pfx;
+            overrides.lookupQuery = rawQ.slice(colonIdx + 1).trim();
+          } else {
+            overrides.lookupKind = "auto";
+            overrides.lookupQuery = rawQ;
+          }
+        }
       } else if (action.kind === "codex_random") {
         overrides.tab = "codex";
         overrides.entityPath = pickRandomSpotlightPath(p.sts2EntityPath);
@@ -9207,7 +9284,15 @@ export class P2PDirectApp {
     if (botId === WIKI_BOT_ID) {
       const overrides = {};
       if (action.kind === "tab") overrides.tab = action.tab;
-      if (action.kind === "refresh" && p.wikiTab === "lookup" && p.wikiQuery) {
+      if (action.kind === "lookup" && action.query) {
+        overrides.tab = "lookup";
+        overrides.query = action.query;
+      } else if (action.kind === "search") {
+        const q = String(value || "").trim();
+        if (!q) return false;
+        overrides.tab = "lookup";
+        overrides.query = q;
+      } else if (action.kind === "refresh" && p.wikiTab === "lookup" && p.wikiQuery) {
         overrides.query = p.wikiQuery;
       }
       return this.ensureBuiltinBotCard(WIKI_BOT_ID, {
@@ -14701,6 +14786,7 @@ export class P2PDirectApp {
               this.handleBuiltinBotAction(parsedBuiltin.botId, act.messageId, act.actionId, {
                 actorPeerId: act.fromPeerId || null,
                 actorName: act.fromName || act.fromPeerId || "Peer",
+                value: act.value ?? null,
               });
             }
           }
@@ -16980,7 +17066,13 @@ export class P2PDirectApp {
     );
     if (input) {
       input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
+      try {
+        if (typeof input.setSelectionRange === "function") {
+          input.setSelectionRange(input.value.length, input.value.length);
+        }
+      } catch {
+        // Number/select inputs do not support setSelectionRange.
+      }
     }
   }
 
@@ -17162,11 +17254,39 @@ export class P2PDirectApp {
     }
   }
 
+  applyInlineEditSpec(msg, editSpec) {
+    if (!msg || !this.wasm || typeof editSpec !== "string" || !editSpec.trim()) return;
+    const base = msg.payload && typeof msg.payload === "object" ? { ...msg.payload } : {};
+    const params = new URLSearchParams(editSpec.trim());
+    const allowedKeys = new Set(["title", "subtitle", "badge", "text", "footer", "color"]);
+    let changed = false;
+    for (const [k, v] of params.entries()) {
+      if (allowedKeys.has(k)) {
+        base[k] = v;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.submitEditMessage(msg.id, base);
+    }
+  }
+
   handleBotButtonClick(msg, btnObj, btnEl) {
     if (!msg || !btnObj || btnObj.disabled || !this.wasm) return;
 
     if (typeof btnObj.url === "string" && SAFE_HTTP_URL_RE.test(btnObj.url.trim())) {
       window.open(btnObj.url.trim(), "_blank", "noopener,noreferrer");
+      return;
+    }
+
+    // Declarative in-place edit buttons/tiles (`editPayload` or `editPatch`)
+    if (btnObj.editPayload && typeof btnObj.editPayload === "object" && !Array.isArray(btnObj.editPayload)) {
+      this.submitEditMessage(msg.id, btnObj.editPayload);
+      return;
+    }
+    if (btnObj.editPatch && typeof btnObj.editPatch === "object" && !Array.isArray(btnObj.editPatch)) {
+      const base = msg.payload && typeof msg.payload === "object" ? { ...msg.payload } : {};
+      this.submitEditMessage(msg.id, { ...base, ...btnObj.editPatch });
       return;
     }
 
@@ -17227,6 +17347,7 @@ export class P2PDirectApp {
       this.handleBuiltinBotAction(builtinParsed.botId, msg.id, actionId, {
         actorPeerId: this.status?.peerId || "self",
         actorName: this.status?.authorName || "Peer",
+        value,
       });
       return;
     }
@@ -17537,11 +17658,237 @@ export class P2PDirectApp {
     return cleanRows;
   }
 
+  _renderBotButtonRowsHtml(buttonRows, flatButtons) {
+    if (!Array.isArray(buttonRows) || buttonRows.length === 0) return "";
+    const allowedStyles = new Set(["primary", "success", "warning", "danger", "secondary"]);
+    const rowsHtml = buttonRows
+      .map((row) => {
+        const btnsHtml = row
+          .map((btn) => {
+            const idx = flatButtons.length;
+            flatButtons.push(btn);
+            const style = allowedStyles.has(btn.style) ? btn.style : "secondary";
+            const label = escapeHtml(btn.label || btn.id || "Action");
+            const sublabel =
+              typeof btn.sublabel === "string" && btn.sublabel.trim()
+                ? `<span class="bot-btn-sub">${escapeHtml(btn.sublabel.trim())}</span>`
+                : "";
+            const imgSrc =
+              typeof btn.image === "string"
+                ? btn.image
+                : btn.image && typeof btn.image === "object"
+                  ? btn.image.url || btn.image.dataUrl || ""
+                  : "";
+            const hasImg = isSafeImageSrc(imgSrc);
+            const imgHtml = hasImg
+              ? `<img class="bot-btn-img" src="${escapeHtml(imgSrc)}" alt="" loading="lazy" />`
+              : "";
+            const isLink = typeof btn.url === "string" && SAFE_HTTP_URL_RE.test(btn.url.trim());
+            const suffix = isLink ? ` ${LINK_ARROW_SVG}` : "";
+            const disabledAttr = btn.disabled ? " disabled" : "";
+            const activeCls = btn.active ? " is-active" : "";
+            const imgCls = hasImg ? " has-img" : "";
+            const copyHtml = sublabel
+              ? `<span class="bot-btn-copy"><span class="bot-btn-label">${label}${suffix}</span>${sublabel}</span>`
+              : `<span class="bot-btn-label">${label}${suffix}</span>`;
+            return `<button type="button" class="bot-btn bot-btn-${style}${activeCls}${imgCls}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(btn.id || btn.actionId || "")}"${disabledAttr}>${imgHtml}${copyHtml}</button>`;
+          })
+          .join("");
+        return `<div class="bot-btn-row">${btnsHtml}</div>`;
+      })
+      .join("");
+    return `<div class="bot-card-actions">${rowsHtml}</div>`;
+  }
+
+  _renderBotBlocksHtml(blocks, flatButtons, inputBindings, selectBindings) {
+    if (!Array.isArray(blocks) || blocks.length === 0) return "";
+    const allowedColors = new Set(["cobalt", "mint", "ochre", "coral", "cyan", "ink"]);
+    const allowedTones = new Set(["info", "success", "warning", "danger"]);
+    const out = [];
+
+    for (const blk of blocks.slice(0, 24)) {
+      if (!blk || typeof blk !== "object") continue;
+      const type = String(blk.type || "").toLowerCase();
+
+      if (type === "heading") {
+        const tag = blk.level === 2 ? "h3" : "h4";
+        const badge = blk.badge
+          ? `<span class="bot-blk-badge">${escapeHtml(blk.badge)}</span>`
+          : "";
+        out.push(
+          `<div class="bot-blk-heading"><${tag}>${escapeHtml(blk.text || "")}</${tag}>${badge}</div>`
+        );
+      } else if (type === "text" && typeof blk.text === "string" && blk.text.trim()) {
+        out.push(`<div class="bot-blk-text">${formatBotRichText(blk.text)}</div>`);
+      } else if (type === "divider") {
+        out.push(`<hr class="bot-blk-divider" />`);
+      } else if (type === "progress") {
+        const max = Math.max(1, Number(blk.max) || 100);
+        const val = Math.max(0, Math.min(max, Number(blk.value) || 0));
+        const pct = Math.round((val / max) * 100);
+        const barColor = allowedColors.has(blk.color) ? blk.color : "cobalt";
+        const disp = blk.display !== undefined ? String(blk.display) : `${pct}%`;
+        out.push(`
+          <div class="bot-blk-progress">
+            <div class="bot-blk-progress-head">
+              <span class="bot-blk-progress-label">${formatBotRichText(blk.label || "")}</span>
+              <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
+            </div>
+            <div class="bot-blk-progress-track">
+              <div class="bot-blk-progress-fill is-${barColor}" style="width:${pct}%"></div>
+            </div>
+          </div>
+        `);
+      } else if (type === "stats" && Array.isArray(blk.items) && blk.items.length > 0) {
+        const tiles = blk.items
+          .slice(0, 8)
+          .filter((it) => it && typeof it === "object")
+          .map((it) => {
+            const acc = allowedColors.has(it.accent) ? ` is-${it.accent}` : "";
+            return `
+              <div class="bot-blk-stat${acc}">
+                <span class="bot-blk-stat-label">${escapeHtml(it.label || "")}</span>
+                <span class="bot-blk-stat-val">${formatBotRichText(it.value ?? "")}</span>
+              </div>
+            `;
+          })
+          .join("");
+        if (tiles) out.push(`<div class="bot-blk-stats">${tiles}</div>`);
+      } else if (type === "callout") {
+        const tone = allowedTones.has(blk.tone) ? blk.tone : "info";
+        const titleHtml = blk.title
+          ? `<strong class="bot-blk-callout-title">${escapeHtml(blk.title)}</strong>`
+          : "";
+        const textHtml = blk.text
+          ? `<div class="bot-blk-callout-body">${formatBotRichText(blk.text)}</div>`
+          : "";
+        out.push(`<div class="bot-blk-callout is-${tone}">${titleHtml}${textHtml}</div>`);
+      } else if (type === "table" && Array.isArray(blk.rows)) {
+        const cols = Array.isArray(blk.columns) ? blk.columns.slice(0, 6) : [];
+        const thead =
+          cols.length > 0
+            ? `<thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>`
+            : "";
+        const tbody = blk.rows
+          .slice(0, 12)
+          .filter((r) => Array.isArray(r))
+          .map(
+            (row) =>
+              `<tr>${row
+                .slice(0, 6)
+                .map((cell) => `<td>${formatBotRichText(cell ?? "")}</td>`)
+                .join("")}</tr>`
+          )
+          .join("");
+        out.push(`<div class="bot-blk-table-wrap"><table class="bot-blk-table">${thead}<tbody>${tbody}</tbody></table></div>`);
+      } else if (type === "gallery" && Array.isArray(blk.items) && blk.items.length > 0) {
+        const cols = Math.max(2, Math.min(4, Number(blk.columns) || 3));
+        const cards = blk.items
+          .slice(0, 12)
+          .filter((it) => it && typeof it === "object")
+          .map((it) => {
+            const idx = flatButtons.length;
+            flatButtons.push({
+              id: it.actionId || it.id || `gallery_${idx}`,
+              label: it.title || it.label || "Select",
+              value: it.value !== undefined ? it.value : null,
+              url: it.url || null,
+              editPatch: it.editPatch || null,
+              editPayload: it.editPayload || null,
+              disabled: Boolean(it.disabled),
+            });
+            const imgSrc =
+              typeof it.image === "string"
+                ? it.image
+                : it.image && typeof it.image === "object"
+                  ? it.image.url || it.image.dataUrl || ""
+                  : "";
+            const imgHtml = isSafeImageSrc(imgSrc)
+              ? `<img class="bot-gallery-img" src="${escapeHtml(imgSrc)}" alt="${escapeHtml(it.title || "")}" loading="lazy" />`
+              : "";
+            const subHtml = it.subtitle
+              ? `<span class="bot-gallery-sub">${escapeHtml(it.subtitle)}</span>`
+              : "";
+            const actCls = it.active ? " is-active" : "";
+            return `
+              <button type="button" class="bot-gallery-tile${actCls}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(it.actionId || it.id || "")}">
+                ${imgHtml}
+                <span class="bot-gallery-copy">
+                  <span class="bot-gallery-title">${escapeHtml(it.title || it.label || "")}</span>
+                  ${subHtml}
+                </span>
+              </button>
+            `;
+          })
+          .join("");
+        if (cards) {
+          out.push(`<div class="bot-blk-gallery cols-${cols}">${cards}</div>`);
+        }
+      } else if (type === "input") {
+        const idx = inputBindings.length;
+        inputBindings.push(blk);
+        const labelHtml = blk.label
+          ? `<label class="bot-blk-input-label">${escapeHtml(blk.label)}</label>`
+          : "";
+        const submitLbl = escapeHtml(blk.submitLabel || "Go");
+        out.push(`
+          <div class="bot-blk-input-wrap" data-bot-input-idx="${idx}">
+            ${labelHtml}
+            <div class="bot-blk-input-row">
+              <input
+                type="text"
+                class="bot-blk-input"
+                data-bot-input-field="${idx}"
+                placeholder="${escapeHtml(blk.placeholder || "Type here…")}"
+                value="${escapeHtml(blk.value || "")}"
+                autocomplete="off"
+                aria-label="${escapeHtml(blk.label || blk.placeholder || "Bot input")}"
+              />
+              <button type="button" class="btn btn-sm btn-primary bot-blk-input-submit" data-bot-input-submit="${idx}">${submitLbl}</button>
+            </div>
+            <div class="bot-autocomplete-list hidden" data-bot-ac-list="${idx}" role="listbox"></div>
+          </div>
+        `);
+      } else if (type === "select" && Array.isArray(blk.options) && blk.options.length > 0) {
+        const idx = selectBindings.length;
+        selectBindings.push(blk);
+        const labelHtml = blk.label
+          ? `<label class="bot-blk-input-label">${escapeHtml(blk.label)}</label>`
+          : "";
+        const optsHtml = blk.options
+          .slice(0, 30)
+          .map((opt) => {
+            const val = typeof opt === "object" ? String(opt.value ?? opt.label ?? "") : String(opt);
+            const lbl = typeof opt === "object" ? String(opt.label ?? opt.value ?? "") : String(opt);
+            const sel = val === String(blk.value ?? "") ? " selected" : "";
+            return `<option value="${escapeHtml(val)}"${sel}>${escapeHtml(lbl)}</option>`;
+          })
+          .join("");
+        out.push(`
+          <div class="bot-blk-select-wrap">
+            ${labelHtml}
+            <select class="select-input bot-blk-select" data-bot-select-idx="${idx}">${optsHtml}</select>
+          </div>
+        `);
+      } else if (type === "buttons") {
+        const bRows = this.normalizeBotButtonRows(blk.rows || blk.buttons);
+        if (bRows.length > 0) {
+          out.push(this._renderBotButtonRowsHtml(bRows, flatButtons));
+        }
+      }
+    }
+
+    return out.length > 0 ? `<div class="bot-card-blocks">${out.join("")}</div>` : "";
+  }
+
   renderBotCardPayload(payload) {
     const p = payload && typeof payload === "object" ? payload : {};
     const allowedColors = new Set(["cobalt", "mint", "ochre", "coral", "cyan", "ink"]);
     const accent = allowedColors.has(p.color) ? p.color : "cobalt";
     const parts = [];
+    const flatButtons = [];
+    const inputBindings = [];
+    const selectBindings = [];
 
     if (p.title || p.subtitle || p.badge) {
       const subHtml = p.subtitle
@@ -17563,6 +17910,16 @@ export class P2PDirectApp {
 
     if (typeof p.text === "string" && p.text.trim()) {
       parts.push(`<div class="bot-card-text">${formatBotRichText(p.text)}</div>`);
+    }
+
+    if (Array.isArray(p.blocks) && p.blocks.length > 0) {
+      const blocksHtml = this._renderBotBlocksHtml(
+        p.blocks,
+        flatButtons,
+        inputBindings,
+        selectBindings
+      );
+      if (blocksHtml) parts.push(blocksHtml);
     }
 
     if (Array.isArray(p.fields) && p.fields.length > 0) {
@@ -17599,27 +17956,8 @@ export class P2PDirectApp {
     }
 
     const buttonRows = this.normalizeBotButtonRows(p.buttons);
-    const flatButtons = [];
     if (buttonRows.length > 0) {
-      const allowedStyles = new Set(["primary", "success", "warning", "danger", "secondary"]);
-      const rowsHtml = buttonRows
-        .map((row) => {
-          const btnsHtml = row
-            .map((btn) => {
-              const idx = flatButtons.length;
-              flatButtons.push(btn);
-              const style = allowedStyles.has(btn.style) ? btn.style : "secondary";
-              const label = escapeHtml(btn.label || btn.id || "Action");
-              const isLink = typeof btn.url === "string" && SAFE_HTTP_URL_RE.test(btn.url.trim());
-              const suffix = isLink ? ` ${LINK_ARROW_SVG}` : "";
-              const disabledAttr = btn.disabled ? " disabled" : "";
-              return `<button type="button" class="bot-btn bot-btn-${style}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(btn.id || btn.actionId || "")}"${disabledAttr}>${label}${suffix}</button>`;
-            })
-            .join("");
-          return `<div class="bot-btn-row">${btnsHtml}</div>`;
-        })
-        .join("");
-      parts.push(`<div class="bot-card-actions">${rowsHtml}</div>`);
+      parts.push(this._renderBotButtonRowsHtml(buttonRows, flatButtons));
     }
 
     if (typeof p.footer === "string" && p.footer.trim()) {
@@ -17629,7 +17967,819 @@ export class P2PDirectApp {
     return {
       html: `<div class="bot-card bot-accent-${accent}">${parts.join("")}</div>`,
       buttons: flatButtons,
+      inputs: inputBindings,
+      selects: selectBindings,
     };
+  }
+
+  async _fetchCardAutocompleteSuggestions(provider, query, staticSuggestions = null) {
+    const q = String(query || "").trim();
+    if (Array.isArray(staticSuggestions) && staticSuggestions.length > 0) {
+      const low = q.toLowerCase();
+      return staticSuggestions
+        .filter((s) => {
+          if (!s) return false;
+          const lbl = typeof s === "object" ? String(s.label || s.value || "") : String(s);
+          const sub = typeof s === "object" ? String(s.sublabel || "") : "";
+          return !low || lbl.toLowerCase().includes(low) || sub.toLowerCase().includes(low);
+        })
+        .slice(0, 8)
+        .map((s) =>
+          typeof s === "object"
+            ? {
+                label: String(s.label || s.value || ""),
+                sublabel: String(s.sublabel || ""),
+                value: s.value !== undefined ? String(s.value) : String(s.label || ""),
+                image: s.image || "",
+                actionId: s.actionId || null,
+              }
+            : { label: String(s), sublabel: "", value: String(s), image: "", actionId: null }
+        );
+    }
+    if (q.length < 2) return [];
+    if (provider === "sts2") {
+      try {
+        return await searchSts2Suggestions(q);
+      } catch {
+        return [];
+      }
+    }
+    if (provider === "wiki") {
+      try {
+        return await searchWikiSuggestions(q);
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  }
+
+  _bindBotCardInteractiveElements(article, msg, botButtons, botInputs, botSelects) {
+    // 1. Standard / image / gallery buttons
+    for (const btnEl of article.querySelectorAll("[data-bot-btn-idx]")) {
+      const idx = Number(btnEl.dataset.botBtnIdx);
+      const btnObj = botButtons[idx];
+      if (btnObj) {
+        btnEl.addEventListener("click", () => this.handleBotButtonClick(msg, btnObj, btnEl));
+      }
+    }
+
+    // 2. Inline `[Label](action:actionId)` clickable links inside text, fields, tables, callouts
+    for (const linkBtn of article.querySelectorAll("[data-bot-inline-action]")) {
+      const actId = linkBtn.dataset.botInlineAction;
+      if (actId) {
+        linkBtn.addEventListener("click", () => {
+          this.handleBotButtonClick(
+            msg,
+            { id: actId, label: linkBtn.textContent || actId },
+            linkBtn
+          );
+        });
+      }
+    }
+
+    // 3. Inline `[Label](edit:key=val)` clickable links that edit the message directly in place
+    for (const editBtn of article.querySelectorAll("[data-bot-inline-edit]")) {
+      const editSpec = editBtn.dataset.botInlineEdit;
+      if (editSpec) {
+        editBtn.addEventListener("click", () => this.applyInlineEditSpec(msg, editSpec));
+      }
+    }
+
+    // 4. In-card select dropdowns
+    for (const selEl of article.querySelectorAll("[data-bot-select-idx]")) {
+      const idx = Number(selEl.dataset.botSelectIdx);
+      const spec = botSelects[idx];
+      if (!spec) continue;
+      selEl.addEventListener("change", () => {
+        this.handleBotButtonClick(
+          msg,
+          {
+            id: spec.id || spec.actionId || `select_${idx}`,
+            label: spec.label || selEl.value,
+            value: selEl.value,
+          },
+          selEl
+        );
+      });
+    }
+
+    // 5. In-card text inputs with optional live or static autocomplete dropdown!
+    for (const wrap of article.querySelectorAll("[data-bot-input-idx]")) {
+      const idx = Number(wrap.dataset.botInputIdx);
+      const spec = botInputs[idx];
+      if (!spec) continue;
+      const inputEl = wrap.querySelector(`[data-bot-input-field="${idx}"]`);
+      const submitBtn = wrap.querySelector(`[data-bot-input-submit="${idx}"]`);
+      const listEl = wrap.querySelector(`[data-bot-ac-list="${idx}"]`);
+      if (!inputEl) continue;
+
+      let acItems = [];
+      let acActiveIdx = -1;
+      let acTimer = null;
+      let acReqGen = 0;
+
+      const closeAc = () => {
+        acItems = [];
+        acActiveIdx = -1;
+        if (listEl) {
+          listEl.classList.add("hidden");
+          listEl.innerHTML = "";
+        }
+      };
+
+      const fireInputValue = (val, overrideActionId = null, label = null) => {
+        const cleanVal = String(val ?? "").trim();
+        if (!cleanVal) return;
+        closeAc();
+        inputEl.value = "";
+        this.handleBotButtonClick(
+          msg,
+          {
+            id: overrideActionId || spec.id || spec.actionId || `input_${idx}`,
+            label: label || spec.submitLabel || cleanVal,
+            value: cleanVal,
+          },
+          submitBtn
+        );
+      };
+
+      const renderAc = () => {
+        if (!listEl) return;
+        if (acItems.length === 0) {
+          listEl.classList.add("hidden");
+          listEl.innerHTML = "";
+          return;
+        }
+        listEl.innerHTML = "";
+        acItems.forEach((item, i) => {
+          const optBtn = document.createElement("button");
+          optBtn.type = "button";
+          optBtn.className = `bot-ac-item${i === acActiveIdx ? " is-active" : ""}`;
+          optBtn.setAttribute("role", "option");
+          optBtn.setAttribute("aria-selected", i === acActiveIdx ? "true" : "false");
+          if (item.image && isSafeImageSrc(item.image)) {
+            const img = document.createElement("img");
+            img.className = "bot-ac-img";
+            img.src = item.image;
+            img.alt = "";
+            optBtn.appendChild(img);
+          }
+          const copy = document.createElement("span");
+          copy.className = "bot-ac-copy";
+          const main = document.createElement("span");
+          main.className = "bot-ac-label";
+          main.textContent = item.label;
+          copy.appendChild(main);
+          if (item.sublabel) {
+            const sub = document.createElement("span");
+            sub.className = "bot-ac-sub";
+            sub.textContent = item.sublabel;
+            copy.appendChild(sub);
+          }
+          optBtn.appendChild(copy);
+          // mousedown fires before input blur so selection never gets lost
+          optBtn.addEventListener("mousedown", (ev) => {
+            ev.preventDefault();
+            fireInputValue(item.value, item.actionId || null, item.label);
+          });
+          listEl.appendChild(optBtn);
+        });
+        listEl.classList.remove("hidden");
+      };
+
+      const hasAc = Boolean(spec.autocomplete || (Array.isArray(spec.suggestions) && spec.suggestions.length > 0));
+      if (hasAc) {
+        const triggerAc = () => {
+          const q = inputEl.value.trim();
+          if (acTimer) clearTimeout(acTimer);
+          if (!q && !Array.isArray(spec.suggestions)) {
+            closeAc();
+            return;
+          }
+          const delay = Array.isArray(spec.suggestions) ? 0 : 150;
+          const myGen = ++acReqGen;
+          acTimer = setTimeout(async () => {
+            const results = await this._fetchCardAutocompleteSuggestions(
+              spec.autocomplete || null,
+              q,
+              spec.suggestions || null
+            );
+            if (myGen !== acReqGen || !inputEl.isConnected) return;
+            acItems = results;
+            acActiveIdx = results.length > 0 ? 0 : -1;
+            renderAc();
+          }, delay);
+        };
+
+        inputEl.addEventListener("input", triggerAc);
+        if (Array.isArray(spec.suggestions) && spec.suggestions.length > 0) {
+          inputEl.addEventListener("focus", triggerAc);
+        }
+        inputEl.addEventListener("blur", () => {
+          setTimeout(() => closeAc(), 120);
+        });
+      }
+
+      inputEl.addEventListener("keydown", (ev) => {
+        if (ev.key === "ArrowDown" && acItems.length > 0) {
+          ev.preventDefault();
+          acActiveIdx = (acActiveIdx + 1) % acItems.length;
+          renderAc();
+        } else if (ev.key === "ArrowUp" && acItems.length > 0) {
+          ev.preventDefault();
+          acActiveIdx = (acActiveIdx - 1 + acItems.length) % acItems.length;
+          renderAc();
+        } else if (ev.key === "Escape") {
+          if (acItems.length > 0) {
+            ev.preventDefault();
+            closeAc();
+          }
+        } else if (ev.key === "Enter") {
+          ev.preventDefault();
+          if (acItems.length > 0 && acActiveIdx >= 0 && acItems[acActiveIdx]) {
+            const chosen = acItems[acActiveIdx];
+            fireInputValue(chosen.value, chosen.actionId || null, chosen.label);
+          } else {
+            fireInputValue(inputEl.value);
+          }
+        }
+      });
+
+      if (submitBtn) {
+        submitBtn.addEventListener("click", () => {
+          fireInputValue(inputEl.value);
+        });
+      }
+    }
+  }
+
+  /**
+   * Attaches a reusable Flat Metro chip-list editor with live comma auto-splitting
+   * inside an inline bot edit form.
+   */
+  _attachInlineListEditor(containerEl, initialItems, { min = 1, max = 12, maxLen = 48, itemWord = "items", placeholder = "Add item…" } = {}) {
+    let items = Array.isArray(initialItems) ? [...initialItems] : [];
+    const chipsEl = containerEl.querySelector("[data-inline-chips]");
+    const countEl = containerEl.querySelector("[data-inline-count]");
+    const inputEl = containerEl.querySelector("[data-inline-list-input]");
+    const addBtn = containerEl.querySelector("[data-inline-list-add]");
+
+    const render = () => {
+      const atMax = items.length >= max;
+      const atMin = items.length <= min;
+      if (countEl) {
+        countEl.textContent = `${items.length} / ${max}`;
+        countEl.classList.toggle("is-full", atMax);
+      }
+      if (inputEl) {
+        inputEl.disabled = atMax;
+        inputEl.placeholder = atMax ? `Max ${max} ${itemWord} reached` : placeholder;
+      }
+      if (addBtn) addBtn.disabled = atMax;
+      if (!chipsEl) return;
+      chipsEl.innerHTML = "";
+      items.forEach((item, idx) => {
+        const chip = document.createElement("span");
+        chip.className = "settings-list-chip";
+        const txt = document.createElement("span");
+        txt.className = "settings-list-chip-text";
+        txt.textContent = item;
+        chip.appendChild(txt);
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "settings-list-chip-del";
+        del.textContent = "×";
+        del.disabled = atMin;
+        del.setAttribute("aria-label", `Remove ${item}`);
+        del.addEventListener("click", () => {
+          const res = removeListEditorItem(items, idx, { min });
+          if (res.removed) {
+            items = res.items;
+            render();
+          }
+        });
+        chip.appendChild(del);
+        chipsEl.appendChild(chip);
+      });
+    };
+
+    const commitTokens = (tokens) => {
+      const res = mergeListEditorItems(items, tokens, { max, maxLen, dedupe: true });
+      items = res.items;
+      render();
+    };
+
+    if (inputEl) {
+      inputEl.addEventListener("input", (ev) => {
+        const val = inputEl.value;
+        if (!val) return;
+        if (!/\S/.test(val)) {
+          inputEl.value = "";
+          return;
+        }
+        if (!/[,;\n]/.test(val)) return;
+        if (ev.inputType === "insertFromPaste") {
+          commitTokens(splitAllListTokens(val));
+          inputEl.value = "";
+          return;
+        }
+        const { ready, remainder } = extractLiveSplitTokens(val);
+        if (ready.length > 0) {
+          commitTokens(ready);
+          inputEl.value = remainder;
+        }
+      });
+      inputEl.addEventListener("paste", (ev) => {
+        const text = ev.clipboardData?.getData("text") || "";
+        if (!/[,;\n]/.test(text)) return;
+        ev.preventDefault();
+        commitTokens(splitAllListTokens(`${inputEl.value}${text}`));
+        inputEl.value = "";
+      });
+      inputEl.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          if (inputEl.value.trim()) {
+            commitTokens(splitAllListTokens(inputEl.value));
+            inputEl.value = "";
+          }
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          this.cancelEditMessage();
+        }
+      });
+    }
+    if (addBtn && inputEl) {
+      addBtn.addEventListener("click", () => {
+        if (inputEl.value.trim()) {
+          commitTokens(splitAllListTokens(inputEl.value));
+          inputEl.value = "";
+          inputEl.focus();
+        }
+      });
+    }
+
+    render();
+    return {
+      getItems: () => {
+        if (inputEl && inputEl.value.trim()) {
+          commitTokens(splitAllListTokens(inputEl.value));
+          inputEl.value = "";
+        }
+        return [...items];
+      },
+    };
+  }
+
+  _inlineListEditorSlotHtml(name, label, placeholder) {
+    return `
+      <div class="settings-field settings-list-editor" data-inline-list="${escapeHtml(name)}">
+        <div class="settings-list-head">
+          <span class="settings-label">${escapeHtml(label)}</span>
+          <span class="settings-list-count" data-inline-count></span>
+        </div>
+        <div class="settings-list-chips" data-inline-chips></div>
+        <div class="settings-list-add-row">
+          <input type="text" class="text-input settings-list-input" data-inline-list-input placeholder="${escapeHtml(placeholder)}" autocomplete="off" />
+          <button type="button" class="btn btn-sm btn-primary settings-list-add-btn" data-inline-list-add>+ Add</button>
+        </div>
+      </div>
+    `;
+  }
+
+  _buildBotInlineEditFormHtml(m) {
+    const p = m.payload && typeof m.payload === "object" ? m.payload : {};
+    const botId = p.builtinBot || "";
+    const st = p.botState && typeof p.botState === "object" ? p.botState : {};
+    let fieldsHtml = "";
+
+    if (botId === POLL_BOT_ID) {
+      fieldsHtml = `
+        <div class="settings-field">
+          <label class="settings-label">Question</label>
+          <input type="text" class="text-input msg-edit-input" data-bot-edit-field="question" maxlength="120" value="${escapeHtml(st.question || p.title || "")}" />
+        </div>
+        ${this._inlineListEditorSlotHtml("options", "Options (2–6)", "Add option…")}
+      `;
+    } else if (botId === CHECKLIST_BOT_ID) {
+      fieldsHtml = `
+        <div class="settings-field">
+          <label class="settings-label">Title</label>
+          <input type="text" class="text-input msg-edit-input" data-bot-edit-field="title" maxlength="80" value="${escapeHtml(st.title || p.title || "")}" />
+        </div>
+        ${this._inlineListEditorSlotHtml("items", "Items (1–12)", "Add item…")}
+      `;
+    } else if (botId === RANDOMIZER_BOT_ID) {
+      fieldsHtml = this._inlineListEditorSlotHtml("options", "Options Pool (1–12)", "Add option…");
+    } else if (botId === POMODORO_BOT_ID) {
+      fieldsHtml = `
+        <div class="bot-inline-edit-grid3">
+          <div class="settings-field">
+            <label class="settings-label">Focus (min)</label>
+            <input type="number" class="text-input msg-edit-input" data-bot-edit-field="focusMin" min="1" max="120" value="${escapeHtml(st.focusMin ?? 25)}" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Break (min)</label>
+            <input type="number" class="text-input" data-bot-edit-field="breakMin" min="1" max="60" value="${escapeHtml(st.breakMin ?? 5)}" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Long (min)</label>
+            <input type="number" class="text-input" data-bot-edit-field="longBreakMin" min="1" max="90" value="${escapeHtml(st.longBreakMin ?? 15)}" />
+          </div>
+        </div>
+      `;
+    } else if (botId === SCOREBOARD_BOT_ID) {
+      const mode = st.mode === "ratings" ? "ratings" : "scores";
+      fieldsHtml = `
+        <div class="bot-inline-edit-grid2">
+          <div class="settings-field">
+            <label class="settings-label">Mode</label>
+            <select class="select-input" data-bot-edit-field="mode">
+              <option value="scores"${mode === "scores" ? " selected" : ""}>Scoreboard (+1 / -1)</option>
+              <option value="ratings"${mode === "ratings" ? " selected" : ""}>Ratings (1–5★)</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Rating Title</label>
+            <input type="text" class="text-input msg-edit-input" data-bot-edit-field="ratingTitle" maxlength="90" value="${escapeHtml(st.ratingTitle || "")}" />
+          </div>
+        </div>
+        ${this._inlineListEditorSlotHtml("players", "Players (1–6)", "Add player…")}
+      `;
+    } else if (botId === WEATHER_BOT_ID) {
+      const unit = p.wxUnit === "f" ? "f" : "c";
+      fieldsHtml = `
+        <div class="settings-field">
+          <label class="settings-label">Unit</label>
+          <select class="select-input" data-bot-edit-field="unit">
+            <option value="c"${unit === "c" ? " selected" : ""}>Celsius (°C)</option>
+            <option value="f"${unit === "f" ? " selected" : ""}>Fahrenheit (°F)</option>
+          </select>
+        </div>
+        ${this._inlineListEditorSlotHtml("cities", "Cities (1–4)", "Add city…")}
+      `;
+    } else if (botId === GITHUB_BOT_ID) {
+      const ghTab = p.ghTab || "overview";
+      fieldsHtml = `
+        <div class="bot-inline-edit-grid2">
+          <div class="settings-field">
+            <label class="settings-label">Repository</label>
+            <input type="text" class="text-input msg-edit-input" data-bot-edit-field="repo" value="${escapeHtml(p.ghRepo || this.builtinBots.settings.github.repo)}" placeholder="owner/repo" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Tab</label>
+            <select class="select-input" data-bot-edit-field="tab">
+              <option value="overview"${ghTab === "overview" ? " selected" : ""}>Overview &amp; Release</option>
+              <option value="commits"${ghTab === "commits" ? " selected" : ""}>Commits</option>
+              <option value="issues"${ghTab === "issues" ? " selected" : ""}>Issues &amp; PRs</option>
+            </select>
+          </div>
+        </div>
+      `;
+    } else if (botId === WIKI_BOT_ID) {
+      const wTab = p.wikiTab || "featured";
+      fieldsHtml = `
+        <div class="bot-inline-edit-grid2">
+          <div class="settings-field">
+            <label class="settings-label">Article Lookup</label>
+            <input type="text" class="text-input msg-edit-input" data-bot-edit-field="query" value="${escapeHtml(p.wikiQuery || "")}" placeholder="Topic (leave blank for tab)" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Tab</label>
+            <select class="select-input" data-bot-edit-field="tab">
+              <option value="featured"${wTab === "featured" ? " selected" : ""}>Featured</option>
+              <option value="random"${wTab === "random" ? " selected" : ""}>Random</option>
+              <option value="onthisday"${wTab === "onthisday" ? " selected" : ""}>On This Day</option>
+            </select>
+          </div>
+        </div>
+      `;
+    } else if (botId === STS2_BOT_ID) {
+      const sTab = p.sts2Tab || "meta";
+      const sChar = p.sts2Char || "ironclad";
+      const sBr = p.sts2Bracket || "all";
+      fieldsHtml = `
+        <div class="settings-field">
+          <label class="settings-label">Card / Relic Lookup</label>
+          <input type="text" class="text-input msg-edit-input" data-bot-edit-field="query" value="" placeholder="Card, relic, potion… (optional)" />
+        </div>
+        <div class="bot-inline-edit-grid3">
+          <div class="settings-field">
+            <label class="settings-label">Tab</label>
+            <select class="select-input" data-bot-edit-field="tab">
+              <option value="meta"${sTab === "meta" ? " selected" : ""}>Meta</option>
+              <option value="encounters"${sTab === "encounters" ? " selected" : ""}>Fights</option>
+              <option value="codex"${sTab === "codex" ? " selected" : ""}>Codex</option>
+              <option value="news"${sTab === "news" ? " selected" : ""}>Patches</option>
+              <option value="coop"${sTab === "coop" ? " selected" : ""}>Co-op</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Character</label>
+            <select class="select-input" data-bot-edit-field="character">
+              <option value="ironclad"${sChar === "ironclad" ? " selected" : ""}>Ironclad</option>
+              <option value="silent"${sChar === "silent" ? " selected" : ""}>Silent</option>
+              <option value="defect"${sChar === "defect" ? " selected" : ""}>Defect</option>
+              <option value="regent"${sChar === "regent" ? " selected" : ""}>Regent</option>
+              <option value="necrobinder"${sChar === "necrobinder" ? " selected" : ""}>Necrobinder</option>
+              <option value="fool"${sChar === "fool" ? " selected" : ""}>Fool</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Bracket</label>
+            <select class="select-input" data-bot-edit-field="bracket">
+              <option value="all"${sBr === "all" ? " selected" : ""}>All</option>
+              <option value="a10"${sBr === "a10" ? " selected" : ""}>A10</option>
+              <option value="2p"${sBr === "2p" ? " selected" : ""}>2P</option>
+              <option value="3p"${sBr === "3p" ? " selected" : ""}>3P</option>
+              <option value="4p"${sBr === "4p" ? " selected" : ""}>4P</option>
+            </select>
+          </div>
+        </div>
+      `;
+    } else if (botId === "warframe") {
+      const wfPlat = p.wfPlatform || this.warframeBot.settings.platform || "pc";
+      const wfView = p.wfView || "cycles";
+      fieldsHtml = `
+        <div class="bot-inline-edit-grid2">
+          <div class="settings-field">
+            <label class="settings-label">Platform</label>
+            <select class="select-input" data-bot-edit-field="platform">
+              <option value="pc"${wfPlat === "pc" ? " selected" : ""}>PC</option>
+              <option value="ps4"${wfPlat === "ps4" ? " selected" : ""}>PlayStation</option>
+              <option value="xb1"${wfPlat === "xb1" ? " selected" : ""}>Xbox</option>
+              <option value="swi"${wfPlat === "swi" ? " selected" : ""}>Switch</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Tab</label>
+            <select class="select-input" data-bot-edit-field="view">
+              <option value="cycles"${wfView === "cycles" ? " selected" : ""}>Open Worlds</option>
+              <option value="fissures"${wfView === "fissures" ? " selected" : ""}>Fissures</option>
+              <option value="sortie"${wfView === "sortie" ? " selected" : ""}>Sortie &amp; Archon</option>
+              <option value="baro"${wfView === "baro" ? " selected" : ""}>Baro &amp; Steel</option>
+              <option value="invasions"${wfView === "invasions" ? " selected" : ""}>Invasions</option>
+            </select>
+          </div>
+        </div>
+      `;
+    } else {
+      // Any custom/external bot card — friendly structured visual fields (zero raw JSON!)
+      fieldsHtml = `
+        <div class="bot-inline-edit-grid2">
+          <div class="settings-field">
+            <label class="settings-label">Title</label>
+            <input type="text" class="text-input msg-edit-input" data-bot-edit-field="title" value="${escapeHtml(p.title || "")}" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Badge</label>
+            <input type="text" class="text-input" data-bot-edit-field="badge" value="${escapeHtml(p.badge || "")}" />
+          </div>
+        </div>
+        <div class="settings-field">
+          <label class="settings-label">Text</label>
+          <textarea class="msg-edit-input bot-inline-edit-textarea" data-bot-edit-field="text">${escapeHtml(p.text || "")}</textarea>
+        </div>
+        <div class="bot-inline-edit-grid2">
+          <div class="settings-field">
+            <label class="settings-label">Subtitle</label>
+            <input type="text" class="text-input" data-bot-edit-field="subtitle" value="${escapeHtml(p.subtitle || "")}" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Footer</label>
+            <input type="text" class="text-input" data-bot-edit-field="footer" value="${escapeHtml(p.footer || "")}" />
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <form class="msg-edit-form bot-inline-edit-form" data-bot-edit-form="${escapeHtml(m.id)}">
+        <div class="bot-inline-edit-fields">${fieldsHtml}</div>
+        <div class="msg-edit-error hidden" data-edit-error></div>
+        <div class="msg-edit-bar">
+          <span class="msg-edit-hint">Esc to cancel</span>
+          <div class="msg-edit-actions">
+            <button type="button" class="btn btn-sm" data-edit-cancel>Cancel</button>
+            <button type="submit" class="btn btn-sm btn-primary" data-edit-save>Save</button>
+          </div>
+        </div>
+      </form>
+    `;
+  }
+
+  _bindBotInlineEditForm(article, m) {
+    const formEl = article.querySelector("[data-bot-edit-form]");
+    if (!formEl) return;
+    const p = m.payload && typeof m.payload === "object" ? m.payload : {};
+    const botId = p.builtinBot || "";
+    const st = p.botState && typeof p.botState === "object" ? p.botState : {};
+    const errEl = formEl.querySelector("[data-edit-error]");
+    const cancelBtn = formEl.querySelector("[data-edit-cancel]");
+    const saveBtn = formEl.querySelector("[data-edit-save]");
+
+    const listEditors = {};
+    const mountList = (name, initial, opts) => {
+      const slot = formEl.querySelector(`[data-inline-list="${name}"]`);
+      if (slot) listEditors[name] = this._attachInlineListEditor(slot, initial, opts);
+    };
+
+    if (botId === POLL_BOT_ID) {
+      mountList("options", Array.isArray(st.options) ? st.options : [], {
+        min: 2,
+        max: 6,
+        maxLen: 44,
+        itemWord: "options",
+        placeholder: "Add option…",
+      });
+    } else if (botId === CHECKLIST_BOT_ID) {
+      mountList("items", (Array.isArray(st.items) ? st.items : []).map((i) => i.text), {
+        min: 1,
+        max: 12,
+        maxLen: 64,
+        itemWord: "items",
+        placeholder: "Add item…",
+      });
+    } else if (botId === RANDOMIZER_BOT_ID) {
+      mountList("options", Array.isArray(st.options) ? st.options : [], {
+        min: 1,
+        max: 12,
+        maxLen: 48,
+        itemWord: "options",
+        placeholder: "Add option…",
+      });
+    } else if (botId === SCOREBOARD_BOT_ID) {
+      mountList("players", (Array.isArray(st.entries) ? st.entries : []).map((e) => e.name), {
+        min: 1,
+        max: 6,
+        maxLen: 32,
+        itemWord: "players",
+        placeholder: "Add player…",
+      });
+    } else if (botId === WEATHER_BOT_ID) {
+      const curCities = splitAllListTokens(this.builtinBots.settings.weather.cities || p.wxCity || "Berlin");
+      mountList("cities", curCities, {
+        min: 1,
+        max: 4,
+        maxLen: 48,
+        itemWord: "cities",
+        placeholder: "Add city…",
+      });
+    }
+
+    const getField = (name) => formEl.querySelector(`[data-bot-edit-field="${name}"]`)?.value ?? "";
+    const showErr = (txt) => {
+      if (!errEl) return;
+      errEl.textContent = txt;
+      errEl.classList.remove("hidden");
+    };
+
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", () => this.cancelEditMessage());
+    }
+    formEl.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        this.cancelEditMessage();
+      }
+    });
+
+    formEl.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const nowMs = Date.now();
+      if (saveBtn) saveBtn.disabled = true;
+
+      try {
+        if (botId === POLL_BOT_ID) {
+          const opts = listEditors.options?.getItems() || [];
+          if (opts.length < 2) {
+            showErr("Add at least 2 options.");
+            if (saveBtn) saveBtn.disabled = false;
+            return;
+          }
+          const nextState = updatePollFromInlineEdit(st, { question: getField("question"), options: opts });
+          this.submitEditMessage(m.id, buildPollCard(nextState, { nowMs }));
+          return;
+        }
+        if (botId === CHECKLIST_BOT_ID) {
+          const items = listEditors.items?.getItems() || [];
+          const nextState = updateChecklistFromInlineEdit(st, { title: getField("title"), items });
+          this.submitEditMessage(m.id, buildChecklistCard(nextState, { nowMs }));
+          return;
+        }
+        if (botId === RANDOMIZER_BOT_ID) {
+          const opts = listEditors.options?.getItems() || [];
+          const nextState = updateRandomizerFromInlineEdit(st, { options: opts });
+          this.submitEditMessage(m.id, buildRandomizerCard(nextState, { nowMs }));
+          return;
+        }
+        if (botId === POMODORO_BOT_ID) {
+          const nextState = updatePomodoroFromInlineEdit(st, {
+            focusMin: Number(getField("focusMin")),
+            breakMin: Number(getField("breakMin")),
+            longBreakMin: Number(getField("longBreakMin")),
+          });
+          this.submitEditMessage(m.id, buildPomodoroCard(nextState, { nowMs }));
+          return;
+        }
+        if (botId === SCOREBOARD_BOT_ID) {
+          const players = listEditors.players?.getItems() || [];
+          const nextState = updateScoreboardFromInlineEdit(st, {
+            mode: getField("mode"),
+            ratingTitle: getField("ratingTitle"),
+            players,
+          });
+          this.submitEditMessage(m.id, buildScoreboardCard(nextState, { nowMs }));
+          return;
+        }
+        if (botId === WEATHER_BOT_ID) {
+          const cities = listEditors.cities?.getItems() || ["Berlin"];
+          const unit = getField("unit") === "f" ? "f" : "c";
+          const nextCfg = { ...this.builtinBots.settings.weather, cities: cities.join(", "), unit };
+          if (this.builtinBots.settings.weather.enabled) {
+            this.builtinBots.settings = saveBuiltinBotsSettings({
+              ...this.builtinBots.settings,
+              weather: nextCfg,
+            });
+            this.syncBuiltinBotsSettingsControls();
+          }
+          const card = await fetchWeatherCard(nextCfg, { cityIndex: 0, unitOverride: unit, nowMs });
+          this.submitEditMessage(m.id, card);
+          return;
+        }
+        if (botId === GITHUB_BOT_ID) {
+          const repo = getField("repo").trim();
+          const tab = getField("tab") || "overview";
+          const nextCfg = { ...this.builtinBots.settings.github, repo, defaultTab: tab };
+          if (this.builtinBots.settings.github.enabled) {
+            this.builtinBots.settings = saveBuiltinBotsSettings({
+              ...this.builtinBots.settings,
+              github: nextCfg,
+            });
+            this.syncBuiltinBotsSettingsControls();
+          }
+          const card = await fetchGithubCard(nextCfg, { tab, nowMs });
+          this.submitEditMessage(m.id, card);
+          return;
+        }
+        if (botId === WIKI_BOT_ID) {
+          const q = getField("query").trim();
+          const tab = q ? "lookup" : getField("tab") || "featured";
+          const card = await fetchWikiCard({ tab, query: q || null, nowMs });
+          this.submitEditMessage(m.id, card);
+          return;
+        }
+        if (botId === STS2_BOT_ID) {
+          const q = getField("query").trim();
+          const card = await fetchSts2Card({
+            tab: q ? "codex" : getField("tab") || "meta",
+            character: getField("character") || "ironclad",
+            bracket: getField("bracket") || "all",
+            metricKind: p.sts2MetricKind || "cards",
+            entityPath: q ? null : p.sts2EntityPath || null,
+            entityName: q ? null : p.sts2EntityName || null,
+            upgraded: false,
+            coopSeats: p.sts2CoopSeats || {},
+            lookupQuery: q || null,
+            nowMs,
+          });
+          this.submitEditMessage(m.id, card);
+          return;
+        }
+        if (botId === "warframe") {
+          const platform = getField("platform") || "pc";
+          const view = getField("view") || "cycles";
+          if (this.warframeBot.settings.enabled) {
+            this.warframeBot.settings = saveWarframeBotSettings({
+              ...this.warframeBot.settings,
+              platform,
+            });
+            this.syncWarframeSettingsControls();
+          }
+          const card = await fetchWarframeWorldstateCard(view, {
+            platform,
+            fissureFilter: p.wfFilter || "normal",
+            autoRefreshSec: this.warframeBot.settings.autoRefreshSec,
+            nowMs,
+          });
+          this.submitEditMessage(m.id, card);
+          return;
+        }
+
+        // Generic / custom external bot card: preserve blocks, buttons, fields, image, color, etc.
+        const nextPayload = { ...p };
+        nextPayload.title = getField("title").trim();
+        nextPayload.badge = getField("badge").trim();
+        nextPayload.text = getField("text").trim();
+        nextPayload.subtitle = getField("subtitle").trim();
+        nextPayload.footer = getField("footer").trim();
+        this.submitEditMessage(m.id, nextPayload);
+      } catch (err) {
+        showErr(err?.message || "Could not save edit.");
+        if (saveBtn) saveBtn.disabled = false;
+      }
+    });
   }
 
   buildLogEntryElement(m, isSelf, isNew) {
@@ -17647,12 +18797,16 @@ export class P2PDirectApp {
 
     let bodyHtml;
     let botButtons = [];
+    let botInputs = [];
+    let botSelects = [];
     let gifBindings = [];
     let videoBindings = [];
     if (isBotMsg) {
       const rendered = this.renderBotCardPayload(m.payload);
       bodyHtml = rendered.html;
       botButtons = rendered.buttons;
+      botInputs = rendered.inputs || [];
+      botSelects = rendered.selects || [];
     } else if (isChat) {
       const rendered = this.renderChatPayload(m.payload, m.id);
       bodyHtml = rendered.html;
@@ -17664,35 +18818,39 @@ export class P2PDirectApp {
 
     let editFormHtml = "";
     if (isEditing) {
-      const hasMedia =
-        isChat &&
-        m.payload &&
-        ((Array.isArray(m.payload.images) && m.payload.images.length > 0) ||
-          (Array.isArray(m.payload.videos) && m.payload.videos.length > 0));
-      const initialValue = isChat
-        ? String(m.payload?.text ?? "")
-        : JSON.stringify(m.payload ?? {}, null, 2);
-      const hintText = isChat
-        ? hasMedia
-          ? "Enter to save · Esc to cancel · Attached media is preserved"
-          : "Enter to save · Shift+Enter for newline · Esc to cancel"
-        : "Ctrl/Cmd+Enter to save JSON · Esc to cancel";
-      editFormHtml = `
-        <form class="msg-edit-form" data-edit-form="${escapeHtml(m.id)}">
-          <textarea
-            class="msg-edit-input${isChat ? "" : " is-json"}"
-            aria-label="Edit message content"
-          >${escapeHtml(initialValue)}</textarea>
-          <div class="msg-edit-error hidden" data-edit-error></div>
-          <div class="msg-edit-bar">
-            <span class="msg-edit-hint">${escapeHtml(hintText)}</span>
-            <div class="msg-edit-actions">
-              <button type="button" class="btn btn-sm" data-edit-cancel>Cancel</button>
-              <button type="submit" class="btn btn-sm btn-primary" data-edit-save>Save Edit</button>
+      if (isBotMsg) {
+        editFormHtml = this._buildBotInlineEditFormHtml(m);
+      } else {
+        const hasMedia =
+          isChat &&
+          m.payload &&
+          ((Array.isArray(m.payload.images) && m.payload.images.length > 0) ||
+            (Array.isArray(m.payload.videos) && m.payload.videos.length > 0));
+        const initialValue = isChat
+          ? String(m.payload?.text ?? "")
+          : JSON.stringify(m.payload ?? {}, null, 2);
+        const hintText = isChat
+          ? hasMedia
+            ? "Enter to save · Esc to cancel · Attached media is preserved"
+            : "Enter to save · Shift+Enter for newline · Esc to cancel"
+          : "Ctrl/Cmd+Enter to save JSON · Esc to cancel";
+        editFormHtml = `
+          <form class="msg-edit-form" data-edit-form="${escapeHtml(m.id)}">
+            <textarea
+              class="msg-edit-input${isChat ? "" : " is-json"}"
+              aria-label="Edit message content"
+            >${escapeHtml(initialValue)}</textarea>
+            <div class="msg-edit-error hidden" data-edit-error></div>
+            <div class="msg-edit-bar">
+              <span class="msg-edit-hint">${escapeHtml(hintText)}</span>
+              <div class="msg-edit-actions">
+                <button type="button" class="btn btn-sm" data-edit-cancel>Cancel</button>
+                <button type="submit" class="btn btn-sm btn-primary" data-edit-save>Save Edit</button>
+              </div>
             </div>
-          </div>
-        </form>
-      `;
+          </form>
+        `;
+      }
     }
 
     const isPersistentWf = isPersistentWarframeMessage(m);
@@ -17784,7 +18942,9 @@ export class P2PDirectApp {
       });
     }
 
-    if (isEditing) {
+    if (isEditing && isBotMsg) {
+      this._bindBotInlineEditForm(article, m);
+    } else if (isEditing) {
       const formEl = article.querySelector("[data-edit-form]");
       const inputEl = formEl?.querySelector(".msg-edit-input");
       const errEl = formEl?.querySelector("[data-edit-error]");
@@ -18244,12 +19404,8 @@ export class P2PDirectApp {
       }
     }
 
-    for (const btnEl of article.querySelectorAll("[data-bot-btn-idx]")) {
-      const idx = Number(btnEl.dataset.botBtnIdx);
-      const btnObj = botButtons[idx];
-      if (btnObj) {
-        btnEl.addEventListener("click", () => this.handleBotButtonClick(m, btnObj, btnEl));
-      }
+    if (isBotMsg && !isEditing) {
+      this._bindBotCardInteractiveElements(article, m, botButtons, botInputs, botSelects);
     }
 
     return article;

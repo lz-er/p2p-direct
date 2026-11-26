@@ -218,16 +218,20 @@ export function buildPollCard(stateInput, { nowMs = Date.now() } = {}) {
   const totalVotes = votersByIdx.reduce((acc, arr) => acc + arr.length, 0);
   const maxVotes = votersByIdx.reduce((m, arr) => Math.max(m, arr.length), 0);
 
-  const fields = options.map((opt, idx) => {
+  const progressBlocks = options.map((opt, idx) => {
     const voters = votersByIdx[idx];
     const count = voters.length;
     const pct = totalVotes > 0 ? Math.round((count / totalVotes) * 100) : 0;
     const leadMark = totalVotes > 0 && count === maxVotes && count > 0 ? " ★" : "";
-    const voterNames = voters.length > 0 ? ` · ${voters.slice(0, 5).join(", ")}${voters.length > 5 ? "…" : ""}` : "";
+    const voterNames =
+      voters.length > 0 ? ` · ${voters.slice(0, 5).join(", ")}${voters.length > 5 ? "…" : ""}` : "";
     return {
+      type: "progress",
       label: `${idx + 1}. ${opt}${leadMark}`,
-      value: `\`${renderBar(totalVotes > 0 ? count / totalVotes : 0)}\` **${pct}%** (${count})${voterNames}`,
-      inline: false,
+      value: count,
+      max: Math.max(1, totalVotes),
+      display: `${pct}% (${count})${voterNames}`,
+      color: totalVotes > 0 && count === maxVotes && count > 0 ? "mint" : "cobalt",
     };
   });
 
@@ -259,7 +263,7 @@ export function buildPollCard(stateInput, { nowMs = Date.now() } = {}) {
     title: state.question || DEFAULT_POLL_SETTINGS.question,
     badge: `${totalVotes} ${totalVotes === 1 ? "VOTE" : "VOTES"}`,
     color: "cobalt",
-    fields,
+    blocks: progressBlocks,
     buttons: btnRows,
     footer: `Updated ${formatClock(nowMs)}`,
   };
@@ -435,6 +439,7 @@ export function parseChecklistAction(actionId) {
   if (rest === "uncheck_all") return { kind: "uncheck_all" };
   if (rest === "clear_done") return { kind: "clear_done" };
   if (rest === "dismiss") return { kind: "dismiss" };
+  if (rest === "add_inline") return { kind: "add_inline" };
   if (rest.startsWith("toggle:")) {
     const idx = Number(rest.slice(7));
     if (Number.isInteger(idx) && idx >= 0 && idx < 12) return { kind: "toggle", index: idx };
@@ -460,7 +465,7 @@ export function createChecklistStateFromSettings(settingsInput) {
   };
 }
 
-export function applyChecklistAction(prevState, action, { peerName = "Peer" } = {}) {
+export function applyChecklistAction(prevState, action, { peerName = "Peer", value = null } = {}) {
   const base = prevState && typeof prevState === "object" ? prevState : createChecklistStateFromSettings(null);
   const items = Array.isArray(base.items) ? base.items.map((it) => ({ ...it })) : [];
 
@@ -480,6 +485,13 @@ export function applyChecklistAction(prevState, action, { peerName = "Peer" } = 
     };
   } else if (action?.kind === "add" && action.text && items.length < 12) {
     items.push({ text: String(action.text).trim().slice(0, 64), done: false, by: "" });
+  } else if (action?.kind === "add_inline") {
+    const raw = typeof action.text === "string" ? action.text : typeof value === "string" ? value : "";
+    const parts = parseCsvOrLines(raw, { max: 12 - items.length, maxLen: 64, fallback: [] });
+    for (const part of parts) {
+      if (items.length >= 12) break;
+      items.push({ text: part, done: false, by: "" });
+    }
   }
   return { title: base.title || DEFAULT_CHECKLIST_SETTINGS.title, items };
 }
@@ -495,11 +507,21 @@ export function buildChecklistCard(stateInput, { nowMs = Date.now() } = {}) {
       ? items.map((it, idx) => ({
           label: `${it.done ? "☑" : "☐"} #${idx + 1}`,
           value: it.done
-            ? `**${it.text}** · _done${it.by ? ` by ${it.by}` : ""}_`
+            ? `**${it.text}** · ${it.by ? `done by ${it.by}` : "done"}`
             : it.text,
           inline: false,
         }))
-      : [{ label: "Empty List", value: "Type `+todo Buy snacks` in chat or edit items in Settings.", inline: false }];
+      : [{ label: "Empty", value: "Add an item below.", inline: false }];
+
+  const blocks = [];
+  if (items.length < 12) {
+    blocks.push({
+      type: "input",
+      id: "todo:add_inline",
+      placeholder: "Add item…",
+      submitLabel: "+ Add",
+    });
+  }
 
   const toggleBtns = items.map((it, idx) => {
     const short = it.text.length > 18 ? `${it.text.slice(0, 17)}…` : it.text;
@@ -528,8 +550,8 @@ export function buildChecklistCard(stateInput, { nowMs = Date.now() } = {}) {
     title: state.title || DEFAULT_CHECKLIST_SETTINGS.title,
     badge: `${doneCount}/${items.length} DONE`,
     color: allDone ? "mint" : "cyan",
-    text: "Add via `+todo <item>`",
     fields,
+    blocks,
     buttons: rows,
     footer: `Updated ${formatClock(nowMs)}`,
   };
@@ -885,4 +907,99 @@ export function summarizeScoreboardPill(msg) {
     return "RATE · 1-5★";
   }
   return "SCOREBOARD";
+}
+
+// ---------------------------------------------------------------------------
+// INLINE EDIT STATE-PRESERVING UPDATERS
+// ---------------------------------------------------------------------------
+
+export function updatePollFromInlineEdit(prevState, { question, options }) {
+  const prev = prevState && typeof prevState === "object" ? prevState : createPollStateFromSettings(null);
+  const prevOptions = Array.isArray(prev.options) ? prev.options : [];
+  const nextOptions = Array.isArray(options) && options.length >= 2
+    ? options.slice(0, 6).map((s) => String(s).trim().slice(0, 44)).filter(Boolean)
+    : prevOptions;
+  const nextVotes = {};
+  const newIndexByText = new Map(nextOptions.map((opt, idx) => [opt.toLowerCase(), idx]));
+  for (const [peerId, vote] of Object.entries(prev.votes || {})) {
+    if (!vote || !Number.isInteger(vote.idx)) continue;
+    const oldText = prevOptions[vote.idx];
+    if (!oldText) continue;
+    const mappedIdx = newIndexByText.get(oldText.toLowerCase());
+    if (mappedIdx !== undefined) {
+      nextVotes[peerId] = { name: vote.name || "Peer", idx: mappedIdx };
+    }
+  }
+  return {
+    question: String(question || prev.question || DEFAULT_POLL_SETTINGS.question).trim().slice(0, 120),
+    options: nextOptions,
+    votes: nextVotes,
+  };
+}
+
+export function updateChecklistFromInlineEdit(prevState, { title, items }) {
+  const prev = prevState && typeof prevState === "object" ? prevState : createChecklistStateFromSettings(null);
+  const prevMap = new Map(
+    (Array.isArray(prev.items) ? prev.items : []).map((it) => [String(it.text || "").toLowerCase(), it])
+  );
+  const cleanTexts = Array.isArray(items) && items.length > 0
+    ? items.slice(0, 12).map((s) => String(s).trim().slice(0, 64)).filter(Boolean)
+    : (prev.items || []).map((i) => i.text);
+  return {
+    title: String(title || prev.title || DEFAULT_CHECKLIST_SETTINGS.title).trim().slice(0, 80),
+    items: cleanTexts.map((text) => {
+      const existing = prevMap.get(text.toLowerCase());
+      return existing ? { text, done: Boolean(existing.done), by: existing.by || "" } : { text, done: false, by: "" };
+    }),
+  };
+}
+
+export function updateRandomizerFromInlineEdit(prevState, { options }) {
+  const prev = prevState && typeof prevState === "object" ? prevState : createRandomizerStateFromSettings(null);
+  const nextOptions = Array.isArray(options) && options.length > 0
+    ? options.slice(0, 12).map((s) => String(s).trim().slice(0, 48)).filter(Boolean)
+    : prev.options || [];
+  return {
+    ...prev,
+    options: nextOptions,
+  };
+}
+
+export function updatePomodoroFromInlineEdit(prevState, { focusMin, breakMin, longBreakMin }) {
+  const prev = prevState && typeof prevState === "object" ? prevState : createPomodoroStateFromSettings(null);
+  const clean = sanitizePomodoroSettings({ focusMin, breakMin, longBreakMin });
+  const modeDur =
+    prev.mode === "break"
+      ? clean.breakMin * 60 * 1000
+      : prev.mode === "long"
+        ? clean.longBreakMin * 60 * 1000
+        : clean.focusMin * 60 * 1000;
+  return {
+    ...prev,
+    focusMin: clean.focusMin,
+    breakMin: clean.breakMin,
+    longBreakMin: clean.longBreakMin,
+    durationMs: modeDur,
+    remainingMs: prev.running ? prev.remainingMs : modeDur,
+  };
+}
+
+export function updateScoreboardFromInlineEdit(prevState, { mode, ratingTitle, players }) {
+  const prev = prevState && typeof prevState === "object" ? prevState : createScoreboardStateFromSettings(null);
+  const prevByName = new Map(
+    (Array.isArray(prev.entries) ? prev.entries : []).map((e) => [String(e.name || "").toLowerCase(), e])
+  );
+  const cleanPlayers = Array.isArray(players) && players.length > 0
+    ? players.slice(0, 6).map((s) => String(s).trim().slice(0, 32)).filter(Boolean)
+    : (prev.entries || []).map((e) => e.name);
+  const entries = cleanPlayers.map((name, idx) => {
+    const existing = prevByName.get(name.toLowerCase());
+    return existing ? { ...existing, name } : { id: `custom-${idx}-${name.toLowerCase()}`, name, score: 0 };
+  });
+  return {
+    mode: mode === "ratings" ? "ratings" : "scores",
+    entries,
+    ratingTitle: String(ratingTitle || prev.ratingTitle || "Tonight's Watch / Pick").trim().slice(0, 90),
+    ratings: { ...(prev.ratings || {}) },
+  };
 }

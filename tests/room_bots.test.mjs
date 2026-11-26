@@ -25,11 +25,17 @@ import {
   createScoreboardStateFromSettings,
   extractChecklistAppendText,
   formatCountdownMmSs,
+  parseChecklistAction,
   sanitizeChecklistSettings,
   sanitizePollSettings,
   sanitizePomodoroSettings,
   sanitizeRandomizerSettings,
   sanitizeScoreboardSettings,
+  updateChecklistFromInlineEdit,
+  updatePollFromInlineEdit,
+  updatePomodoroFromInlineEdit,
+  updateRandomizerFromInlineEdit,
+  updateScoreboardFromInlineEdit,
 } from "../room_bots.js";
 
 describe("room_bots (5 Pure-P2P Offline Bots)", () => {
@@ -41,19 +47,22 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     assert.equal(sanitizeScoreboardSettings(null).enabled, false);
   });
 
-  it("1. Live Poll: multi-peer voting, vote switching, retracting, and reset", () => {
+  it("1. Live Poll: multi-peer voting, vote switching, retracting, reset, and declarative progress blocks", () => {
     let st = createPollStateFromSettings({ question: "Game night?", options: "StS2, Warframe" });
     st = applyPollAction(st, { kind: "vote", index: 0 }, { peerId: "a", peerName: "Alice" });
     st = applyPollAction(st, { kind: "vote", index: 1 }, { peerId: "b", peerName: "Bob" });
     let card = buildPollCard(st);
     assert.equal(card.builtinBot, POLL_BOT_ID);
     assert.equal(card.badge, "2 VOTES");
-    assert.match(card.fields[0].value, /50%/);
+    assert.equal(card.blocks.length, 2);
+    assert.equal(card.blocks[0].type, "progress");
+    assert.match(card.blocks[0].display, /50%/);
 
     // Bob switches to StS2
     st = applyPollAction(st, { kind: "vote", index: 0 }, { peerId: "b", peerName: "Bob" });
     card = buildPollCard(st);
-    assert.match(card.fields[0].value, /100%.*Alice, Bob/);
+    assert.match(card.blocks[0].display, /100%.*Alice, Bob/);
+    assert.equal(card.blocks[0].value, 2);
 
     // Alice retracts her vote by clicking same option
     st = applyPollAction(st, { kind: "vote", index: 0 }, { peerId: "a", peerName: "Alice" });
@@ -82,22 +91,26 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     assert.match(card.title, /Short Break \(5m\) — 05:00/);
   });
 
-  it("3. Shared Checklist: toggle, +todo append, clear done, and uncheck all", () => {
+  it("3. Shared Checklist: toggle, in-card add_inline, +todo append, clear done, and uncheck all", () => {
     assert.equal(extractChecklistAppendText("+todo Bring drinks"), "Bring drinks");
     assert.equal(extractChecklistAppendText("hello world"), null);
+    assert.deepEqual(parseChecklistAction("todo:add_inline"), { kind: "add_inline" });
 
     let st = createChecklistStateFromSettings({ title: "Co-op Prep", items: "Mic check, Ready up" });
-    st = applyChecklistAction(st, { kind: "add", text: "Pick snacks" }, { peerName: "Bob" });
-    assert.equal(st.items.length, 3);
+    st = applyChecklistAction(st, { kind: "add_inline", text: "Pick snacks, Start stream" }, { peerName: "Bob" });
+    assert.equal(st.items.length, 4);
+    assert.equal(st.items[3].text, "Start stream");
 
     st = applyChecklistAction(st, { kind: "toggle", index: 0 }, { peerName: "Alice" });
     let card = buildChecklistCard(st);
     assert.equal(card.builtinBot, CHECKLIST_BOT_ID);
-    assert.equal(card.badge, "1/3 DONE");
+    assert.equal(card.badge, "1/4 DONE");
     assert.match(card.fields[0].value, /Alice/);
+    assert.equal(card.blocks[0].type, "input");
+    assert.equal(card.blocks[0].id, "todo:add_inline");
 
     st = applyChecklistAction(st, { kind: "clear_done" });
-    assert.equal(st.items.length, 2);
+    assert.equal(st.items.length, 3);
   });
 
   it("4. Randomizer & Dice: coin, random peer, custom option, and tabletop dice", () => {
@@ -137,5 +150,58 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     card = buildScoreboardCard(st);
     assert.equal(card.title, "Rate It: Dune Part Two");
     assert.equal(card.badge, "★ 4.5 / 5 (2)");
+  });
+
+  it("6. Visual inline edit updaters preserve existing votes, checked state, scores, and history", () => {
+    // Poll: re-index votes cleanly when options reorder or expand
+    let poll = createPollStateFromSettings({ question: "Game?", options: "StS2, Warframe" });
+    poll = applyPollAction(poll, { kind: "vote", index: 1 }, { peerId: "a", peerName: "Alice" });
+    const pollEdited = updatePollFromInlineEdit(poll, {
+      question: "Friday Game?",
+      options: ["Hades 2", "Warframe", "StS2"],
+    });
+    assert.equal(pollEdited.question, "Friday Game?");
+    assert.deepEqual(pollEdited.options, ["Hades 2", "Warframe", "StS2"]);
+    assert.equal(pollEdited.votes.a.idx, 1); // Warframe stayed at index 1
+
+    // Checklist: preserves done/by status on matching items
+    let list = createChecklistStateFromSettings({ title: "Prep", items: "Mic, Snacks" });
+    list = applyChecklistAction(list, { kind: "toggle", index: 0 }, { peerName: "Alice" });
+    const listEdited = updateChecklistFromInlineEdit(list, {
+      title: "Raid Prep",
+      items: ["Mic", "Potions"],
+    });
+    assert.equal(listEdited.title, "Raid Prep");
+    assert.equal(listEdited.items[0].done, true);
+    assert.equal(listEdited.items[0].by, "Alice");
+    assert.equal(listEdited.items[1].done, false);
+
+    // Randomizer: keeps history intact
+    let rand = createRandomizerStateFromSettings({ options: "A, B" });
+    rand = applyRandomizerAction(rand, { kind: "coin" }, { peerName: "Alice", rng: () => 0.1 });
+    const randEdited = updateRandomizerFromInlineEdit(rand, { options: ["Pizza", "Sushi", "Tacos"] });
+    assert.deepEqual(randEdited.options, ["Pizza", "Sushi", "Tacos"]);
+    assert.equal(randEdited.history.length, 1);
+
+    // Pomodoro: updates durations cleanly
+    const pomo = createPomodoroStateFromSettings({ focusMin: 25, breakMin: 5, longBreakMin: 15 });
+    const pomoEdited = updatePomodoroFromInlineEdit(pomo, { focusMin: 40, breakMin: 10, longBreakMin: 20 });
+    assert.equal(pomoEdited.focusMin, 40);
+    assert.equal(formatCountdownMmSs(pomoEdited.remainingMs), "40:00");
+
+    // Scoreboard: preserves scores for existing players while adding new ones
+    let sb = createScoreboardStateFromSettings(
+      { mode: "scores" },
+      { roomPeers: [{ id: "a", name: "Alice" }, { id: "b", name: "Bob" }] }
+    );
+    sb = applyScoreboardAction(sb, { kind: "delta", index: 0, delta: 3 });
+    const sbEdited = updateScoreboardFromInlineEdit(sb, {
+      mode: "scores",
+      ratingTitle: "Movie Night",
+      players: ["Alice", "Charlie"],
+    });
+    assert.equal(sbEdited.entries[0].score, 3);
+    assert.equal(sbEdited.entries[1].name, "Charlie");
+    assert.equal(sbEdited.entries[1].score, 0);
   });
 });

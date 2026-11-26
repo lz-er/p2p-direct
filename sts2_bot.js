@@ -213,11 +213,19 @@ export function parseSts2Action(actionId) {
   const rest = actionId.slice(STS2_ACTION_PREFIX.length);
   if (rest === "refresh") return { kind: "refresh" };
   if (rest === "dismiss") return { kind: "dismiss" };
+  if (rest === "search") return { kind: "search" };
   if (rest === "codex:random") return { kind: "codex_random" };
   if (rest === "codex:upgrade") return { kind: "codex_upgrade" };
   if (rest === "coop:leave") return { kind: "coop_leave" };
   if (rest === "coop:clear") return { kind: "coop_clear" };
 
+  if (rest.startsWith("open:")) {
+    const entityPath = rest.slice(5).trim();
+    if (/^\/(?:cards|relics|potions|events|monsters)\/[a-z0-9_-]+$/i.test(entityPath)) {
+      return { kind: "open", entityPath };
+    }
+    return null;
+  }
   if (rest.startsWith("tab:")) {
     const tab = rest.slice(4);
     return VALID_TABS.has(tab) ? { kind: "tab", tab } : null;
@@ -293,8 +301,53 @@ async function fetchJsonCached(url, { fetchImpl = globalThis.fetch, bypassCache 
   return data;
 }
 
+export function buildSts2SearchBlock() {
+  return {
+    type: "input",
+    id: `${STS2_ACTION_PREFIX}search`,
+    autocomplete: "sts2",
+    placeholder: "Search card, relic, potion, monster…",
+    submitLabel: "Go",
+  };
+}
+
+/**
+ * Live autocomplete suggestions from Spire Codex `/api/search` (5-min cached).
+ */
+export async function searchSts2Suggestions(
+  query,
+  { fetchImpl = globalThis.fetch, apiBase = STS2_API_BASE, nowMs = Date.now(), limit = 8 } = {}
+) {
+  const q = String(query || "").trim();
+  if (q.length < 2) return [];
+  const base = apiBase.replace(/\/+$/, "");
+  const data = await fetchJsonCached(`${base}/api/search?q=${encodeURIComponent(q)}`, {
+    fetchImpl,
+    bypassCache: false,
+    nowMs,
+  });
+  const categories = Array.isArray(data?.categories) ? data.categories : [];
+  const out = [];
+  for (const cat of categories) {
+    if (!Array.isArray(cat?.items)) continue;
+    for (const item of cat.items) {
+      if (!item?.name || !item?.path) continue;
+      out.push({
+        label: item.name,
+        sublabel: item.subtitle || cat.label || cat.kind || "",
+        value: item.path,
+        image: resolveSts2ImageUrl(item.image_url || item.image || ""),
+        actionId: `${STS2_ACTION_PREFIX}open:${item.path}`,
+      });
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
 function basePayload(state, overrides) {
   const nowMs = state.nowMs || Date.now();
+  const extraBlocks = Array.isArray(overrides?.blocks) ? overrides.blocks : [];
   return {
     builtinBot: STS2_BOT_ID,
     persistent: true,
@@ -309,6 +362,7 @@ function basePayload(state, overrides) {
     sts2UpdatedAt: nowMs,
     subtitle: "SLAY THE SPIRE 2",
     ...overrides,
+    blocks: [buildSts2SearchBlock(), ...extraBlocks],
   };
 }
 
@@ -325,17 +379,20 @@ export function buildSts2MetaCard(metricsData, state) {
     topRows.length > 0
       ? topRows.map((r, idx) => {
           const tier = r.tier ? `[${r.tier}] ` : "";
+          const rawId = String(r.id || r.entity_id || "");
+          const slug = rawId.toLowerCase();
+          const entityPath = /^[a-z0-9_-]+$/.test(slug) ? `/${metricKind}/${slug}` : "";
           const score = r.score != null ? `Score **${Math.round(Number(r.score))}**` : "";
           const wr = r.win_rate != null ? `WR **${Number(r.win_rate).toFixed(1)}%**` : "";
           const pr = r.pick_rate != null ? `Pick ${Number(r.pick_rate).toFixed(0)}%` : "";
-          const picks = r.picks != null ? `${Number(r.picks).toLocaleString()} picks` : "";
+          const openLink = entityPath ? `[View](action:${STS2_ACTION_PREFIX}open:${entityPath})` : "";
           return {
-            label: `#${idx + 1} ${tier}${humanizeEntityId(r.id || r.entity_id)}`,
-            value: [score, wr, pr, picks].filter(Boolean).join(" · "),
+            label: `#${idx + 1} ${tier}${humanizeEntityId(rawId)}`,
+            value: [score, wr, pr, openLink].filter(Boolean).join(" · "),
             inline: true,
           };
         })
-      : [{ label: "No Metrics", value: "No community run data returned for this filter.", inline: false }];
+      : [{ label: "No Metrics", value: "No data for this filter.", inline: false }];
 
   const totalRuns = Number(metricsData?.character_runs || metricsData?.total_runs || 0);
   const baseWr = metricsData?.baseline_win_rate != null ? `${Number(metricsData.baseline_win_rate).toFixed(1)}%` : "—";
@@ -364,7 +421,7 @@ export function buildSts2MetaCard(metricsData, state) {
     title: `Top ${c.label} ${kindLabel} · ${bracketLabel(state.bracket)}`,
     badge: totalRuns > 0 ? `${totalRuns.toLocaleString()} RUNS` : "META",
     color: c.accent,
-    text: `Baseline WR **${baseWr}** · Lookup: \`[[Card]]\``,
+    text: `Baseline WR **${baseWr}**`,
     fields,
     buttons: [buildNavButtonRows("meta"), charRow, bracketRow, buildFooterControls()],
     footer: `Spire Codex · ${formatUpdatedClock(state.nowMs || Date.now())}`,

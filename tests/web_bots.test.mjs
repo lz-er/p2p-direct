@@ -22,6 +22,7 @@ import {
   sanitizeGithubSettings,
   sanitizeWeatherSettings,
   sanitizeWikiSettings,
+  searchWikiSuggestions,
 } from "../web_bots.js";
 
 describe("web_bots settings & parsers", () => {
@@ -46,6 +47,8 @@ describe("web_bots settings & parsers", () => {
     assert.deepEqual(parseWeatherAction("wx:city:2"), { kind: "city", index: 2 });
     assert.deepEqual(parseWeatherAction("wx:unit:f"), { kind: "unit", unit: "f" });
     assert.deepEqual(parseWikiAction("wiki:tab:onthisday"), { kind: "tab", tab: "onthisday" });
+    assert.deepEqual(parseWikiAction("wiki:search"), { kind: "search" });
+    assert.deepEqual(parseWikiAction("wiki:lookup:WebRTC"), { kind: "lookup", query: "WebRTC" });
     assert.deepEqual(parseGithubAction("gh:tab:commits"), { kind: "tab", tab: "commits" });
     assert.equal(formatTemp(20, "c"), "20°C");
     assert.equal(formatTemp(20, "f"), "68°F");
@@ -89,8 +92,14 @@ describe("web_bots live card builders (mocked fetch)", () => {
     assert.match(cardF.title, /50°F/);
   });
 
-  it("builds Wikipedia Featured, Lookup, and On This Day cards", async () => {
+  it("builds Wikipedia Featured, Lookup, On This Day cards, and OpenSearch autocomplete", async () => {
     const mockFetch = async (url) => {
+      if (url.includes("action=opensearch")) {
+        return {
+          ok: true,
+          json: async () => ["We", ["WebRTC", "WebAssembly"], ["Real-time P2P", "Binary instruction format"], []],
+        };
+      }
       if (url.includes("/feed/featured/")) {
         return {
           ok: true,
@@ -128,10 +137,18 @@ describe("web_bots live card builders (mocked fetch)", () => {
       throw new Error(`Unexpected URL ${url}`);
     };
 
+    const sug = await searchWikiSuggestions("We", { fetchImpl: mockFetch });
+    assert.equal(sug.length, 2);
+    assert.equal(sug[0].label, "WebRTC");
+    assert.equal(sug[0].actionId, "wiki:lookup:WebRTC");
+
     const feat = await fetchWikiCard({ tab: "featured", fetchImpl: mockFetch });
     assert.equal(feat.builtinBot, WIKI_BOT_ID);
     assert.equal(feat.title, "WebRTC");
     assert.equal(feat.image.url, "https://upload.wikimedia.org/thumb.png");
+    assert.equal(feat.blocks[0].id, "wiki:search");
+    assert.equal(feat.blocks[0].autocomplete, "wiki");
+    assert.ok(feat.fields.some((f) => f.value.includes("[Rust](action:wiki:lookup:Rust)")));
 
     const lookup = await fetchWikiCard({ tab: "lookup", query: "Slay the Spire", fetchImpl: mockFetch });
     assert.equal(lookup.badge, "LOOKUP");
