@@ -6728,6 +6728,7 @@ input[type="checkbox"].metro-switch:checked::after {
 .watch-header-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   flex-shrink: 0;
 }
@@ -6744,7 +6745,8 @@ input[type="checkbox"].metro-switch:checked::after {
   border-bottom: none;
 }
 
-.watch-panel.is-minimized .watch-playlist-bar {
+.watch-panel.is-minimized .watch-playlist-bar,
+.watch-panel.is-minimized .watch-spotify-session-bar {
   display: none;
 }
 
@@ -6771,7 +6773,7 @@ input[type="checkbox"].metro-switch:checked::after {
 .watch-panel.provider-spotify .watch-embed-stage {
   aspect-ratio: auto;
   min-height: 0;
-  height: 112px;
+  height: 152px;
   max-height: none;
 }
 
@@ -6895,6 +6897,60 @@ input[type="checkbox"].metro-switch:checked::after {
 .watch-autoplay-banner:hover {
   background: var(--acid);
   color: #0e0f12;
+}
+
+.watch-spotify-session-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--bg-inset);
+  border-bottom: 2px solid var(--rule);
+  border-left: 4px solid #1db954;
+  flex-wrap: wrap;
+}
+
+.watch-spotify-session-copy {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 240px;
+  flex-wrap: wrap;
+}
+
+.watch-spotify-session-tag {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  background: #1db954;
+  color: #0e0f12;
+  flex-shrink: 0;
+}
+
+.watch-spotify-session-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--ink-primary);
+}
+
+.watch-spotify-session-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.watch-spotify-session-actions a.media-ctrl-btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
 }
 
 /* Watch Together Synced Playlist Bar & Tracklist Drawer (Flat Metro Signal Blocks) */
@@ -7247,8 +7303,8 @@ input[type="checkbox"].metro-switch:checked::after {
 
   .watch-panel.provider-spotify .watch-embed-stage {
     min-height: 0;
-    height: 112px;
-    max-height: 112px;
+    height: 152px;
+    max-height: 152px;
   }
 
   .watch-panel.provider-soundcloud .watch-embed-stage {
@@ -7435,6 +7491,7 @@ html[data-watch-stage="true"] .join-listen-strip {
       max-width: 132px;
     }
 
+    .watch-chat-split.is-watch-side-eligible .watch-spotify-session-bar,
     .watch-chat-split.is-watch-side-eligible .watch-playlist-bar,
     .watch-chat-split.is-watch-side-eligible .watch-queue-section {
       flex-shrink: 0;
@@ -7558,6 +7615,17 @@ html[data-watch-stage="true"] .join-listen-strip {
       aspect-ratio: auto;
       min-height: 0;
       max-height: none;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-spotify-session-bar {
+      padding: 5px 10px;
+      gap: 6px 8px;
+      flex-shrink: 0;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-playlist-bar,
+    .watch-chat-split.is-watch-side-eligible .watch-queue-section {
+      flex-shrink: 0;
     }
 
     .watch-chat-split.is-watch-side-eligible .watch-transport {
@@ -8389,6 +8457,7 @@ html[data-watch-stage="true"] .join-listen-strip {
 
   /* Watch Together mobile spacing */
   .watch-header,
+  .watch-spotify-session-bar,
   .watch-transport,
   .watch-queue-section,
   .watch-playlist-head {

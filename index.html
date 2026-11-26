@@ -662,6 +662,12 @@
                 </div>
               </div>
               <div class="watch-header-actions">
+                <button
+                  type="button"
+                  id="btn-watch-spotify-reload"
+                  class="btn btn-sm hidden"
+                  title="Reload Spotify player locally to pick up your logged-in browser session (does not affect other peers)"
+                >↻ Session</button>
                 <a
                   id="watch-open-external"
                   class="btn btn-sm hidden"
@@ -696,6 +702,36 @@
                 >
                   Browser muted autoplay · Click to unmute (local only)
                 </button>
+              </div>
+
+              <div class="watch-spotify-session-bar hidden" id="watch-spotify-session-bar" role="status" aria-live="polite">
+                <div class="watch-spotify-session-copy">
+                  <span class="watch-spotify-session-tag">SPOTIFY SESSION</span>
+                  <span class="watch-spotify-session-text" id="watch-spotify-session-text"></span>
+                </div>
+                <div class="watch-spotify-session-actions">
+                  <a
+                    id="watch-spotify-open-login"
+                    class="media-ctrl-btn"
+                    href="https://open.spotify.com/"
+                    target="_blank"
+                    rel="noopener"
+                    title="Open Spotify in this browser to sign in or verify your active session"
+                  >Open Spotify ↗</a>
+                  <button
+                    type="button"
+                    id="btn-watch-spotify-session-reload"
+                    class="media-ctrl-btn"
+                    title="Reload Spotify embed locally with your current browser cookies/session"
+                  >↻ Reload Session</button>
+                  <button
+                    type="button"
+                    id="btn-watch-spotify-session-dismiss"
+                    class="media-ctrl-btn"
+                    aria-label="Dismiss Spotify session notice"
+                    title="Dismiss"
+                  >×</button>
+                </div>
               </div>
 
               <div class="watch-playlist-bar hidden" id="watch-playlist-bar">

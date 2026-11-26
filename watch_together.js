@@ -717,6 +717,252 @@ function loadSpotifyIframeApi() {
   return spotifyApiPromise;
 }
 
+export const SPOTIFY_EMBED_ALLOW =
+  "autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture; storage-access";
+
+/**
+ * Ensures a Spotify embed `<iframe>` has the exact permissions and attributes needed to reuse
+ * the user's logged-in Spotify browser session and stream DRM-protected full tracks.
+ */
+export function configureSpotifyIframeForSession(iframe) {
+  if (!iframe || typeof iframe.setAttribute !== "function") return;
+  iframe.setAttribute("allow", SPOTIFY_EMBED_ALLOW);
+  iframe.setAttribute("loading", "eager");
+  iframe.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
+  if (typeof iframe.getAttribute !== "function" || !iframe.getAttribute("title")) {
+    iframe.setAttribute("title", "Spotify player");
+  }
+  if (typeof iframe.removeAttribute === "function") {
+    // `allow` already includes `fullscreen`; removing legacy `allowfullscreen` avoids browser warnings.
+    iframe.removeAttribute("allowfullscreen");
+    // Never sandbox or make credentialless — Spotify embeds require browser cookies & EME DRM.
+    iframe.removeAttribute("sandbox");
+    iframe.removeAttribute("credentialless");
+  }
+  try {
+    if ("credentialless" in iframe) {
+      iframe.credentialless = false;
+    }
+  } catch {
+    // ignore readonly property in mocked/older environments
+  }
+}
+
+/**
+ * Detects browser and origin characteristics that govern whether Spotify's embed can use
+ * the user's logged-in browser session for full-track playback.
+ */
+export function detectSpotifyBrowserConstraints(envOverride = null) {
+  const ua =
+    envOverride && typeof envOverride.userAgent === "string"
+      ? envOverride.userAgent
+      : typeof navigator !== "undefined" && typeof navigator.userAgent === "string"
+        ? navigator.userAgent
+        : "";
+  const hasBrave =
+    envOverride && typeof envOverride.isBrave === "boolean"
+      ? envOverride.isBrave
+      : typeof navigator !== "undefined" && Boolean(navigator.brave);
+  const isSecureContext =
+    envOverride && typeof envOverride.isSecureContext === "boolean"
+      ? envOverride.isSecureContext
+      : typeof window !== "undefined" && typeof window.isSecureContext === "boolean"
+        ? window.isSecureContext
+        : true;
+
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile|IEMobile|Opera Mini/i.test(ua);
+  let browser = "other";
+  if (hasBrave) {
+    browser = "brave";
+  } else if (/Firefox\/|FxiOS\//i.test(ua)) {
+    browser = "firefox";
+  } else if (/Edg\/|EdgA\/|EdgiOS\//i.test(ua)) {
+    browser = "edge";
+  } else if (
+    /Safari\//i.test(ua) &&
+    !/Chrome\/|Chromium\/|CriOS\/|Edg\/|OPR\/|Opera|Brave/i.test(ua)
+  ) {
+    browser = "safari";
+  } else if (/Chrome\/|Chromium\/|CriOS\/|OPR\//i.test(ua)) {
+    browser = "chrome";
+  }
+
+  return {
+    browser,
+    isMobile,
+    isSafari: browser === "safari",
+    isSecureContext,
+    drmSupported:
+      envOverride && typeof envOverride.drmSupported === "boolean"
+        ? envOverride.drmSupported
+        : null,
+  };
+}
+
+let spotifyDrmCachedTrue = false;
+let spotifyDrmInFlight = null;
+/**
+ * Probes whether the browser exposes EME / DRM (Widevine, PlayReady, or FairPlay),
+ * which Spotify's Harmony embed player requires for full-track logged-in playback.
+ * Never permanently caches `false` so enabling DRM and clicking Reload Session re-probes cleanly.
+ */
+export function probeSpotifyDrmSupport({ force = false } = {}) {
+  if (!force && spotifyDrmCachedTrue) return Promise.resolve(true);
+  if (!force && spotifyDrmInFlight) return spotifyDrmInFlight;
+  const probe = (async () => {
+    if (typeof window !== "undefined" && window.isSecureContext === false) {
+      return false;
+    }
+    if (
+      typeof navigator === "undefined" ||
+      typeof navigator.requestMediaKeySystemAccess !== "function"
+    ) {
+      return false;
+    }
+    const candidates = [
+      [
+        "com.widevine.alpha",
+        [
+          {
+            initDataTypes: ["cenc"],
+            audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+          },
+        ],
+      ],
+      [
+        "com.microsoft.playready.recommendation",
+        [
+          {
+            initDataTypes: ["cenc"],
+            audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+          },
+        ],
+      ],
+      [
+        "com.microsoft.playready",
+        [
+          {
+            initDataTypes: ["cenc"],
+            audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+          },
+        ],
+      ],
+      [
+        "com.apple.fps.1_0",
+        [
+          {
+            audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+          },
+        ],
+      ],
+    ];
+    for (const [keySystem, configs] of candidates) {
+      try {
+        await navigator.requestMediaKeySystemAccess(keySystem, configs);
+        spotifyDrmCachedTrue = true;
+        return true;
+      } catch {
+        // try next key system
+      }
+    }
+    if (force) {
+      spotifyDrmCachedTrue = false;
+    }
+    return false;
+  })().finally(() => {
+    if (spotifyDrmInFlight === probe) {
+      spotifyDrmInFlight = null;
+    }
+  });
+  spotifyDrmInFlight = probe;
+  return probe;
+}
+
+/**
+ * Classifies whether the Spotify embed is using a logged-in full-track session or fell back
+ * to 30-second preview mode (and why).
+ */
+export function classifySpotifyPlaybackMode({
+  durationMs = 0,
+  entityType = "track",
+  env = null,
+  hasError = false,
+  errorMessage = "",
+} = {}) {
+  const info = env || detectSpotifyBrowserConstraints();
+  const dur = Math.max(0, Number(durationMs) || 0);
+  const isPodcast = entityType === "episode" || entityType === "show";
+
+  // Actual full-track playback (> 32s) overrides all heuristics.
+  if (dur > 32000 && !hasError) {
+    return {
+      mode: "full",
+      isPreview: false,
+      browser: info.browser,
+      errorMessage: "",
+    };
+  }
+  if (hasError) {
+    return {
+      mode: "error",
+      isPreview: true,
+      browser: info.browser,
+      errorMessage: String(errorMessage || ""),
+    };
+  }
+  if (info.isMobile) {
+    return { mode: "preview-mobile", isPreview: true, browser: info.browser, errorMessage: "" };
+  }
+  if (info.isSafari) {
+    return { mode: "preview-safari", isPreview: true, browser: info.browser, errorMessage: "" };
+  }
+  if (info.isSecureContext === false) {
+    return { mode: "preview-insecure", isPreview: true, browser: info.browser, errorMessage: "" };
+  }
+  if (info.drmSupported === false) {
+    return { mode: "preview-no-drm", isPreview: true, browser: info.browser, errorMessage: "" };
+  }
+  // Spotify music previews report ~29–30s MP3 duration (~27.5s–31.5s) in `playback_update`.
+  if (!isPodcast && dur >= 27500 && dur <= 31500) {
+    return { mode: "preview-session", isPreview: true, browser: info.browser, errorMessage: "" };
+  }
+  return { mode: "checking", isPreview: false, browser: info.browser, errorMessage: "" };
+}
+
+/**
+ * Returns a concise, browser-specific explanation for why Spotify is in 30s preview mode
+ * and how the user can let the embed reuse their logged-in Spotify browser session.
+ */
+export function formatSpotifySessionGuidance(session) {
+  if (!session || !session.isPreview) return "";
+  switch (session.mode) {
+    case "preview-mobile":
+      return "Spotify embeds limit mobile browsers to 30s previews even when logged in. Open in Spotify or use a desktop browser for full embedded tracks.";
+    case "preview-safari":
+      return "Spotify embeds limit Safari to 30s previews even when logged in. Use Chrome, Firefox, or Edge (with cookies allowed for open.spotify.com) for full tracks.";
+    case "preview-insecure":
+      return "Spotify full-track DRM & session cookies require HTTPS or localhost. Open this room over HTTPS to use your logged-in Spotify session.";
+    case "preview-no-drm":
+      return "Browser Protected Content (DRM / Widevine) is disabled — enable DRM in your browser settings for full Spotify tracks, then click Reload Session.";
+    case "error":
+      return session.errorMessage
+        ? `Spotify embed error (${session.errorMessage}). Sign into open.spotify.com in this browser and allow cookies/DRM, then click Reload Session.`
+        : "Spotify embed could not start full playback. Sign into open.spotify.com in this browser and allow cookies/DRM, then click Reload Session.";
+    case "preview-session":
+    default:
+      if (session.browser === "firefox") {
+        return "Playing 30s preview — Firefox isolates cross-site cookies by default. Click the Shield icon in the address bar to allow cookies for this site while logged into open.spotify.com, then click Reload Session.";
+      }
+      if (session.browser === "brave") {
+        return "Playing 30s preview — Brave Shields block cross-site Spotify cookies. Click the Brave icon → Allow all cookies for this site while logged into open.spotify.com, then click Reload Session.";
+      }
+      if (session.browser === "edge") {
+        return "Playing 30s preview — Sign in at open.spotify.com in this browser and allow third-party cookies for open.spotify.com (tracking prevention / cookie icon), then click Reload Session.";
+      }
+      return "Playing 30s preview — Sign in at open.spotify.com in this browser and allow third-party cookies for open.spotify.com (eye/cookie icon in address bar), then click Reload Session.";
+  }
+}
+
 let scApiPromise = null;
 function loadSoundCloudWidgetApi() {
   if (typeof window === "undefined") return Promise.reject(new Error("no window"));
@@ -787,6 +1033,407 @@ function loadTwitchEmbedApi() {
 
 /* ==================== Unified Watch Together Player Adapter ==================== */
 
+export const WATCH_SYNC_DEFAULTS = Object.freeze({
+  POLL_INTERVAL_MS: 333,
+  DRASTIC_DRIFT_PLAYING_MS: 3000,
+  DRASTIC_DRIFT_PLAYING_SPOTIFY_MS: 4000,
+  DRASTIC_DRIFT_PAUSED_MS: 2000,
+  MILD_DRIFT_YT_MS: 1200,
+  MILD_DRIFT_SC_MS: 1500,
+  MILD_DRIFT_TWITCH_MS: 1300,
+  MILD_DRIFT_SPOTIFY_MS: 2200,
+  RATE_MISMATCH_MILLI: 100,
+  CONFIRM_POLLS: 2,
+  GRACE_LOCAL_EMBED_MS: 350,
+  GRACE_LOCAL_DRIFT_SEEK_MS: 950,
+  GRACE_REMOTE_APPLY_MS: 1450,
+  GRACE_TRACK_SWITCH_MS: 2200,
+  GRACE_INITIAL_MOUNT_MS: 2400,
+  GRACE_RESYNC_RETRY_MS: 1600,
+  BASE_NEGOTIATION_COOLDOWN_MS: 1800,
+  MAX_NEGOTIATION_COOLDOWN_MS: 8000,
+  CONVERGED_BACKOFF_RESET_MS: 8000,
+  MAX_AUTO_NEGOTIATIONS_IN_WINDOW: 4,
+  AUTO_NEGOTIATION_WINDOW_MS: 15000,
+  TAB_WAKE_POLL_GAP_MS: 2500,
+  CONVERGENCE_POS_TOLERANCE_MS: 2200,
+});
+
+function computePeerStaggerMs(peerId) {
+  const s = String(peerId || "");
+  if (!s) return 0;
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) % 321;
+}
+
+/**
+ * Deterministic, clock-skew-independent state divergence detector & shared-state negotiator.
+ *
+ * Driven by 3 Hz player state snapshots (comparing actual local player state against the room's
+ * authoritative `MediaSyncState`). Separates mild local drift catch-up from drastic divergence
+ * (play/pause mismatch, large position jump, track/video switch, playback rate mismatch), and
+ * prevents multi-peer oscillation via settling grace periods, multi-sample confirmation,
+ * autoplay-block / tab-sleep guards, and exponential backoff on LWW tie-break contention.
+ */
+export class WatchSyncNegotiator {
+  constructor(options = {}) {
+    this.cfg = { ...WATCH_SYNC_DEFAULTS, ...(options.config || {}) };
+    this.getLocalPeerId =
+      typeof options.getLocalPeerId === "function"
+        ? options.getLocalPeerId
+        : () => String(options.localPeerId || "");
+    this.explicitStaggerMs =
+      typeof options.peerStaggerMs === "number" && Number.isFinite(options.peerStaggerMs)
+        ? Math.max(0, options.peerStaggerMs)
+        : null;
+    this.reset();
+  }
+
+  reset() {
+    this.currentRev = 0;
+    this.convergedToRev = false;
+    this.appliedWasInitial = false;
+    this.preApplySnapshot = null;
+    this.localResyncAttempts = 0;
+    this.graceUntilPerf = 0;
+    this.negotiationCooldownUntil = 0;
+    this.currentBackoffMs = this.cfg.BASE_NEGOTIATION_COOLDOWN_MS;
+    this.lastNegotiationPerf = 0;
+    this.lastNegotiatedFromRev = -1;
+    this.autoNegotiationTimes = [];
+    this.convergedSincePerf = 0;
+    this.lastPollPerf = 0;
+    this.divergenceStreak = 0;
+    this.divergenceSignature = "";
+  }
+
+  _resetStreak() {
+    this.divergenceStreak = 0;
+    this.divergenceSignature = "";
+  }
+
+  _getStaggerMs() {
+    if (this.explicitStaggerMs !== null) return this.explicitStaggerMs;
+    return computePeerStaggerMs(this.getLocalPeerId());
+  }
+
+  onLocalDriftSeek(nowPerf) {
+    this._resetStreak();
+    this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + this.cfg.GRACE_LOCAL_DRIFT_SEEK_MS);
+  }
+
+  onSharedStateApplied(state, nowPerf, opts = {}) {
+    const rev = Number(state?.rev) || 0;
+    const source = opts.source || "remote";
+    this.currentRev = rev;
+    this._resetStreak();
+
+    if (source === "local-embed" || source === "negotiated") {
+      this.convergedToRev = true;
+      this.appliedWasInitial = false;
+      this.localResyncAttempts = 0;
+      this.preApplySnapshot = null;
+      this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + this.cfg.GRACE_LOCAL_EMBED_MS);
+      if (source === "local-embed") {
+        // Explicit user click resets automatic-negotiation backoff so controls stay responsive
+        this.currentBackoffMs = this.cfg.BASE_NEGOTIATION_COOLDOWN_MS;
+        this.autoNegotiationTimes = [];
+      }
+      return;
+    }
+
+    // Detect contention: another peer's remote update arrived shortly after our auto-negotiation
+    // (e.g., we lost a simultaneous (rev, actor) LWW tie-break or another peer overrode us).
+    if (
+      source === "remote" &&
+      this.lastNegotiationPerf > 0 &&
+      nowPerf - this.lastNegotiationPerf < 5000
+    ) {
+      this.currentBackoffMs = Math.min(
+        this.cfg.MAX_NEGOTIATION_COOLDOWN_MS,
+        Math.round(this.currentBackoffMs * 2)
+      );
+      this.negotiationCooldownUntil = Math.max(
+        this.negotiationCooldownUntil,
+        nowPerf + this.currentBackoffMs + this._getStaggerMs()
+      );
+    }
+
+    this.appliedWasInitial = Boolean(opts.isInitial);
+    this.localResyncAttempts = 0;
+
+    if (!opts.didMutate) {
+      this.convergedToRev = true;
+      this.preApplySnapshot = null;
+      this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + 500);
+      return;
+    }
+
+    this.convergedToRev = false;
+    this.preApplySnapshot = opts.preApplySnapshot ? { ...opts.preApplySnapshot } : null;
+    const graceMs = opts.isInitial
+      ? this.cfg.GRACE_INITIAL_MOUNT_MS
+      : opts.isTrackSwitch
+        ? this.cfg.GRACE_TRACK_SWITCH_MS
+        : this.cfg.GRACE_REMOTE_APPLY_MS;
+    this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + graceMs);
+  }
+
+  _movedSignificantlyFromPreApply(snapshot, sharedState, drasticPosThreshold) {
+    const pre = this.preApplySnapshot;
+    if (!pre) return false;
+    if (
+      snapshot.playlistIndex !== undefined &&
+      pre.playlistIndex !== undefined &&
+      snapshot.playlistIndex !== pre.playlistIndex &&
+      snapshot.playlistIndex !== (Number(sharedState.playlistIndex) || 0)
+    ) {
+      return true;
+    }
+    if (
+      snapshot.trackUri &&
+      pre.trackUri &&
+      snapshot.trackUri !== pre.trackUri &&
+      snapshot.trackUri !== (sharedState.trackUri || "")
+    ) {
+      return true;
+    }
+    if (
+      snapshot.hasPlayState &&
+      typeof pre.playing === "boolean" &&
+      Boolean(snapshot.playing) !== pre.playing &&
+      Boolean(snapshot.playing) !== Boolean(sharedState.playing)
+    ) {
+      return true;
+    }
+    if (
+      snapshot.hasPosition &&
+      typeof pre.positionMs === "number" &&
+      Math.abs(snapshot.positionMs - pre.positionMs) >= drasticPosThreshold
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  evaluate(snapshot, sharedState, context = {}) {
+    if (!sharedState || !sharedState.active || !snapshot || !snapshot.ready) {
+      return { action: "none", reason: "not-ready" };
+    }
+
+    const nowPerf = Number(snapshot.observedAt) || 0;
+    const wallNowMs = Number(snapshot.wallNowMs) || Date.now();
+    const pollGap = this.lastPollPerf > 0 ? nowPerf - this.lastPollPerf : 0;
+    this.lastPollPerf = nowPerf;
+
+    const rawExpectedPosMs = projectMediaPositionMs(sharedState, wallNowMs);
+    if (
+      snapshot.provider === "spotify" &&
+      snapshot.durationMs > 0 &&
+      snapshot.durationMs <= 35000 &&
+      rawExpectedPosMs > snapshot.durationMs
+    ) {
+      // Logged-out 30s Spotify preview peer cannot seek past preview length — never override full-track peers
+      this._resetStreak();
+      return { action: "none", reason: "preview-out-of-range" };
+    }
+    let expectedPosMs = rawExpectedPosMs;
+    if (snapshot.durationMs > 0) {
+      expectedPosMs = Math.min(expectedPosMs, snapshot.durationMs);
+    }
+    const driftMs = snapshot.hasPosition ? Math.abs(snapshot.positionMs - expectedPosMs) : 0;
+    const playStateMismatch = Boolean(
+      snapshot.hasPlayState &&
+        !snapshot.buffering &&
+        !snapshot.unstarted &&
+        !snapshot.ended &&
+        Boolean(snapshot.playing) !== Boolean(sharedState.playing)
+    );
+    const drasticPosThreshold = sharedState.playing
+      ? snapshot.provider === "spotify"
+        ? this.cfg.DRASTIC_DRIFT_PLAYING_SPOTIFY_MS
+        : this.cfg.DRASTIC_DRIFT_PLAYING_MS
+      : this.cfg.DRASTIC_DRIFT_PAUSED_MS;
+    const positionMismatch = Boolean(
+      snapshot.hasPosition &&
+        !snapshot.buffering &&
+        !snapshot.unstarted &&
+        !snapshot.ended &&
+        !snapshot.stalled &&
+        driftMs >= drasticPosThreshold
+    );
+    const playlistIdxMismatch = Boolean(
+      snapshot.playlistIndex !== undefined &&
+        (sharedState.playlistId || (Number(snapshot.playlistCount) || 0) > 1) &&
+        snapshot.playlistIndex !== (Number(sharedState.playlistIndex) || 0)
+    );
+    const trackUriMismatch = Boolean(
+      snapshot.trackUri &&
+        sharedState.trackUri &&
+        snapshot.trackUri !== sharedState.trackUri &&
+        (!sharedState.playlistId || snapshot.trackUri !== sharedState.playlistId)
+    );
+    const trackMismatch = playlistIdxMismatch || trackUriMismatch;
+    const rateMismatch = Boolean(
+      snapshot.hasRate &&
+        Math.abs((Number(snapshot.rateMilli) || 1000) - (Number(sharedState.rateMilli) || 1000)) >=
+          this.cfg.RATE_MISMATCH_MILLI
+    );
+    const isDrastic = playStateMismatch || positionMismatch || trackMismatch || rateMismatch;
+
+    // Backgrounded/sleeping tab wake-up: if the 3 Hz timer was throttled/frozen for > 2.5s,
+    // re-sync locally to the room's authoritative state instead of dragging everyone backward.
+    if (pollGap > this.cfg.TAB_WAKE_POLL_GAP_MS) {
+      this._resetStreak();
+      if (isDrastic && !snapshot.ended) {
+        this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + this.cfg.GRACE_REMOTE_APPLY_MS);
+        return { action: "resync-local", reason: "tab-wake-resync" };
+      }
+      return { action: "none", reason: "tab-wake-in-sync" };
+    }
+
+    // Ignore transient loading / buffering / ended states
+    if (snapshot.buffering || snapshot.unstarted || snapshot.ended) {
+      this._resetStreak();
+      return {
+        action: "none",
+        reason: snapshot.ended ? "ended" : snapshot.buffering ? "buffering" : "unstarted",
+      };
+    }
+
+    const isConvergedNow =
+      !playStateMismatch &&
+      !trackMismatch &&
+      !rateMismatch &&
+      (!snapshot.hasPosition || driftMs <= this.cfg.CONVERGENCE_POS_TOLERANCE_MS);
+
+    if (isConvergedNow) {
+      this.convergedToRev = true;
+      this.appliedWasInitial = false;
+      this.graceUntilPerf = 0;
+      this.localResyncAttempts = 0;
+      this._resetStreak();
+      if (this.convergedSincePerf === 0) {
+        this.convergedSincePerf = nowPerf;
+      } else if (nowPerf - this.convergedSincePerf >= this.cfg.CONVERGED_BACKOFF_RESET_MS) {
+        this.currentBackoffMs = this.cfg.BASE_NEGOTIATION_COOLDOWN_MS;
+      }
+      return { action: "none", reason: "in-sync" };
+    }
+
+    if (!isDrastic) {
+      this._resetStreak();
+      return { action: "none", reason: "mild-drift" };
+    }
+
+    // Drastic divergence observed
+    this.convergedSincePerf = 0;
+    if (nowPerf < this.graceUntilPerf) {
+      return { action: "none", reason: "in-grace-window" };
+    }
+
+    const sig =
+      `${trackMismatch ? `t:${snapshot.playlistIndex ?? ""}:${snapshot.trackUri ?? ""}` : ""}` +
+      `|${playStateMismatch ? `p:${snapshot.playing ? 1 : 0}` : ""}` +
+      `|${positionMismatch ? `d:${snapshot.positionMs >= expectedPosMs ? "+" : "-"}` : ""}` +
+      `|${rateMismatch ? `r:${snapshot.rateMilli}` : ""}`;
+
+    if (sig === this.divergenceSignature) {
+      this.divergenceStreak += 1;
+    } else {
+      this.divergenceSignature = sig;
+      this.divergenceStreak = 1;
+    }
+
+    if (this.divergenceStreak < this.cfg.CONFIRM_POLLS) {
+      return { action: "none", reason: "confirming-divergence" };
+    }
+
+    // Confirmed drastic divergence — distinguish unconverged remote apply vs genuine divergence
+    if (!this.convergedToRev) {
+      // Never let a synthetic initial pre-apply snapshot bypass initial/autoplay guards;
+      // genuine user clicks still propagate immediately via onUserAction -> local-embed.
+      const movedFromPre = this.appliedWasInitial
+        ? false
+        : this._movedSignificantlyFromPreApply(snapshot, sharedState, drasticPosThreshold);
+      if (!movedFromPre) {
+        if (this.localResyncAttempts < 1) {
+          this.localResyncAttempts += 1;
+          this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + this.cfg.GRACE_RESYNC_RETRY_MS);
+          this._resetStreak();
+          return { action: "resync-local", reason: "unconverged-retry" };
+        }
+        const hasEverPlayed = Boolean(context.hasEverPlayedLocally);
+        if (sharedState.playing && !snapshot.playing && (this.appliedWasInitial || !hasEverPlayed)) {
+          // Autoplay-blocked guard: never pause the room just because this browser blocked autoplay
+          this._resetStreak();
+          this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + 4000);
+          return { action: "none", reason: "autoplay-blocked-guard" };
+        }
+        if (this.appliedWasInitial) {
+          this._resetStreak();
+          this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + 3000);
+          return { action: "none", reason: "initial-unconverged-guard" };
+        }
+      }
+    }
+
+    if (nowPerf < this.negotiationCooldownUntil) {
+      return { action: "none", reason: "negotiation-cooldown" };
+    }
+
+    this.autoNegotiationTimes = this.autoNegotiationTimes.filter(
+      (t) => nowPerf - t < this.cfg.AUTO_NEGOTIATION_WINDOW_MS
+    );
+    if (this.autoNegotiationTimes.length >= this.cfg.MAX_AUTO_NEGOTIATIONS_IN_WINDOW) {
+      this.currentBackoffMs = this.cfg.MAX_NEGOTIATION_COOLDOWN_MS;
+      this.negotiationCooldownUntil = nowPerf + this.currentBackoffMs + this._getStaggerMs();
+      this._resetStreak();
+      return { action: "none", reason: "rate-limited" };
+    }
+
+    const reasons = [];
+    if (trackMismatch) reasons.push("track-mismatch");
+    if (playStateMismatch) reasons.push("play-state");
+    if (positionMismatch) reasons.push("position-drift");
+    if (rateMismatch) reasons.push("rate-mismatch");
+
+    this.autoNegotiationTimes.push(nowPerf);
+    this.lastNegotiationPerf = nowPerf;
+    this.lastNegotiatedFromRev = Number(sharedState.rev) || 0;
+    this.negotiationCooldownUntil = nowPerf + this.currentBackoffMs + this._getStaggerMs();
+    this.graceUntilPerf = Math.max(this.graceUntilPerf, nowPerf + this.cfg.GRACE_LOCAL_EMBED_MS);
+    this._resetStreak();
+
+    return {
+      action: "negotiate",
+      reason: reasons.join("+") || "divergence",
+      divergence: {
+        playStateMismatch,
+        positionMismatch,
+        trackMismatch,
+        rateMismatch,
+        driftMs,
+        expectedPosMs,
+      },
+      proposal: {
+        playing: snapshot.hasPlayState ? Boolean(snapshot.playing) : Boolean(sharedState.playing),
+        positionMs: snapshot.hasPosition ? Math.max(0, Math.round(snapshot.positionMs)) : expectedPosMs,
+        rateMilli: snapshot.hasRate
+          ? Math.max(250, Math.min(4000, Math.round(snapshot.rateMilli)))
+          : Number(sharedState.rateMilli) || 1000,
+        playlistIndex: snapshot.playlistIndex !== undefined ? snapshot.playlistIndex : undefined,
+        trackUri: snapshot.trackUri !== undefined ? snapshot.trackUri : undefined,
+        trackTitle: snapshot.trackTitle || undefined,
+      },
+    };
+  }
+}
+
 function isYouTubeFamily(provider) {
   return provider === "youtube" || provider === "ytmusic";
 }
@@ -796,14 +1443,27 @@ export class WatchTogetherPlayer {
    * @param {HTMLElement} mountEl - Container element where the embed mounts
    * @param {object} callbacks
    * @param {(ev: {playing: boolean, positionMs: number, rateMilli?: number, ended?: boolean, playlistIndex?: number, trackUri?: string, trackTitle?: string}) => void} callbacks.onUserAction
+   * @param {(ev: {playing: boolean, positionMs: number, rateMilli?: number, playlistIndex?: number, trackUri?: string, trackTitle?: string, reason?: string, negotiated?: boolean}) => void} [callbacks.onNegotiateState]
    * @param {(meta: {durationMs: number, positionMs: number, title?: string, ready?: boolean, apiUnavailable?: boolean, playlistCount?: number, playlistIndex?: number, playlistItems?: Array, trackUri?: string, spotifyTrackDetached?: boolean, twitchOffline?: boolean}) => void} callbacks.onTelemetry
    * @param {(muted: boolean) => void} callbacks.onAutoplayMuted
+   * @param {() => string} [callbacks.getLocalPeerId]
+   * @param {() => number} [callbacks.perfNow]
+   * @param {() => number} [callbacks.wallNow]
    */
   constructor(mountEl, callbacks = {}) {
     this.mountEl = mountEl;
     this.onUserAction = callbacks.onUserAction || (() => {});
+    this.onNegotiateState =
+      typeof callbacks.onNegotiateState === "function"
+        ? callbacks.onNegotiateState
+        : this.onUserAction;
     this.onTelemetry = callbacks.onTelemetry || (() => {});
     this.onAutoplayMuted = callbacks.onAutoplayMuted || (() => {});
+    this._perfNow =
+      typeof callbacks.perfNow === "function"
+        ? callbacks.perfNow
+        : () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+    this._wallNow = typeof callbacks.wallNow === "function" ? callbacks.wallNow : () => Date.now();
 
     this.provider = "";
     this.mediaId = "";
@@ -820,9 +1480,53 @@ export class WatchTogetherPlayer {
     this.playlistCount = 0;
     this.playlistItems = [];
     this.spotifyShowingTrackUri = "";
+    this.spotifyEntityType = "track";
+    this.spotifyIframe = null;
+    this.spotifyHasContext = false;
+    this.spotifyInitialStartSec = 0;
+    this.spotifyLastPosMs = 0;
+    this.spotifyLastIsPaused = true;
+    this.spotifyAwaitingInitialSettle = false;
+    this.spotifyEnv = null;
+    this.spotifyHasError = false;
+    this.spotifyErrorMessage = "";
+    this.spotifySession = null;
+    this._nextSpotifyForceDrmProbe = false;
     this.twitchKind = "";
     this.twitchEpoch = 0;
     this.suppressUntilMs = 0;
+
+    // Targeted programmatic command expectation (replaces blunt global echo suppression for YT/SC/Twitch)
+    this.expectedCommand = null;
+    this._commandSeq = 0;
+    this._syncSeq = 0;
+    this._syncTimers = new Set();
+    this._autoplayTimerId = null;
+    this._hasEverPlayedLocally = false;
+    this._lastAppliedEpoch = 0;
+
+    // YouTube rebuffer-vs-scrub tracking
+    this._ytWasBuffering = false;
+    this._ytBufferingFromPosMs = 0;
+
+    // SoundCloud async action & polling race guards
+    this._scActionSeq = 0;
+    this._scPollSeq = 0;
+    this._scPollInFlight = false;
+    this._scPollStartedAt = 0;
+    this._scPrevPollPlaying = false;
+    this._scPrevPollPosMs = -1;
+    this._scLastProgressMoveAt = 0;
+    this._spPrevPollPosMs = -1;
+    this._spLastPosMoveAt = 0;
+
+    // Periodic 3 Hz divergence detector & multi-peer state negotiator
+    this.negotiator = new WatchSyncNegotiator({
+      getLocalPeerId: callbacks.getLocalPeerId,
+      localPeerId: callbacks.localPeerId,
+      peerStaggerMs: callbacks.peerStaggerMs,
+      config: callbacks.syncConfig,
+    });
 
     // Local-only volume (0..100) & mute — NEVER transmitted or overwritten by remote sync
     this.localVolume = 80;
@@ -839,11 +1543,161 @@ export class WatchTogetherPlayer {
   }
 
   _suppress(ms = 900) {
-    this.suppressUntilMs = Math.max(this.suppressUntilMs, performance.now() + ms);
+    this.suppressUntilMs = Math.max(this.suppressUntilMs, this._perfNow() + ms);
   }
 
   _isSuppressed() {
-    return performance.now() < this.suppressUntilMs;
+    const now = this._perfNow();
+    if (now < this.suppressUntilMs) return true;
+    return Boolean(this.expectedCommand && now < this.expectedCommand.expiresAt);
+  }
+
+  _scheduleSyncTimer(delayMs, fn) {
+    const id = setTimeout(() => {
+      this._syncTimers.delete(id);
+      if (this._autoplayTimerId === id) {
+        this._autoplayTimerId = null;
+      }
+      fn();
+    }, delayMs);
+    this._syncTimers.add(id);
+    return id;
+  }
+
+  _clearAutoplayTimer() {
+    if (this._autoplayTimerId !== null) {
+      clearTimeout(this._autoplayTimerId);
+      this._syncTimers.delete(this._autoplayTimerId);
+      this._autoplayTimerId = null;
+    }
+  }
+
+  _clearSyncTimers() {
+    for (const id of this._syncTimers) {
+      clearTimeout(id);
+    }
+    this._syncTimers.clear();
+    this._autoplayTimerId = null;
+  }
+
+  _setExpectedCommand(spec, windowMs = 950) {
+    const now = this._perfNow();
+    this.expectedCommand = {
+      id: ++this._commandSeq,
+      issuedAt: now,
+      expiresAt: now + windowMs,
+      isInitial: Boolean(spec.isInitial),
+      expectTrackSwitch: Boolean(spec.expectTrackSwitch),
+      trackSwitchSettled: !spec.expectTrackSwitch,
+      expectPlayState: Boolean(spec.expectPlayState),
+      targetPlaying: Boolean(spec.targetPlaying),
+      playEchoSeen: false,
+      expectSeek: Boolean(spec.expectSeek),
+      targetPosMs: Number(spec.targetPosMs) || 0,
+      seekEchoSeen: false,
+      expectRate: Boolean(spec.expectRate),
+      targetRateMilli: Number(spec.targetRateMilli) || 1000,
+      targetPlaylistIndex: Number(spec.targetPlaylistIndex) || 0,
+      targetTrackUri: String(spec.targetTrackUri || ""),
+    };
+    return this.expectedCommand;
+  }
+
+  /**
+   * Command-aware echo filter: suppresses ONLY the expected echo of a programmatic command
+   * we actually issued, while allowing rapid opposite-direction user clicks (e.g., fast
+   * Pause -> Resume inside SoundCloud/YouTube) to propagate immediately.
+   */
+  _shouldSuppressEmbedEvent(event) {
+    const cmd = this.expectedCommand;
+    const now = this._perfNow();
+    if (!cmd || now >= cmd.expiresAt) {
+      this.expectedCommand = null;
+      return false;
+    }
+    const elapsed = now - cmd.issuedAt;
+
+    if (event.kind === "playstate") {
+      if (cmd.expectTrackSwitch && !cmd.trackSwitchSettled) {
+        return true;
+      }
+      if (Boolean(event.playing) === cmd.targetPlaying) {
+        if (cmd.expectPlayState || cmd.expectSeek || cmd.expectTrackSwitch || cmd.isInitial) {
+          cmd.playEchoSeen = true;
+          if (
+            cmd.expectSeek &&
+            typeof event.positionMs === "number" &&
+            Math.abs(event.positionMs - cmd.targetPosMs) <= 2200
+          ) {
+            cmd.seekEchoSeen = true;
+          }
+          return true;
+        }
+        return false;
+      }
+      // Event has the OPPOSITE play/pause state from what we commanded!
+      // Once our command echo was observed (or past a brief in-flight race window), this is a genuine user click.
+      const inFlightWindowMs = cmd.isInitial ? 450 : 180;
+      if (cmd.playEchoSeen || elapsed >= inFlightWindowMs) {
+        this.expectedCommand = null;
+        this._clearSyncTimers();
+        return false;
+      }
+      return true;
+    }
+
+    if (event.kind === "seek") {
+      if (cmd.expectTrackSwitch && !cmd.trackSwitchSettled) {
+        return true;
+      }
+      if (cmd.expectSeek) {
+        if (Math.abs((Number(event.positionMs) || 0) - cmd.targetPosMs) <= 2200) {
+          cmd.seekEchoSeen = true;
+          return true;
+        }
+        if (cmd.seekEchoSeen || elapsed >= 220) {
+          this.expectedCommand = null;
+          this._clearSyncTimers();
+          return false;
+        }
+        return true;
+      }
+      return false;
+    }
+
+    if (event.kind === "rate") {
+      if (cmd.expectRate && Math.abs((Number(event.rateMilli) || 1000) - cmd.targetRateMilli) <= 30) {
+        return true;
+      }
+      return false;
+    }
+
+    if (event.kind === "track") {
+      if (cmd.expectTrackSwitch) {
+        const matchesIdx =
+          event.playlistIndex !== undefined && event.playlistIndex === cmd.targetPlaylistIndex;
+        const matchesUri =
+          Boolean(event.trackUri) && Boolean(cmd.targetTrackUri) && event.trackUri === cmd.targetTrackUri;
+        if (matchesIdx || matchesUri || !cmd.trackSwitchSettled || elapsed < 350) {
+          return true;
+        }
+        this.expectedCommand = null;
+        this._clearSyncTimers();
+        return false;
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  _capturePreApplySnapshot() {
+    return {
+      playing: Boolean(this.lastKnownPlaying),
+      positionMs: Number(this.lastKnownPosMs) || 0,
+      playlistIndex: this.lastKnownPlaylistIndex,
+      trackUri: this.lastKnownTrackUri || "",
+    };
   }
 
   /**
@@ -896,19 +1750,25 @@ export class WatchTogetherPlayer {
    */
   showSpotifyPlaylistView() {
     if (this.provider !== "spotify" || !this.playlistId || !this.spotifyCtrl) return false;
-    this._suppress(1300);
+    this._suppress(1600);
     this.spotifyShowingTrackUri = "";
+    this.spotifyHasContext = false;
+    this.spotifyInitialStartSec = 0;
+    this.spotifyLastPosMs = 0;
+    this.spotifyLastIsPaused = true;
+    this.spotifyAwaitingInitialSettle = true;
     try {
-      if (typeof this.spotifyCtrl.loadEntity === "function") {
-        this.spotifyCtrl.loadEntity(this.playlistId);
-      } else if (typeof this.spotifyCtrl.loadUri === "function") {
+      if (typeof this.spotifyCtrl.loadUri === "function") {
         this.spotifyCtrl.loadUri(this.playlistId);
+      } else if (typeof this.spotifyCtrl.loadEntity === "function") {
+        this.spotifyCtrl.loadEntity(this.playlistId);
       }
       this.onTelemetry({
         durationMs: this.durationMs,
         positionMs: this.lastKnownPosMs,
         ready: this.ready,
         spotifyTrackDetached: false,
+        spotifySession: this.spotifySession,
       });
       return true;
     } catch {
@@ -917,15 +1777,58 @@ export class WatchTogetherPlayer {
   }
 
   /**
-   * Synchronizes the embed to an authoritative `MediaSyncState`.
+   * Locally remounts the Spotify embed iframe so the browser sends a fresh request with the
+   * user's current Spotify session cookies/permissions, then resyncs to room state.
+   * Strictly local — never emits `onUserAction` or disrupts other peers.
    */
-  async applyState(state, nowMs = Date.now()) {
+  async reloadSpotifySession() {
+    if (this.provider !== "spotify" || !this.pendingState || !this.pendingState.active) {
+      return false;
+    }
+    this._nextSpotifyForceDrmProbe = true;
+    await this._mountProvider(this.pendingState);
+    this._suppress(2500);
+    return true;
+  }
+
+  _spotifyMatchesPendingState(playing, posMs, playingUri = "") {
+    const st = this.pendingState;
+    if (!st || !st.active || st.provider !== "spotify") return false;
+    if (Boolean(playing) !== Boolean(st.playing)) return false;
+    const expectedMs = projectMediaPositionMs(st, this._wallNow());
+    if (Math.abs(posMs - expectedMs) > 2500) return false;
+    if (this.playlistId && playingUri && st.trackUri && playingUri !== st.trackUri) {
+      return false;
+    }
+    return true;
+  }
+
+  _resumeSpotify() {
+    if (!this.spotifyCtrl) return;
+    // Spotify's `resume` command resumes an active context and automatically starts playback
+    // when no context exists yet; calling `play()` immediately after `resume()` restarts from 0:00.
+    if (typeof this.spotifyCtrl.resume === "function") {
+      this.spotifyCtrl.resume();
+    } else if (typeof this.spotifyCtrl.play === "function") {
+      this.spotifyCtrl.play();
+    }
+  }
+
+  /**
+   * Synchronizes the embed to an authoritative `MediaSyncState`.
+   * @param {object} state
+   * @param {number} [nowMs]
+   * @param {{source?: "local-embed"|"local-ui"|"remote"|"negotiated"}} [options]
+   */
+  async applyState(state, nowMs = this._wallNow(), options = {}) {
     if (!state || !state.active || !state.provider || !state.mediaId) {
       this.destroy();
       return;
     }
 
+    const prevState = this.pendingState;
     this.pendingState = state;
+    const source = options?.source || "remote";
     const isTwitchClipReplay =
       state.provider === "twitch" &&
       this.provider === "twitch" &&
@@ -952,7 +1855,37 @@ export class WatchTogetherPlayer {
     if (!this.ready) {
       return;
     }
-    this._syncMountedPlayer(state, nowMs, false);
+
+    // If this state update is the self-echo of an event just emitted by this local embed
+    // (or a local state negotiation from this player's actual state), do NOT re-command the
+    // player and do NOT arm echo suppression — otherwise rapid clicks (< 950ms) get swallowed!
+    if (source === "local-embed" || source === "negotiated") {
+      const isEpochJump =
+        prevState && (Number(state.epoch) || 0) !== (Number(prevState.epoch) || 0);
+      if (!isEpochJump) {
+        this._lastAppliedEpoch = Number(state.epoch) || 0;
+        this._clearSyncTimers();
+        this.expectedCommand = null;
+        this.suppressUntilMs = 0;
+        if (isYouTubeFamily(this.provider) && this.playlistId && this.ytPlayer) {
+          try {
+            this.ytPlayer.setLoop?.(Boolean(state.loop));
+          } catch {
+            // ignore
+          }
+        }
+        this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+          source,
+          didMutate: false,
+        });
+        if (!this.pollTimer && !(this.provider === "twitch" && this.twitchKind === "clip")) {
+          this._startPollLoop(this.generation);
+        }
+        return;
+      }
+    }
+
+    this._syncMountedPlayer(state, nowMs, false, { source, prevState });
   }
 
   async _mountProvider(state) {
@@ -965,15 +1898,36 @@ export class WatchTogetherPlayer {
     this.ready = false;
     this.apiUnavailable = false;
     this.durationMs = 0;
-    this.lastKnownPosMs = projectMediaPositionMs(state, Date.now());
+    this.lastKnownPosMs = projectMediaPositionMs(state, this._wallNow());
     this.lastKnownPlaying = Boolean(state.playing);
     this.lastKnownPlaylistIndex = Math.max(0, Number(state.playlistIndex) || 0);
     this.lastKnownTrackUri = state.trackUri || "";
     this.playlistCount = 0;
     this.playlistItems = [];
     this.spotifyShowingTrackUri = "";
+    this.spotifyEntityType = "track";
+    this.spotifyIframe = null;
+    this.spotifyHasContext = false;
+    this.spotifyInitialStartSec = 0;
+    this.spotifyLastPosMs = 0;
+    this.spotifyLastIsPaused = true;
+    this.spotifyAwaitingInitialSettle = false;
+    this.spotifyEnv = null;
+    this.spotifyHasError = false;
+    this.spotifyErrorMessage = "";
+    this.spotifySession = null;
     this.twitchKind = "";
     this.twitchEpoch = Number(state.epoch) || 0;
+    this._lastAppliedEpoch = Number(state.epoch) || 0;
+    this._hasEverPlayedLocally = false;
+    this._ytWasBuffering = false;
+    this._ytBufferingFromPosMs = 0;
+    this._scPrevPollPlaying = false;
+    this._scPrevPollPosMs = -1;
+    this._scLastProgressMoveAt = 0;
+    this._spPrevPollPosMs = -1;
+    this._spLastPosMoveAt = 0;
+    this.negotiator.reset();
 
     if (!this.mountEl) return;
     this.mountEl.innerHTML = "";
@@ -1027,7 +1981,7 @@ export class WatchTogetherPlayer {
       if (gen !== this.generation) return;
 
       const isPlaylist = Boolean(state.playlistId);
-      const startSec = Math.floor(projectMediaPositionMs(state, Date.now()) / 1000);
+      const startSec = Math.floor(projectMediaPositionMs(state, this._wallNow()) / 1000);
       const startIdx = Math.max(0, Number(state.playlistIndex) || 0);
 
       const playerVars = {
@@ -1100,7 +2054,7 @@ export class WatchTogetherPlayer {
               trackUri: this.lastKnownTrackUri,
             });
             if (this.pendingState) {
-              this._syncMountedPlayer(this.pendingState, Date.now(), true);
+              this._syncMountedPlayer(this.pendingState, this._wallNow(), true, { source: "remote" });
             }
             this._startPollLoop(gen);
           },
@@ -1112,6 +2066,7 @@ export class WatchTogetherPlayer {
             if (dur > 0) this.durationMs = Math.round(dur * 1000);
             const rateMilli = Math.round((this.ytPlayer?.getPlaybackRate?.() || 1) * 1000);
             const vdata = this.ytPlayer?.getVideoData?.() || {};
+            const prevPlaying = this.lastKnownPlaying;
             this.lastKnownPosMs = curMs;
 
             let trackChanged = false;
@@ -1144,6 +2099,37 @@ export class WatchTogetherPlayer {
               });
             }
 
+            if (code === 3) {
+              if (!this._ytWasBuffering) {
+                this._ytWasBuffering = true;
+                this._ytBufferingFromPosMs = curMs;
+              }
+              if (
+                trackChanged &&
+                !this._shouldSuppressEmbedEvent({
+                  kind: "track",
+                  playlistIndex: this.lastKnownPlaylistIndex,
+                  trackUri: this.lastKnownTrackUri,
+                })
+              ) {
+                this.expectedCommand = null;
+                this._clearSyncTimers();
+                this.onUserAction({
+                  playing: true,
+                  positionMs: curMs,
+                  rateMilli,
+                  playlistIndex: this.lastKnownPlaylistIndex,
+                  trackUri: this.lastKnownTrackUri,
+                  trackTitle: vdata.title || undefined,
+                });
+              }
+              return;
+            }
+
+            const wasBuffering = this._ytWasBuffering;
+            const bufferingFromPosMs = this._ytBufferingFromPosMs;
+            this._ytWasBuffering = false;
+
             if (code === 0) {
               // ENDED — in a playlist, YouTube automatically advances unless on the final video
               if (
@@ -1154,6 +2140,7 @@ export class WatchTogetherPlayer {
                 return;
               }
               this.lastKnownPlaying = false;
+              this._clearAutoplayTimer();
               this.onUserAction({
                 playing: false,
                 positionMs: curMs,
@@ -1164,13 +2151,50 @@ export class WatchTogetherPlayer {
               });
               return;
             }
-            if (this._isSuppressed()) {
-              if (code === 1) this.lastKnownPlaying = true;
-              if (code === 2) this.lastKnownPlaying = false;
-              return;
-            }
+
             if (code === 1) {
               this.lastKnownPlaying = true;
+              this._hasEverPlayedLocally = true;
+              this._clearAutoplayTimer();
+              if (
+                this._shouldSuppressEmbedEvent({
+                  kind: "playstate",
+                  playing: true,
+                  positionMs: curMs,
+                  trackChanged,
+                })
+              ) {
+                return;
+              }
+              // Distinguish brief local network rebuffering (3 -> 1 at the same spot while already
+              // playing) from a user resume or scrubber seek so slow WiFi doesn't drag other peers back.
+              if (
+                wasBuffering &&
+                prevPlaying &&
+                !trackChanged &&
+                this.pendingState?.playing &&
+                Math.abs(curMs - bufferingFromPosMs) < 1500
+              ) {
+                const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+                const rateDiff = Math.abs(rateMilli - (Number(this.pendingState.rateMilli) || 1000));
+                if (rateDiff < 50) {
+                  if (Math.abs(curMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS) {
+                    try {
+                      this._setExpectedCommand(
+                        { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                        850
+                      );
+                      this.ytPlayer.seekTo?.(expectedMs / 1000, true);
+                      this.negotiator.onLocalDriftSeek(this._perfNow());
+                    } catch {
+                      // ignore
+                    }
+                  }
+                  return;
+                }
+              }
+              this.expectedCommand = null;
+              this._clearSyncTimers();
               this.onUserAction({
                 playing: true,
                 positionMs: curMs,
@@ -1181,6 +2205,18 @@ export class WatchTogetherPlayer {
               });
             } else if (code === 2) {
               this.lastKnownPlaying = false;
+              if (
+                this._shouldSuppressEmbedEvent({
+                  kind: "playstate",
+                  playing: false,
+                  positionMs: curMs,
+                  trackChanged,
+                })
+              ) {
+                return;
+              }
+              this.expectedCommand = null;
+              this._clearSyncTimers();
               this.onUserAction({
                 playing: false,
                 positionMs: curMs,
@@ -1189,9 +2225,20 @@ export class WatchTogetherPlayer {
                 trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
                 trackTitle: vdata.title || undefined,
               });
-            } else if (trackChanged && (code === 3 || code === 5)) {
+            } else if (trackChanged && code === 5) {
+              if (
+                this._shouldSuppressEmbedEvent({
+                  kind: "track",
+                  playlistIndex: this.lastKnownPlaylistIndex,
+                  trackUri: this.lastKnownTrackUri,
+                })
+              ) {
+                return;
+              }
+              this.expectedCommand = null;
+              this._clearSyncTimers();
               this.onUserAction({
-                playing: code === 3 || this.lastKnownPlaying,
+                playing: this.lastKnownPlaying,
                 positionMs: curMs,
                 rateMilli,
                 playlistIndex: this.lastKnownPlaylistIndex,
@@ -1201,9 +2248,10 @@ export class WatchTogetherPlayer {
             }
           },
           onPlaybackRateChange: (ev) => {
-            if (gen !== this.generation || this._isSuppressed()) return;
+            if (gen !== this.generation) return;
             const curMs = Math.max(0, Math.round((this.ytPlayer?.getCurrentTime?.() || 0) * 1000));
             const rateMilli = Math.round((Number(ev.data) || 1) * 1000);
+            if (this._shouldSuppressEmbedEvent({ kind: "rate", rateMilli })) return;
             this.onUserAction({
               playing: this.lastKnownPlaying,
               positionMs: curMs,
@@ -1227,11 +2275,25 @@ export class WatchTogetherPlayer {
     this.mountEl.appendChild(holder);
 
     const parsed = parseWatchMediaUrl(state.url);
+    const entityType = parsed?.entityType || "track";
     const isCollection =
       Boolean(state.playlistId) ||
-      (parsed && (parsed.entityType === "playlist" || parsed.entityType === "album" || parsed.entityType === "show"));
+      entityType === "playlist" ||
+      entityType === "album" ||
+      entityType === "show";
     const height = isCollection ? 352 : 152;
     const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+
+    this.spotifyEntityType = entityType;
+    this.spotifyHasContext = false;
+    this.spotifyHasError = false;
+    this.spotifyErrorMessage = "";
+    this.spotifyEnv = detectSpotifyBrowserConstraints();
+    this.spotifySession = classifySpotifyPlaybackMode({
+      durationMs: 0,
+      entityType,
+      env: this.spotifyEnv,
+    });
 
     // If joining an active Spotify playlist where a specific trackUri is already playing, start right on it
     const initialUri =
@@ -1241,15 +2303,53 @@ export class WatchTogetherPlayer {
     if (state.playlistId && initialUri !== state.playlistId) {
       this.spotifyShowingTrackUri = initialUri;
     }
+    const initialStartSec =
+      !isCollection || Boolean(this.spotifyShowingTrackUri)
+        ? Math.floor(projectMediaPositionMs(state, this._wallNow()) / 1000)
+        : 0;
+    this.spotifyInitialStartSec = initialStartSec;
+    this.spotifyLastPosMs = initialStartSec * 1000;
+    this.spotifyLastIsPaused = true;
+    this.spotifyAwaitingInitialSettle = true;
+
+    const forceDrmProbe = Boolean(this._nextSpotifyForceDrmProbe);
+    this._nextSpotifyForceDrmProbe = false;
+
+    // Non-blocking EME/DRM capability check to surface actionable guidance when DRM is disabled
+    probeSpotifyDrmSupport({ force: forceDrmProbe })
+      .then((drmSupported) => {
+        if (gen !== this.generation || this.provider !== "spotify") return;
+        this.spotifyEnv = { ...(this.spotifyEnv || detectSpotifyBrowserConstraints()), drmSupported };
+        const nextSession = classifySpotifyPlaybackMode({
+          durationMs: this.durationMs,
+          entityType: this.spotifyEntityType,
+          env: this.spotifyEnv,
+          hasError: this.spotifyHasError,
+          errorMessage: this.spotifyErrorMessage,
+        });
+        this.spotifySession = nextSession;
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: this.lastKnownPosMs,
+          ready: this.ready,
+          trackUri: this.lastKnownTrackUri,
+          spotifyTrackDetached: Boolean(this.spotifyShowingTrackUri),
+          spotifySession: nextSession,
+        });
+      })
+      .catch(() => {
+        // ignore probe errors
+      });
 
     try {
       const IFrameAPI = await loadSpotifyIframeApi();
       if (gen !== this.generation) return;
 
+      // Omit `uri` here so Spotify's v1 createController doesn't double-navigate the iframe
+      // before we configure session/DRM attributes and attach listeners.
       IFrameAPI.createController(
         holder,
         {
-          uri: initialUri,
           width: "100%",
           height,
           theme: isDark ? "dark" : undefined,
@@ -1264,8 +2364,21 @@ export class WatchTogetherPlayer {
             return;
           }
           this.spotifyCtrl = ctrl;
-          let lastIsPaused = true;
-          let lastPosMs = 0;
+          const iframe = ctrl.iframeElement || this.mountEl?.querySelector?.("iframe") || null;
+          this.spotifyIframe = iframe;
+          configureSpotifyIframeForSession(iframe);
+
+          const updateSpotifySession = (durMs) => {
+            const nextSession = classifySpotifyPlaybackMode({
+              durationMs: durMs,
+              entityType: this.spotifyEntityType,
+              env: this.spotifyEnv,
+              hasError: this.spotifyHasError,
+              errorMessage: this.spotifyErrorMessage,
+            });
+            this.spotifySession = nextSession;
+            return nextSession;
+          };
 
           ctrl.addListener("ready", () => {
             if (gen !== this.generation) return;
@@ -1276,9 +2389,10 @@ export class WatchTogetherPlayer {
               ready: true,
               trackUri: this.lastKnownTrackUri,
               spotifyTrackDetached: Boolean(this.spotifyShowingTrackUri),
+              spotifySession: this.spotifySession,
             });
             if (this.pendingState) {
-              this._syncMountedPlayer(this.pendingState, Date.now(), true);
+              this._syncMountedPlayer(this.pendingState, this._wallNow(), true, { source: "remote" });
             }
           });
 
@@ -1287,6 +2401,9 @@ export class WatchTogetherPlayer {
             if (gen !== this.generation) return;
             const playingUri = String(ev?.data?.playingURI || "").trim();
             if (!playingUri) return;
+            this.spotifyHasContext = true;
+            this.spotifyHasError = false;
+            this.spotifyErrorMessage = "";
             const changed = playingUri !== this.lastKnownTrackUri;
             this.lastKnownTrackUri = playingUri;
             this.lastKnownPlaying = true;
@@ -1296,10 +2413,20 @@ export class WatchTogetherPlayer {
               ready: true,
               trackUri: playingUri,
               spotifyTrackDetached: Boolean(this.spotifyShowingTrackUri),
+              spotifySession: updateSpotifySession(this.durationMs),
             });
-            if (changed && this.playlistId && !this._isSuppressed()) {
-              lastIsPaused = false;
-              lastPosMs = 0;
+            const matchesPendingTrack =
+              Boolean(this.pendingState?.trackUri) && playingUri === this.pendingState.trackUri;
+            if (
+              changed &&
+              this.playlistId &&
+              this.ready &&
+              !this._isSuppressed() &&
+              !matchesPendingTrack
+            ) {
+              this.spotifyAwaitingInitialSettle = false;
+              this.spotifyLastIsPaused = false;
+              this.spotifyLastPosMs = 0;
               this.onUserAction({
                 playing: true,
                 positionMs: 0,
@@ -1314,6 +2441,13 @@ export class WatchTogetherPlayer {
             const posMs = Math.max(0, Number(d.position) || 0);
             const durMs = Math.max(0, Number(d.duration) || 0);
             const playing = !d.isPaused;
+            if (playing || posMs > 0 || durMs > 0) {
+              this.spotifyHasContext = true;
+            }
+            if (playing && posMs > 0) {
+              this.spotifyHasError = false;
+              this.spotifyErrorMessage = "";
+            }
             const playingUri = String(d.playingURI || "").trim();
             const uriChanged = Boolean(playingUri && playingUri !== this.lastKnownTrackUri);
             if (playingUri) {
@@ -1328,21 +2462,54 @@ export class WatchTogetherPlayer {
               ready: true,
               trackUri: this.lastKnownTrackUri,
               spotifyTrackDetached: Boolean(this.spotifyShowingTrackUri),
+              spotifySession: updateSpotifySession(this.durationMs),
             });
 
-            if (this._isSuppressed()) {
-              lastIsPaused = Boolean(d.isPaused);
-              lastPosMs = posMs;
+            if (!this.ready || this._isSuppressed()) {
+              this.spotifyLastIsPaused = Boolean(d.isPaused);
+              this.spotifyLastPosMs = posMs;
+              // Clear initial-settle gate once the embed reaches the expected play/pause state
+              // (preserving it when autoplay-blocked paused on a playing room so post-suppress
+              // hydration updates are still absorbed without pausing the room).
+              if (
+                this.ready &&
+                !d.isBuffering &&
+                (playing || !this.pendingState?.playing) &&
+                (durMs > 0 || playing || posMs > 0)
+              ) {
+                this.spotifyAwaitingInitialSettle = false;
+              }
               return;
             }
-            const stateChanged = Boolean(d.isPaused) !== lastIsPaused;
-            const jumped = Math.abs(posMs - lastPosMs) > 2200;
-            lastIsPaused = Boolean(d.isPaused);
-            lastPosMs = posMs;
+            // Absorb initial boot/reload hydration updates (paused/buffering/already-matching) so slow
+            // iframe loads or autoplay blocks never pause the room, while letting a genuine first Play
+            // click on a paused room or new playlist track propagate immediately.
+            if (this.spotifyAwaitingInitialSettle) {
+              if (
+                d.isPaused ||
+                d.isBuffering ||
+                this._spotifyMatchesPendingState(playing, posMs, playingUri)
+              ) {
+                this.spotifyLastIsPaused = Boolean(d.isPaused);
+                this.spotifyLastPosMs = posMs;
+                if (!d.isBuffering) {
+                  this.spotifyAwaitingInitialSettle = false;
+                }
+                return;
+              }
+              this.spotifyAwaitingInitialSettle = false;
+            }
+            const stateChanged = Boolean(d.isPaused) !== this.spotifyLastIsPaused;
+            const jumped = Math.abs(posMs - this.spotifyLastPosMs) > 2200;
+            this.spotifyLastIsPaused = Boolean(d.isPaused);
+            this.spotifyLastPosMs = posMs;
 
             if (durMs > 0 && d.isPaused && posMs >= durMs - 400 && !this.playlistId) {
               this.onUserAction({ playing: false, positionMs: posMs, ended: true });
             } else if (stateChanged || jumped || (uriChanged && this.playlistId)) {
+              if (this._spotifyMatchesPendingState(playing, posMs, playingUri)) {
+                return;
+              }
               this.onUserAction({
                 playing,
                 positionMs: posMs,
@@ -1350,6 +2517,26 @@ export class WatchTogetherPlayer {
               });
             }
           });
+
+          ctrl.addListener("error", (ev) => {
+            if (gen !== this.generation) return;
+            this.spotifyHasError = true;
+            this.spotifyErrorMessage = String(ev?.data?.message || ev?.data?.code || "playback_error");
+            this.onTelemetry({
+              durationMs: this.durationMs,
+              positionMs: this.lastKnownPosMs,
+              ready: this.ready,
+              trackUri: this.lastKnownTrackUri,
+              spotifyTrackDetached: Boolean(this.spotifyShowingTrackUri),
+              spotifySession: updateSpotifySession(this.durationMs),
+            });
+          });
+
+          if (typeof ctrl.loadUri === "function") {
+            ctrl.loadUri(initialUri, false, initialStartSec);
+          } else if (typeof ctrl.loadEntity === "function") {
+            ctrl.loadEntity(initialUri, false, initialStartSec);
+          }
         }
       );
     } catch {
@@ -1505,60 +2692,132 @@ export class WatchTogetherPlayer {
         });
 
         if (this.pendingState) {
-          this._syncMountedPlayer(this.pendingState, Date.now(), true);
+          this._syncMountedPlayer(this.pendingState, this._wallNow(), true, { source: "remote" });
         }
+        this._startPollLoop(gen);
       });
+
+      const readScPosMs = (ev, fallbackMs) => {
+        const raw = ev?.currentPosition;
+        if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
+          return Math.round(raw);
+        }
+        return Math.max(0, Math.round(Number(fallbackMs) || 0));
+      };
 
       widget.bind(SC.Widget.Events.PLAY, (ev) => {
         if (gen !== this.generation) return;
-        const posMs = Math.max(0, Math.round(ev?.currentPosition || this.lastKnownPosMs));
+        const posMs = readScPosMs(ev, this.lastKnownPosMs);
+        const actionSeq = ++this._scActionSeq;
+        this._scPollSeq += 1; // invalidate any in-flight async poll snapshot
         this.lastKnownPosMs = posMs;
         this.lastKnownPlaying = true;
-        if (this.playlistCount > 1 || this.playlistId) {
-          if (typeof widget.getCurrentSoundIndex === "function") {
-            widget.getCurrentSoundIndex((idx) => {
-              if (gen !== this.generation) return;
-              const resolvedIdx = typeof idx === "number" && idx >= 0 ? idx : this.lastKnownPlaylistIndex;
-              this.lastKnownPlaylistIndex = resolvedIdx;
-              const item = this.playlistItems[resolvedIdx];
-              const title = item
-                ? item.artist
-                  ? `${item.artist} — ${item.title}`
-                  : item.title
-                : "";
-              if (item && item.durationMs > 0) this.durationMs = item.durationMs;
-              this.onTelemetry({
-                durationMs: this.durationMs,
-                positionMs: posMs,
-                title: title || undefined,
-                ready: true,
-                playlistCount: this.playlistCount,
-                playlistIndex: resolvedIdx,
-                playlistItems: this.playlistItems,
-              });
-              if (!this._isSuppressed()) {
-                this.onUserAction({
-                  playing: true,
-                  positionMs: posMs,
-                  playlistIndex: resolvedIdx,
-                  trackTitle: title || undefined,
-                });
-              }
+        this._hasEverPlayedLocally = true;
+        this._scLastProgressMoveAt = this._perfNow();
+
+        const isPlaylist = this.playlistCount > 1 || Boolean(this.playlistId);
+        let syncIdx = -1;
+        if (isPlaylist && ev?.soundId !== undefined && ev.soundId !== null) {
+          syncIdx = this.playlistItems.findIndex((it) => it.id === String(ev.soundId));
+        }
+
+        const suppressed = this._shouldSuppressEmbedEvent({
+          kind: "playstate",
+          playing: true,
+          positionMs: posMs,
+        });
+
+        const emitPlayWithIndex = (resolvedIdx) => {
+          this.lastKnownPlaylistIndex = resolvedIdx;
+          const item = this.playlistItems[resolvedIdx];
+          const title = item
+            ? item.artist
+              ? `${item.artist} — ${item.title}`
+              : item.title
+            : "";
+          if (item && item.durationMs > 0) this.durationMs = item.durationMs;
+          this.onTelemetry({
+            durationMs: this.durationMs,
+            positionMs: posMs,
+            title: title || undefined,
+            ready: true,
+            playlistCount: this.playlistCount,
+            playlistIndex: resolvedIdx,
+            playlistItems: this.playlistItems,
+          });
+          if (!suppressed) {
+            this.expectedCommand = null;
+            this._clearSyncTimers();
+            this.onUserAction({
+              playing: true,
+              positionMs: posMs,
+              playlistIndex: resolvedIdx,
+              trackTitle: title || undefined,
             });
+          }
+        };
+
+        if (isPlaylist) {
+          if (syncIdx >= 0) {
+            emitPlayWithIndex(syncIdx);
+            return;
+          }
+          if (typeof widget.getCurrentSoundIndex === "function") {
+            let settled = false;
+            const fallbackTimer = this._scheduleSyncTimer(160, () => {
+              if (settled || gen !== this.generation || actionSeq !== this._scActionSeq) return;
+              settled = true;
+              emitPlayWithIndex(this.lastKnownPlaylistIndex);
+            });
+            try {
+              widget.getCurrentSoundIndex((idx) => {
+                if (settled || gen !== this.generation || actionSeq !== this._scActionSeq) return;
+                settled = true;
+                clearTimeout(fallbackTimer);
+                this._syncTimers.delete(fallbackTimer);
+                const resolvedIdx =
+                  typeof idx === "number" && idx >= 0 ? idx : this.lastKnownPlaylistIndex;
+                emitPlayWithIndex(resolvedIdx);
+              });
+            } catch {
+              if (!settled) {
+                settled = true;
+                clearTimeout(fallbackTimer);
+                this._syncTimers.delete(fallbackTimer);
+                emitPlayWithIndex(this.lastKnownPlaylistIndex);
+              }
+            }
             return;
           }
         }
-        if (!this._isSuppressed()) {
-          this.onUserAction({ playing: true, positionMs: posMs });
+
+        if (!suppressed) {
+          this.expectedCommand = null;
+          this._clearSyncTimers();
+          this.onUserAction({
+            playing: true,
+            positionMs: posMs,
+            playlistIndex: isPlaylist ? this.lastKnownPlaylistIndex : undefined,
+          });
         }
       });
 
       widget.bind(SC.Widget.Events.PAUSE, (ev) => {
         if (gen !== this.generation) return;
-        const posMs = Math.max(0, Math.round(ev?.currentPosition || this.lastKnownPosMs));
+        const posMs = readScPosMs(ev, this.lastKnownPosMs);
+        this._scActionSeq += 1; // cancel any stale in-flight PLAY index lookup
+        this._scPollSeq += 1;
         this.lastKnownPosMs = posMs;
         this.lastKnownPlaying = false;
-        if (!this._isSuppressed()) {
+        if (
+          !this._shouldSuppressEmbedEvent({
+            kind: "playstate",
+            playing: false,
+            positionMs: posMs,
+          })
+        ) {
+          this.expectedCommand = null;
+          this._clearSyncTimers();
           this.onUserAction({
             playing: false,
             positionMs: posMs,
@@ -1569,9 +2828,14 @@ export class WatchTogetherPlayer {
 
       widget.bind(SC.Widget.Events.SEEK, (ev) => {
         if (gen !== this.generation) return;
-        const posMs = Math.max(0, Math.round(ev?.currentPosition || 0));
+        const posMs = readScPosMs(ev, 0);
+        this._scActionSeq += 1;
+        this._scPollSeq += 1;
         this.lastKnownPosMs = posMs;
-        if (!this._isSuppressed()) {
+        this._scLastProgressMoveAt = this._perfNow();
+        if (!this._shouldSuppressEmbedEvent({ kind: "seek", positionMs: posMs })) {
+          this.expectedCommand = null;
+          this._clearSyncTimers();
           this.onUserAction({
             playing: this.lastKnownPlaying,
             positionMs: posMs,
@@ -1582,6 +2846,8 @@ export class WatchTogetherPlayer {
 
       widget.bind(SC.Widget.Events.FINISH, () => {
         if (gen !== this.generation) return;
+        this._scActionSeq += 1;
+        this._scPollSeq += 1;
         if (this.playlistCount > 1 && this.lastKnownPlaylistIndex < this.playlistCount - 1) {
           // SoundCloud widget advances to next track inside the playlist; sync next index cleanly
           const nextIdx = this.lastKnownPlaylistIndex + 1;
@@ -1604,7 +2870,10 @@ export class WatchTogetherPlayer {
 
       widget.bind(SC.Widget.Events.PLAY_PROGRESS, (ev) => {
         if (gen !== this.generation || !ev) return;
-        const posMs = Math.max(0, Math.round(ev.currentPosition || 0));
+        const posMs = readScPosMs(ev, this.lastKnownPosMs);
+        if (posMs !== this.lastKnownPosMs) {
+          this._scLastProgressMoveAt = this._perfNow();
+        }
         this.lastKnownPosMs = posMs;
         this.onTelemetry({
           durationMs: this.durationMs,
@@ -1675,7 +2944,7 @@ export class WatchTogetherPlayer {
         muted: Boolean(this.localMuted),
       };
 
-      const initMs = projectMediaPositionMs(state, Date.now());
+      const initMs = projectMediaPositionMs(state, this._wallNow());
       if (info.kind === "channel") {
         opts.channel = info.id;
       } else if (info.kind === "video") {
@@ -1732,9 +3001,9 @@ export class WatchTogetherPlayer {
           trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
         });
         if (this.pendingState) {
-          this._syncMountedPlayer(this.pendingState, Date.now(), true);
+          this._syncMountedPlayer(this.pendingState, this._wallNow(), true, { source: "remote" });
         }
-        if (this.twitchKind === "video" || this.twitchKind === "collection") {
+        if (this.twitchKind !== "clip") {
           this._startPollLoop(gen);
         }
       });
@@ -1755,13 +3024,27 @@ export class WatchTogetherPlayer {
         this.lastKnownPosMs = posMs;
         const wasPlaying = this.lastKnownPlaying;
         this.lastKnownPlaying = true;
+        this._hasEverPlayedLocally = true;
         this.onTelemetry({
           durationMs: this.durationMs,
           positionMs: posMs,
           ready: true,
           trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
         });
-        if (!this._isSuppressed() && (!wasPlaying || vidChanged)) {
+        if (
+          this._shouldSuppressEmbedEvent({
+            kind: "playstate",
+            playing: true,
+            positionMs: posMs,
+            trackChanged: vidChanged,
+          })
+        ) {
+          return;
+        }
+        const sharedDisagrees = Boolean(this.pendingState && !this.pendingState.playing);
+        if (!wasPlaying || vidChanged || sharedDisagrees) {
+          this.expectedCommand = null;
+          this._clearSyncTimers();
           this.onUserAction({
             playing: true,
             positionMs: posMs,
@@ -1779,7 +3062,19 @@ export class WatchTogetherPlayer {
         this.lastKnownPosMs = posMs;
         const wasPlaying = this.lastKnownPlaying;
         this.lastKnownPlaying = false;
-        if (!this._isSuppressed() && wasPlaying) {
+        if (
+          this._shouldSuppressEmbedEvent({
+            kind: "playstate",
+            playing: false,
+            positionMs: posMs,
+          })
+        ) {
+          return;
+        }
+        const sharedDisagrees = Boolean(this.pendingState && this.pendingState.playing);
+        if (wasPlaying || sharedDisagrees) {
+          this.expectedCommand = null;
+          this._clearSyncTimers();
           this.onUserAction({
             playing: false,
             positionMs: posMs,
@@ -1800,7 +3095,9 @@ export class WatchTogetherPlayer {
           ready: true,
           trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
         });
-        if (!this._isSuppressed()) {
+        if (!this._shouldSuppressEmbedEvent({ kind: "seek", positionMs: posMs })) {
+          this.expectedCommand = null;
+          this._clearSyncTimers();
           this.onUserAction({
             playing: this.lastKnownPlaying,
             positionMs: posMs,
@@ -1824,7 +3121,10 @@ export class WatchTogetherPlayer {
       player.addEventListener(EV.PLAYBACK_BLOCKED, () => {
         if (gen !== this.generation) return;
         try {
-          this._suppress(900);
+          this._setExpectedCommand(
+            { expectPlayState: true, targetPlaying: true, isInitial: true },
+            950
+          );
           player.setMuted?.(true);
           player.play?.();
           this.localMuted = true;
@@ -1895,7 +3195,7 @@ export class WatchTogetherPlayer {
     this.mountEl.appendChild(box);
     this.onTelemetry({
       durationMs: this.durationMs,
-      positionMs: projectMediaPositionMs(state, Date.now()),
+      positionMs: projectMediaPositionMs(state, this._wallNow()),
       ready: false,
       apiUnavailable: true,
       playlistIndex: Number(state.playlistIndex) || 0,
@@ -1903,14 +3203,35 @@ export class WatchTogetherPlayer {
     });
   }
 
-  _syncMountedPlayer(state, nowMs, isInitial) {
+  _syncMountedPlayer(state, nowMs, isInitial, options = {}) {
     const targetMs = projectMediaPositionMs(state, nowMs);
     const targetSec = targetMs / 1000;
     const rate = (Number(state.rateMilli) || 1000) / 1000;
     const desiredIdx = Math.max(0, Number(state.playlistIndex) || 0);
+    const source = options?.source || "remote";
+    const forceResync = Boolean(options?.forceResync);
+    const prevState = options?.prevState || null;
+    const isEpochReplay =
+      forceResync ||
+      (Number(state.epoch) > 0 &&
+        Number(state.epoch) !== (prevState ? Number(prevState.epoch) || 0 : this._lastAppliedEpoch));
+    const preApply = isInitial ? null : this._capturePreApplySnapshot();
+    const activeCmd =
+      this.expectedCommand && this._perfNow() < this.expectedCommand.expiresAt
+        ? this.expectedCommand
+        : null;
+    const hasOppositePendingPlayCmd = Boolean(
+      activeCmd && activeCmd.expectPlayState && activeCmd.targetPlaying !== Boolean(state.playing)
+    );
+    const hasDifferentPendingSeekCmd = Boolean(
+      activeCmd && activeCmd.expectSeek && Math.abs(activeCmd.targetPosMs - targetMs) > 1100
+    );
+
+    if (this.ready && !this.pollTimer && !(this.provider === "twitch" && this.twitchKind === "clip")) {
+      this._startPollLoop(this.generation);
+    }
 
     if (isYouTubeFamily(this.provider) && this.ytPlayer) {
-      this._suppress(isInitial ? 1400 : 950);
       try {
         if (this.playlistId) {
           this.ytPlayer.setLoop?.(Boolean(state.loop));
@@ -1919,7 +3240,32 @@ export class WatchTogetherPlayer {
               ? this.ytPlayer.getPlaylistIndex()
               : this.lastKnownPlaylistIndex;
           if (curIdx !== desiredIdx && desiredIdx >= 0) {
-            this._suppress(1700);
+            this._clearSyncTimers();
+            const syncSeq = ++this._syncSeq;
+            const checkGen = this.generation;
+            this._lastAppliedEpoch = Number(state.epoch) || 0;
+            const cmd = this._setExpectedCommand(
+              {
+                expectTrackSwitch: true,
+                expectPlayState: true,
+                targetPlaying: Boolean(state.playing),
+                expectSeek: targetSec > 1.5,
+                targetPosMs: targetMs,
+                targetPlaylistIndex: desiredIdx,
+                targetTrackUri: state.trackUri || "",
+                isInitial,
+              },
+              1700
+            );
+            if (source !== "resync-local") {
+              this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+                source,
+                didMutate: true,
+                isInitial,
+                isTrackSwitch: true,
+                preApplySnapshot: preApply,
+              });
+            }
             this.lastKnownPlaylistIndex = desiredIdx;
             if (isInitial && !state.playing && typeof this.ytPlayer.cuePlaylist === "function") {
               this.ytPlayer.cuePlaylist({
@@ -1928,26 +3274,40 @@ export class WatchTogetherPlayer {
                 index: desiredIdx,
                 startSeconds: targetSec,
               });
+              cmd.trackSwitchSettled = true;
               return;
             }
             if (typeof this.ytPlayer.playVideoAt === "function") {
               this.ytPlayer.playVideoAt(desiredIdx);
-              const checkGen = this.generation;
               if (targetSec > 1.5 || !state.playing) {
-                setTimeout(() => {
-                  if (checkGen !== this.generation || !this.ytPlayer) return;
+                this._scheduleSyncTimer(260, () => {
+                  if (syncSeq !== this._syncSeq || checkGen !== this.generation || !this.ytPlayer) {
+                    return;
+                  }
+                  const liveState = this.pendingState || state;
+                  const liveTargetSec = projectMediaPositionMs(liveState, this._wallNow()) / 1000;
                   try {
-                    this._suppress(900);
-                    if (targetSec > 1.5) {
-                      this.ytPlayer.seekTo?.(targetSec, true);
+                    if (this.expectedCommand && this.expectedCommand.id === cmd.id) {
+                      this.expectedCommand.trackSwitchSettled = true;
+                      this.expectedCommand.targetPlaying = Boolean(liveState.playing);
+                      this.expectedCommand.targetPosMs = Math.round(liveTargetSec * 1000);
+                      this.expectedCommand.expiresAt = Math.max(
+                        this.expectedCommand.expiresAt,
+                        this._perfNow() + 900
+                      );
                     }
-                    if (!state.playing) {
+                    if (liveTargetSec > 1.5) {
+                      this.ytPlayer.seekTo?.(liveTargetSec, true);
+                    }
+                    if (!liveState.playing) {
                       this.ytPlayer.pauseVideo?.();
                     }
                   } catch {
                     // ignore
                   }
-                }, 260);
+                });
+              } else {
+                cmd.trackSwitchSettled = true;
               }
               return;
             }
@@ -1955,37 +3315,92 @@ export class WatchTogetherPlayer {
         }
 
         const curRate = Number(this.ytPlayer.getPlaybackRate?.() || 1);
-        if (Math.abs(curRate - rate) > 0.02) {
+        const curSec = Number(this.ytPlayer.getCurrentTime?.() || 0);
+        const ytState = this.ytPlayer.getPlayerState?.();
+        const driftThreshold = isInitial ? 0.5 : 0.9;
+        const needRateChange = Math.abs(curRate - rate) > 0.02;
+        const needSeek =
+          isEpochReplay || hasDifferentPendingSeekCmd || Math.abs(curSec - targetSec) > driftThreshold;
+        const isPlayingOrBuffering = ytState === 1 || ytState === 3;
+        const needPlayChange =
+          hasOppositePendingPlayCmd ||
+          (state.playing
+            ? !isPlayingOrBuffering || isEpochReplay
+            : isPlayingOrBuffering || (needSeek && (ytState === -1 || ytState === 5)));
+
+        this._lastAppliedEpoch = Number(state.epoch) || 0;
+        if (!needRateChange && !needSeek && !needPlayChange) {
+          if (source !== "resync-local") {
+            this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+              source,
+              didMutate: false,
+              isInitial,
+              isTrackSwitch: false,
+            });
+          }
+          return;
+        }
+
+        this._clearSyncTimers();
+        const syncSeq = ++this._syncSeq;
+        const checkGen = this.generation;
+        this._setExpectedCommand(
+          {
+            expectPlayState: needPlayChange || isInitial,
+            targetPlaying: Boolean(state.playing),
+            expectSeek: needSeek,
+            targetPosMs: targetMs,
+            expectRate: needRateChange,
+            targetRateMilli: Number(state.rateMilli) || 1000,
+            isInitial,
+          },
+          isInitial ? 1400 : 950
+        );
+        if (source !== "resync-local") {
+          this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+            source,
+            didMutate: true,
+            isInitial,
+            isTrackSwitch: false,
+            preApplySnapshot: preApply,
+          });
+        }
+
+        if (needRateChange) {
           this.ytPlayer.setPlaybackRate?.(rate);
         }
-        const curSec = Number(this.ytPlayer.getCurrentTime?.() || 0);
-        const driftThreshold = isInitial ? 0.5 : 0.9;
-        if (Math.abs(curSec - targetSec) > driftThreshold) {
+        if (needSeek) {
           this.ytPlayer.seekTo?.(targetSec, true);
         }
-        const ytState = this.ytPlayer.getPlayerState?.();
-        if (state.playing) {
-          if (ytState !== 1 && ytState !== 3) {
-            this.ytPlayer.playVideo?.();
-            // Autoplay-blocked guard: if YouTube stays unstarted/paused after 900ms, retry muted locally
-            const checkGen = this.generation;
-            setTimeout(() => {
-              if (checkGen !== this.generation || !this.pendingState?.playing || !this.ytPlayer) return;
-              const stNow = this.ytPlayer.getPlayerState?.();
-              if (stNow !== 1 && stNow !== 3) {
-                try {
-                  this._suppress(800);
-                  this.ytPlayer.mute?.();
-                  this.ytPlayer.playVideo?.();
-                  this.localMuted = true;
-                  this.onAutoplayMuted(true);
-                } catch {
-                  // ignore
-                }
+        if (state.playing && needPlayChange) {
+          this.ytPlayer.playVideo?.();
+          // Autoplay-blocked guard: if YouTube stays unstarted/paused after 900ms, retry muted locally
+          this._autoplayTimerId = this._scheduleSyncTimer(900, () => {
+            if (
+              syncSeq !== this._syncSeq ||
+              checkGen !== this.generation ||
+              !this.pendingState?.playing ||
+              !this.ytPlayer
+            ) {
+              return;
+            }
+            const stNow = this.ytPlayer.getPlayerState?.();
+            if (stNow !== 1 && stNow !== 3) {
+              try {
+                this._setExpectedCommand(
+                  { expectPlayState: true, targetPlaying: true, isInitial: true },
+                  850
+                );
+                this.ytPlayer.mute?.();
+                this.ytPlayer.playVideo?.();
+                this.localMuted = true;
+                this.onAutoplayMuted(true);
+              } catch {
+                // ignore
               }
-            }, 900);
-          }
-        } else if (ytState === 1 || ytState === 3) {
+            }
+          });
+        } else if (!state.playing && needPlayChange) {
           this.ytPlayer.pauseVideo?.();
         }
       } catch {
@@ -1994,8 +3409,28 @@ export class WatchTogetherPlayer {
       return;
     }
 
+    if (this.provider === "spotify" && this.spotifyCtrl && source !== "resync-local") {
+      const spTrackChange = Boolean(
+        this.playlistId &&
+          state.trackUri &&
+          state.trackUri !== this.playlistId &&
+          state.trackUri !== this.lastKnownTrackUri &&
+          state.trackUri !== this.spotifyShowingTrackUri
+      );
+      const spSeek = Math.abs(this.lastKnownPosMs / 1000 - targetSec) > (isInitial ? 1.0 : 1.5);
+      const spPlay = Boolean(state.playing) !== Boolean(this.lastKnownPlaying) || isInitial;
+      this._lastAppliedEpoch = Number(state.epoch) || 0;
+      this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+        source,
+        didMutate: spTrackChange || spSeek || spPlay || isEpochReplay,
+        isInitial,
+        isTrackSwitch: spTrackChange,
+        preApplySnapshot: preApply,
+      });
+    }
+
     if (this.provider === "spotify" && this.spotifyCtrl) {
-      this._suppress(isInitial ? 800 : 650);
+      this._suppress(isInitial ? 1600 : 650);
       try {
         // Sync active track inside a Spotify playlist/album when another peer picks a specific trackURI
         if (
@@ -2005,13 +3440,19 @@ export class WatchTogetherPlayer {
           state.trackUri !== this.lastKnownTrackUri &&
           state.trackUri !== this.spotifyShowingTrackUri
         ) {
-          this._suppress(1200);
+          this._suppress(1600);
           this.lastKnownTrackUri = state.trackUri;
           this.spotifyShowingTrackUri = state.trackUri;
-          if (typeof this.spotifyCtrl.loadEntity === "function") {
-            this.spotifyCtrl.loadEntity(state.trackUri);
-          } else if (typeof this.spotifyCtrl.loadUri === "function") {
-            this.spotifyCtrl.loadUri(state.trackUri);
+          this.spotifyHasContext = false;
+          const loadStartSec = targetSec > 1.2 ? Math.floor(targetSec) : 0;
+          this.spotifyInitialStartSec = loadStartSec;
+          this.spotifyLastPosMs = loadStartSec * 1000;
+          this.spotifyLastIsPaused = true;
+          this.spotifyAwaitingInitialSettle = true;
+          if (typeof this.spotifyCtrl.loadUri === "function") {
+            this.spotifyCtrl.loadUri(state.trackUri, false, loadStartSec);
+          } else if (typeof this.spotifyCtrl.loadEntity === "function") {
+            this.spotifyCtrl.loadEntity(state.trackUri, false, loadStartSec);
           }
           this.onTelemetry({
             durationMs: this.durationMs,
@@ -2019,27 +3460,27 @@ export class WatchTogetherPlayer {
             ready: this.ready,
             trackUri: state.trackUri,
             spotifyTrackDetached: true,
+            spotifySession: this.spotifySession,
           });
-          if (targetSec > 1.2) {
-            this.spotifyCtrl.seek?.(Math.floor(targetSec));
-          }
           if (state.playing) {
-            this.spotifyCtrl.resume?.();
-            this.spotifyCtrl.play?.();
-          } else {
-            this.spotifyCtrl.pause?.();
+            this._resumeSpotify();
           }
           return;
         }
 
         const curSec = this.lastKnownPosMs / 1000;
-        if (Math.abs(curSec - targetSec) > (isInitial ? 1.0 : 1.5)) {
+        const needsSeek = isInitial
+          ? this.spotifyHasContext && Math.abs(curSec - targetSec) > 1.0
+          : Math.abs(curSec - targetSec) > 1.5;
+        if (needsSeek) {
           this.spotifyCtrl.seek?.(Math.floor(targetSec));
         }
         if (state.playing) {
           if (!this.lastKnownPlaying || isInitial) {
-            this.spotifyCtrl.resume?.();
-            this.spotifyCtrl.play?.();
+            this._resumeSpotify();
+            if (isInitial && !this.spotifyHasContext && Math.abs(targetSec - this.spotifyInitialStartSec) > 2.0) {
+              this.spotifyCtrl.seek?.(Math.floor(targetSec));
+            }
           }
         } else if (this.lastKnownPlaying || !isInitial) {
           this.spotifyCtrl.pause?.();
@@ -2051,10 +3492,36 @@ export class WatchTogetherPlayer {
     }
 
     if (this.provider === "soundcloud" && this.scWidget) {
-      this._suppress(isInitial ? 1400 : 950);
       try {
-        if ((this.playlistCount > 1 || this.playlistId) && desiredIdx !== this.lastKnownPlaylistIndex) {
-          this._suppress(1600);
+        const isPlaylist = this.playlistCount > 1 || Boolean(this.playlistId);
+        if (isPlaylist && desiredIdx !== this.lastKnownPlaylistIndex) {
+          this._clearSyncTimers();
+          const syncSeq = ++this._syncSeq;
+          const checkGen = this.generation;
+          this._scActionSeq += 1;
+          this._scPollSeq += 1;
+          this._lastAppliedEpoch = Number(state.epoch) || 0;
+          const cmd = this._setExpectedCommand(
+            {
+              expectTrackSwitch: true,
+              expectPlayState: true,
+              targetPlaying: Boolean(state.playing),
+              expectSeek: targetMs > 800,
+              targetPosMs: targetMs,
+              targetPlaylistIndex: desiredIdx,
+              isInitial,
+            },
+            1700
+          );
+          if (source !== "resync-local") {
+            this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+              source,
+              didMutate: true,
+              isInitial,
+              isTrackSwitch: true,
+              preApplySnapshot: preApply,
+            });
+          }
           this.lastKnownPlaylistIndex = desiredIdx;
           this.scWidget.skip?.(desiredIdx);
           const item = this.playlistItems[desiredIdx];
@@ -2070,15 +3537,24 @@ export class WatchTogetherPlayer {
               playlistItems: this.playlistItems,
             });
           }
-          const checkGen = this.generation;
-          setTimeout(() => {
-            if (checkGen !== this.generation || !this.scWidget) return;
+          this._scheduleSyncTimer(220, () => {
+            if (syncSeq !== this._syncSeq || checkGen !== this.generation || !this.scWidget) return;
+            const liveState = this.pendingState || state;
+            const liveTargetMs = projectMediaPositionMs(liveState, this._wallNow());
             try {
-              this._suppress(900);
-              if (targetMs > 800) {
-                this.scWidget.seekTo?.(targetMs);
+              if (this.expectedCommand && this.expectedCommand.id === cmd.id) {
+                this.expectedCommand.trackSwitchSettled = true;
+                this.expectedCommand.targetPlaying = Boolean(liveState.playing);
+                this.expectedCommand.targetPosMs = liveTargetMs;
+                this.expectedCommand.expiresAt = Math.max(
+                  this.expectedCommand.expiresAt,
+                  this._perfNow() + 950
+                );
               }
-              if (state.playing) {
+              if (liveTargetMs > 800) {
+                this.scWidget.seekTo?.(liveTargetMs);
+              }
+              if (liveState.playing) {
                 this.scWidget.play?.();
               } else {
                 this.scWidget.pause?.();
@@ -2086,17 +3562,75 @@ export class WatchTogetherPlayer {
             } catch {
               // ignore
             }
-          }, 220);
+          });
           return;
         }
 
-        if (Math.abs(this.lastKnownPosMs - targetMs) > (isInitial ? 600 : 1100)) {
-          this.scWidget.seekTo?.(targetMs);
+        const alreadyTargetingPlay = Boolean(
+          activeCmd &&
+            activeCmd.expectPlayState &&
+            activeCmd.targetPlaying === Boolean(state.playing)
+        );
+        // SoundCloud's iframe URL has no start-time parameter and always boots at 0ms, so on
+        // initial mount compare against targetMs > 600 rather than synthetic lastKnownPosMs.
+        const needSeek = isInitial
+          ? targetMs > 600
+          : isEpochReplay ||
+            hasDifferentPendingSeekCmd ||
+            Math.abs(this.lastKnownPosMs - targetMs) > 1100;
+        const needPlayChange =
+          isInitial ||
+          isEpochReplay ||
+          hasOppositePendingPlayCmd ||
+          (Boolean(state.playing) !== Boolean(this.lastKnownPlaying) && !alreadyTargetingPlay);
+
+        this._lastAppliedEpoch = Number(state.epoch) || 0;
+        if (!needSeek && !needPlayChange) {
+          if (source !== "resync-local") {
+            this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+              source,
+              didMutate: false,
+              isInitial,
+              isTrackSwitch: false,
+            });
+          }
+          return;
         }
-        if (state.playing) {
-          this.scWidget.play?.();
-        } else {
-          this.scWidget.pause?.();
+
+        this._clearSyncTimers();
+        this._syncSeq += 1;
+        this._scActionSeq += 1;
+        this._scPollSeq += 1;
+        this._setExpectedCommand(
+          {
+            expectPlayState: needPlayChange || isInitial,
+            targetPlaying: Boolean(state.playing),
+            expectSeek: needSeek,
+            targetPosMs: targetMs,
+            isInitial,
+          },
+          isInitial ? 1500 : 1100
+        );
+        if (source !== "resync-local") {
+          this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+            source,
+            didMutate: true,
+            isInitial,
+            isTrackSwitch: false,
+            preApplySnapshot: preApply,
+          });
+        }
+
+        if (needSeek) {
+          this.scWidget.seekTo?.(targetMs);
+          this.lastKnownPosMs = targetMs;
+        }
+        if (needPlayChange) {
+          if (state.playing) {
+            this.scWidget.play?.();
+          } else {
+            this.scWidget.pause?.();
+          }
         }
       } catch {
         // ignore
@@ -2105,7 +3639,6 @@ export class WatchTogetherPlayer {
     }
 
     if (this.provider === "twitch" && this.twitchPlayer) {
-      this._suppress(isInitial ? 1400 : 950);
       try {
         if (this.twitchKind === "collection") {
           const desiredVid = normalizeTwitchVideoId(state.trackUri || "");
@@ -2114,18 +3647,53 @@ export class WatchTogetherPlayer {
           );
           const colId = this.mediaId.startsWith("collection:") ? this.mediaId.slice(11) : "";
           if (desiredVid && colId && desiredVid !== curVid) {
-            this._suppress(1600);
+            this._clearSyncTimers();
+            const syncSeq = ++this._syncSeq;
+            const checkGen = this.generation;
+            this._lastAppliedEpoch = Number(state.epoch) || 0;
+            const cmd = this._setExpectedCommand(
+              {
+                expectTrackSwitch: true,
+                expectPlayState: true,
+                targetPlaying: Boolean(state.playing),
+                expectSeek: targetSec > 1.5,
+                targetPosMs: targetMs,
+                targetTrackUri: desiredVid,
+                isInitial,
+              },
+              1700
+            );
+            if (source !== "resync-local") {
+              this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+                source,
+                didMutate: true,
+                isInitial,
+                isTrackSwitch: true,
+                preApplySnapshot: preApply,
+              });
+            }
             this.lastKnownTrackUri = desiredVid;
             this.twitchPlayer.setCollection?.(colId, desiredVid);
-            const checkGen = this.generation;
-            setTimeout(() => {
-              if (checkGen !== this.generation || !this.twitchPlayer) return;
+            this._scheduleSyncTimer(260, () => {
+              if (syncSeq !== this._syncSeq || checkGen !== this.generation || !this.twitchPlayer) {
+                return;
+              }
+              const liveState = this.pendingState || state;
+              const liveTargetSec = projectMediaPositionMs(liveState, this._wallNow()) / 1000;
               try {
-                this._suppress(900);
-                if (targetSec > 1.5) {
-                  this.twitchPlayer.seek?.(targetSec);
+                if (this.expectedCommand && this.expectedCommand.id === cmd.id) {
+                  this.expectedCommand.trackSwitchSettled = true;
+                  this.expectedCommand.targetPlaying = Boolean(liveState.playing);
+                  this.expectedCommand.targetPosMs = Math.round(liveTargetSec * 1000);
+                  this.expectedCommand.expiresAt = Math.max(
+                    this.expectedCommand.expiresAt,
+                    this._perfNow() + 900
+                  );
                 }
-                if (state.playing) {
+                if (liveTargetSec > 1.5) {
+                  this.twitchPlayer.seek?.(liveTargetSec);
+                }
+                if (liveState.playing) {
                   this.twitchPlayer.play?.();
                 } else {
                   this.twitchPlayer.pause?.();
@@ -2133,33 +3701,73 @@ export class WatchTogetherPlayer {
               } catch {
                 // ignore
               }
-            }, 260);
+            });
             return;
           }
         }
 
-        if (this.twitchKind === "video" || this.twitchKind === "collection") {
-          const curSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
-          const driftThreshold = isInitial ? 0.6 : 1.0;
-          if (Math.abs(curSec - targetSec) > driftThreshold) {
-            this.twitchPlayer.seek?.(targetSec);
-          }
-        }
-
+        const isSeekable = this.twitchKind === "video" || this.twitchKind === "collection";
+        const curSec = isSeekable ? Number(this.twitchPlayer.getCurrentTime?.() || 0) : 0;
+        const driftThreshold = isInitial ? 0.6 : 1.0;
+        const needSeek =
+          isSeekable &&
+          (isEpochReplay || hasDifferentPendingSeekCmd || Math.abs(curSec - targetSec) > driftThreshold);
         const isPaused =
           typeof this.twitchPlayer.isPaused === "function"
             ? Boolean(this.twitchPlayer.isPaused())
             : !this.lastKnownPlaying;
-        if (state.playing) {
-          if (isPaused || isInitial) {
+        const needPlayChange =
+          isInitial ||
+          isEpochReplay ||
+          hasOppositePendingPlayCmd ||
+          (state.playing ? isPaused : !isPaused);
+
+        this._lastAppliedEpoch = Number(state.epoch) || 0;
+        if (!needSeek && !needPlayChange) {
+          if (source !== "resync-local") {
+            this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+              source,
+              didMutate: false,
+              isInitial,
+              isTrackSwitch: false,
+            });
+          }
+          return;
+        }
+
+        this._clearSyncTimers();
+        this._syncSeq += 1;
+        this._setExpectedCommand(
+          {
+            expectPlayState: needPlayChange || isInitial,
+            targetPlaying: Boolean(state.playing),
+            expectSeek: needSeek,
+            targetPosMs: targetMs,
+            isInitial,
+          },
+          isInitial ? 1400 : 950
+        );
+        if (source !== "resync-local") {
+          this.negotiator.onSharedStateApplied(state, this._perfNow(), {
+            source,
+            didMutate: true,
+            isInitial,
+            isTrackSwitch: false,
+            preApplySnapshot: preApply,
+          });
+        }
+
+        if (needSeek) {
+          this.twitchPlayer.seek?.(targetSec);
+        }
+        if (needPlayChange) {
+          if (state.playing) {
             this.twitchPlayer.play?.();
-          }
-          this.lastKnownPlaying = true;
-        } else {
-          if (!isPaused || isInitial) {
+            this.lastKnownPlaying = true;
+          } else {
             this.twitchPlayer.pause?.();
+            this.lastKnownPlaying = false;
           }
-          this.lastKnownPlaying = false;
         }
       } catch {
         // ignore
@@ -2168,9 +3776,11 @@ export class WatchTogetherPlayer {
   }
 
   /**
-   * Periodic drift correction (called ~every 1.5s while Watch Together is active & playing).
+   * Periodic mild drift correction (called ~every 1.2s while Watch Together is active & playing).
+   * Handles small local clock/buffer skew only; drastic divergence (>= 3s) is deferred to the
+   * 3 Hz WatchSyncNegotiator so rapid scrubs or divergent states are negotiated cleanly.
    */
-  correctDrift(state, nowMs = Date.now()) {
+  correctDrift(state, nowMs = this._wallNow()) {
     if (!this.ready || !state || !state.active || !state.playing || this._isSuppressed()) {
       return;
     }
@@ -2180,27 +3790,84 @@ export class WatchTogetherPlayer {
         if (this.ytPlayer.getPlayerState?.() !== 1) return;
         const curMs = Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000);
         this.lastKnownPosMs = curMs;
-        if (Math.abs(curMs - targetMs) > 1200) {
-          this._suppress(800);
+        const drift = Math.abs(curMs - targetMs);
+        if (
+          drift > WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS &&
+          drift < WATCH_SYNC_DEFAULTS.DRASTIC_DRIFT_PLAYING_MS
+        ) {
+          this._setExpectedCommand(
+            { expectSeek: true, targetPosMs: targetMs, targetPlaying: true },
+            850
+          );
           this.ytPlayer.seekTo?.(targetMs / 1000, true);
+          this.negotiator.onLocalDriftSeek(this._perfNow());
         }
       } catch {
         // ignore
       }
     } else if (this.provider === "soundcloud" && this.scWidget) {
-      if (Math.abs(this.lastKnownPosMs - targetMs) > 1500) {
-        this._suppress(850);
+      if (!this.lastKnownPlaying) return;
+      const checkGen = this.generation;
+      const syncSeq0 = this._syncSeq;
+      const actionSeq0 = this._scActionSeq;
+      const applySoundCloudDrift = (posMs) => {
+        if (
+          checkGen !== this.generation ||
+          syncSeq0 !== this._syncSeq ||
+          actionSeq0 !== this._scActionSeq ||
+          !this.ready ||
+          !this.scWidget ||
+          !this.lastKnownPlaying ||
+          this._isSuppressed()
+        ) {
+          return;
+        }
+        const liveState = this.pendingState || state;
+        if (!liveState || !liveState.active || !liveState.playing) return;
+        const liveTargetMs = projectMediaPositionMs(liveState, this._wallNow());
+        this.lastKnownPosMs = posMs;
+        const drift = Math.abs(posMs - liveTargetMs);
+        if (
+          drift > WATCH_SYNC_DEFAULTS.MILD_DRIFT_SC_MS &&
+          drift < WATCH_SYNC_DEFAULTS.DRASTIC_DRIFT_PLAYING_MS
+        ) {
+          this._setExpectedCommand(
+            { expectSeek: true, targetPosMs: liveTargetMs, targetPlaying: true },
+            900
+          );
+          try {
+            this.scWidget.seekTo?.(liveTargetMs);
+            this.negotiator.onLocalDriftSeek(this._perfNow());
+          } catch {
+            // ignore
+          }
+        }
+      };
+      if (typeof this.scWidget.getPosition === "function") {
         try {
-          this.scWidget.seekTo?.(targetMs);
+          this.scWidget.getPosition((rawPos) => {
+            const posMs = Number(rawPos);
+            if (Number.isFinite(posMs) && posMs >= 0) {
+              applySoundCloudDrift(Math.round(posMs));
+            }
+          });
         } catch {
           // ignore
         }
+      } else {
+        applySoundCloudDrift(this.lastKnownPosMs);
       }
     } else if (this.provider === "spotify" && this.spotifyCtrl) {
-      if (Math.abs(this.lastKnownPosMs - targetMs) > 2200) {
+      if (!this.lastKnownPlaying) return;
+      const drift = Math.abs(this.lastKnownPosMs - targetMs);
+      if (
+        drift > WATCH_SYNC_DEFAULTS.MILD_DRIFT_SPOTIFY_MS &&
+        drift < WATCH_SYNC_DEFAULTS.DRASTIC_DRIFT_PLAYING_SPOTIFY_MS
+      ) {
         this._suppress(950);
         try {
           this.spotifyCtrl.seek?.(Math.floor(targetMs / 1000));
+          this.negotiator.onLocalDriftSeek(this._perfNow());
         } catch {
           // ignore
         }
@@ -2217,13 +3884,390 @@ export class WatchTogetherPlayer {
           Math.round((Number(this.twitchPlayer.getCurrentTime?.()) || 0) * 1000)
         );
         this.lastKnownPosMs = curMs;
-        if (Math.abs(curMs - targetMs) > 1300) {
-          this._suppress(850);
+        const drift = Math.abs(curMs - targetMs);
+        if (
+          drift > WATCH_SYNC_DEFAULTS.MILD_DRIFT_TWITCH_MS &&
+          drift < WATCH_SYNC_DEFAULTS.DRASTIC_DRIFT_PLAYING_MS
+        ) {
+          this._setExpectedCommand(
+            { expectSeek: true, targetPosMs: targetMs, targetPlaying: true },
+            850
+          );
           this.twitchPlayer.seek?.(targetMs / 1000);
+          this.negotiator.onLocalDriftSeek(this._perfNow());
         }
       } catch {
         // ignore
       }
+    }
+  }
+
+  _handlePolledSnapshot(snapshot) {
+    if (!this.pendingState || !this.pendingState.active) return;
+    const decision = this.negotiator.evaluate(snapshot, this.pendingState, {
+      hasEverPlayedLocally: this._hasEverPlayedLocally,
+    });
+    if (decision.action === "resync-local") {
+      this._syncMountedPlayer(this.pendingState, snapshot.wallNowMs, false, {
+        source: "resync-local",
+        forceResync: true,
+      });
+      return;
+    }
+    if (decision.action === "negotiate" && decision.proposal) {
+      this._clearSyncTimers();
+      this.expectedCommand = null;
+      const p = decision.proposal;
+      this.onNegotiateState({
+        playing: p.playing,
+        positionMs: p.positionMs,
+        rateMilli: p.rateMilli,
+        playlistIndex: p.playlistIndex,
+        trackUri: p.trackUri,
+        trackTitle: p.trackTitle,
+        reason: decision.reason,
+        negotiated: true,
+      });
+    }
+  }
+
+  _pollPlayerStateOnce(gen = this.generation) {
+    if (gen !== this.generation || !this.ready) return;
+
+    if (isYouTubeFamily(this.provider) && this.ytPlayer) {
+      try {
+        const ytState = this.ytPlayer.getPlayerState?.();
+        const curMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
+        const dur = Number(this.ytPlayer.getDuration?.() || 0);
+        if (dur > 0) this.durationMs = Math.round(dur * 1000);
+        const rateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
+        this.lastKnownPosMs = curMs;
+        if (ytState === 1) {
+          this.lastKnownPlaying = true;
+          this._hasEverPlayedLocally = true;
+          this._clearAutoplayTimer();
+        } else if (ytState === 2 || ytState === 0) {
+          this.lastKnownPlaying = false;
+        }
+
+        let vdata = null;
+        if (this.playlistId) {
+          this._refreshYouTubePlaylistInfo();
+          const curIdx = this.ytPlayer.getPlaylistIndex?.();
+          vdata = this.ytPlayer.getVideoData?.() || {};
+          if (typeof curIdx === "number" && curIdx >= 0) {
+            this.lastKnownPlaylistIndex = curIdx;
+          }
+          if (vdata.video_id) this.lastKnownTrackUri = vdata.video_id;
+        }
+
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: curMs,
+          title: vdata?.title || undefined,
+          ready: true,
+          playlistCount: this.playlistCount,
+          playlistIndex: this.lastKnownPlaylistIndex,
+          playlistItems: this.playlistItems,
+          trackUri: this.lastKnownTrackUri,
+        });
+
+        this._handlePolledSnapshot({
+          provider: this.provider,
+          ready: true,
+          buffering: ytState === 3,
+          unstarted: ytState === -1 || ytState === 5,
+          ended: ytState === 0,
+          stalled: false,
+          playing: ytState === 1,
+          hasPlayState: ytState === 1 || ytState === 2,
+          positionMs: curMs,
+          hasPosition: ytState === 1 || ytState === 2 || ytState === 0,
+          durationMs: this.durationMs,
+          rateMilli,
+          hasRate: true,
+          playlistCount: this.playlistCount,
+          playlistIndex: this.playlistId ? this.lastKnownPlaylistIndex : undefined,
+          trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
+          trackTitle: vdata?.title || undefined,
+          observedAt: this._perfNow(),
+          wallNowMs: this._wallNow(),
+        });
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (this.provider === "soundcloud" && this.scWidget) {
+      const nowPerf = this._perfNow();
+      if (this._scPollInFlight && nowPerf - this._scPollStartedAt < 1200) {
+        return;
+      }
+      const hasIsPaused = typeof this.scWidget.isPaused === "function";
+      const hasGetPos = typeof this.scWidget.getPosition === "function";
+      if (!hasIsPaused && !hasGetPos) return;
+
+      const pollSeq = ++this._scPollSeq;
+      const actionSeq0 = this._scActionSeq;
+      const syncSeq0 = this._syncSeq;
+      this._scPollInFlight = true;
+      this._scPollStartedAt = nowPerf;
+
+      const wantIdx =
+        (this.playlistCount > 1 || Boolean(this.playlistId)) &&
+        typeof this.scWidget.getCurrentSoundIndex === "function";
+      let pending = (hasIsPaused ? 1 : 0) + (hasGetPos ? 1 : 0) + (wantIdx ? 1 : 0);
+      let pausedVal;
+      let posVal;
+      let idxVal;
+      let finished = false;
+
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        this._scPollInFlight = false;
+        if (
+          gen !== this.generation ||
+          !this.ready ||
+          !this.scWidget ||
+          pollSeq !== this._scPollSeq ||
+          actionSeq0 !== this._scActionSeq ||
+          syncSeq0 !== this._syncSeq
+        ) {
+          return;
+        }
+        const obsPerf = this._perfNow();
+        const wallNow = this._wallNow();
+        const hasPlayState = typeof pausedVal === "boolean";
+        const playing = hasPlayState ? !pausedVal : this.lastKnownPlaying;
+        const hasPosition = typeof posVal === "number" && Number.isFinite(posVal) && posVal >= 0;
+        const posMs = hasPosition ? Math.round(posVal) : this.lastKnownPosMs;
+
+        let stalled = false;
+        if (
+          playing &&
+          hasPosition &&
+          this._scPrevPollPlaying &&
+          this._scPrevPollPosMs >= 0 &&
+          Math.abs(posMs - this._scPrevPollPosMs) < 25 &&
+          obsPerf - this._scLastProgressMoveAt > 650
+        ) {
+          stalled = true;
+        }
+        if (hasPosition && posMs !== this._scPrevPollPosMs) {
+          this._scLastProgressMoveAt = obsPerf;
+        }
+        this._scPrevPollPlaying = playing;
+        this._scPrevPollPosMs = hasPosition ? posMs : this._scPrevPollPosMs;
+
+        if (hasPlayState) {
+          this.lastKnownPlaying = playing;
+          if (playing) this._hasEverPlayedLocally = true;
+        }
+        if (hasPosition) {
+          this.lastKnownPosMs = posMs;
+        }
+        let resolvedIdx;
+        let trackTitle;
+        if (wantIdx && typeof idxVal === "number" && idxVal >= 0) {
+          resolvedIdx = idxVal;
+          this.lastKnownPlaylistIndex = idxVal;
+          const item = this.playlistItems[idxVal];
+          if (item) {
+            if (item.durationMs > 0) this.durationMs = item.durationMs;
+            trackTitle = item.artist ? `${item.artist} — ${item.title}` : item.title;
+          }
+        }
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: this.lastKnownPosMs,
+          title: trackTitle || undefined,
+          ready: true,
+          playlistCount: this.playlistCount,
+          playlistIndex: this.lastKnownPlaylistIndex,
+          playlistItems: this.playlistItems,
+        });
+
+        const ended = Boolean(
+          this.durationMs > 0 &&
+            hasPlayState &&
+            !playing &&
+            hasPosition &&
+            posMs >= this.durationMs - 400 &&
+            !(this.playlistCount > 1 && this.lastKnownPlaylistIndex < this.playlistCount - 1)
+        );
+
+        this._handlePolledSnapshot({
+          provider: "soundcloud",
+          ready: true,
+          buffering: false,
+          unstarted: false,
+          ended,
+          stalled,
+          playing,
+          hasPlayState,
+          positionMs: posMs,
+          hasPosition,
+          durationMs: this.durationMs,
+          rateMilli: 1000,
+          hasRate: false,
+          playlistCount: this.playlistCount,
+          playlistIndex: resolvedIdx,
+          trackUri: undefined,
+          trackTitle,
+          observedAt: obsPerf,
+          wallNowMs: wallNow,
+        });
+      };
+
+      const stepDone = () => {
+        pending -= 1;
+        if (pending <= 0) finish();
+      };
+
+      try {
+        if (hasIsPaused) {
+          this.scWidget.isPaused((p) => {
+            pausedVal = Boolean(p);
+            stepDone();
+          });
+        }
+        if (hasGetPos) {
+          this.scWidget.getPosition((pos) => {
+            posVal = Number(pos);
+            stepDone();
+          });
+        }
+        if (wantIdx) {
+          this.scWidget.getCurrentSoundIndex((idx) => {
+            idxVal = Number(idx);
+            stepDone();
+          });
+        }
+      } catch {
+        this._scPollInFlight = false;
+      }
+      return;
+    }
+
+    if (this.provider === "twitch" && this.twitchPlayer && this.twitchKind !== "clip") {
+      try {
+        const isLive = this.twitchKind === "channel";
+        const isPaused =
+          typeof this.twitchPlayer.isPaused === "function"
+            ? Boolean(this.twitchPlayer.isPaused())
+            : !this.lastKnownPlaying;
+        const playing = !isPaused;
+        if (playing) this._hasEverPlayedLocally = true;
+        this.lastKnownPlaying = playing;
+
+        let curMs = 0;
+        if (!isLive) {
+          const curSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
+          curMs = Number.isFinite(curSec) && curSec > 0 ? Math.round(curSec * 1000) : 0;
+          const durSec = Number(this.twitchPlayer.getDuration?.() || 0);
+          if (Number.isFinite(durSec) && durSec > 0) {
+            this.durationMs = Math.round(durSec * 1000);
+          }
+          this.lastKnownPosMs = curMs;
+        }
+
+        if (this.twitchKind === "collection") {
+          const curVid = normalizeTwitchVideoId(this.twitchPlayer.getVideo?.() || "");
+          if (curVid) this.lastKnownTrackUri = curVid;
+        }
+
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: curMs,
+          ready: true,
+          trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+        });
+
+        const ended = Boolean(!isLive && this.durationMs > 0 && isPaused && curMs >= this.durationMs - 400);
+        this._handlePolledSnapshot({
+          provider: "twitch",
+          ready: true,
+          buffering: false,
+          unstarted: false,
+          ended,
+          stalled: false,
+          playing,
+          hasPlayState: typeof this.twitchPlayer.isPaused === "function",
+          positionMs: curMs,
+          hasPosition: !isLive,
+          durationMs: this.durationMs,
+          rateMilli: 1000,
+          hasRate: false,
+          playlistCount: 0,
+          playlistIndex: undefined,
+          trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+          observedAt: this._perfNow(),
+          wallNowMs: this._wallNow(),
+        });
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (this.provider === "spotify" && this.spotifyCtrl) {
+      if (this.durationMs <= 0) return;
+      if (this.spotifyAwaitingInitialSettle) return;
+      // Skip divergence negotiation while locally browsing the full playlist tracklist via Show Playlist
+      const browsingSpotifyPlaylist = Boolean(
+        this.playlistId &&
+          !this.spotifyShowingTrackUri &&
+          !this.lastKnownPlaying &&
+          (this.lastKnownTrackUri === this.playlistId ||
+            (this.lastKnownPosMs === 0 &&
+              this.pendingState?.trackUri &&
+              this.pendingState.trackUri !== this.playlistId))
+      );
+      if (browsingSpotifyPlaylist) return;
+      const obsPerf = this._perfNow();
+      if (this.lastKnownPlaying) this._hasEverPlayedLocally = true;
+      let stalled = false;
+      if (
+        this.lastKnownPlaying &&
+        this._spPrevPollPosMs >= 0 &&
+        Math.abs(this.lastKnownPosMs - this._spPrevPollPosMs) < 25 &&
+        this._spLastPosMoveAt > 0 &&
+        obsPerf - this._spLastPosMoveAt > 1500
+      ) {
+        stalled = true;
+      }
+      if (this.lastKnownPosMs !== this._spPrevPollPosMs) {
+        this._spLastPosMoveAt = obsPerf;
+      }
+      this._spPrevPollPosMs = this.lastKnownPosMs;
+      const ended = Boolean(
+        !this.lastKnownPlaying &&
+          this.durationMs > 0 &&
+          this.lastKnownPosMs >= this.durationMs - 400 &&
+          !this.playlistId
+      );
+      this._handlePolledSnapshot({
+        provider: "spotify",
+        ready: true,
+        buffering: false,
+        unstarted: false,
+        ended,
+        stalled,
+        playing: Boolean(this.lastKnownPlaying),
+        hasPlayState: true,
+        positionMs: this.lastKnownPosMs,
+        hasPosition: true,
+        durationMs: this.durationMs,
+        rateMilli: 1000,
+        hasRate: false,
+        playlistCount: 0,
+        playlistIndex: undefined,
+        trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
+        observedAt: obsPerf,
+        wallNowMs: this._wallNow(),
+      });
     }
   }
 
@@ -2232,133 +4276,12 @@ export class WatchTogetherPlayer {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
-    if (isYouTubeFamily(this.provider)) {
-      this.pollTimer = setInterval(() => {
-        if (gen !== this.generation || !this.ytPlayer || !this.ready) return;
-        try {
-          const curMs = Math.max(0, Math.round((this.ytPlayer.getCurrentTime?.() || 0) * 1000));
-          const dur = Number(this.ytPlayer.getDuration?.() || 0);
-          if (dur > 0) this.durationMs = Math.round(dur * 1000);
-          const prevMs = this.lastKnownPosMs;
-          this.lastKnownPosMs = curMs;
-
-          let trackChanged = false;
-          let vdata = null;
-          if (this.playlistId) {
-            this._refreshYouTubePlaylistInfo();
-            const curIdx = this.ytPlayer.getPlaylistIndex?.();
-            vdata = this.ytPlayer.getVideoData?.() || {};
-            if (typeof curIdx === "number" && curIdx >= 0 && curIdx !== this.lastKnownPlaylistIndex) {
-              this.lastKnownPlaylistIndex = curIdx;
-              trackChanged = true;
-            }
-            if (vdata.video_id) this.lastKnownTrackUri = vdata.video_id;
-          }
-
-          this.onTelemetry({
-            durationMs: this.durationMs,
-            positionMs: curMs,
-            title: vdata?.title || undefined,
-            ready: true,
-            playlistCount: this.playlistCount,
-            playlistIndex: this.lastKnownPlaylistIndex,
-            playlistItems: this.playlistItems,
-            trackUri: this.lastKnownTrackUri,
-          });
-
-          // Detect in-iframe YouTube scrubber seeks or playlist track switches
-          if (!this._isSuppressed() && this.pendingState) {
-            const ytState = this.ytPlayer.getPlayerState?.();
-            const rateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
-            if (trackChanged && (ytState === 1 || ytState === 2 || ytState === 3)) {
-              this.onUserAction({
-                playing: ytState !== 2,
-                positionMs: curMs,
-                rateMilli,
-                playlistIndex: this.lastKnownPlaylistIndex,
-                trackUri: this.lastKnownTrackUri,
-                trackTitle: vdata?.title || undefined,
-              });
-              return;
-            }
-            const expectedMs = projectMediaPositionMs(this.pendingState, Date.now());
-            if (
-              (ytState === 1 || ytState === 2) &&
-              Math.abs(curMs - prevMs) > 1800 &&
-              Math.abs(curMs - expectedMs) > 1500
-            ) {
-              this.onUserAction({
-                playing: ytState === 1,
-                positionMs: curMs,
-                rateMilli,
-                playlistIndex: this.playlistId ? this.lastKnownPlaylistIndex : undefined,
-                trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
-              });
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }, 500);
+    if (this.provider === "twitch" && this.twitchKind === "clip") {
       return;
     }
-
-    if (
-      this.provider === "twitch" &&
-      (this.twitchKind === "video" || this.twitchKind === "collection")
-    ) {
-      this.pollTimer = setInterval(() => {
-        if (gen !== this.generation || !this.twitchPlayer || !this.ready) return;
-        try {
-          const curSec = Number(this.twitchPlayer.getCurrentTime?.() || 0);
-          const curMs = Number.isFinite(curSec) && curSec > 0 ? Math.round(curSec * 1000) : 0;
-          const durSec = Number(this.twitchPlayer.getDuration?.() || 0);
-          if (Number.isFinite(durSec) && durSec > 0) {
-            this.durationMs = Math.round(durSec * 1000);
-          }
-          const prevMs = this.lastKnownPosMs;
-          this.lastKnownPosMs = curMs;
-
-          let vidChanged = false;
-          if (this.twitchKind === "collection") {
-            const curVid = normalizeTwitchVideoId(this.twitchPlayer.getVideo?.() || "");
-            if (curVid && curVid !== this.lastKnownTrackUri) {
-              this.lastKnownTrackUri = curVid;
-              vidChanged = true;
-            }
-          }
-
-          this.onTelemetry({
-            durationMs: this.durationMs,
-            positionMs: curMs,
-            ready: true,
-            trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
-          });
-
-          if (!this._isSuppressed() && this.pendingState) {
-            const isPaused = Boolean(this.twitchPlayer.isPaused?.());
-            if (vidChanged) {
-              this.onUserAction({
-                playing: !isPaused,
-                positionMs: curMs,
-                trackUri: this.lastKnownTrackUri,
-              });
-              return;
-            }
-            const expectedMs = projectMediaPositionMs(this.pendingState, Date.now());
-            if (Math.abs(curMs - prevMs) > 1800 && Math.abs(curMs - expectedMs) > 1500) {
-              this.onUserAction({
-                playing: !isPaused,
-                positionMs: curMs,
-                trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
-              });
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }, 500);
-    }
+    this.pollTimer = setInterval(() => {
+      this._pollPlayerStateOnce(gen);
+    }, WATCH_SYNC_DEFAULTS.POLL_INTERVAL_MS);
   }
 
   _teardownAdapterOnly() {
@@ -2366,6 +4289,13 @@ export class WatchTogetherPlayer {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this._clearSyncTimers();
+    this._syncSeq += 1;
+    this._scActionSeq += 1;
+    this._scPollSeq += 1;
+    this._scPollInFlight = false;
+    this.expectedCommand = null;
+    this.suppressUntilMs = 0;
     if (this.ytPlayer) {
       try {
         this.ytPlayer.destroy?.();
@@ -2382,6 +4312,8 @@ export class WatchTogetherPlayer {
       }
       this.spotifyCtrl = null;
     }
+    this.spotifyIframe = null;
+    this.spotifyHasContext = false;
     if (this.twitchPlayer) {
       try {
         this.twitchPlayer.pause?.();
@@ -2400,6 +4332,7 @@ export class WatchTogetherPlayer {
   destroy() {
     this.generation++;
     this._teardownAdapterOnly();
+    this.negotiator.reset();
     this.provider = "";
     this.mediaId = "";
     this.playlistId = "";
@@ -2413,8 +4346,29 @@ export class WatchTogetherPlayer {
     this.playlistCount = 0;
     this.playlistItems = [];
     this.spotifyShowingTrackUri = "";
+    this.spotifyEntityType = "track";
+    this.spotifyIframe = null;
+    this.spotifyHasContext = false;
+    this.spotifyInitialStartSec = 0;
+    this.spotifyLastPosMs = 0;
+    this.spotifyLastIsPaused = true;
+    this.spotifyAwaitingInitialSettle = false;
+    this.spotifyEnv = null;
+    this.spotifyHasError = false;
+    this.spotifyErrorMessage = "";
+    this.spotifySession = null;
+    this._nextSpotifyForceDrmProbe = false;
     this.twitchKind = "";
     this.twitchEpoch = 0;
+    this._lastAppliedEpoch = 0;
+    this._hasEverPlayedLocally = false;
+    this._ytWasBuffering = false;
+    this._ytBufferingFromPosMs = 0;
+    this._scPrevPollPlaying = false;
+    this._scPrevPollPosMs = -1;
+    this._scLastProgressMoveAt = 0;
+    this._spPrevPollPosMs = -1;
+    this._spLastPosMoveAt = 0;
     if (this.mountEl) {
       this.mountEl.innerHTML = "";
     }
