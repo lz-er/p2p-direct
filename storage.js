@@ -9,6 +9,19 @@
  */
 
 import { sanitizeWarframeSettings } from "./warframe_bot.js";
+import { sanitizeSts2Settings } from "./sts2_bot.js";
+import {
+  sanitizeWeatherSettings,
+  sanitizeWikiSettings,
+  sanitizeGithubSettings,
+} from "./web_bots.js";
+import {
+  sanitizePollSettings,
+  sanitizePomodoroSettings,
+  sanitizeChecklistSettings,
+  sanitizeRandomizerSettings,
+  sanitizeScoreboardSettings,
+} from "./room_bots.js";
 
 const LEGACY_DB_NAME = "p2p_direct_mesh_v2";
 const LEGACY_LS_PREFIX = "p2p_direct_profile_v2:";
@@ -17,6 +30,7 @@ const SESSION_AUDIO_KEY = "p2p-direct-audio-settings";
 export const SAVED_ROOMS_KEY = "p2p-direct-saved-rooms-v1";
 export const LAST_ROOM_KEY = "p2p-direct-last-room-v1";
 export const WARFRAME_BOT_SETTINGS_KEY = "p2p-direct-warframe-bot-v1";
+export const BUILTIN_BOTS_SETTINGS_KEY = "p2p-direct-builtin-bots-v1";
 const MAX_SAVED_ROOMS = 50;
 
 export const DEFAULT_AUDIO_SETTINGS = Object.freeze({
@@ -506,6 +520,51 @@ export function saveWarframeBotSettings(settings) {
   try {
     if (typeof localStorage !== "undefined") {
       localStorage.setItem(WARFRAME_BOT_SETTINGS_KEY, JSON.stringify(clean));
+    }
+  } catch {
+    // ignore storage restrictions
+  }
+  return clean;
+}
+
+/**
+ * Sanitizes settings for all built-in persistent bots (StS2, Web Info, Pure-P2P Room Tools).
+ * All bots default to disabled (`enabled: false`) so zero external API requests occur unless opted in.
+ */
+export function sanitizeBuiltinBotsSettings(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  return {
+    sts2: sanitizeSts2Settings(src.sts2),
+    weather: sanitizeWeatherSettings(src.weather),
+    wikipedia: sanitizeWikiSettings(src.wikipedia),
+    github: sanitizeGithubSettings(src.github),
+    poll: sanitizePollSettings(src.poll),
+    pomodoro: sanitizePomodoroSettings(src.pomodoro),
+    checklist: sanitizeChecklistSettings(src.checklist),
+    randomizer: sanitizeRandomizerSettings(src.randomizer),
+    scoreboard: sanitizeScoreboardSettings(src.scoreboard),
+  };
+}
+
+export function loadBuiltinBotsSettings() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem(BUILTIN_BOTS_SETTINGS_KEY);
+      if (raw) {
+        return sanitizeBuiltinBotsSettings(JSON.parse(raw));
+      }
+    }
+  } catch {
+    // ignore storage restrictions
+  }
+  return sanitizeBuiltinBotsSettings(null);
+}
+
+export function saveBuiltinBotsSettings(settings) {
+  const clean = sanitizeBuiltinBotsSettings(settings);
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(BUILTIN_BOTS_SETTINGS_KEY, JSON.stringify(clean));
     }
   } catch {
     // ignore storage restrictions

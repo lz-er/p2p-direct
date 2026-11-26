@@ -9240,16 +9240,237 @@ html[data-watch-stage="true"] .join-listen-strip {
     max-height: calc(100dvh - 20px);
   }
 
-  .settings-grid {
+  .settings-grid,
+  .settings-grid-2 {
     grid-template-columns: 1fr;
   }
 
-  .chat-wf-pill {
-    max-width: 148px;
+  .chat-wf-pill,
+  .chat-bot-pill {
+    max-width: 140px;
     font-size: 9px;
     padding: 2px 6px;
   }
 }
+
+/* ================= Tabbed Settings Modal & Multi-Bot Pills ================= */
+
+.settings-tab-bar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-bottom: 2px solid var(--rule);
+  background: var(--bg-subtle);
+  flex-shrink: 0;
+}
+
+.settings-tab-btn {
+  appearance: none;
+  border: none;
+  border-right: 2px solid var(--rule);
+  background: transparent;
+  color: var(--ink-secondary);
+  padding: 10px 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.settings-tab-btn:last-child {
+  border-right: none;
+}
+
+.settings-tab-btn:hover {
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+}
+
+.settings-tab-btn.is-active {
+  background: var(--cobalt);
+  color: #ffffff;
+}
+
+[data-theme="dark"] .settings-tab-btn.is-active {
+  background: var(--acid);
+  color: #0e0f12;
+}
+
+.settings-tab-count:not(:empty) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: var(--ink-primary);
+  color: var(--ink-inv);
+  font-size: 9.5px;
+  line-height: 1;
+}
+
+.settings-tab-btn.is-active .settings-tab-count:not(:empty) {
+  background: #0e0f12;
+  color: #ffffff;
+}
+
+.settings-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-p2p-banner {
+  margin: 0;
+  padding: 10px 12px;
+  border: 2px solid var(--rule);
+  border-left: 6px solid var(--mint);
+  background: var(--bg-subtle);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink-primary);
+}
+
+.settings-grid-1 {
+  grid-template-columns: 1fr;
+}
+
+.settings-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-field .text-input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 2px solid var(--rule);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.settings-field .text-input:focus {
+  outline: 2px solid var(--cobalt);
+  outline-offset: -2px;
+}
+
+[data-theme="dark"] .settings-field .text-input:focus {
+  outline-color: var(--acid);
+}
+
+.settings-inline-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--ink-secondary);
+  cursor: pointer;
+}
+
+.settings-inline-check input[type="checkbox"] {
+  margin-top: 2px;
+  accent-color: var(--cobalt);
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.settings-inline-check code {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 1px 4px;
+  border: 1px solid var(--rule-soft);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+}
+
+/* Multi-bot quick-jump pills in Chat header */
+.chat-bot-pills {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-width: 100%;
+}
+
+.chat-bot-pill {
+  border: 2px solid var(--rule);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-bot-pill:hover {
+  background: var(--cobalt);
+  border-color: var(--cobalt);
+  color: #ffffff;
+}
+
+[data-theme="dark"] .chat-bot-pill:hover {
+  background: var(--acid);
+  border-color: var(--acid);
+  color: #0e0f12;
+}
+
+.bot-card-image-btn img {
+  max-height: 300px;
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+@media (max-width: 640px) {
+  .settings-grid-2 {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-tab-btn {
+    font-size: 9.5px;
+    padding: 9px 4px;
+  }
+
+  .chat-bot-pills {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .chat-bot-pills::-webkit-scrollbar {
+    display: none;
+  }
+
+  .chat-bot-pill {
+    max-width: 132px;
+    font-size: 9px;
+    padding: 2px 5px;
+  }
+}
+
+
 
 
 

@@ -20,6 +20,7 @@ import {
   loadSavedRooms,
   loadSessionAudioSettings,
   loadWarframeBotSettings,
+  loadBuiltinBotsSettings,
   purgeLegacyClientStorage,
   randomBase64Url,
   removeSavedRoom,
@@ -28,6 +29,7 @@ import {
   saveSessionAudioSettings,
   saveSessionAuthorName,
   saveWarframeBotSettings,
+  saveBuiltinBotsSettings,
   upsertSavedRoom,
 } from "./storage.js";
 import {
@@ -37,6 +39,69 @@ import {
   parseWarframeAction,
   summarizeWarframePill,
 } from "./warframe_bot.js";
+import {
+  STS2_BOT_ID,
+  applySts2CoopAction,
+  buildSts2CoopCard,
+  extractSts2BracketQuery,
+  fetchSts2Card,
+  findPersistentSts2Message,
+  parseSts2Action,
+  pickRandomSpotlightPath,
+  summarizeSts2Pill,
+} from "./sts2_bot.js";
+import {
+  GITHUB_BOT_ID,
+  WEATHER_BOT_ID,
+  WIKI_BOT_ID,
+  extractWikiBracketQuery,
+  fetchGithubCard,
+  fetchWeatherCard,
+  fetchWikiCard,
+  findPersistentBotMessage,
+  parseGithubAction,
+  parseWeatherAction,
+  parseWikiAction,
+  summarizeGithubPill,
+  summarizeWeatherPill,
+  summarizeWikiPill,
+} from "./web_bots.js";
+import {
+  CHECKLIST_BOT_ID,
+  POLL_BOT_ID,
+  POMODORO_BOT_ID,
+  PURE_P2P_BOT_IDS,
+  RANDOMIZER_BOT_ID,
+  SCOREBOARD_BOT_ID,
+  applyChecklistAction,
+  applyPollAction,
+  applyPomodoroAction,
+  applyRandomizerAction,
+  applyScoreboardAction,
+  buildChecklistCard,
+  buildPollCard,
+  buildPomodoroCard,
+  buildRandomizerCard,
+  buildScoreboardCard,
+  computePomodoroRemainingMs,
+  createChecklistStateFromSettings,
+  createPollStateFromSettings,
+  createPomodoroStateFromSettings,
+  createRandomizerStateFromSettings,
+  createScoreboardStateFromSettings,
+  extractChecklistAppendText,
+  formatCountdownMmSs,
+  parseChecklistAction,
+  parsePollAction,
+  parsePomodoroAction,
+  parseRandomizerAction,
+  parseScoreboardAction,
+  summarizeChecklistPill,
+  summarizePollPill,
+  summarizePomodoroPill,
+  summarizeRandomizerPill,
+  summarizeScoreboardPill,
+} from "./room_bots.js";
 import {
   MediaSyncController,
   WatchTraceRecorder,
@@ -60,7 +125,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v26";
+export const APP_VERSION = "v27";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -1923,6 +1988,7 @@ export class P2PDirectApp {
     });
     this._checkingAppUpdate = false;
     this.settingsOpen = false;
+    this.settingsActiveTab = "gaming";
     this.warframeBot = {
       settings: loadWarframeBotSettings(),
       inFlight: false,
@@ -1931,6 +1997,15 @@ export class P2PDirectApp {
       refreshTimer: null,
       dismissedInRoomTopic: null,
     };
+    this.builtinBots = {
+      settings: loadBuiltinBotsSettings(),
+      inFlight: {},
+      requestGen: {},
+      dismissedByRoom: {},
+      bootstrapTimer: null,
+    };
+    this._pomoTickTimer = null;
+    this._seenTriggerMsgIds = new Set();
     this.el = {};
   }
 
@@ -2160,8 +2235,92 @@ export class P2PDirectApp {
       "btn-wf-jump-msg",
       "setting-wf-note",
       "btn-chat-warframe-jump",
+      "chat-bot-pills",
       "adv-wf-status-text",
       "btn-adv-open-wf-settings",
+      "btn-settings-tab-gaming",
+      "btn-settings-tab-room",
+      "btn-settings-tab-web",
+      "settings-count-gaming",
+      "settings-count-room",
+      "settings-count-web",
+      "settings-panel-gaming",
+      "settings-panel-room",
+      "settings-panel-web",
+      // Slay the Spire 2
+      "setting-sts2-status-badge",
+      "setting-sts2-enabled",
+      "settings-sts2-options",
+      "setting-sts2-tab",
+      "setting-sts2-char",
+      "setting-sts2-bracket",
+      "setting-sts2-inline",
+      "btn-sts2-post-now",
+      "btn-sts2-jump-msg",
+      // Poll
+      "setting-poll-status-badge",
+      "setting-poll-enabled",
+      "settings-poll-options",
+      "setting-poll-question",
+      "setting-poll-choices",
+      "btn-poll-post-now",
+      "btn-poll-jump-msg",
+      // Pomodoro
+      "setting-pomodoro-status-badge",
+      "setting-pomodoro-enabled",
+      "settings-pomodoro-options",
+      "setting-pomodoro-focus",
+      "setting-pomodoro-break",
+      "setting-pomodoro-long",
+      "btn-pomodoro-post-now",
+      "btn-pomodoro-jump-msg",
+      // Checklist
+      "setting-checklist-status-badge",
+      "setting-checklist-enabled",
+      "settings-checklist-options",
+      "setting-checklist-title",
+      "setting-checklist-items",
+      "btn-checklist-post-now",
+      "btn-checklist-jump-msg",
+      // Randomizer
+      "setting-randomizer-status-badge",
+      "setting-randomizer-enabled",
+      "settings-randomizer-options",
+      "setting-randomizer-choices",
+      "btn-randomizer-post-now",
+      "btn-randomizer-jump-msg",
+      // Scoreboard
+      "setting-scoreboard-status-badge",
+      "setting-scoreboard-enabled",
+      "settings-scoreboard-options",
+      "setting-scoreboard-mode",
+      "setting-scoreboard-title",
+      "btn-scoreboard-post-now",
+      "btn-scoreboard-jump-msg",
+      // Weather
+      "setting-weather-status-badge",
+      "setting-weather-enabled",
+      "settings-weather-options",
+      "setting-weather-cities",
+      "setting-weather-unit",
+      "btn-weather-post-now",
+      "btn-weather-jump-msg",
+      // Wikipedia
+      "setting-wikipedia-status-badge",
+      "setting-wikipedia-enabled",
+      "settings-wikipedia-options",
+      "setting-wikipedia-tab",
+      "setting-wikipedia-inline",
+      "btn-wikipedia-post-now",
+      "btn-wikipedia-jump-msg",
+      // GitHub
+      "setting-github-status-badge",
+      "setting-github-enabled",
+      "settings-github-options",
+      "setting-github-repo",
+      "setting-github-tab",
+      "btn-github-post-now",
+      "btn-github-jump-msg",
       "auto-mesh-toggle",
       "auto-mesh-badge",
       "peer-list",
@@ -2717,6 +2876,85 @@ export class P2PDirectApp {
       });
     }
 
+    // Settings category tabs (Gaming / Room Tools P2P / Web Info)
+    for (const tabBtn of document.querySelectorAll("[data-settings-tab]")) {
+      tabBtn.addEventListener("click", () => {
+        this.setSettingsTab(tabBtn.dataset.settingsTab);
+      });
+    }
+
+    // Helper for wiring all 9 additional persistent built-in bots cleanly
+    const bindBotControls = (botId, fieldsSpec) => {
+      const enEl = this.el[`setting-${botId}-enabled`];
+      if (enEl) {
+        enEl.addEventListener("change", () => {
+          this.updateBuiltinBotSettings(botId, { enabled: enEl.checked });
+        });
+      }
+      for (const [elId, prop, kind] of fieldsSpec) {
+        const el = this.el[elId];
+        if (!el) continue;
+        el.addEventListener("change", () => {
+          const val =
+            kind === "bool" ? el.checked : kind === "num" ? Number(el.value) : el.value;
+          this.updateBuiltinBotSettings(botId, { [prop]: val });
+        });
+      }
+      const postBtn = this.el[`btn-${botId}-post-now`];
+      if (postBtn) {
+        postBtn.addEventListener("click", () => {
+          this.ensureBuiltinBotCard(botId, { forcePost: true, forceResetFromSettings: true }).then((ok) => {
+            if (ok) this.jumpToPersistentBotMessage(botId);
+          });
+        });
+      }
+      const jumpBtn = this.el[`btn-${botId}-jump-msg`];
+      if (jumpBtn) {
+        jumpBtn.addEventListener("click", () => {
+          this.jumpToPersistentBotMessage(botId);
+        });
+      }
+    };
+
+    bindBotControls(STS2_BOT_ID, [
+      ["setting-sts2-tab", "defaultTab", "str"],
+      ["setting-sts2-char", "defaultCharacter", "str"],
+      ["setting-sts2-bracket", "defaultBracket", "str"],
+      ["setting-sts2-inline", "inlineLookup", "bool"],
+    ]);
+    bindBotControls(POLL_BOT_ID, [
+      ["setting-poll-question", "question", "str"],
+      ["setting-poll-choices", "options", "str"],
+    ]);
+    bindBotControls(POMODORO_BOT_ID, [
+      ["setting-pomodoro-focus", "focusMin", "num"],
+      ["setting-pomodoro-break", "breakMin", "num"],
+      ["setting-pomodoro-long", "longBreakMin", "num"],
+    ]);
+    bindBotControls(CHECKLIST_BOT_ID, [
+      ["setting-checklist-title", "title", "str"],
+      ["setting-checklist-items", "items", "str"],
+    ]);
+    bindBotControls(RANDOMIZER_BOT_ID, [
+      ["setting-randomizer-choices", "options", "str"],
+    ]);
+    bindBotControls(SCOREBOARD_BOT_ID, [
+      ["setting-scoreboard-mode", "mode", "str"],
+      ["setting-scoreboard-title", "ratingTitle", "str"],
+    ]);
+    bindBotControls(WEATHER_BOT_ID, [
+      ["setting-weather-cities", "cities", "str"],
+      ["setting-weather-unit", "unit", "str"],
+    ]);
+    bindBotControls(WIKI_BOT_ID, [
+      ["setting-wikipedia-tab", "defaultTab", "str"],
+      ["setting-wikipedia-inline", "inlineLookup", "bool"],
+    ]);
+    bindBotControls(GITHUB_BOT_ID, [
+      ["setting-github-repo", "repo", "str"],
+      ["setting-github-tab", "defaultTab", "str"],
+    ]);
+
     // Collapsible & pinnable Advanced rail section headers
     for (const btn of document.querySelectorAll("[data-toggle-panel]")) {
       btn.addEventListener("click", () => {
@@ -3184,6 +3422,9 @@ export class P2PDirectApp {
           if (ok) this.jumpToPersistentWarframeMessage();
         });
       }
+      if (images.length === 0 && videos.length === 0 && text) {
+        this.handleChatTriggersForText(text, this.status?.authorName || "Peer");
+      }
     });
 
     this.el["json-composer-form"].addEventListener("submit", (ev) => {
@@ -3349,6 +3590,8 @@ export class P2PDirectApp {
     this.syncAudioSettingsUI();
     this.syncWarframeSettingsControls();
     this.syncWarframeUiStatus();
+    this.syncBuiltinBotsSettingsControls();
+    this.syncBuiltinBotsUiStatus();
 
     this.setupBroadcastChannel();
     this.startKeepaliveWorker();
@@ -7280,9 +7523,13 @@ export class P2PDirectApp {
       this.logMessages = state.log;
       return;
     }
+    const newlyAddedRemote = [];
     if (Array.isArray(delta.changed)) {
       for (const msg of delta.changed) {
         if (msg && msg.id) {
+          if (!byId.has(msg.id) && msg.type === "chat" && msg.author !== this.status?.peerId) {
+            newlyAddedRemote.push(msg);
+          }
           byId.set(msg.id, msg);
         }
       }
@@ -7293,6 +7540,9 @@ export class P2PDirectApp {
       if (item) nextLog.push(item);
     }
     this.logMessages = nextLog;
+    if (newlyAddedRemote.length > 0) {
+      this._scanNewIncomingChatTriggers(newlyAddedRemote);
+    }
   }
 
   wipeLocalLog() {
@@ -7643,9 +7893,12 @@ export class P2PDirectApp {
     this.renderAll();
 
     this.warframeBot.dismissedInRoomTopic = null;
+    this.builtinBots.dismissedByRoom = {};
+    this._seenTriggerMsgIds.clear();
     if (this.warframeBot.settings.enabled) {
       this.scheduleWarframeBotBootstrap({ delayMs: joined ? 1600 : 120 });
     }
+    this.scheduleBuiltinBotsBootstrap({ delayMs: joined ? 1800 : 180 });
 
     this.addTelemetry(
       "room",
@@ -7662,7 +7915,10 @@ export class P2PDirectApp {
 
   leaveLongLivedRoom({ silent = false } = {}) {
     this.stopWarframeBotTimers();
+    this.stopBuiltinBotsTimers();
     this.warframeBot.dismissedInRoomTopic = null;
+    this.builtinBots.dismissedByRoom = {};
+    this._seenTriggerMsgIds.clear();
     this.stopPreCallMicMonitor();
     this.closeLightbox();
     for (const item of this.pendingImages) {
@@ -7708,8 +7964,11 @@ export class P2PDirectApp {
       this.el["btn-settings-toggle"].classList.toggle("is-active", next);
     }
     if (next) {
+      this.setSettingsTab(this.settingsActiveTab || "gaming");
       this.syncWarframeSettingsControls();
+      this.syncBuiltinBotsSettingsControls();
       this.syncWarframeUiStatus();
+      this.syncBuiltinBotsUiStatus();
     }
   }
 
@@ -7747,7 +8006,7 @@ export class P2PDirectApp {
     }
 
     if (this.el["btn-settings-toggle"]) {
-      this.el["btn-settings-toggle"].classList.toggle("has-active-bot", Boolean(s.enabled));
+      this.el["btn-settings-toggle"].classList.toggle("has-active-bot", this._isAnyBuiltinBotEnabled());
     }
 
     if (this.el["setting-wf-status-badge"]) {
@@ -8068,6 +8327,824 @@ export class P2PDirectApp {
       if (targetEl.isConnected) targetEl.classList.remove("is-wf-highlight");
     }, 1500);
     return true;
+  }
+
+  /* ================= Unified Built-in Persistent Bots Controller ================= */
+
+  setSettingsTab(tab) {
+    const allowed = new Set(["gaming", "room", "web"]);
+    const next = allowed.has(tab) ? tab : "gaming";
+    this.settingsActiveTab = next;
+    for (const btn of document.querySelectorAll("[data-settings-tab]")) {
+      const isAct = btn.dataset.settingsTab === next;
+      btn.classList.toggle("is-active", isAct);
+      btn.setAttribute("aria-selected", isAct ? "true" : "false");
+    }
+    for (const panel of document.querySelectorAll("[data-settings-panel]")) {
+      panel.classList.toggle("hidden", panel.dataset.settingsPanel !== next);
+    }
+  }
+
+  _allManagedBuiltinBotIds() {
+    return [
+      STS2_BOT_ID,
+      POLL_BOT_ID,
+      POMODORO_BOT_ID,
+      CHECKLIST_BOT_ID,
+      RANDOMIZER_BOT_ID,
+      SCOREBOARD_BOT_ID,
+      WEATHER_BOT_ID,
+      WIKI_BOT_ID,
+      GITHUB_BOT_ID,
+    ];
+  }
+
+  _isAnyBuiltinBotEnabled() {
+    if (this.warframeBot.settings.enabled) return true;
+    const s = this.builtinBots.settings || {};
+    return this._allManagedBuiltinBotIds().some((id) => Boolean(s[id]?.enabled));
+  }
+
+  syncBuiltinBotsSettingsControls() {
+    const s = this.builtinBots.settings;
+    const setVal = (id, val) => {
+      if (this.el[id]) this.el[id].value = String(val ?? "");
+    };
+    const setChk = (id, val) => {
+      if (this.el[id]) this.el[id].checked = Boolean(val);
+    };
+    const setDis = (botId) => {
+      const box = this.el[`settings-${botId}-options`];
+      if (box) box.classList.toggle("is-disabled", !s[botId]?.enabled);
+    };
+
+    // StS2
+    setChk("setting-sts2-enabled", s.sts2.enabled);
+    setVal("setting-sts2-tab", s.sts2.defaultTab);
+    setVal("setting-sts2-char", s.sts2.defaultCharacter);
+    setVal("setting-sts2-bracket", s.sts2.defaultBracket);
+    setChk("setting-sts2-inline", s.sts2.inlineLookup);
+    setDis(STS2_BOT_ID);
+
+    // Room Tools (Pure P2P)
+    setChk("setting-poll-enabled", s.poll.enabled);
+    setVal("setting-poll-question", s.poll.question);
+    setVal("setting-poll-choices", s.poll.options);
+    setDis(POLL_BOT_ID);
+
+    setChk("setting-pomodoro-enabled", s.pomodoro.enabled);
+    setVal("setting-pomodoro-focus", s.pomodoro.focusMin);
+    setVal("setting-pomodoro-break", s.pomodoro.breakMin);
+    setVal("setting-pomodoro-long", s.pomodoro.longBreakMin);
+    setDis(POMODORO_BOT_ID);
+
+    setChk("setting-checklist-enabled", s.checklist.enabled);
+    setVal("setting-checklist-title", s.checklist.title);
+    setVal("setting-checklist-items", s.checklist.items);
+    setDis(CHECKLIST_BOT_ID);
+
+    setChk("setting-randomizer-enabled", s.randomizer.enabled);
+    setVal("setting-randomizer-choices", s.randomizer.options);
+    setDis(RANDOMIZER_BOT_ID);
+
+    setChk("setting-scoreboard-enabled", s.scoreboard.enabled);
+    setVal("setting-scoreboard-mode", s.scoreboard.mode);
+    setVal("setting-scoreboard-title", s.scoreboard.ratingTitle);
+    setDis(SCOREBOARD_BOT_ID);
+
+    // Web Info
+    setChk("setting-weather-enabled", s.weather.enabled);
+    setVal("setting-weather-cities", s.weather.cities);
+    setVal("setting-weather-unit", s.weather.unit);
+    setDis(WEATHER_BOT_ID);
+
+    setChk("setting-wikipedia-enabled", s.wikipedia.enabled);
+    setVal("setting-wikipedia-tab", s.wikipedia.defaultTab);
+    setChk("setting-wikipedia-inline", s.wikipedia.inlineLookup);
+    setDis(WIKI_BOT_ID);
+
+    setChk("setting-github-enabled", s.github.enabled);
+    setVal("setting-github-repo", s.github.repo);
+    setVal("setting-github-tab", s.github.defaultTab);
+    setDis(GITHUB_BOT_ID);
+  }
+
+  _summarizeBuiltinBotPill(botId, msg) {
+    switch (botId) {
+      case STS2_BOT_ID:
+        return summarizeSts2Pill(msg);
+      case WEATHER_BOT_ID:
+        return summarizeWeatherPill(msg);
+      case WIKI_BOT_ID:
+        return summarizeWikiPill(msg);
+      case GITHUB_BOT_ID:
+        return summarizeGithubPill(msg);
+      case POLL_BOT_ID:
+        return summarizePollPill(msg);
+      case POMODORO_BOT_ID:
+        return summarizePomodoroPill(msg, Date.now());
+      case CHECKLIST_BOT_ID:
+        return summarizeChecklistPill(msg);
+      case RANDOMIZER_BOT_ID:
+        return summarizeRandomizerPill(msg);
+      case SCOREBOARD_BOT_ID:
+        return summarizeScoreboardPill(msg);
+      default:
+        return botId.toUpperCase();
+    }
+  }
+
+  syncBuiltinBotsUiStatus() {
+    const s = this.builtinBots.settings;
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    const botIds = this._allManagedBuiltinBotIds();
+
+    if (this.el["btn-settings-toggle"]) {
+      this.el["btn-settings-toggle"].classList.toggle(
+        "has-active-bot",
+        this._isAnyBuiltinBotEnabled()
+      );
+    }
+
+    // Update Settings tab active counts
+    const gamingCount = (this.warframeBot.settings.enabled ? 1 : 0) + (s.sts2.enabled ? 1 : 0);
+    const roomCount = PURE_P2P_BOT_IDS.reduce((n, id) => n + (s[id]?.enabled ? 1 : 0), 0);
+    const webCount = [WEATHER_BOT_ID, WIKI_BOT_ID, GITHUB_BOT_ID].reduce(
+      (n, id) => n + (s[id]?.enabled ? 1 : 0),
+      0
+    );
+    if (this.el["settings-count-gaming"]) {
+      this.el["settings-count-gaming"].textContent = gamingCount > 0 ? String(gamingCount) : "";
+    }
+    if (this.el["settings-count-room"]) {
+      this.el["settings-count-room"].textContent = roomCount > 0 ? String(roomCount) : "";
+    }
+    if (this.el["settings-count-web"]) {
+      this.el["settings-count-web"].textContent = webCount > 0 ? String(webCount) : "";
+    }
+
+    // Render chat header jump pills for every active persistent bot message (excluding Warframe which has its dedicated pill)
+    const pillsWrap = this.el["chat-bot-pills"];
+    const activePills = [];
+
+    for (const botId of botIds) {
+      const cfg = s[botId] || { enabled: false };
+      const msg = findPersistentBotMessage(this.logMessages, botId);
+      const busy = Boolean(this.builtinBots.inFlight[botId]);
+
+      if (msg) {
+        activePills.push({
+          botId,
+          msg,
+          label: this._summarizeBuiltinBotPill(botId, msg),
+        });
+      }
+
+      const badge = this.el[`setting-${botId}-status-badge`];
+      if (badge) {
+        badge.classList.remove("auto", "pending");
+        if (!cfg.enabled) {
+          badge.textContent = "Off";
+        } else if (busy) {
+          badge.textContent = "Updating…";
+          badge.classList.add("pending");
+        } else if (!inRoom) {
+          badge.textContent = "Ready · Join Room";
+          badge.classList.add("pending");
+        } else if (msg) {
+          badge.textContent = "Active · Persistent";
+          badge.classList.add("auto");
+        } else {
+          badge.textContent = "Enabled";
+          badge.classList.add("auto");
+        }
+      }
+
+      const postBtn = this.el[`btn-${botId}-post-now`];
+      if (postBtn) {
+        postBtn.disabled = !cfg.enabled || !inRoom || busy;
+      }
+      const jumpBtn = this.el[`btn-${botId}-jump-msg`];
+      if (jumpBtn) {
+        jumpBtn.classList.toggle("hidden", !msg);
+      }
+    }
+
+    if (pillsWrap) {
+      if (activePills.length === 0) {
+        pillsWrap.classList.add("hidden");
+        pillsWrap.innerHTML = "";
+      } else {
+        pillsWrap.classList.remove("hidden");
+        pillsWrap.innerHTML = "";
+        for (const item of activePills) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "chat-bot-pill";
+          btn.dataset.jumpBotId = item.botId;
+          btn.textContent = item.label;
+          btn.title = `Jump to persistent ${item.botId} card in chat`;
+          btn.addEventListener("click", () => this.jumpToPersistentBotMessage(item.botId));
+          pillsWrap.appendChild(btn);
+        }
+      }
+    }
+
+    // Keep live 1-second visual tick running iff a persistent Pomodoro card is actively running
+    this._syncPomodoroDisplayTick();
+  }
+
+  updateBuiltinBotSettings(botId, patch, { silent = false } = {}) {
+    const prevAll = this.builtinBots.settings;
+    const prev = prevAll[botId];
+    if (!prev) return;
+    const nextAll = saveBuiltinBotsSettings({
+      ...prevAll,
+      [botId]: { ...prev, ...patch },
+    });
+    this.builtinBots.settings = nextAll;
+    const next = nextAll[botId];
+    this.syncBuiltinBotsSettingsControls();
+
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    if (!next.enabled) {
+      this.syncBuiltinBotsUiStatus();
+      if (!silent && prev.enabled) {
+        this.showToast(`${botId.toUpperCase()} bot disabled`);
+      }
+      return;
+    }
+
+    if (!prev.enabled) {
+      delete this.builtinBots.dismissedByRoom[botId];
+    }
+
+    if (inRoom) {
+      const existing = findPersistentBotMessage(this.logMessages, botId);
+      if (!prev.enabled) {
+        this.ensureBuiltinBotCard(botId, { forcePost: true });
+        if (!silent) {
+          this.showToast(
+            existing
+              ? `${botId.toUpperCase()} bot enabled — synced to persistent card`
+              : `${botId.toUpperCase()} bot enabled — posted persistent card in chat`
+          );
+        }
+      } else if (existing) {
+        // User edited settings (e.g., Poll options, Cities, GitHub repo, Checklist items) while active
+        this.ensureBuiltinBotCard(botId, { forcePost: false, forceResetFromSettings: true });
+      }
+    } else if (!silent && !prev.enabled) {
+      this.showToast(`${botId.toUpperCase()} bot enabled — will appear when you join a room`);
+    }
+    this.syncBuiltinBotsUiStatus();
+  }
+
+  stopBuiltinBotsTimers() {
+    if (this.builtinBots.bootstrapTimer) {
+      clearTimeout(this.builtinBots.bootstrapTimer);
+      this.builtinBots.bootstrapTimer = null;
+    }
+    if (this._pomoTickTimer) {
+      clearInterval(this._pomoTickTimer);
+      this._pomoTickTimer = null;
+    }
+  }
+
+  scheduleBuiltinBotsBootstrap({ delayMs = 180 } = {}) {
+    if (this.builtinBots.bootstrapTimer) {
+      clearTimeout(this.builtinBots.bootstrapTimer);
+      this.builtinBots.bootstrapTimer = null;
+    }
+    const enabledBots = this._allManagedBuiltinBotIds().filter(
+      (id) => Boolean(this.builtinBots.settings[id]?.enabled)
+    );
+    if (enabledBots.length === 0) return;
+
+    const roomTopic = this.activeRoom?.topic || "__local__";
+    this.builtinBots.bootstrapTimer = setTimeout(() => {
+      this.builtinBots.bootstrapTimer = null;
+      const curTopic = this.activeRoom?.topic || "__local__";
+      if (curTopic !== roomTopic) return;
+      for (const botId of enabledBots) {
+        if (!this.builtinBots.settings[botId]?.enabled) continue;
+        if (this.builtinBots.dismissedByRoom[botId] === curTopic) continue;
+        const existing = findPersistentBotMessage(this.logMessages, botId);
+        if (!existing) {
+          this.ensureBuiltinBotCard(botId, { forcePost: true });
+        }
+      }
+    }, delayMs);
+  }
+
+  _getRoomPeerEntries() {
+    const out = [];
+    const seen = new Set();
+    const selfId = this.status?.peerId || "self";
+    const selfName = this.status?.authorName || this.profile?.authorName || "You";
+    out.push({ id: selfId, name: selfName });
+    seen.add(selfId);
+    for (const p of this.status?.peers || []) {
+      if (p?.peerId && !seen.has(p.peerId)) {
+        seen.add(p.peerId);
+        out.push({ id: p.peerId, name: p.authorName || p.name || p.peerId.slice(0, 8) });
+      }
+    }
+    return out;
+  }
+
+  _getActiveWatchTitle() {
+    const ms = this.watchTogether?.currentMedia;
+    if (ms && typeof ms.title === "string" && ms.title.trim()) {
+      return ms.title.trim();
+    }
+    return "";
+  }
+
+  _upsertPersistentBotCard(botId, card, { targetMsgId = null, forcePost = false } = {}) {
+    if (!this.wasm || !card) return false;
+    const existing =
+      (targetMsgId && this.logMessages.find((m) => m.id === targetMsgId)) ||
+      findPersistentBotMessage(this.logMessages, botId);
+
+    if (existing) {
+      const res = this.wasm.call({
+        cmd: "edit_message",
+        targetId: existing.id,
+        payload: card,
+        ts: Date.now(),
+        entropy: randomBase64Url(16),
+      });
+      this.status = res.status;
+      this.executeActions(res.actions);
+      this.renderMessageUpdate();
+      this.syncBuiltinBotsUiStatus();
+      return true;
+    }
+    if (forcePost) {
+      delete this.builtinBots.dismissedByRoom[botId];
+      this.publishMessage("bot", card);
+      this.syncBuiltinBotsUiStatus();
+      return true;
+    }
+    return false;
+  }
+
+  async ensureBuiltinBotCard(
+    botId,
+    {
+      forcePost = false,
+      forceResetFromSettings = false,
+      targetMsgId = null,
+      overrides = {},
+      bypassCache = false,
+    } = {}
+  ) {
+    if (!this.wasm) return false;
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    if (!inRoom) return false;
+    const cfg = this.builtinBots.settings[botId];
+    if (!cfg) return false;
+
+    const existingBefore =
+      (targetMsgId && this.logMessages.find((m) => m.id === targetMsgId)) ||
+      findPersistentBotMessage(this.logMessages, botId);
+
+    if (!existingBefore && !forcePost) return false;
+
+    const nowMs = Date.now();
+
+    // Pure P2P bots (instant, synchronous, ZERO external requests)
+    if (PURE_P2P_BOT_IDS.includes(botId)) {
+      const peers = this._getRoomPeerEntries();
+      const watchTitle = this._getActiveWatchTitle();
+      let card = null;
+      if (botId === POLL_BOT_ID) {
+        const st =
+          !forceResetFromSettings && existingBefore?.payload?.botState
+            ? existingBefore.payload.botState
+            : createPollStateFromSettings(cfg);
+        card = buildPollCard(st, { nowMs });
+      } else if (botId === POMODORO_BOT_ID) {
+        const st =
+          !forceResetFromSettings && existingBefore?.payload?.botState
+            ? existingBefore.payload.botState
+            : createPomodoroStateFromSettings(cfg);
+        card = buildPomodoroCard(st, { nowMs });
+      } else if (botId === CHECKLIST_BOT_ID) {
+        const st =
+          !forceResetFromSettings && existingBefore?.payload?.botState
+            ? existingBefore.payload.botState
+            : createChecklistStateFromSettings(cfg);
+        card = buildChecklistCard(st, { nowMs });
+      } else if (botId === RANDOMIZER_BOT_ID) {
+        const st =
+          !forceResetFromSettings && existingBefore?.payload?.botState
+            ? { ...existingBefore.payload.botState, options: createRandomizerStateFromSettings(cfg).options }
+            : createRandomizerStateFromSettings(cfg);
+        card = buildRandomizerCard(st, { nowMs });
+      } else if (botId === SCOREBOARD_BOT_ID) {
+        const st =
+          !forceResetFromSettings && existingBefore?.payload?.botState
+            ? existingBefore.payload.botState
+            : createScoreboardStateFromSettings(cfg, { roomPeers: peers, watchTitle });
+        card = buildScoreboardCard(st, { nowMs });
+      }
+      return this._upsertPersistentBotCard(botId, card, { targetMsgId, forcePost });
+    }
+
+    // External Public-API bots (strictly gated on enabled!)
+    if (!cfg.enabled) return false;
+
+    const reqGen = (this.builtinBots.requestGen[botId] || 0) + 1;
+    this.builtinBots.requestGen[botId] = reqGen;
+    const roomTopic = this.activeRoom?.topic || "__local__";
+    this.builtinBots.inFlight[botId] = true;
+    this.syncBuiltinBotsUiStatus();
+
+    try {
+      let card = null;
+      const p = existingBefore?.payload || {};
+      if (botId === STS2_BOT_ID) {
+        const stateInput = {
+          tab: overrides.tab || (!forceResetFromSettings && p.sts2Tab) || cfg.defaultTab,
+          character: overrides.character || (!forceResetFromSettings && p.sts2Char) || cfg.defaultCharacter,
+          bracket: overrides.bracket || (!forceResetFromSettings && p.sts2Bracket) || cfg.defaultBracket,
+          metricKind: overrides.metricKind || p.sts2MetricKind || "cards",
+          entityPath: overrides.entityPath !== undefined ? overrides.entityPath : p.sts2EntityPath || null,
+          entityName: overrides.entityName !== undefined ? overrides.entityName : p.sts2EntityName || null,
+          upgraded: overrides.upgraded !== undefined ? overrides.upgraded : Boolean(p.sts2Upgraded),
+          coopSeats: overrides.coopSeats || p.sts2CoopSeats || {},
+          lookupQuery: overrides.lookupQuery || null,
+          lookupKind: overrides.lookupKind || "auto",
+          nowMs,
+        };
+        card = await fetchSts2Card(stateInput, { bypassCache });
+      } else if (botId === WEATHER_BOT_ID) {
+        card = await fetchWeatherCard(cfg, {
+          cityIndex: overrides.cityIndex !== undefined ? overrides.cityIndex : (!forceResetFromSettings ? p.wxCityIndex || 0 : 0),
+          unitOverride: overrides.unitOverride || (!forceResetFromSettings ? p.wxUnit : null),
+          nowMs,
+        });
+      } else if (botId === WIKI_BOT_ID) {
+        card = await fetchWikiCard({
+          tab: overrides.tab || (!forceResetFromSettings && p.wikiTab) || cfg.defaultTab,
+          query: overrides.query || null,
+          nowMs,
+        });
+      } else if (botId === GITHUB_BOT_ID) {
+        card = await fetchGithubCard(cfg, {
+          tab: overrides.tab || (!forceResetFromSettings && p.ghTab) || cfg.defaultTab,
+          nowMs,
+        });
+      }
+
+      if (
+        reqGen !== this.builtinBots.requestGen[botId] ||
+        !this.builtinBots.settings[botId]?.enabled ||
+        (this.activeRoom?.topic || "__local__") !== roomTopic
+      ) {
+        return false;
+      }
+
+      return this._upsertPersistentBotCard(botId, card, { targetMsgId, forcePost });
+    } catch (err) {
+      this.addTelemetry("error", `${botId} bot update failed: ${err.message}`);
+      return false;
+    } finally {
+      if (reqGen === this.builtinBots.requestGen[botId]) {
+        this.builtinBots.inFlight[botId] = false;
+        this.syncBuiltinBotsUiStatus();
+      }
+    }
+  }
+
+  parseAnyBuiltinBotAction(msg, actionId) {
+    const botId = msg?.payload?.builtinBot;
+    if (!botId || !msg?.payload?.persistent) return null;
+    if (botId === STS2_BOT_ID) {
+      const a = parseSts2Action(actionId);
+      return a ? { botId, action: a, offlineCapable: a.kind.startsWith("coop_") || a.kind === "dismiss" } : null;
+    }
+    if (botId === WEATHER_BOT_ID) {
+      const a = parseWeatherAction(actionId);
+      return a ? { botId, action: a, offlineCapable: a.kind === "dismiss" } : null;
+    }
+    if (botId === WIKI_BOT_ID) {
+      const a = parseWikiAction(actionId);
+      return a ? { botId, action: a, offlineCapable: a.kind === "dismiss" } : null;
+    }
+    if (botId === GITHUB_BOT_ID) {
+      const a = parseGithubAction(actionId);
+      return a ? { botId, action: a, offlineCapable: a.kind === "dismiss" } : null;
+    }
+    if (botId === POLL_BOT_ID) {
+      const a = parsePollAction(actionId);
+      return a ? { botId, action: a, offlineCapable: true } : null;
+    }
+    if (botId === POMODORO_BOT_ID) {
+      const a = parsePomodoroAction(actionId);
+      return a ? { botId, action: a, offlineCapable: true } : null;
+    }
+    if (botId === CHECKLIST_BOT_ID) {
+      const a = parseChecklistAction(actionId);
+      return a ? { botId, action: a, offlineCapable: true } : null;
+    }
+    if (botId === RANDOMIZER_BOT_ID) {
+      const a = parseRandomizerAction(actionId);
+      return a ? { botId, action: a, offlineCapable: true } : null;
+    }
+    if (botId === SCOREBOARD_BOT_ID) {
+      const a = parseScoreboardAction(actionId);
+      return a ? { botId, action: a, offlineCapable: true } : null;
+    }
+    return null;
+  }
+
+  async handleBuiltinBotAction(botId, messageId, actionId, { actorPeerId = null, actorName = "Peer" } = {}) {
+    const existing =
+      (messageId && this.logMessages.find((m) => m.id === messageId)) ||
+      findPersistentBotMessage(this.logMessages, botId);
+    const parsed = existing
+      ? this.parseAnyBuiltinBotAction(existing, actionId)
+      : this.parseAnyBuiltinBotAction({ payload: { builtinBot: botId, persistent: true } }, actionId);
+    if (!parsed) return false;
+
+    const { action } = parsed;
+    if (action.kind === "dismiss") {
+      if (existing) this.deleteLogMessage(existing.id);
+      return true;
+    }
+
+    const peerId = actorPeerId || this.status?.peerId || "self";
+    const peerName = actorName || this.status?.authorName || "Peer";
+    const nowMs = Date.now();
+
+    // Pure P2P bots — immediate local state transition & E2EE edit_message
+    if (PURE_P2P_BOT_IDS.includes(botId)) {
+      const prevState = existing?.payload?.botState;
+      const roomPeers = this._getRoomPeerEntries();
+      const watchTitle = this._getActiveWatchTitle();
+      let card = null;
+      if (botId === POLL_BOT_ID) {
+        const nextState = applyPollAction(prevState, action, { peerId, peerName });
+        card = buildPollCard(nextState, { nowMs });
+      } else if (botId === POMODORO_BOT_ID) {
+        const nextState = applyPomodoroAction(prevState, action, { nowMs });
+        card = buildPomodoroCard(nextState, { nowMs });
+      } else if (botId === CHECKLIST_BOT_ID) {
+        const nextState = applyChecklistAction(prevState, action, { peerName });
+        card = buildChecklistCard(nextState, { nowMs });
+      } else if (botId === RANDOMIZER_BOT_ID) {
+        const nextState = applyRandomizerAction(prevState, action, {
+          peerName,
+          roomPeers: roomPeers.map((p) => p.name),
+          nowMs,
+        });
+        card = buildRandomizerCard(nextState, { nowMs });
+      } else if (botId === SCOREBOARD_BOT_ID) {
+        const nextState = applyScoreboardAction(prevState, action, {
+          peerId,
+          peerName,
+          roomPeers,
+          watchTitle,
+        });
+        card = buildScoreboardCard(nextState, { nowMs });
+      }
+      return this._upsertPersistentBotCard(botId, card, {
+        targetMsgId: existing?.id || null,
+        forcePost: !existing,
+      });
+    }
+
+    // StS2 Co-op Party Picker — instant 100% offline E2EE edit!
+    if (botId === STS2_BOT_ID && (action.kind === "coop_claim" || action.kind === "coop_leave" || action.kind === "coop_clear")) {
+      const p = existing?.payload || {};
+      const nextSeats = applySts2CoopAction(p.sts2CoopSeats, action, { peerId, peerName });
+      const card = buildSts2CoopCard({
+        tab: "coop",
+        character: p.sts2Char || this.builtinBots.settings.sts2.defaultCharacter,
+        bracket: p.sts2Bracket || this.builtinBots.settings.sts2.defaultBracket,
+        metricKind: p.sts2MetricKind || "cards",
+        entityPath: p.sts2EntityPath || null,
+        entityName: p.sts2EntityName || null,
+        upgraded: Boolean(p.sts2Upgraded),
+        coopSeats: nextSeats,
+        nowMs,
+      });
+      return this._upsertPersistentBotCard(STS2_BOT_ID, card, {
+        targetMsgId: existing?.id || null,
+        forcePost: !existing,
+      });
+    }
+
+    // External API bots require local setting enabled
+    if (!this.builtinBots.settings[botId]?.enabled) return false;
+
+    const p = existing?.payload || {};
+    if (botId === STS2_BOT_ID) {
+      const overrides = {};
+      if (action.kind === "tab") overrides.tab = action.tab;
+      else if (action.kind === "char") {
+        overrides.tab = "meta";
+        overrides.character = action.character;
+      } else if (action.kind === "bracket") {
+        overrides.tab = "meta";
+        overrides.bracket = action.bracket;
+      } else if (action.kind === "metric") {
+        overrides.tab = "meta";
+        overrides.metricKind = action.metricKind;
+      } else if (action.kind === "codex_random") {
+        overrides.tab = "codex";
+        overrides.entityPath = pickRandomSpotlightPath(p.sts2EntityPath);
+        overrides.upgraded = false;
+      } else if (action.kind === "codex_upgrade") {
+        overrides.tab = "codex";
+        overrides.upgraded = !Boolean(p.sts2Upgraded);
+      }
+      return this.ensureBuiltinBotCard(STS2_BOT_ID, {
+        forcePost: !existing,
+        targetMsgId: existing?.id || null,
+        overrides,
+        bypassCache: action.kind === "refresh",
+      });
+    }
+
+    if (botId === WEATHER_BOT_ID) {
+      const overrides = {};
+      if (action.kind === "city") overrides.cityIndex = action.index;
+      if (action.kind === "unit") overrides.unitOverride = action.unit;
+      return this.ensureBuiltinBotCard(WEATHER_BOT_ID, {
+        forcePost: !existing,
+        targetMsgId: existing?.id || null,
+        overrides,
+      });
+    }
+
+    if (botId === WIKI_BOT_ID) {
+      const overrides = {};
+      if (action.kind === "tab") overrides.tab = action.tab;
+      if (action.kind === "refresh" && p.wikiTab === "lookup" && p.wikiQuery) {
+        overrides.query = p.wikiQuery;
+      }
+      return this.ensureBuiltinBotCard(WIKI_BOT_ID, {
+        forcePost: !existing,
+        targetMsgId: existing?.id || null,
+        overrides,
+      });
+    }
+
+    if (botId === GITHUB_BOT_ID) {
+      const overrides = {};
+      if (action.kind === "tab") overrides.tab = action.tab;
+      return this.ensureBuiltinBotCard(GITHUB_BOT_ID, {
+        forcePost: !existing,
+        targetMsgId: existing?.id || null,
+        overrides,
+      });
+    }
+
+    return false;
+  }
+
+  handleChatTriggersForText(text, actorName = "Peer") {
+    if (typeof text !== "string" || !text.trim()) return;
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    if (!inRoom) return;
+
+    // 1. Wikipedia inline `[[wiki:Topic]]`
+    const wikiCfg = this.builtinBots.settings.wikipedia;
+    if (wikiCfg?.enabled && wikiCfg.inlineLookup) {
+      const wikiQ = extractWikiBracketQuery(text);
+      if (wikiQ) {
+        this.ensureBuiltinBotCard(WIKI_BOT_ID, {
+          forcePost: true,
+          overrides: { tab: "lookup", query: wikiQ },
+        });
+      }
+    }
+
+    // 2. Slay the Spire 2 inline `[[Card Name]]` / `[[relic:...]]` / `[[potion:...]]`
+    const sts2Cfg = this.builtinBots.settings.sts2;
+    if (sts2Cfg?.enabled && sts2Cfg.inlineLookup) {
+      const stsQ = extractSts2BracketQuery(text);
+      if (stsQ) {
+        this.ensureBuiltinBotCard(STS2_BOT_ID, {
+          forcePost: true,
+          overrides: {
+            tab: "codex",
+            lookupQuery: stsQ.query,
+            lookupKind: stsQ.kind,
+            upgraded: false,
+          },
+        });
+      }
+    }
+
+    // 3. Shared Checklist inline `+todo <item>` (updates existing card or creates one when enabled)
+    const todoText = extractChecklistAppendText(text);
+    if (todoText) {
+      const existingTodo = findPersistentBotMessage(this.logMessages, CHECKLIST_BOT_ID);
+      if (existingTodo || this.builtinBots.settings.checklist?.enabled) {
+        const prevState =
+          existingTodo?.payload?.botState ||
+          createChecklistStateFromSettings(this.builtinBots.settings.checklist);
+        const nextState = applyChecklistAction(prevState, { kind: "add", text: todoText }, { peerName: actorName });
+        const card = buildChecklistCard(nextState, { nowMs: Date.now() });
+        this._upsertPersistentBotCard(CHECKLIST_BOT_ID, card, {
+          targetMsgId: existingTodo?.id || null,
+          forcePost: true,
+        });
+      }
+    }
+  }
+
+  _scanNewIncomingChatTriggers(newMsgs) {
+    const now = Date.now();
+    for (const m of newMsgs) {
+      if (!m || !m.id || this._seenTriggerMsgIds.has(m.id)) continue;
+      this._seenTriggerMsgIds.add(m.id);
+      // Only trigger on live messages (not historical backfill > 20s old)
+      const ageMs = now - (Number(m.ts) || 0);
+      if (ageMs > 20_000 || ageMs < -30_000) continue;
+      const text = typeof m.payload?.text === "string" ? m.payload.text : "";
+      if (text) {
+        this.handleChatTriggersForText(text, m.authorName || "Peer");
+      }
+    }
+  }
+
+  jumpToPersistentBotMessage(botId) {
+    const persistentMsg = findPersistentBotMessage(this.logMessages, botId);
+    if (!persistentMsg) {
+      this.showToast(`No persistent ${botId} message in this room yet`);
+      return false;
+    }
+    if (this.settingsOpen) {
+      this.toggleSettingsModal(false);
+    }
+    if (this.rawJsonMode) {
+      this.rawJsonMode = false;
+      if (this.el["btn-toggle-raw"]) {
+        this.el["btn-toggle-raw"].textContent = "Raw JSON";
+      }
+      this.renderLog();
+    }
+    const feed = this.el["log-feed"];
+    if (!feed) return false;
+    const targetEl = feed.querySelector(`.log-entry[data-msg-id="${CSS.escape(persistentMsg.id)}"]`);
+    if (!targetEl) return false;
+    targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    targetEl.classList.remove("is-wf-highlight");
+    void targetEl.offsetWidth;
+    targetEl.classList.add("is-wf-highlight");
+    setTimeout(() => {
+      if (targetEl.isConnected) targetEl.classList.remove("is-wf-highlight");
+    }, 1500);
+    return true;
+  }
+
+  _syncPomodoroDisplayTick() {
+    const pomoMsg = findPersistentBotMessage(this.logMessages, POMODORO_BOT_ID);
+    const isRunning = Boolean(pomoMsg?.payload?.botState?.running);
+    if (!isRunning) {
+      if (this._pomoTickTimer) {
+        clearInterval(this._pomoTickTimer);
+        this._pomoTickTimer = null;
+      }
+      return;
+    }
+    if (this._pomoTickTimer) return;
+    this._pomoTickTimer = setInterval(() => {
+      const msg = findPersistentBotMessage(this.logMessages, POMODORO_BOT_ID);
+      const st = msg?.payload?.botState;
+      if (!msg || !st || !st.running) {
+        clearInterval(this._pomoTickTimer);
+        this._pomoTickTimer = null;
+        return;
+      }
+      const nowMs = Date.now();
+      const remMs = computePomodoroRemainingMs(st, nowMs);
+      const clock = formatCountdownMmSs(remMs);
+      const pill = this.el["chat-bot-pills"]?.querySelector(`[data-jump-bot-id="${POMODORO_BOT_ID}"]`);
+      if (pill) {
+        pill.textContent = summarizePomodoroPill(msg, nowMs);
+      }
+      const entryEl = this.el["log-feed"]?.querySelector(
+        `.log-entry[data-msg-id="${CSS.escape(msg.id)}"]`
+      );
+      if (entryEl) {
+        const badgeEl = entryEl.querySelector(".bot-card-badge");
+        if (badgeEl) badgeEl.textContent = `${remMs === 0 ? "DONE" : "RUNNING"} · ${clock}`;
+        const titleEl = entryEl.querySelector(".bot-card-title");
+        if (titleEl && titleEl.textContent.includes("—")) {
+          const prefix = titleEl.textContent.split("—")[0].trim();
+          titleEl.textContent = `${prefix} — ${clock}`;
+        }
+        const firstCode = entryEl.querySelector(".bot-field-value code");
+        if (firstCode) firstCode.textContent = clock;
+      }
+    }, 1000);
   }
 
   /* ================= Locally Saved Rooms & Last Joined Room ================= */
@@ -13390,6 +14467,19 @@ export class P2PDirectApp {
               act.actionId,
               act.fromName || act.fromPeerId || "Peer"
             );
+          } else {
+            const targetMsg = act.messageId
+              ? this.logMessages.find((m) => m.id === act.messageId)
+              : null;
+            const parsedBuiltin = targetMsg
+              ? this.parseAnyBuiltinBotAction(targetMsg, act.actionId)
+              : null;
+            if (parsedBuiltin) {
+              this.handleBuiltinBotAction(parsedBuiltin.botId, act.messageId, act.actionId, {
+                actorPeerId: act.fromPeerId || null,
+                actorName: act.fromName || act.fromPeerId || "Peer",
+              });
+            }
           }
           break;
         }
@@ -15823,6 +16913,11 @@ export class P2PDirectApp {
     if (existingWf && existingWf.id === msgId) {
       this.warframeBot.dismissedInRoomTopic = this.activeRoom?.topic || "__local__";
     }
+    const deletedMsg = this.logMessages.find((m) => m.id === msgId);
+    if (deletedMsg?.payload?.builtinBot && deletedMsg.payload.persistent) {
+      this.builtinBots.dismissedByRoom[deletedMsg.payload.builtinBot] =
+        this.activeRoom?.topic || "__local__";
+    }
     if (this.editingMessageId === msgId) {
       this.editingMessageId = null;
     }
@@ -15898,12 +16993,27 @@ export class P2PDirectApp {
       return;
     }
 
-    // Discord-style silent E2EE interaction callback routed to the bot peer
-    // For built-in Warframe dashboards, broadcast ("*") if the original poster is no longer connected
-    // so any other peer with the built-in Warframe bot enabled can fulfill the update seamlessly.
+    const builtinParsed = this.parseAnyBuiltinBotAction(msg, actionId);
+    if (
+      builtinParsed &&
+      (builtinParsed.offlineCapable || this.builtinBots.settings[builtinParsed.botId]?.enabled)
+    ) {
+      if (btnEl) {
+        btnEl.classList.add("is-sent");
+      }
+      this.handleBuiltinBotAction(builtinParsed.botId, msg.id, actionId, {
+        actorPeerId: this.status?.peerId || "self",
+        actorName: this.status?.authorName || "Peer",
+      });
+      return;
+    }
+
+    // Discord-style silent E2EE interaction callback routed to the bot peer.
+    // For built-in persistent dashboards, broadcast ("*") if the original poster is no longer connected
+    // so any other peer with that built-in bot enabled can fulfill the update seamlessly.
     try {
       let targetBot = msg.author || "*";
-      if (wfAction) {
+      if (wfAction || builtinParsed) {
         const authorConnected =
           targetBot === this.status?.peerId ||
           Boolean(this.status?.peers?.some((p) => p.peerId === targetBot));
@@ -16924,6 +18034,7 @@ export class P2PDirectApp {
 
   renderLog() {
     this.syncWarframeUiStatus();
+    this.syncBuiltinBotsUiStatus();
     const feed = this.el["log-feed"];
     const query = this.advancedMode ? this.el["log-search-input"].value.trim().toLowerCase() : "";
     const typeFilter = this.advancedMode ? this.el["log-type-filter"].value : "";
