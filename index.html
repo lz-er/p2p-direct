@@ -100,7 +100,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v25</strong>
+            <strong id="app-version-display">v26</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -116,6 +116,22 @@
               <line x1="4" y1="20" x2="20" y2="20" />
             </svg>
             <span>Install</span>
+          </button>
+          <button
+            type="button"
+            id="btn-settings-toggle"
+            class="top-bar-btn btn-settings"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+            aria-controls="settings-modal"
+            title="App settings &amp; built-in bots (Warframe Worldstate)"
+            aria-label="Settings"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06-2.2 2.2-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21h-3.1v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06-2.2-2.2.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3v-3.1h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06 2.2-2.2.06.06a1.65 1.65 0 0 0 1.82.33H8.4a1.65 1.65 0 0 0 1-1.51V3h3.1v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06 2.2 2.2-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21v3.1h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+            <span class="settings-btn-label">Settings</span>
           </button>
           <button
             type="button"
@@ -837,6 +853,12 @@
               <div class="chat-header-left">
                 <h2 class="panel-title" id="log-panel-title">Chat</h2>
                 <span class="panel-meta" id="chat-sync-meta">In-memory<span class="mobile-hide"> · Encrypted</span></span>
+                <button
+                  type="button"
+                  id="btn-chat-warframe-jump"
+                  class="chat-wf-pill hidden"
+                  title="Jump to the persistent Warframe Worldstate dashboard message in chat"
+                >WF · LIVE</button>
               </div>
               <div class="chat-header-right">
                 <div class="btn-row advanced-only" style="margin-top: 0">
@@ -1459,8 +1481,17 @@
               </div>
             </div>
             <div class="panel-body bot-setup-body" id="adv-body-bot">
+              <div class="adv-builtin-bot-row">
+                <div class="adv-builtin-bot-copy">
+                  <strong>Built-in Warframe Bot</strong>
+                  <span id="adv-wf-status-text">Off · Persistent dashboard message</span>
+                </div>
+                <button type="button" id="btn-adv-open-wf-settings" class="btn btn-sm">
+                  Configure
+                </button>
+              </div>
               <p class="step-hint">
-                Bots join as normal encrypted peers using this room link (no roles or permissions needed).
+                Custom bots join as normal encrypted peers using this room link (no roles or permissions needed).
               </p>
               <textarea
                 id="bot-cli-command"
@@ -1580,7 +1611,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v25</span>
+                <span id="adv-version-number">v26</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>
@@ -1598,6 +1629,111 @@
           </footer>
         </aside>
       </main>
+    </div>
+
+    <!-- App & Built-in Bots Settings Modal -->
+    <div
+      id="settings-modal"
+      class="settings-modal hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-modal-title"
+    >
+      <div class="settings-modal-backdrop" id="settings-modal-backdrop"></div>
+      <div class="settings-modal-card">
+        <div class="settings-modal-head">
+          <div class="settings-modal-titles">
+            <span class="settings-modal-kicker">PREFERENCES &amp; INTEGRATIONS</span>
+            <h2 class="settings-modal-title" id="settings-modal-title">Settings</h2>
+          </div>
+          <button
+            type="button"
+            id="btn-settings-close"
+            class="btn btn-sm"
+            aria-label="Close settings"
+          >
+            Done
+          </button>
+        </div>
+
+        <div class="settings-modal-body">
+          <section class="settings-section" aria-labelledby="settings-wf-heading">
+            <div class="settings-section-head">
+              <span class="settings-section-kicker" id="settings-wf-heading">Built-in Bots</span>
+              <span class="badge" id="setting-wf-status-badge">Off</span>
+            </div>
+
+            <div class="settings-bot-card" id="settings-wf-card">
+              <label class="audio-switch-row settings-switch-row" for="setting-wf-enabled">
+                <input id="setting-wf-enabled" class="metro-switch" type="checkbox" />
+                <span class="audio-switch-copy">
+                  <span class="audio-switch-title">Warframe Worldstate Bot</span>
+                  <span class="audio-switch-desc">
+                    Maintains one persistent interactive dashboard message in chat (Open Worlds, Fissures, Sortie &amp; Archon, Baro, Invasions) — updated in place via edits instead of commands.
+                  </span>
+                </span>
+              </label>
+
+              <div class="settings-grid" id="settings-wf-options">
+                <div class="settings-field">
+                  <label class="settings-label" for="setting-wf-platform">Platform</label>
+                  <select id="setting-wf-platform" class="select-input">
+                    <option value="pc">PC (Cross-Play)</option>
+                    <option value="ps4">PlayStation</option>
+                    <option value="xb1">Xbox</option>
+                    <option value="swi">Nintendo Switch</option>
+                  </select>
+                </div>
+
+                <div class="settings-field">
+                  <label class="settings-label" for="setting-wf-default-view">Default Tab</label>
+                  <select id="setting-wf-default-view" class="select-input">
+                    <option value="cycles">Open Worlds &amp; Cycles</option>
+                    <option value="fissures">Void Fissures</option>
+                    <option value="sortie">Sortie &amp; Archon Hunt</option>
+                    <option value="baro">Baro &amp; Steel Path</option>
+                    <option value="invasions">Alerts &amp; Invasions</option>
+                  </select>
+                </div>
+
+                <div class="settings-field">
+                  <label class="settings-label" for="setting-wf-refresh">Auto-Refresh</label>
+                  <select id="setting-wf-refresh" class="select-input">
+                    <option value="0">Manual only</option>
+                    <option value="60">Every 1 min</option>
+                    <option value="120" selected>Every 2 min</option>
+                    <option value="300">Every 5 min</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="settings-wf-actions">
+                <button
+                  type="button"
+                  id="btn-wf-post-now"
+                  class="btn btn-sm btn-primary"
+                  disabled
+                  title="Post or refresh the persistent Warframe dashboard message in the active room"
+                >
+                  ↻ Post / Refresh Dashboard
+                </button>
+                <button
+                  type="button"
+                  id="btn-wf-jump-msg"
+                  class="btn btn-sm hidden"
+                  title="Scroll chat straight to the persistent Warframe dashboard message"
+                >
+                  Jump to Message
+                </button>
+              </div>
+
+              <p class="settings-privacy-note" id="setting-wf-note">
+                Zero requests are sent to <code>api.warframestat.us</code> while disabled. Anyone in the room can click tabs or Refresh on the persistent card.
+              </p>
+            </div>
+          </section>
+        </div>
+      </div>
     </div>
 
     <!-- Media Lightbox Modal (Images, Animated GIFs & Videos) -->

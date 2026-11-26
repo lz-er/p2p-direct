@@ -19,6 +19,7 @@ import {
   loadLastJoinedRoom,
   loadSavedRooms,
   loadSessionAudioSettings,
+  loadWarframeBotSettings,
   purgeLegacyClientStorage,
   randomBase64Url,
   removeSavedRoom,
@@ -26,8 +27,16 @@ import {
   saveLastJoinedRoom,
   saveSessionAudioSettings,
   saveSessionAuthorName,
+  saveWarframeBotSettings,
   upsertSavedRoom,
 } from "./storage.js";
+import {
+  fetchWarframeWorldstateCard,
+  findPersistentWarframeMessage,
+  isPersistentWarframeMessage,
+  parseWarframeAction,
+  summarizeWarframePill,
+} from "./warframe_bot.js";
 import {
   MediaSyncController,
   WatchTraceRecorder,
@@ -51,7 +60,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v25";
+export const APP_VERSION = "v26";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -1913,6 +1922,15 @@ export class P2PDirectApp {
       supported: false,
     });
     this._checkingAppUpdate = false;
+    this.settingsOpen = false;
+    this.warframeBot = {
+      settings: loadWarframeBotSettings(),
+      inFlight: false,
+      requestGen: 0,
+      bootstrapTimer: null,
+      refreshTimer: null,
+      dismissedInRoomTopic: null,
+    };
     this.el = {};
   }
 
@@ -2128,6 +2146,22 @@ export class P2PDirectApp {
       "topology-svg",
       "topology-inspector",
       "profile-slot-label",
+      "btn-settings-toggle",
+      "settings-modal",
+      "settings-modal-backdrop",
+      "btn-settings-close",
+      "setting-wf-status-badge",
+      "setting-wf-enabled",
+      "settings-wf-options",
+      "setting-wf-platform",
+      "setting-wf-default-view",
+      "setting-wf-refresh",
+      "btn-wf-post-now",
+      "btn-wf-jump-msg",
+      "setting-wf-note",
+      "btn-chat-warframe-jump",
+      "adv-wf-status-text",
+      "btn-adv-open-wf-settings",
       "auto-mesh-toggle",
       "auto-mesh-badge",
       "peer-list",
@@ -2626,6 +2660,63 @@ export class P2PDirectApp {
       });
     }
 
+    // Settings Modal & Built-in Warframe Worldstate Bot controls
+    if (this.el["btn-settings-toggle"]) {
+      this.el["btn-settings-toggle"].addEventListener("click", () => this.toggleSettingsModal());
+    }
+    if (this.el["btn-settings-close"]) {
+      this.el["btn-settings-close"].addEventListener("click", () => this.toggleSettingsModal(false));
+    }
+    if (this.el["settings-modal-backdrop"]) {
+      this.el["settings-modal-backdrop"].addEventListener("click", () =>
+        this.toggleSettingsModal(false)
+      );
+    }
+    if (this.el["btn-adv-open-wf-settings"]) {
+      this.el["btn-adv-open-wf-settings"].addEventListener("click", () =>
+        this.toggleSettingsModal(true)
+      );
+    }
+    if (this.el["btn-chat-warframe-jump"]) {
+      this.el["btn-chat-warframe-jump"].addEventListener("click", () =>
+        this.jumpToPersistentWarframeMessage()
+      );
+    }
+    if (this.el["setting-wf-enabled"]) {
+      this.el["setting-wf-enabled"].addEventListener("change", () => {
+        this.updateWarframeBotSettings({ enabled: this.el["setting-wf-enabled"].checked });
+      });
+    }
+    if (this.el["setting-wf-platform"]) {
+      this.el["setting-wf-platform"].addEventListener("change", () => {
+        this.updateWarframeBotSettings({ platform: this.el["setting-wf-platform"].value });
+      });
+    }
+    if (this.el["setting-wf-default-view"]) {
+      this.el["setting-wf-default-view"].addEventListener("change", () => {
+        this.updateWarframeBotSettings({ defaultView: this.el["setting-wf-default-view"].value });
+      });
+    }
+    if (this.el["setting-wf-refresh"]) {
+      this.el["setting-wf-refresh"].addEventListener("change", () => {
+        this.updateWarframeBotSettings({
+          autoRefreshSec: Number(this.el["setting-wf-refresh"].value) || 0,
+        });
+      });
+    }
+    if (this.el["btn-wf-post-now"]) {
+      this.el["btn-wf-post-now"].addEventListener("click", () => {
+        this.ensureWarframeDashboard({ forcePost: true }).then((ok) => {
+          if (ok) this.jumpToPersistentWarframeMessage();
+        });
+      });
+    }
+    if (this.el["btn-wf-jump-msg"]) {
+      this.el["btn-wf-jump-msg"].addEventListener("click", () => {
+        this.jumpToPersistentWarframeMessage();
+      });
+    }
+
     // Collapsible & pinnable Advanced rail section headers
     for (const btn of document.querySelectorAll("[data-toggle-panel]")) {
       btn.addEventListener("click", () => {
@@ -3024,6 +3115,10 @@ export class P2PDirectApp {
       }
     });
     document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && this.settingsOpen) {
+        this.toggleSettingsModal(false);
+        return;
+      }
       if (this.el["image-lightbox"].classList.contains("hidden")) return;
       if (ev.key === "Escape") {
         this.closeLightbox();
@@ -3079,6 +3174,16 @@ export class P2PDirectApp {
       this.pendingImages = [];
       this.renderImageTray();
       this.el["composer-error"].classList.add("hidden");
+      if (
+        this.warframeBot.settings.enabled &&
+        images.length === 0 &&
+        videos.length === 0 &&
+        /^!(?:wf|warframe)$/i.test(text)
+      ) {
+        this.ensureWarframeDashboard({ forcePost: true }).then((ok) => {
+          if (ok) this.jumpToPersistentWarframeMessage();
+        });
+      }
     });
 
     this.el["json-composer-form"].addEventListener("submit", (ev) => {
@@ -3242,6 +3347,8 @@ export class P2PDirectApp {
     this.el["auto-mesh-toggle"].checked = this.status.autoMeshEnabled;
     this.el["auto-mesh-badge"].textContent = this.status.autoMeshEnabled ? "ON" : "OFF";
     this.syncAudioSettingsUI();
+    this.syncWarframeSettingsControls();
+    this.syncWarframeUiStatus();
 
     this.setupBroadcastChannel();
     this.startKeepaliveWorker();
@@ -7535,6 +7642,11 @@ export class P2PDirectApp {
     }
     this.renderAll();
 
+    this.warframeBot.dismissedInRoomTopic = null;
+    if (this.warframeBot.settings.enabled) {
+      this.scheduleWarframeBotBootstrap({ delayMs: joined ? 1600 : 120 });
+    }
+
     this.addTelemetry(
       "room",
       `${joined ? "Joined" : "Created"} long-lived room "${displayName}" (topic ${encoded.roomTopic.slice(0, 10)}…)`
@@ -7549,6 +7661,8 @@ export class P2PDirectApp {
   }
 
   leaveLongLivedRoom({ silent = false } = {}) {
+    this.stopWarframeBotTimers();
+    this.warframeBot.dismissedInRoomTopic = null;
     this.stopPreCallMicMonitor();
     this.closeLightbox();
     for (const item of this.pendingImages) {
@@ -7579,6 +7693,381 @@ export class P2PDirectApp {
     if (!silent) {
       this.showToast("Left room — local messages cleared");
     }
+  }
+
+  /* ================= Settings Modal & Built-in Warframe Worldstate Bot ================= */
+
+  toggleSettingsModal(forceOpen = null) {
+    const next = typeof forceOpen === "boolean" ? forceOpen : !this.settingsOpen;
+    this.settingsOpen = next;
+    if (this.el["settings-modal"]) {
+      this.el["settings-modal"].classList.toggle("hidden", !next);
+    }
+    if (this.el["btn-settings-toggle"]) {
+      this.el["btn-settings-toggle"].setAttribute("aria-expanded", next ? "true" : "false");
+      this.el["btn-settings-toggle"].classList.toggle("is-active", next);
+    }
+    if (next) {
+      this.syncWarframeSettingsControls();
+      this.syncWarframeUiStatus();
+    }
+  }
+
+  syncWarframeSettingsControls() {
+    const s = this.warframeBot.settings;
+    if (this.el["setting-wf-enabled"]) {
+      this.el["setting-wf-enabled"].checked = Boolean(s.enabled);
+    }
+    if (this.el["setting-wf-platform"]) {
+      this.el["setting-wf-platform"].value = s.platform;
+    }
+    if (this.el["setting-wf-default-view"]) {
+      this.el["setting-wf-default-view"].value = s.defaultView;
+    }
+    if (this.el["setting-wf-refresh"]) {
+      this.el["setting-wf-refresh"].value = String(s.autoRefreshSec);
+    }
+    if (this.el["settings-wf-options"]) {
+      this.el["settings-wf-options"].classList.toggle("is-disabled", !s.enabled);
+    }
+  }
+
+  syncWarframeUiStatus() {
+    const s = this.warframeBot.settings;
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    const persistentMsg = findPersistentWarframeMessage(this.logMessages);
+
+    if (this.el["btn-chat-warframe-jump"]) {
+      if (persistentMsg) {
+        this.el["btn-chat-warframe-jump"].textContent = summarizeWarframePill(persistentMsg);
+        this.el["btn-chat-warframe-jump"].classList.remove("hidden");
+      } else {
+        this.el["btn-chat-warframe-jump"].classList.add("hidden");
+      }
+    }
+
+    if (this.el["btn-settings-toggle"]) {
+      this.el["btn-settings-toggle"].classList.toggle("has-active-bot", Boolean(s.enabled));
+    }
+
+    if (this.el["setting-wf-status-badge"]) {
+      const badge = this.el["setting-wf-status-badge"];
+      badge.classList.remove("auto", "pending");
+      if (!s.enabled) {
+        badge.textContent = "Off";
+      } else if (this.warframeBot.inFlight) {
+        badge.textContent = "Updating…";
+        badge.classList.add("pending");
+      } else if (!inRoom) {
+        badge.textContent = "Ready · Join Room";
+        badge.classList.add("pending");
+      } else if (persistentMsg) {
+        badge.textContent = "Active · Persistent";
+        badge.classList.add("auto");
+      } else {
+        badge.textContent = "Enabled";
+        badge.classList.add("auto");
+      }
+    }
+
+    if (this.el["btn-wf-post-now"]) {
+      this.el["btn-wf-post-now"].disabled = !s.enabled || !inRoom || this.warframeBot.inFlight;
+      this.el["btn-wf-post-now"].textContent = persistentMsg
+        ? "↻ Refresh Persistent Dashboard"
+        : "+ Post Persistent Dashboard";
+    }
+
+    if (this.el["btn-wf-jump-msg"]) {
+      this.el["btn-wf-jump-msg"].classList.toggle("hidden", !persistentMsg);
+    }
+
+    if (this.el["adv-wf-status-text"]) {
+      if (!s.enabled) {
+        this.el["adv-wf-status-text"].textContent = "Off · Persistent dashboard message";
+      } else if (persistentMsg) {
+        this.el["adv-wf-status-text"].textContent =
+          `Active (${s.platform.toUpperCase()}) · Updating 1 persistent card`;
+      } else {
+        this.el["adv-wf-status-text"].textContent =
+          `Enabled (${s.platform.toUpperCase()}) · Ready in room`;
+      }
+    }
+  }
+
+  updateWarframeBotSettings(patch, { silent = false } = {}) {
+    const prev = this.warframeBot.settings;
+    const next = saveWarframeBotSettings({ ...prev, ...patch });
+    this.warframeBot.settings = next;
+    this.syncWarframeSettingsControls();
+
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    if (!next.enabled) {
+      this.stopWarframeBotTimers();
+      this.syncWarframeUiStatus();
+      if (!silent && prev.enabled) {
+        this.showToast("Warframe bot disabled (no external Warframe requests)");
+      }
+      return;
+    }
+
+    // Re-enabling explicitly clears any prior room dismissal
+    if (!prev.enabled) {
+      this.warframeBot.dismissedInRoomTopic = null;
+    }
+
+    if (inRoom) {
+      const existing = findPersistentWarframeMessage(this.logMessages);
+      const settingsChanged =
+        prev.platform !== next.platform ||
+        prev.defaultView !== next.defaultView ||
+        prev.autoRefreshSec !== next.autoRefreshSec;
+      this.startWarframeAutoRefreshTimer();
+      if (!prev.enabled) {
+        this.ensureWarframeDashboard({
+          forcePost: true,
+          view: existing?.payload?.wfView || next.defaultView,
+          filter: existing?.payload?.wfFilter || "normal",
+        });
+        if (!silent) {
+          this.showToast(
+            existing
+              ? "Warframe bot enabled — syncing existing persistent dashboard"
+              : "Warframe bot enabled — posting persistent dashboard in chat"
+          );
+        }
+      } else if (settingsChanged && existing) {
+        const targetView =
+          prev.defaultView !== next.defaultView
+            ? next.defaultView
+            : existing.payload?.wfView || next.defaultView;
+        this.ensureWarframeDashboard({
+          forcePost: false,
+          view: targetView,
+          filter: existing.payload?.wfFilter || "normal",
+        });
+      }
+    } else if (!silent && !prev.enabled) {
+      this.showToast("Warframe bot enabled — dashboard will appear when you join a room");
+    }
+    this.syncWarframeUiStatus();
+  }
+
+  stopWarframeBotTimers() {
+    if (this.warframeBot.bootstrapTimer) {
+      clearTimeout(this.warframeBot.bootstrapTimer);
+      this.warframeBot.bootstrapTimer = null;
+    }
+    if (this.warframeBot.refreshTimer) {
+      clearInterval(this.warframeBot.refreshTimer);
+      this.warframeBot.refreshTimer = null;
+    }
+  }
+
+  scheduleWarframeBotBootstrap({ delayMs = 120 } = {}) {
+    this.stopWarframeBotTimers();
+    if (!this.warframeBot.settings.enabled) return;
+    const roomTopic = this.activeRoom?.topic || "__local__";
+    this.warframeBot.bootstrapTimer = setTimeout(() => {
+      this.warframeBot.bootstrapTimer = null;
+      if (!this.warframeBot.settings.enabled) return;
+      const curTopic = this.activeRoom?.topic || "__local__";
+      if (curTopic !== roomTopic) return;
+      if (this.warframeBot.dismissedInRoomTopic === curTopic) return;
+      const existing = findPersistentWarframeMessage(this.logMessages);
+      if (existing) {
+        // Adopt existing persistent dashboard from peers cleanly; only refresh if stale (>90s)
+        const updatedAt = Number(existing.payload?.wfUpdatedAt) || Number(existing.ts) || 0;
+        if (Date.now() - updatedAt > 90_000) {
+          this.ensureWarframeDashboard({
+            forcePost: false,
+            view: existing.payload?.wfView || this.warframeBot.settings.defaultView,
+            filter: existing.payload?.wfFilter || "normal",
+            isAuto: true,
+          });
+        }
+      } else {
+        this.ensureWarframeDashboard({
+          forcePost: true,
+          view: this.warframeBot.settings.defaultView,
+          filter: "normal",
+          isAuto: true,
+        });
+      }
+      this.startWarframeAutoRefreshTimer();
+    }, delayMs);
+  }
+
+  startWarframeAutoRefreshTimer() {
+    if (this.warframeBot.refreshTimer) {
+      clearInterval(this.warframeBot.refreshTimer);
+      this.warframeBot.refreshTimer = null;
+    }
+    const sec = Number(this.warframeBot.settings.autoRefreshSec) || 0;
+    if (!this.warframeBot.settings.enabled || sec <= 0) return;
+    const intervalMs = Math.max(30_000, sec * 1000);
+    this.warframeBot.refreshTimer = setInterval(() => {
+      if (!this.warframeBot.settings.enabled) return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+      if (!inRoom) return;
+      const existing = findPersistentWarframeMessage(this.logMessages);
+      if (!existing) return;
+      // Multi-peer dedup: if any peer already refreshed this persistent message recently, skip this tick
+      const lastUpdated = Number(existing.payload?.wfUpdatedAt) || 0;
+      const minGap = Math.max(25_000, Math.round(intervalMs * 0.75));
+      if (lastUpdated > 0 && Date.now() - lastUpdated < minGap) return;
+      this.ensureWarframeDashboard({
+        forcePost: false,
+        view: existing.payload?.wfView || this.warframeBot.settings.defaultView,
+        filter: existing.payload?.wfFilter || "normal",
+        isAuto: true,
+      });
+    }, intervalMs);
+  }
+
+  async ensureWarframeDashboard({
+    forcePost = false,
+    view = null,
+    filter = null,
+    targetMsgId = null,
+    isAuto = false,
+  } = {}) {
+    if (!this.wasm || !this.warframeBot.settings.enabled) return false;
+    const inRoom = Boolean(this.activeRoom || this.directPeers.size > 0);
+    if (!inRoom) return false;
+
+    const reqGen = ++this.warframeBot.requestGen;
+    const roomTopic = this.activeRoom?.topic || "__local__";
+    const existingBefore =
+      (targetMsgId && this.logMessages.find((m) => m.id === targetMsgId)) ||
+      findPersistentWarframeMessage(this.logMessages);
+
+    if (!existingBefore && !forcePost) {
+      return false;
+    }
+
+    const activeView = view || existingBefore?.payload?.wfView || this.warframeBot.settings.defaultView;
+    const activeFilter = filter || existingBefore?.payload?.wfFilter || "normal";
+
+    this.warframeBot.inFlight = true;
+    this.syncWarframeUiStatus();
+
+    try {
+      const card = await fetchWarframeWorldstateCard(activeView, {
+        platform: this.warframeBot.settings.platform,
+        fissureFilter: activeFilter,
+        autoRefreshSec: this.warframeBot.settings.autoRefreshSec,
+        nowMs: Date.now(),
+      });
+
+      // Drop stale response if user left room, disabled bot, or triggered a newer tab switch
+      if (
+        reqGen !== this.warframeBot.requestGen ||
+        !this.warframeBot.settings.enabled ||
+        (this.activeRoom?.topic || "__local__") !== roomTopic
+      ) {
+        return false;
+      }
+
+      // Re-check room log right before writing in case a peer posted a persistent dashboard while fetching
+      const existingNow =
+        (targetMsgId && this.logMessages.find((m) => m.id === targetMsgId)) ||
+        findPersistentWarframeMessage(this.logMessages);
+
+      if (existingNow) {
+        const res = this.wasm.call({
+          cmd: "edit_message",
+          targetId: existingNow.id,
+          payload: card,
+          ts: Date.now(),
+          entropy: randomBase64Url(16),
+        });
+        this.status = res.status;
+        this.executeActions(res.actions);
+        this.renderMessageUpdate();
+      } else if (forcePost) {
+        this.warframeBot.dismissedInRoomTopic = null;
+        this.publishMessage("bot", card);
+      }
+
+      this.addTelemetry(
+        "warframe_bot",
+        `${isAuto ? "Auto-refreshed" : "Updated"} persistent Warframe card (${card.wfView})`
+      );
+      return true;
+    } catch (err) {
+      this.addTelemetry("error", `Warframe bot update failed: ${err.message}`);
+      return false;
+    } finally {
+      if (reqGen === this.warframeBot.requestGen) {
+        this.warframeBot.inFlight = false;
+        this.syncWarframeUiStatus();
+      }
+    }
+  }
+
+  async handleWarframeBotAction(messageId, actionId, actorName = "Peer") {
+    if (!this.warframeBot.settings.enabled) return;
+    const parsed = parseWarframeAction(actionId);
+    if (!parsed) return;
+
+    const existing =
+      (messageId && this.logMessages.find((m) => m.id === messageId)) ||
+      findPersistentWarframeMessage(this.logMessages);
+
+    if (parsed.kind === "dismiss") {
+      if (existing) {
+        this.deleteLogMessage(existing.id);
+      }
+      return;
+    }
+
+    const currentView = existing?.payload?.wfView || this.warframeBot.settings.defaultView;
+    const currentFilter = existing?.payload?.wfFilter || "normal";
+    const nextView = parsed.view || currentView;
+    const nextFilter = parsed.kind === "filter" ? parsed.filter : currentFilter;
+
+    this.addTelemetry(
+      "warframe_bot",
+      `Handling "${actionId}" from ${actorName} → ${nextView}${nextView === "fissures" ? ` (${nextFilter})` : ""}`
+    );
+
+    await this.ensureWarframeDashboard({
+      forcePost: !existing,
+      view: nextView,
+      filter: nextFilter,
+      targetMsgId: existing?.id || null,
+    });
+  }
+
+  jumpToPersistentWarframeMessage() {
+    const persistentMsg = findPersistentWarframeMessage(this.logMessages);
+    if (!persistentMsg) {
+      this.showToast("No persistent Warframe message in this room yet");
+      return false;
+    }
+    if (this.settingsOpen) {
+      this.toggleSettingsModal(false);
+    }
+    if (this.rawJsonMode) {
+      this.rawJsonMode = false;
+      if (this.el["btn-toggle-raw"]) {
+        this.el["btn-toggle-raw"].textContent = "Raw JSON";
+      }
+      this.renderLog();
+    }
+    const feed = this.el["log-feed"];
+    if (!feed) return false;
+    const targetEl = feed.querySelector(`.log-entry[data-msg-id="${CSS.escape(persistentMsg.id)}"]`);
+    if (!targetEl) return false;
+    targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    targetEl.classList.remove("is-wf-highlight");
+    void targetEl.offsetWidth;
+    targetEl.classList.add("is-wf-highlight");
+    setTimeout(() => {
+      if (targetEl.isConnected) targetEl.classList.remove("is-wf-highlight");
+    }, 1500);
+    return true;
   }
 
   /* ================= Locally Saved Rooms & Last Joined Room ================= */
@@ -12895,6 +13384,13 @@ export class P2PDirectApp {
             "bot_action",
             `${act.fromName || act.fromPeerId} clicked "${act.label || act.actionId}"`
           );
+          if (this.warframeBot.settings.enabled && parseWarframeAction(act.actionId)) {
+            this.handleWarframeBotAction(
+              act.messageId,
+              act.actionId,
+              act.fromName || act.fromPeerId || "Peer"
+            );
+          }
           break;
         }
         case "media_sync": {
@@ -15323,6 +15819,10 @@ export class P2PDirectApp {
 
   deleteLogMessage(msgId) {
     if (!msgId || !this.wasm) return;
+    const existingWf = findPersistentWarframeMessage(this.logMessages);
+    if (existingWf && existingWf.id === msgId) {
+      this.warframeBot.dismissedInRoomTopic = this.activeRoom?.topic || "__local__";
+    }
     if (this.editingMessageId === msgId) {
       this.editingMessageId = null;
     }
@@ -15389,9 +15889,28 @@ export class P2PDirectApp {
       return;
     }
 
+    const wfAction = isPersistentWarframeMessage(msg) ? parseWarframeAction(actionId) : null;
+    if (wfAction && this.warframeBot.settings.enabled) {
+      if (btnEl) {
+        btnEl.classList.add("is-sent");
+      }
+      this.handleWarframeBotAction(msg.id, actionId, this.status?.authorName || "Peer");
+      return;
+    }
+
     // Discord-style silent E2EE interaction callback routed to the bot peer
+    // For built-in Warframe dashboards, broadcast ("*") if the original poster is no longer connected
+    // so any other peer with the built-in Warframe bot enabled can fulfill the update seamlessly.
     try {
-      const targetBot = msg.author || "*";
+      let targetBot = msg.author || "*";
+      if (wfAction) {
+        const authorConnected =
+          targetBot === this.status?.peerId ||
+          Boolean(this.status?.peers?.some((p) => p.peerId === targetBot));
+        if (!authorConnected) {
+          targetBot = "*";
+        }
+      }
       const res = this.wasm.call({
         cmd: "send_bot_action",
         toPeerId: targetBot,
@@ -15843,8 +16362,11 @@ export class P2PDirectApp {
       `;
     }
 
+    const isPersistentWf = isPersistentWarframeMessage(m);
     const showBotTag = isBotMsg || this.isPeerBot(m.author);
-    const botTagHtml = showBotTag ? '<span class="bot-tag">BOT</span>' : "";
+    const botTagHtml = showBotTag
+      ? `<span class="bot-tag">BOT</span>${isPersistentWf ? '<span class="bot-tag wf-persistent-tag">PERSISTENT</span>' : ""}`
+      : "";
     const typeTag =
       isChat || isBotMsg ? "" : `<span class="log-type-tag">${escapeHtml(m.type)}</span>`;
 
@@ -15875,7 +16397,7 @@ export class P2PDirectApp {
     const effectiveRev = `${messageEditRev(m)}:${isEditing ? "edit" : "view"}:${isHistOpen ? "h1" : "h0"}`;
 
     const article = document.createElement("article");
-    article.className = `log-entry${isSelf ? " is-self" : ""}${isBotMsg ? " is-bot-entry" : ""}${isEditing ? " is-editing" : ""}${isNew ? " is-new" : ""}`;
+    article.className = `log-entry${isSelf ? " is-self" : ""}${isBotMsg ? " is-bot-entry" : ""}${isPersistentWf ? " is-persistent-wf" : ""}${isEditing ? " is-editing" : ""}${isNew ? " is-new" : ""}`;
     article.dataset.msgId = m.id;
     article.dataset.rev = effectiveRev;
     article.innerHTML = `
@@ -16401,6 +16923,7 @@ export class P2PDirectApp {
   }
 
   renderLog() {
+    this.syncWarframeUiStatus();
     const feed = this.el["log-feed"];
     const query = this.advancedMode ? this.el["log-search-input"].value.trim().toLowerCase() : "";
     const typeFilter = this.advancedMode ? this.el["log-type-filter"].value : "";

@@ -8,12 +8,15 @@
  * users can rejoin it manually in one click (never auto-joined).
  */
 
+import { sanitizeWarframeSettings } from "./warframe_bot.js";
+
 const LEGACY_DB_NAME = "p2p_direct_mesh_v2";
 const LEGACY_LS_PREFIX = "p2p_direct_profile_v2:";
 const SESSION_NAME_KEY = "p2p-direct-name";
 const SESSION_AUDIO_KEY = "p2p-direct-audio-settings";
 export const SAVED_ROOMS_KEY = "p2p-direct-saved-rooms-v1";
 export const LAST_ROOM_KEY = "p2p-direct-last-room-v1";
+export const WARFRAME_BOT_SETTINGS_KEY = "p2p-direct-warframe-bot-v1";
 const MAX_SAVED_ROOMS = 50;
 
 export const DEFAULT_AUDIO_SETTINGS = Object.freeze({
@@ -475,4 +478,37 @@ export function createEphemeralProfile() {
     meshKey: randomBase64Url(32),
     passphraseMode: false,
   };
+}
+
+/**
+ * Loads local UI settings for the optional Built-in Warframe Worldstate Bot.
+ * Disabled by default so zero external Warframe API requests occur unless enabled.
+ */
+export function loadWarframeBotSettings() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem(WARFRAME_BOT_SETTINGS_KEY);
+      if (raw) {
+        return sanitizeWarframeSettings(JSON.parse(raw));
+      }
+    }
+  } catch {
+    // ignore storage restrictions
+  }
+  return sanitizeWarframeSettings(null);
+}
+
+/**
+ * Saves local UI settings for the optional Built-in Warframe Worldstate Bot.
+ */
+export function saveWarframeBotSettings(settings) {
+  const clean = sanitizeWarframeSettings(settings);
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(WARFRAME_BOT_SETTINGS_KEY, JSON.stringify(clean));
+    }
+  } catch {
+    // ignore storage restrictions
+  }
+  return clean;
 }
