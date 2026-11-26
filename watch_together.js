@@ -717,25 +717,52 @@ function loadSpotifyIframeApi() {
   return spotifyApiPromise;
 }
 
+export const YOUTUBE_EMBED_ALLOW =
+  "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share; fullscreen; storage-access";
 export const SPOTIFY_EMBED_ALLOW =
   "autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture; storage-access";
+export const SOUNDCLOUD_EMBED_ALLOW =
+  "autoplay; encrypted-media; fullscreen; picture-in-picture; storage-access";
+export const TWITCH_EMBED_ALLOW =
+  "autoplay; encrypted-media; fullscreen; picture-in-picture; storage-access";
 
 /**
- * Ensures a Spotify embed `<iframe>` has the exact permissions and attributes needed to reuse
- * the user's logged-in Spotify browser session and stream DRM-protected full tracks.
+ * Returns the clean Permissions-Policy `allow` attribute for a Watch Together provider iframe.
  */
-export function configureSpotifyIframeForSession(iframe) {
+export function getEmbedAllowPolicy(provider) {
+  if (provider === "youtube" || provider === "ytmusic") return YOUTUBE_EMBED_ALLOW;
+  if (provider === "soundcloud") return SOUNDCLOUD_EMBED_ALLOW;
+  if (provider === "twitch") return TWITCH_EMBED_ALLOW;
+  return SPOTIFY_EMBED_ALLOW;
+}
+
+/**
+ * Configures any Watch Together provider `<iframe>` with explicit referrer & session/DRM
+ * permissions (`strict-origin-when-cross-origin`, `storage-access`, etc.) and strips legacy
+ * `sandbox` / `credentialless` / duplicate `allowfullscreen` attributes.
+ */
+export function configureEmbedIframeForSession(iframe, provider = "spotify") {
   if (!iframe || typeof iframe.setAttribute !== "function") return;
-  iframe.setAttribute("allow", SPOTIFY_EMBED_ALLOW);
+  iframe.setAttribute("allow", getEmbedAllowPolicy(provider));
   iframe.setAttribute("loading", "eager");
   iframe.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
   if (typeof iframe.getAttribute !== "function" || !iframe.getAttribute("title")) {
-    iframe.setAttribute("title", "Spotify player");
+    const title =
+      provider === "ytmusic"
+        ? "YouTube Music player"
+        : provider === "youtube"
+          ? "YouTube player"
+          : provider === "soundcloud"
+            ? "SoundCloud player"
+            : provider === "twitch"
+              ? "Twitch player"
+              : "Spotify player";
+    iframe.setAttribute("title", title);
   }
   if (typeof iframe.removeAttribute === "function") {
     // `allow` already includes `fullscreen`; removing legacy `allowfullscreen` avoids browser warnings.
     iframe.removeAttribute("allowfullscreen");
-    // Never sandbox or make credentialless — Spotify embeds require browser cookies & EME DRM.
+    // Never sandbox or make credentialless — embeds require browser cookies, Referer, & EME DRM.
     iframe.removeAttribute("sandbox");
     iframe.removeAttribute("credentialless");
   }
@@ -746,6 +773,282 @@ export function configureSpotifyIframeForSession(iframe) {
   } catch {
     // ignore readonly property in mocked/older environments
   }
+}
+
+/**
+ * Ensures a Spotify embed `<iframe>` has the exact permissions and attributes needed to reuse
+ * the user's logged-in Spotify browser session and stream DRM-protected full tracks.
+ */
+export function configureSpotifyIframeForSession(iframe) {
+  configureEmbedIframeForSession(iframe, "spotify");
+}
+
+/**
+ * Sanitizes an external Watch Together link for "Open on <Provider> ↗" actions using
+ * `parseWatchMediaUrl`, falling back to a safe `https://` provider origin.
+ */
+export function sanitizeWatchExternalUrl(rawUrl, provider = "", { trackUri = "", playlistId = "" } = {}) {
+  const safeOrigin = (() => {
+    switch (provider) {
+      case "ytmusic":
+        return "https://music.youtube.com/";
+      case "youtube":
+        return "https://www.youtube.com/";
+      case "spotify":
+        return "https://open.spotify.com/";
+      case "soundcloud":
+        return "https://soundcloud.com/";
+      case "twitch":
+        return "https://www.twitch.tv/";
+      default:
+        return "https://www.youtube.com/";
+    }
+  })();
+
+  const isSameFamily = (parsed) =>
+    Boolean(
+      parsed &&
+        typeof parsed.url === "string" &&
+        parsed.url.startsWith("https://") &&
+        (!provider ||
+          parsed.provider === provider ||
+          (isYouTubeFamily(provider) && isYouTubeFamily(parsed.provider)))
+    );
+
+  // For YouTube/YT Music playlists where a specific video inside the playlist is active/errored,
+  // build and sanitize the direct video-in-playlist URL when trackUri is a valid 11-char ID.
+  if (isYouTubeFamily(provider) && trackUri && YOUTUBE_ID_RE.test(String(trackUri).trim())) {
+    const vid = String(trackUri).trim();
+    const listPart =
+      playlistId && YOUTUBE_LIST_ID_RE.test(String(playlistId).trim())
+        ? `&list=${String(playlistId).trim()}`
+        : "";
+    const candidate = `${provider === "ytmusic" ? "https://music.youtube.com" : "https://www.youtube.com"}/watch?v=${vid}${listPart}`;
+    const parsedDirect = parseWatchMediaUrl(candidate);
+    if (isSameFamily(parsedDirect)) {
+      return parsedDirect.url;
+    }
+  }
+
+  const parsed = parseWatchMediaUrl(rawUrl);
+  if (isSameFamily(parsed)) {
+    if (provider === "ytmusic" && parsed.provider === "youtube") {
+      return parsed.url.replace(/^https:\/\/www\.youtube\.com\b/, "https://music.youtube.com");
+    }
+    return parsed.url;
+  }
+  return safeOrigin;
+}
+
+/**
+ * Classifies a YouTube IFrame Player `onError` code into a structured local notice object
+ * with accurate, honest guidance.
+ */
+export function classifyYouTubePlayerError(errorCode, { provider = "youtube" } = {}) {
+  const normProvider = provider === "ytmusic" ? "ytmusic" : "youtube";
+  const label = normProvider === "ytmusic" ? "YouTube Music" : "YouTube";
+  const tagPrefix = normProvider === "ytmusic" ? "YT MUSIC" : "YOUTUBE";
+  const code = Number(errorCode);
+
+  switch (code) {
+    case 153:
+      return {
+        provider: normProvider,
+        kind: "error",
+        code: 153,
+        severity: "error",
+        tag: `${tagPrefix} · ERROR 153`,
+        message:
+          `Embed blocked (Error 153) — ${label} requires a Referer header. A strict tracking blocker, privacy extension, or browser referrer policy may be stripping it. Allow referrers for youtube.com, then click Reload.`,
+        canReload: true,
+        autoReloadOnReturn: true,
+        blocksSync: true,
+        isPreview: false,
+        previewDurationMs: 0,
+        fullDurationMs: 0,
+      };
+    case 101:
+    case 150:
+      return {
+        provider: normProvider,
+        kind: "restricted",
+        code,
+        severity: "warn",
+        tag: `${tagPrefix} · RESTRICTED (${code})`,
+        message:
+          normProvider === "ytmusic"
+            ? `Restricted in embed (Error ${code}) — This YouTube Music track may have embedding disabled, require a signed-in YT Music Premium session, be age/region-locked, or hit a VPN/bot check. Open on YouTube Music, or sign in with cookies allowed and click Reload.`
+            : `Restricted in embed (Error ${code}) — The uploader disabled embedding, or this video is age/members-only, region-locked, or flagged by a VPN/bot check. Open on YouTube, or sign in with cookies allowed and click Reload.`,
+        canReload: true,
+        autoReloadOnReturn: true,
+        blocksSync: true,
+        isPreview: false,
+        previewDurationMs: 0,
+        fullDurationMs: 0,
+      };
+    case 100:
+      return {
+        provider: normProvider,
+        kind: "error",
+        code: 100,
+        severity: "error",
+        tag: `${tagPrefix} · UNAVAILABLE`,
+        message:
+          `Video unavailable or private (Error 100) — It may have been removed or set to private on ${label}. Open on ${label} to check, or click Reload.`,
+        canReload: true,
+        autoReloadOnReturn: true,
+        blocksSync: true,
+        isPreview: false,
+        previewDurationMs: 0,
+        fullDurationMs: 0,
+      };
+    case 152:
+      return {
+        provider: normProvider,
+        kind: "restricted",
+        code: 152,
+        severity: "warn",
+        tag: `${tagPrefix} · SIGN-IN REQUIRED`,
+        message:
+          `Account or embed context validation failed (Error 152) — Sign into ${label} in this browser and allow third-party cookies for youtube.com, then click Reload.`,
+        canReload: true,
+        autoReloadOnReturn: true,
+        blocksSync: true,
+        isPreview: false,
+        previewDurationMs: 0,
+        fullDurationMs: 0,
+      };
+    case 2:
+      return {
+        provider: normProvider,
+        kind: "error",
+        code: 2,
+        severity: "error",
+        tag: `${tagPrefix} · PLAYBACK ERROR`,
+        message:
+          `Invalid video or playback request (Error 2) — Open on ${label} to check the link, or click Reload.`,
+        canReload: true,
+        autoReloadOnReturn: true,
+        blocksSync: true,
+        isPreview: false,
+        previewDurationMs: 0,
+        fullDurationMs: 0,
+      };
+    case 5:
+      return {
+        provider: normProvider,
+        kind: "error",
+        code: 5,
+        severity: "error",
+        tag: `${tagPrefix} · HTML5 ERROR`,
+        message:
+          `HTML5 player error (Error 5) — This browser or an extension blocked playback in the ${label} embed. Click Reload or open on ${label}.`,
+        canReload: true,
+        autoReloadOnReturn: true,
+        blocksSync: true,
+        isPreview: false,
+        previewDurationMs: 0,
+        fullDurationMs: 0,
+      };
+    default:
+      return {
+        provider: normProvider,
+        kind: "error",
+        code: Number.isFinite(code) ? code : 0,
+        severity: "error",
+        tag: `${tagPrefix} · ERROR${Number.isFinite(code) && code > 0 ? ` ${code}` : ""}`,
+        message:
+          `${label} embed reported a playback error${Number.isFinite(code) && code > 0 ? ` (${code})` : ""}. Click Reload or open on ${label}.`,
+        canReload: true,
+        autoReloadOnReturn: true,
+        blocksSync: true,
+        isPreview: false,
+        previewDurationMs: 0,
+        fullDurationMs: 0,
+      };
+  }
+}
+
+/**
+ * Classifies a SoundCloud widget `getCurrentSound()` object or `SC.Widget.Events.ERROR`
+ * into a structured local notice (30s Go+/geo `SNIP` preview, `BLOCK`/unplayable, or `ERROR`),
+ * or `null` when full playback is available.
+ */
+export function classifySoundCloudSound(sound, { hasError = false, errorMessage = "" } = {}) {
+  if (hasError) {
+    const cleanErr = String(errorMessage || "").trim();
+    return {
+      provider: "soundcloud",
+      kind: "error",
+      code: "ERROR",
+      severity: "error",
+      tag: "SOUNDCLOUD · ERROR",
+      message: cleanErr
+        ? `SoundCloud embed playback error (${cleanErr}) — The track may be private, removed, or blocked by an extension. Open on SoundCloud or click Reload.`
+        : "SoundCloud embed could not load or play this track — it may be private, removed, or blocked by an extension. Open on SoundCloud or click Reload.",
+      canReload: true,
+      autoReloadOnReturn: true,
+      blocksSync: true,
+      isPreview: false,
+      previewDurationMs: 0,
+      fullDurationMs: 0,
+    };
+  }
+
+  if (!sound || typeof sound !== "object") {
+    return null;
+  }
+
+  const policy = String(sound.policy || "").trim().toUpperCase();
+  const durationMs = Math.max(0, Math.round(Number(sound.duration) || 0));
+  const fullDurationMs = Math.max(0, Math.round(Number(sound.full_duration) || 0));
+  const monetization = String(sound.monetization_model || "").trim().toUpperCase();
+
+  const isBlocked = policy === "BLOCK" || sound.playable === false;
+  if (isBlocked) {
+    return {
+      provider: "soundcloud",
+      kind: "restricted",
+      code: "BLOCK",
+      severity: "error",
+      tag: "SOUNDCLOUD · UNAVAILABLE",
+      message:
+        "This track is unavailable or geo-blocked in the SoundCloud embed. Open on SoundCloud to check availability, or click Reload.",
+      canReload: true,
+      autoReloadOnReturn: true,
+      blocksSync: true,
+      isPreview: false,
+      previewDurationMs: 0,
+      fullDurationMs,
+    };
+  }
+
+  const isSnipByDuration =
+    fullDurationMs > 45000 &&
+    durationMs > 0 &&
+    durationMs <= 35000 &&
+    durationMs < fullDurationMs * 0.75;
+  if (policy === "SNIP" || isSnipByDuration) {
+    const isGoPlus = monetization === "SUB_HIGH_TIER" || monetization === "BLACKBOX";
+    return {
+      provider: "soundcloud",
+      kind: "preview",
+      code: "SNIP",
+      severity: "warn",
+      tag: "SOUNDCLOUD · 30S PREVIEW",
+      message: isGoPlus
+        ? "30s preview — SoundCloud embeds don't support Go+ login, so full Go+ playback is only available on SoundCloud."
+        : "30s preview — SoundCloud embeds don't support Go+ login and limit Go+ or geo-restricted tracks to 30-second previews. Open on SoundCloud for full playback.",
+      canReload: false,
+      autoReloadOnReturn: false,
+      blocksSync: false,
+      isPreview: true,
+      previewDurationMs: durationMs > 0 ? durationMs : 30000,
+      fullDurationMs,
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -1230,14 +1533,29 @@ export class WatchSyncNegotiator {
     const pollGap = this.lastPollPerf > 0 ? nowPerf - this.lastPollPerf : 0;
     this.lastPollPerf = nowPerf;
 
+    if (snapshot.blocked || snapshot.errored) {
+      // Errored/blocked embed (e.g., YouTube Error 100/101/150/152/153 or SoundCloud BLOCK/ERROR)
+      // must never drag other peers backward or pause the room.
+      this._resetStreak();
+      return { action: "none", reason: "player-blocked" };
+    }
+
     const rawExpectedPosMs = projectMediaPositionMs(sharedState, wallNowMs);
-    if (
-      snapshot.provider === "spotify" &&
-      snapshot.durationMs > 0 &&
-      snapshot.durationMs <= 35000 &&
-      rawExpectedPosMs > snapshot.durationMs
-    ) {
-      // Logged-out 30s Spotify preview peer cannot seek past preview length — never override full-track peers
+    const isPreviewPeer = Boolean(
+      snapshot.isPreview ||
+        (snapshot.provider === "spotify" &&
+          snapshot.durationMs > 0 &&
+          snapshot.durationMs <= 35000)
+    );
+    const previewLimitMs =
+      Number(snapshot.previewDurationMs) > 0
+        ? Number(snapshot.previewDurationMs)
+        : snapshot.durationMs > 0
+          ? snapshot.durationMs
+          : 0;
+    if (isPreviewPeer && previewLimitMs > 0 && rawExpectedPosMs > previewLimitMs) {
+      // 30s preview peer (logged-out Spotify or SoundCloud SNIP) cannot seek past preview length —
+      // never override full-track peers or pause the room during 3 Hz polling.
       this._resetStreak();
       return { action: "none", reason: "preview-out-of-range" };
     }
@@ -1492,6 +1810,10 @@ export class WatchTogetherPlayer {
     this.spotifyErrorMessage = "";
     this.spotifySession = null;
     this._nextSpotifyForceDrmProbe = false;
+    this.providerNotice = null;
+    this._ytErrorCode = 0;
+    this._scHasError = false;
+    this._scPlaylistSounds = [];
     this.twitchKind = "";
     this.twitchEpoch = 0;
     this.suppressUntilMs = 0;
@@ -1533,6 +1855,7 @@ export class WatchTogetherPlayer {
     this.localMuted = false;
 
     this.ytPlayer = null;
+    this.ytIframe = null;
     this.spotifyCtrl = null;
     this.scWidget = null;
     this.scIframe = null;
@@ -1777,18 +2100,49 @@ export class WatchTogetherPlayer {
   }
 
   /**
-   * Locally remounts the Spotify embed iframe so the browser sends a fresh request with the
-   * user's current Spotify session cookies/permissions, then resyncs to room state.
-   * Strictly local — never emits `onUserAction` or disrupts other peers.
+   * Locally remounts the active Watch Together embed iframe (Spotify, YouTube, YouTube Music,
+   * SoundCloud, or Twitch) so the browser reloads cookies/session/permissions or recovers from
+   * embed errors, then resyncs locally to room state.
+   * Strictly local — never emits `onUserAction` or triggers `WatchSyncNegotiator`.
    */
-  async reloadSpotifySession() {
-    if (this.provider !== "spotify" || !this.pendingState || !this.pendingState.active) {
+  async reloadPlayerSession() {
+    if (!this.provider || !this.pendingState || !this.pendingState.active) {
       return false;
     }
-    this._nextSpotifyForceDrmProbe = true;
+    const hadNotice = Boolean(this.providerNotice);
+    const isSpotify = this.provider === "spotify";
+    if (isSpotify) {
+      this._nextSpotifyForceDrmProbe = true;
+    } else if (hadNotice) {
+      this.providerNotice = null;
+      this._ytErrorCode = 0;
+      this._scHasError = false;
+      this.onTelemetry({
+        durationMs: this.durationMs,
+        positionMs: this.lastKnownPosMs,
+        ready: false,
+        playlistCount: this.playlistCount,
+        playlistIndex: this.lastKnownPlaylistIndex,
+        playlistItems: this.playlistItems,
+        trackUri: this.lastKnownTrackUri,
+        providerNotice: null,
+      });
+    }
     await this._mountProvider(this.pendingState);
-    this._suppress(2500);
+    if (this.provider === "spotify") {
+      this._suppress(2500);
+    }
     return true;
+  }
+
+  /**
+   * Backwards-compatible alias for reloading a Spotify embed locally.
+   */
+  async reloadSpotifySession() {
+    if (this.provider !== "spotify") {
+      return false;
+    }
+    return this.reloadPlayerSession();
   }
 
   _spotifyMatchesPendingState(playing, posMs, playingUri = "") {
@@ -1916,6 +2270,11 @@ export class WatchTogetherPlayer {
     this.spotifyHasError = false;
     this.spotifyErrorMessage = "";
     this.spotifySession = null;
+    this.providerNotice = null;
+    this._ytErrorCode = 0;
+    this._scHasError = false;
+    this._scPlaylistSounds = [];
+    this.ytIframe = null;
     this.twitchKind = "";
     this.twitchEpoch = Number(state.epoch) || 0;
     this._lastAppliedEpoch = Number(state.epoch) || 0;
@@ -1994,7 +2353,7 @@ export class WatchTogetherPlayer {
         origin: typeof window !== "undefined" ? window.location.origin : "",
       };
       const playerOpts = {
-        host: "https://www.youtube-nocookie.com",
+        host: "https://www.youtube.com",
         width: "100%",
         height: "100%",
         playerVars,
@@ -2009,12 +2368,22 @@ export class WatchTogetherPlayer {
         playerVars.start = startSec;
       }
 
+      const configureYtIframe = () => {
+        const iframe =
+          this.ytPlayer?.getIframe?.() || this.mountEl?.querySelector?.("iframe") || null;
+        if (iframe) {
+          this.ytIframe = iframe;
+          configureEmbedIframeForSession(iframe, state.provider);
+        }
+      };
+
       this.ytPlayer = new YT.Player(holder, {
         ...playerOpts,
         events: {
           onReady: () => {
             if (gen !== this.generation) return;
             this.ready = true;
+            configureYtIframe();
             this._applyLocalVolumeToAdapter();
 
             if (isPlaylist) {
@@ -2039,6 +2408,10 @@ export class WatchTogetherPlayer {
               }
             }
 
+            if (this.ytPlayer.getPlayerState?.() === 1) {
+              this._hasEverPlayedLocally = true;
+            }
+
             const dur = Number(this.ytPlayer.getDuration?.() || 0);
             if (dur > 0) this.durationMs = Math.round(dur * 1000);
             const vdata = this.ytPlayer.getVideoData?.() || {};
@@ -2052,8 +2425,9 @@ export class WatchTogetherPlayer {
               playlistIndex: this.lastKnownPlaylistIndex,
               playlistItems: this.playlistItems,
               trackUri: this.lastKnownTrackUri,
+              providerNotice: this.providerNotice,
             });
-            if (this.pendingState) {
+            if (this.pendingState && !this.providerNotice?.blocksSync) {
               this._syncMountedPlayer(this.pendingState, this._wallNow(), true, { source: "remote" });
             }
             this._startPollLoop(gen);
@@ -2080,6 +2454,17 @@ export class WatchTogetherPlayer {
               if (vdata.video_id && vdata.video_id !== this.lastKnownTrackUri) {
                 this.lastKnownTrackUri = vdata.video_id;
               }
+            }
+
+            // Clear any active YouTube error notice cleanly once playback recovers (PLAYING / CUED / track change)
+            let clearedNotice = false;
+            if (this.providerNotice && (code === 1 || code === 5 || trackChanged)) {
+              this.providerNotice = null;
+              this._ytErrorCode = 0;
+              clearedNotice = true;
+            }
+
+            if (this.playlistId) {
               this.onTelemetry({
                 durationMs: this.durationMs,
                 positionMs: curMs,
@@ -2089,13 +2474,15 @@ export class WatchTogetherPlayer {
                 playlistIndex: this.lastKnownPlaylistIndex,
                 playlistItems: this.playlistItems,
                 trackUri: this.lastKnownTrackUri,
+                ...(clearedNotice ? { providerNotice: null } : {}),
               });
-            } else if (vdata.title) {
+            } else if (vdata.title || clearedNotice) {
               this.onTelemetry({
                 durationMs: this.durationMs,
                 positionMs: curMs,
-                title: vdata.title,
+                title: vdata.title || undefined,
                 ready: true,
+                ...(clearedNotice ? { providerNotice: null } : {}),
               });
             }
 
@@ -2131,6 +2518,10 @@ export class WatchTogetherPlayer {
             this._ytWasBuffering = false;
 
             if (code === 0) {
+              if (this.providerNotice?.blocksSync) {
+                this.lastKnownPlaying = false;
+                return;
+              }
               // ENDED — in a playlist, YouTube automatically advances unless on the final video
               if (
                 this.playlistId &&
@@ -2153,6 +2544,7 @@ export class WatchTogetherPlayer {
             }
 
             if (code === 1) {
+              const wasFirstLocalPlay = !this._hasEverPlayedLocally;
               this.lastKnownPlaying = true;
               this._hasEverPlayedLocally = true;
               this._clearAutoplayTimer();
@@ -2164,6 +2556,24 @@ export class WatchTogetherPlayer {
                   trackChanged,
                 })
               ) {
+                return;
+              }
+              // If browser blocked autoplay on initial mount / local reload, or player just recovered
+              // from a local error, locally align to an already-playing room instead of rewinding peers.
+              if ((wasFirstLocalPlay || clearedNotice) && !trackChanged && this.pendingState?.playing) {
+                const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+                if (Math.abs(curMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_YT_MS) {
+                  try {
+                    this._setExpectedCommand(
+                      { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                      850
+                    );
+                    this.ytPlayer.seekTo?.(expectedMs / 1000, true);
+                    this.negotiator.onLocalDriftSeek(this._perfNow());
+                  } catch {
+                    // ignore
+                  }
+                }
                 return;
               }
               // Distinguish brief local network rebuffering (3 -> 1 at the same spot while already
@@ -2205,6 +2615,14 @@ export class WatchTogetherPlayer {
               });
             } else if (code === 2) {
               this.lastKnownPlaying = false;
+              if (this.providerNotice?.blocksSync) {
+                return;
+              }
+              // Autoplay-blocked guard: a newly mounted/reloaded iframe that has never started
+              // playing locally must never emit Pause to pause an already-playing room.
+              if (this.pendingState?.playing && !this._hasEverPlayedLocally) {
+                return;
+              }
               if (
                 this._shouldSuppressEmbedEvent({
                   kind: "playstate",
@@ -2249,6 +2667,7 @@ export class WatchTogetherPlayer {
           },
           onPlaybackRateChange: (ev) => {
             if (gen !== this.generation) return;
+            if (this.providerNotice?.blocksSync) return;
             const curMs = Math.max(0, Math.round((this.ytPlayer?.getCurrentTime?.() || 0) * 1000));
             const rateMilli = Math.round((Number(ev.data) || 1) * 1000);
             if (this._shouldSuppressEmbedEvent({ kind: "rate", rateMilli })) return;
@@ -2260,8 +2679,29 @@ export class WatchTogetherPlayer {
               trackUri: this.playlistId ? this.lastKnownTrackUri : undefined,
             });
           },
+          onError: (ev) => {
+            if (gen !== this.generation) return;
+            const code = Number(ev?.data);
+            const notice = classifyYouTubePlayerError(code, { provider: this.provider });
+            this._ytErrorCode = Number.isFinite(code) ? code : 0;
+            this.providerNotice = notice;
+            this.lastKnownPlaying = false;
+            this._clearSyncTimers();
+            this.expectedCommand = null;
+            this.onTelemetry({
+              durationMs: this.durationMs,
+              positionMs: this.lastKnownPosMs,
+              ready: this.ready,
+              playlistCount: this.playlistCount,
+              playlistIndex: this.lastKnownPlaylistIndex,
+              playlistItems: this.playlistItems,
+              trackUri: this.lastKnownTrackUri,
+              providerNotice: notice,
+            });
+          },
         },
       });
+      configureYtIframe();
     } catch {
       if (gen !== this.generation) return;
       this.apiUnavailable = true;
@@ -2546,6 +2986,51 @@ export class WatchTogetherPlayer {
     }
   }
 
+  _inspectSoundCloudSound(sound, gen, opts = {}) {
+    if (gen !== this.generation || !sound || typeof sound !== "object") return;
+    if (sound.duration > 0) {
+      this.durationMs = Math.round(sound.duration);
+    }
+    const prevNotice = this.providerNotice;
+    const nextNotice = classifySoundCloudSound(sound);
+    // Preserve an active widget ERROR only if `sound` wasn't playable; a valid sound metadata
+    // payload supersedes stale transient error state unless it itself is BLOCK/SNIP.
+    if (nextNotice || !this._scHasError) {
+      this.providerNotice = nextNotice;
+      if (!nextNotice) {
+        this._scHasError = false;
+      } else if (nextNotice.blocksSync) {
+        this._clearSyncTimers();
+        this.expectedCommand = null;
+      }
+    }
+    const noticeChanged =
+      Boolean(prevNotice) !== Boolean(this.providerNotice) ||
+      (prevNotice &&
+        this.providerNotice &&
+        (prevNotice.code !== this.providerNotice.code ||
+          prevNotice.previewDurationMs !== this.providerNotice.previewDurationMs));
+
+    const title = sound.title
+      ? sound.user?.username
+        ? `${sound.user.username} — ${sound.title}`
+        : sound.title
+      : "";
+    if (title || noticeChanged || opts.emitAlways) {
+      this.onTelemetry({
+        durationMs: this.durationMs,
+        positionMs: opts.positionMs !== undefined ? opts.positionMs : this.lastKnownPosMs,
+        title: title || opts.title || undefined,
+        ready: this.ready,
+        playlistCount: this.playlistCount,
+        playlistIndex:
+          opts.playlistIndex !== undefined ? opts.playlistIndex : this.lastKnownPlaylistIndex,
+        playlistItems: this.playlistItems,
+        providerNotice: this.providerNotice,
+      });
+    }
+  }
+
   _syncSoundCloudCurrentTrack(gen, emitUserActionIfChanged, playingHint, posMsHint) {
     if (!this.scWidget || gen !== this.generation) return;
     if (typeof this.scWidget.getCurrentSoundIndex !== "function") return;
@@ -2560,6 +3045,13 @@ export class WatchTogetherPlayer {
           if (gen !== this.generation) return;
           if (sound && sound.duration > 0) {
             this.durationMs = Math.round(sound.duration);
+          }
+          if (sound) {
+            const nextNotice = classifySoundCloudSound(sound);
+            if (nextNotice || !this._scHasError) {
+              this.providerNotice = nextNotice;
+              if (!nextNotice) this._scHasError = false;
+            }
           }
           const title = sound?.title
             ? sound.user?.username
@@ -2578,6 +3070,7 @@ export class WatchTogetherPlayer {
             playlistCount: this.playlistCount,
             playlistIndex: idx,
             playlistItems: this.playlistItems,
+            providerNotice: this.providerNotice,
           });
           if (emitUserActionIfChanged && idxChanged && !this._isSuppressed()) {
             this.onUserAction({
@@ -2603,7 +3096,7 @@ export class WatchTogetherPlayer {
     const startTrack = Math.max(0, Number(state.playlistIndex) || 0);
     const iframe = document.createElement("iframe");
     iframe.className = `watch-embed-iframe is-soundcloud${state.playlistId ? " is-soundcloud-playlist" : ""}`;
-    iframe.setAttribute("allow", "autoplay");
+    configureEmbedIframeForSession(iframe, "soundcloud");
     iframe.setAttribute("scrolling", "no");
     iframe.setAttribute("frameborder", "no");
     iframe.src =
@@ -2627,6 +3120,7 @@ export class WatchTogetherPlayer {
         if (typeof widget.getSounds === "function") {
           widget.getSounds((sounds) => {
             if (gen !== this.generation || !Array.isArray(sounds) || sounds.length === 0) return;
+            this._scPlaylistSounds = sounds.slice();
             this.playlistCount = sounds.length;
             this.playlistItems = sounds.map((s, idx) => ({
               index: idx,
@@ -2638,6 +3132,11 @@ export class WatchTogetherPlayer {
             if (sounds.length > 1 && !this.playlistId) {
               this.playlistId = this.url || this.mediaId;
             }
+            const activeSound = sounds[this.lastKnownPlaylistIndex];
+            if (activeSound && !this.providerNotice) {
+              const notice = classifySoundCloudSound(activeSound);
+              if (notice) this.providerNotice = notice;
+            }
             this.onTelemetry({
               durationMs: this.durationMs,
               positionMs: this.lastKnownPosMs,
@@ -2645,6 +3144,7 @@ export class WatchTogetherPlayer {
               playlistCount: this.playlistCount,
               playlistIndex: this.lastKnownPlaylistIndex,
               playlistItems: this.playlistItems,
+              providerNotice: this.providerNotice,
             });
           });
         }
@@ -2668,30 +3168,17 @@ export class WatchTogetherPlayer {
             playlistCount: this.playlistCount,
             playlistIndex: this.lastKnownPlaylistIndex,
             playlistItems: this.playlistItems,
+            providerNotice: this.providerNotice,
           });
         });
 
-        widget.getCurrentSound((sound) => {
-          if (gen !== this.generation || !sound) return;
-          const title = sound.title
-            ? sound.user?.username
-              ? `${sound.user.username} — ${sound.title}`
-              : sound.title
-            : "";
-          if (title) {
-            this.onTelemetry({
-              durationMs: this.durationMs,
-              positionMs: this.lastKnownPosMs,
-              title,
-              ready: true,
-              playlistCount: this.playlistCount,
-              playlistIndex: this.lastKnownPlaylistIndex,
-              playlistItems: this.playlistItems,
-            });
-          }
-        });
+        if (typeof widget.getCurrentSound === "function") {
+          widget.getCurrentSound((sound) => {
+            this._inspectSoundCloudSound(sound, gen, { emitAlways: Boolean(sound?.title) });
+          });
+        }
 
-        if (this.pendingState) {
+        if (this.pendingState && !this.providerNotice?.blocksSync) {
           this._syncMountedPlayer(this.pendingState, this._wallNow(), true, { source: "remote" });
         }
         this._startPollLoop(gen);
@@ -2710,10 +3197,19 @@ export class WatchTogetherPlayer {
         const posMs = readScPosMs(ev, this.lastKnownPosMs);
         const actionSeq = ++this._scActionSeq;
         this._scPollSeq += 1; // invalidate any in-flight async poll snapshot
+        const wasFirstLocalPlay = !this._hasEverPlayedLocally;
         this.lastKnownPosMs = posMs;
         this.lastKnownPlaying = true;
         this._hasEverPlayedLocally = true;
         this._scLastProgressMoveAt = this._perfNow();
+
+        // Playback started -> clear any transient widget ERROR notice
+        let clearedError = false;
+        if (this._scHasError && this.providerNotice?.code === "ERROR") {
+          this._scHasError = false;
+          this.providerNotice = null;
+          clearedError = true;
+        }
 
         const isPlaylist = this.playlistCount > 1 || Boolean(this.playlistId);
         let syncIdx = -1;
@@ -2727,7 +3223,21 @@ export class WatchTogetherPlayer {
           positionMs: posMs,
         });
 
+        const inspectCurrentSoundForPlay = () => {
+          if (typeof widget.getCurrentSound === "function") {
+            try {
+              widget.getCurrentSound((sound) => {
+                this._inspectSoundCloudSound(sound, gen, { positionMs: posMs });
+              });
+            } catch {
+              // ignore
+            }
+          }
+        };
+
         const emitPlayWithIndex = (resolvedIdx) => {
+          const prevIdx = this.lastKnownPlaylistIndex;
+          const idxChanged = resolvedIdx !== prevIdx;
           this.lastKnownPlaylistIndex = resolvedIdx;
           const item = this.playlistItems[resolvedIdx];
           const title = item
@@ -2736,6 +3246,13 @@ export class WatchTogetherPlayer {
               : item.title
             : "";
           if (item && item.durationMs > 0) this.durationMs = item.durationMs;
+          const cachedSound = this._scPlaylistSounds[resolvedIdx];
+          if (idxChanged) {
+            this._scHasError = false;
+            this.providerNotice = cachedSound ? classifySoundCloudSound(cachedSound) : null;
+          } else if (cachedSound && !this.providerNotice && !this._scHasError) {
+            this.providerNotice = classifySoundCloudSound(cachedSound);
+          }
           this.onTelemetry({
             durationMs: this.durationMs,
             positionMs: posMs,
@@ -2744,8 +3261,32 @@ export class WatchTogetherPlayer {
             playlistCount: this.playlistCount,
             playlistIndex: resolvedIdx,
             playlistItems: this.playlistItems,
+            ...(idxChanged || clearedError ? { providerNotice: this.providerNotice } : {}),
           });
+          inspectCurrentSoundForPlay();
           if (!suppressed) {
+            if ((wasFirstLocalPlay || clearedError) && !idxChanged && this.pendingState?.playing) {
+              const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+              const previewLimit = this.providerNotice?.isPreview
+                ? this.providerNotice.previewDurationMs || this.durationMs || 30000
+                : 0;
+              if (
+                (!previewLimit || expectedMs <= previewLimit) &&
+                Math.abs(posMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_SC_MS
+              ) {
+                try {
+                  this._setExpectedCommand(
+                    { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                    900
+                  );
+                  this.scWidget?.seekTo?.(expectedMs);
+                  this.negotiator.onLocalDriftSeek(this._perfNow());
+                } catch {
+                  // ignore
+                }
+              }
+              return;
+            }
             this.expectedCommand = null;
             this._clearSyncTimers();
             this.onUserAction({
@@ -2791,7 +3332,42 @@ export class WatchTogetherPlayer {
           }
         }
 
+        if (clearedError) {
+          this.onTelemetry({
+            durationMs: this.durationMs,
+            positionMs: posMs,
+            ready: true,
+            playlistCount: this.playlistCount,
+            playlistIndex: this.lastKnownPlaylistIndex,
+            playlistItems: this.playlistItems,
+            providerNotice: null,
+          });
+        }
+        inspectCurrentSoundForPlay();
+
         if (!suppressed) {
+          if ((wasFirstLocalPlay || clearedError) && this.pendingState?.playing) {
+            const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+            const previewLimit = this.providerNotice?.isPreview
+              ? this.providerNotice.previewDurationMs || this.durationMs || 30000
+              : 0;
+            if (
+              (!previewLimit || expectedMs <= previewLimit) &&
+              Math.abs(posMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_SC_MS
+            ) {
+              try {
+                this._setExpectedCommand(
+                  { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                  900
+                );
+                this.scWidget?.seekTo?.(expectedMs);
+                this.negotiator.onLocalDriftSeek(this._perfNow());
+              } catch {
+                // ignore
+              }
+            }
+            return;
+          }
           this.expectedCommand = null;
           this._clearSyncTimers();
           this.onUserAction({
@@ -2809,6 +3385,21 @@ export class WatchTogetherPlayer {
         this._scPollSeq += 1;
         this.lastKnownPosMs = posMs;
         this.lastKnownPlaying = false;
+        if (this.providerNotice?.blocksSync) {
+          return;
+        }
+        // Autoplay-blocked guard: never pause an already-playing room before local playback starts
+        if (this.pendingState?.playing && !this._hasEverPlayedLocally) {
+          return;
+        }
+        // SoundCloud 30s SNIP preview cap guard: hitting the preview limit must not pause full-track peers
+        if (this.providerNotice?.isPreview && this.pendingState?.playing) {
+          const previewLimit = this.providerNotice.previewDurationMs || this.durationMs || 30000;
+          const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+          if (expectedMs > previewLimit - 600 || posMs >= previewLimit - 600) {
+            return;
+          }
+        }
         if (
           !this._shouldSuppressEmbedEvent({
             kind: "playstate",
@@ -2833,6 +3424,9 @@ export class WatchTogetherPlayer {
         this._scPollSeq += 1;
         this.lastKnownPosMs = posMs;
         this._scLastProgressMoveAt = this._perfNow();
+        if (this.providerNotice?.blocksSync) {
+          return;
+        }
         if (!this._shouldSuppressEmbedEvent({ kind: "seek", positionMs: posMs })) {
           this.expectedCommand = null;
           this._clearSyncTimers();
@@ -2848,10 +3442,39 @@ export class WatchTogetherPlayer {
         if (gen !== this.generation) return;
         this._scActionSeq += 1;
         this._scPollSeq += 1;
+        if (this.providerNotice?.blocksSync) {
+          this.lastKnownPlaying = false;
+          return;
+        }
+        // SoundCloud 30s SNIP preview end must NOT end/pause/skip for full-track peers
+        if (this.providerNotice?.isPreview) {
+          this.lastKnownPlaying = false;
+          return;
+        }
         if (this.playlistCount > 1 && this.lastKnownPlaylistIndex < this.playlistCount - 1) {
           // SoundCloud widget advances to next track inside the playlist; sync next index cleanly
           const nextIdx = this.lastKnownPlaylistIndex + 1;
           this.lastKnownPlaylistIndex = nextIdx;
+          this._scHasError = false;
+          const nextSound = this._scPlaylistSounds[nextIdx];
+          if (nextSound) {
+            this._inspectSoundCloudSound(nextSound, gen, {
+              positionMs: 0,
+              playlistIndex: nextIdx,
+              emitAlways: true,
+            });
+          } else {
+            this.providerNotice = null;
+          }
+          if (typeof widget.getCurrentSound === "function") {
+            try {
+              widget.getCurrentSound((sound) =>
+                this._inspectSoundCloudSound(sound, gen, { positionMs: 0, playlistIndex: nextIdx })
+              );
+            } catch {
+              // ignore
+            }
+          }
           this.onUserAction({
             playing: true,
             positionMs: 0,
@@ -2865,6 +3488,29 @@ export class WatchTogetherPlayer {
           positionMs: this.durationMs,
           ended: true,
           playlistIndex: this.playlistCount > 1 || this.playlistId ? this.lastKnownPlaylistIndex : undefined,
+        });
+      });
+
+      widget.bind(SC.Widget.Events.ERROR || "error", (ev) => {
+        if (gen !== this.generation) return;
+        const errMsg =
+          typeof ev === "string"
+            ? ev
+            : String(ev?.message || ev?.error || ev?.code || "");
+        const notice = classifySoundCloudSound(null, { hasError: true, errorMessage: errMsg });
+        this._scHasError = true;
+        this.providerNotice = notice;
+        this.lastKnownPlaying = false;
+        this._clearSyncTimers();
+        this.expectedCommand = null;
+        this.onTelemetry({
+          durationMs: this.durationMs,
+          positionMs: this.lastKnownPosMs,
+          ready: this.ready,
+          playlistCount: this.playlistCount,
+          playlistIndex: this.lastKnownPlaylistIndex,
+          playlistItems: this.playlistItems,
+          providerNotice: notice,
         });
       });
 
@@ -2907,8 +3553,7 @@ export class WatchTogetherPlayer {
     if (info.kind === "clip") {
       const iframe = document.createElement("iframe");
       iframe.className = "watch-embed-iframe is-twitch-clip";
-      iframe.setAttribute("allowfullscreen", "true");
-      iframe.setAttribute("allow", "autoplay; fullscreen");
+      configureEmbedIframeForSession(iframe, "twitch");
       iframe.setAttribute("scrolling", "no");
       iframe.setAttribute("frameborder", "0");
       iframe.src =
@@ -2923,6 +3568,7 @@ export class WatchTogetherPlayer {
         durationMs: 0,
         positionMs: 0,
         ready: true,
+        providerNotice: null,
       });
       return;
     }
@@ -2957,8 +3603,18 @@ export class WatchTogetherPlayer {
         if (initMs > 0) opts.time = formatTwitchTime(initMs);
       }
 
+      const configureTwitchIframe = () => {
+        const iframe =
+          holder.querySelector?.("iframe") || this.mountEl?.querySelector?.("iframe") || null;
+        if (iframe) {
+          this.twitchIframe = iframe;
+          configureEmbedIframeForSession(iframe, "twitch");
+        }
+      };
+
       const player = new Twitch.Player(holder.id, opts);
       this.twitchPlayer = player;
+      configureTwitchIframe();
 
       const EV = {
         READY: Twitch.Player.READY || "ready",
@@ -2987,7 +3643,11 @@ export class WatchTogetherPlayer {
       player.addEventListener(EV.READY, () => {
         if (gen !== this.generation) return;
         this.ready = true;
+        configureTwitchIframe();
         this._applyLocalVolumeToAdapter();
+        if (typeof player.isPaused === "function" && !player.isPaused()) {
+          this._hasEverPlayedLocally = true;
+        }
         const durMs = readDurMs();
         if (durMs > 0) this.durationMs = durMs;
         if (this.twitchKind === "collection") {
@@ -2999,6 +3659,7 @@ export class WatchTogetherPlayer {
           positionMs: readPosMs(),
           ready: true,
           trackUri: this.twitchKind === "collection" ? this.lastKnownTrackUri : undefined,
+          providerNotice: this.providerNotice,
         });
         if (this.pendingState) {
           this._syncMountedPlayer(this.pendingState, this._wallNow(), true, { source: "remote" });
@@ -3021,6 +3682,7 @@ export class WatchTogetherPlayer {
             vidChanged = true;
           }
         }
+        const wasFirstLocalPlay = !this._hasEverPlayedLocally;
         this.lastKnownPosMs = posMs;
         const wasPlaying = this.lastKnownPlaying;
         this.lastKnownPlaying = true;
@@ -3039,6 +3701,24 @@ export class WatchTogetherPlayer {
             trackChanged: vidChanged,
           })
         ) {
+          return;
+        }
+        if (wasFirstLocalPlay && !vidChanged && this.pendingState?.playing) {
+          if (this.twitchKind === "video" || this.twitchKind === "collection") {
+            const expectedMs = projectMediaPositionMs(this.pendingState, this._wallNow());
+            if (Math.abs(posMs - expectedMs) > WATCH_SYNC_DEFAULTS.MILD_DRIFT_TWITCH_MS) {
+              try {
+                this._setExpectedCommand(
+                  { expectSeek: true, targetPosMs: expectedMs, targetPlaying: true },
+                  850
+                );
+                this.twitchPlayer?.seek?.(expectedMs / 1000);
+                this.negotiator.onLocalDriftSeek(this._perfNow());
+              } catch {
+                // ignore
+              }
+            }
+          }
           return;
         }
         const sharedDisagrees = Boolean(this.pendingState && !this.pendingState.playing);
@@ -3062,6 +3742,13 @@ export class WatchTogetherPlayer {
         this.lastKnownPosMs = posMs;
         const wasPlaying = this.lastKnownPlaying;
         this.lastKnownPlaying = false;
+        if (this.providerNotice?.blocksSync) {
+          return;
+        }
+        // Autoplay-blocked guard: never pause an already-playing room before local playback starts
+        if (this.pendingState?.playing && !this._hasEverPlayedLocally) {
+          return;
+        }
         if (
           this._shouldSuppressEmbedEvent({
             kind: "playstate",
@@ -3267,6 +3954,20 @@ export class WatchTogetherPlayer {
               });
             }
             this.lastKnownPlaylistIndex = desiredIdx;
+            if (this.providerNotice) {
+              this.providerNotice = null;
+              this._ytErrorCode = 0;
+              this.onTelemetry({
+                durationMs: this.durationMs,
+                positionMs: targetMs,
+                ready: true,
+                playlistCount: this.playlistCount,
+                playlistIndex: desiredIdx,
+                playlistItems: this.playlistItems,
+                trackUri: state.trackUri || this.lastKnownTrackUri,
+                providerNotice: null,
+              });
+            }
             if (isInitial && !state.playing && typeof this.ytPlayer.cuePlaylist === "function") {
               this.ytPlayer.cuePlaylist({
                 listType: "playlist",
@@ -3312,6 +4013,11 @@ export class WatchTogetherPlayer {
               return;
             }
           }
+        }
+
+        if (this.providerNotice?.blocksSync) {
+          this._lastAppliedEpoch = Number(state.epoch) || 0;
+          return;
         }
 
         const curRate = Number(this.ytPlayer.getPlaybackRate?.() || 1);
@@ -3525,16 +4231,20 @@ export class WatchTogetherPlayer {
           this.lastKnownPlaylistIndex = desiredIdx;
           this.scWidget.skip?.(desiredIdx);
           const item = this.playlistItems[desiredIdx];
-          if (item) {
-            if (item.durationMs > 0) this.durationMs = item.durationMs;
+          const cachedSound = this._scPlaylistSounds[desiredIdx];
+          this._scHasError = false;
+          this.providerNotice = cachedSound ? classifySoundCloudSound(cachedSound) : null;
+          if (item || this.providerNotice === null) {
+            if (item && item.durationMs > 0) this.durationMs = item.durationMs;
             this.onTelemetry({
               durationMs: this.durationMs,
               positionMs: targetMs,
-              title: item.artist ? `${item.artist} — ${item.title}` : item.title,
+              title: item ? (item.artist ? `${item.artist} — ${item.title}` : item.title) : undefined,
               ready: true,
               playlistCount: this.playlistCount,
               playlistIndex: desiredIdx,
               playlistItems: this.playlistItems,
+              providerNotice: this.providerNotice,
             });
           }
           this._scheduleSyncTimer(220, () => {
@@ -3551,6 +4261,14 @@ export class WatchTogetherPlayer {
                   this._perfNow() + 950
                 );
               }
+              if (typeof this.scWidget.getCurrentSound === "function") {
+                this.scWidget.getCurrentSound((sound) => {
+                  this._inspectSoundCloudSound(sound, checkGen, {
+                    positionMs: liveTargetMs,
+                    playlistIndex: desiredIdx,
+                  });
+                });
+              }
               if (liveTargetMs > 800) {
                 this.scWidget.seekTo?.(liveTargetMs);
               }
@@ -3563,6 +4281,18 @@ export class WatchTogetherPlayer {
               // ignore
             }
           });
+          return;
+        }
+
+        if (this.providerNotice?.blocksSync) {
+          this._lastAppliedEpoch = Number(state.epoch) || 0;
+          return;
+        }
+        if (
+          this.providerNotice?.isPreview &&
+          targetMs > (this.providerNotice.previewDurationMs || this.durationMs || 30000)
+        ) {
+          this._lastAppliedEpoch = Number(state.epoch) || 0;
           return;
         }
 
@@ -3784,7 +4514,24 @@ export class WatchTogetherPlayer {
     if (!this.ready || !state || !state.active || !state.playing || this._isSuppressed()) {
       return;
     }
+    if (this.providerNotice?.blocksSync || this.spotifyHasError) {
+      return;
+    }
     const targetMs = projectMediaPositionMs(state, nowMs);
+    if (
+      this.providerNotice?.isPreview &&
+      targetMs > (this.providerNotice.previewDurationMs || this.durationMs || 30000)
+    ) {
+      return;
+    }
+    if (
+      this.provider === "spotify" &&
+      this.durationMs > 0 &&
+      this.durationMs <= 35000 &&
+      targetMs > this.durationMs
+    ) {
+      return;
+    }
     if (isYouTubeFamily(this.provider) && this.ytPlayer) {
       try {
         if (this.ytPlayer.getPlayerState?.() !== 1) return;
@@ -3942,10 +4689,16 @@ export class WatchTogetherPlayer {
         if (dur > 0) this.durationMs = Math.round(dur * 1000);
         const rateMilli = Math.round((this.ytPlayer.getPlaybackRate?.() || 1) * 1000);
         this.lastKnownPosMs = curMs;
+        let clearedNotice = false;
         if (ytState === 1) {
           this.lastKnownPlaying = true;
           this._hasEverPlayedLocally = true;
           this._clearAutoplayTimer();
+          if (this.providerNotice) {
+            this.providerNotice = null;
+            this._ytErrorCode = 0;
+            clearedNotice = true;
+          }
         } else if (ytState === 2 || ytState === 0) {
           this.lastKnownPlaying = false;
         }
@@ -3970,11 +4723,14 @@ export class WatchTogetherPlayer {
           playlistIndex: this.lastKnownPlaylistIndex,
           playlistItems: this.playlistItems,
           trackUri: this.lastKnownTrackUri,
+          ...(clearedNotice ? { providerNotice: null } : {}),
         });
 
         this._handlePolledSnapshot({
           provider: this.provider,
           ready: true,
+          blocked: Boolean(this.providerNotice?.blocksSync),
+          errored: Boolean(this.providerNotice?.kind === "error"),
           buffering: ytState === 3,
           unstarted: ytState === -1 || ytState === 5,
           ended: ytState === 0,
@@ -4070,13 +4826,33 @@ export class WatchTogetherPlayer {
         }
         let resolvedIdx;
         let trackTitle;
+        let pollIdxChanged = false;
         if (wantIdx && typeof idxVal === "number" && idxVal >= 0) {
+          const prevIdx = this.lastKnownPlaylistIndex;
           resolvedIdx = idxVal;
           this.lastKnownPlaylistIndex = idxVal;
           const item = this.playlistItems[idxVal];
           if (item) {
             if (item.durationMs > 0) this.durationMs = item.durationMs;
             trackTitle = item.artist ? `${item.artist} — ${item.title}` : item.title;
+          }
+          if (idxVal !== prevIdx) {
+            pollIdxChanged = true;
+            this._scHasError = false;
+            const cachedSound = this._scPlaylistSounds[idxVal];
+            this.providerNotice = cachedSound ? classifySoundCloudSound(cachedSound) : null;
+            if (typeof this.scWidget.getCurrentSound === "function") {
+              try {
+                this.scWidget.getCurrentSound((sound) => {
+                  this._inspectSoundCloudSound(sound, gen, {
+                    positionMs: this.lastKnownPosMs,
+                    playlistIndex: idxVal,
+                  });
+                });
+              } catch {
+                // ignore
+              }
+            }
           }
         }
         this.onTelemetry({
@@ -4087,6 +4863,7 @@ export class WatchTogetherPlayer {
           playlistCount: this.playlistCount,
           playlistIndex: this.lastKnownPlaylistIndex,
           playlistItems: this.playlistItems,
+          ...(pollIdxChanged ? { providerNotice: this.providerNotice } : {}),
         });
 
         const ended = Boolean(
@@ -4101,6 +4878,10 @@ export class WatchTogetherPlayer {
         this._handlePolledSnapshot({
           provider: "soundcloud",
           ready: true,
+          blocked: Boolean(this.providerNotice?.blocksSync),
+          errored: Boolean(this.providerNotice?.kind === "error"),
+          isPreview: Boolean(this.providerNotice?.isPreview),
+          previewDurationMs: this.providerNotice?.previewDurationMs || 0,
           buffering: false,
           unstarted: false,
           ended,
@@ -4189,6 +4970,8 @@ export class WatchTogetherPlayer {
         this._handlePolledSnapshot({
           provider: "twitch",
           ready: true,
+          blocked: Boolean(this.providerNotice?.blocksSync),
+          errored: Boolean(this.providerNotice?.kind === "error"),
           buffering: false,
           unstarted: false,
           ended,
@@ -4248,9 +5031,15 @@ export class WatchTogetherPlayer {
           this.lastKnownPosMs >= this.durationMs - 400 &&
           !this.playlistId
       );
+      const spPreviewCap =
+        Boolean(this.spotifySession?.isPreview) && this.durationMs > 0 && this.durationMs <= 35000;
       this._handlePolledSnapshot({
         provider: "spotify",
         ready: true,
+        blocked: Boolean(this.spotifyHasError),
+        errored: Boolean(this.spotifyHasError),
+        isPreview: spPreviewCap,
+        previewDurationMs: spPreviewCap ? this.durationMs : 0,
         buffering: false,
         unstarted: false,
         ended,
@@ -4304,6 +5093,7 @@ export class WatchTogetherPlayer {
       }
       this.ytPlayer = null;
     }
+    this.ytIframe = null;
     if (this.spotifyCtrl) {
       try {
         this.spotifyCtrl.destroy?.();
@@ -4358,6 +5148,11 @@ export class WatchTogetherPlayer {
     this.spotifyErrorMessage = "";
     this.spotifySession = null;
     this._nextSpotifyForceDrmProbe = false;
+    this.providerNotice = null;
+    this._ytErrorCode = 0;
+    this._scHasError = false;
+    this._scPlaylistSounds = [];
+    this.ytIframe = null;
     this.twitchKind = "";
     this.twitchEpoch = 0;
     this._lastAppliedEpoch = 0;

@@ -666,8 +666,8 @@
                   type="button"
                   id="btn-watch-spotify-reload"
                   class="btn btn-sm hidden"
-                  title="Reload Spotify player locally to pick up your logged-in browser session (does not affect other peers)"
-                >↻ Session</button>
+                  title="Reload player embed locally and resync to room (does not affect other peers)"
+                >↻ Reload</button>
                 <a
                   id="watch-open-external"
                   class="btn btn-sm hidden"
@@ -704,9 +704,9 @@
                 </button>
               </div>
 
-              <div class="watch-spotify-session-bar hidden" id="watch-spotify-session-bar" role="status" aria-live="polite">
+              <div class="watch-spotify-session-bar watch-provider-notice-bar hidden" id="watch-spotify-session-bar" role="status" aria-live="polite">
                 <div class="watch-spotify-session-copy">
-                  <span class="watch-spotify-session-tag">SPOTIFY SESSION</span>
+                  <span class="watch-spotify-session-tag" id="watch-provider-notice-tag">SPOTIFY SESSION</span>
                   <span class="watch-spotify-session-text" id="watch-spotify-session-text"></span>
                 </div>
                 <div class="watch-spotify-session-actions">
@@ -715,20 +715,20 @@
                     class="media-ctrl-btn"
                     href="https://open.spotify.com/"
                     target="_blank"
-                    rel="noopener"
-                    title="Open Spotify in this browser to sign in or verify your active session"
+                    rel="noopener noreferrer"
+                    title="Open source on provider in this browser"
                   >Open Spotify ↗</a>
                   <button
                     type="button"
                     id="btn-watch-spotify-session-reload"
                     class="media-ctrl-btn"
-                    title="Reload Spotify embed locally with your current browser cookies/session"
+                    title="Reload player embed locally"
                   >↻ Reload Session</button>
                   <button
                     type="button"
                     id="btn-watch-spotify-session-dismiss"
                     class="media-ctrl-btn"
-                    aria-label="Dismiss Spotify session notice"
+                    aria-label="Dismiss player notice"
                     title="Dismiss"
                   >×</button>
                 </div>

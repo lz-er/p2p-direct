@@ -6733,6 +6733,10 @@ input[type="checkbox"].metro-switch:checked::after {
   flex-shrink: 0;
 }
 
+.watch-header-actions .btn-sm {
+  white-space: nowrap;
+}
+
 .watch-body {
   display: flex;
   flex-direction: column;
@@ -6909,6 +6913,51 @@ input[type="checkbox"].metro-switch:checked::after {
   border-bottom: 2px solid var(--rule);
   border-left: 4px solid #1db954;
   flex-wrap: wrap;
+}
+
+.watch-spotify-session-bar.provider-spotify {
+  border-left-color: #1db954;
+}
+
+.watch-spotify-session-bar.provider-spotify .watch-spotify-session-tag {
+  background: #1db954;
+  color: #0e0f12;
+}
+
+.watch-spotify-session-bar.provider-youtube {
+  border-left-color: #ff3b30;
+}
+
+.watch-spotify-session-bar.provider-youtube .watch-spotify-session-tag {
+  background: #ff3b30;
+  color: #ffffff;
+}
+
+.watch-spotify-session-bar.provider-ytmusic {
+  border-left-color: #e11d48;
+}
+
+.watch-spotify-session-bar.provider-ytmusic .watch-spotify-session-tag {
+  background: #e11d48;
+  color: #ffffff;
+}
+
+.watch-spotify-session-bar.provider-soundcloud {
+  border-left-color: #ff5500;
+}
+
+.watch-spotify-session-bar.provider-soundcloud .watch-spotify-session-tag {
+  background: #ff5500;
+  color: #ffffff;
+}
+
+.watch-spotify-session-bar.provider-twitch {
+  border-left-color: #9146ff;
+}
+
+.watch-spotify-session-bar.provider-twitch .watch-spotify-session-tag {
+  background: #9146ff;
+  color: #ffffff;
 }
 
 .watch-spotify-session-copy {
@@ -7591,6 +7640,10 @@ html[data-watch-stage="true"] .join-listen-strip {
     .watch-chat-split.is-watch-side-eligible .watch-header {
       padding: 5px 10px;
       flex-shrink: 0;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .watch-header-actions {
+      gap: 4px;
     }
 
     .watch-chat-split.is-watch-side-eligible .watch-body {
