@@ -29,6 +29,13 @@ import {
   upsertSavedRoom,
 } from "./storage.js";
 import {
+  MediaSyncController,
+  WatchTraceRecorder,
+  getTwitchEntityKind,
+  getWatchProviderFriendlyName,
+  getWatchProviderLabel,
+} from "./media_sync_controller.js";
+import {
   WatchTogetherPlayer,
   formatClockTime,
   formatSpotifySessionGuidance,
@@ -38,11 +45,13 @@ import {
   sanitizeWatchExternalUrl,
 } from "./watch_together.js";
 
+export { MediaSyncController, WatchTraceRecorder };
+
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v24";
+export const APP_VERSION = "v25";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -1611,7 +1620,7 @@ function waitForIceGathering(pc, maxWaitMs = 1400) {
   });
 }
 
-class P2PDirectApp {
+export class P2PDirectApp {
   constructor() {
     this.wasm = null;
     this.profile = null;
@@ -1631,37 +1640,107 @@ class P2PDirectApp {
     this.lightboxState = null; // { kind, blob, dataUrl, tempUrl, syncTargetId, gifBinding, videoBinding }
     this.dcChunkSeq = 0;
 
+    // Opt-in URL debug/trace flags (?debug=1, ?watchTrace=1)
+    let debugFlag = false;
+    let watchTraceFlag = false;
+    try {
+      if (typeof window !== "undefined" && window.location && typeof window.location.search === "string") {
+        const qp = new URLSearchParams(window.location.search);
+        debugFlag = qp.get("debug") === "1" || qp.get("debug") === "true";
+        watchTraceFlag = qp.get("watchTrace") === "1" || qp.get("watchTrace") === "true";
+      }
+    } catch {
+      // ignore invalid query params
+    }
+    this._debugQueryEnabled = debugFlag;
+    this._watchTraceUiRaf = null;
+    this.watchTrace = new WatchTraceRecorder({
+      maxEntries: 2000,
+      enabled: watchTraceFlag,
+      onChange: () => this._scheduleWatchTraceUiUpdate(),
+    });
+
     // Room-wide E2EE Synchronized Media (Videos, GIFs) & Watch Together (YouTube/Spotify/SoundCloud/Twitch)
     // Volume and mute are STRICTLY local-only and never included in mediaSync state.
-    this.mediaSync = {
-      states: new Map(), // targetId -> MediaSyncState
+    this.mediaSyncController = new MediaSyncController({
+      getWasm: () => this.wasm,
+      getMountEl: () => this.el["watch-embed-stage"] || null,
+      getPeerId: () => this.status?.peerId || "",
+      getAuthorName: () => this.status?.authorName || "Peer",
+      executeActions: (actions) => this.executeActions(actions),
+      onStatus: (status) => {
+        this.status = status;
+      },
+      onUiSync: (state, meta) => this._handleWatchControllerUiSync(state, meta),
+      onToast: (msg) => this.showToast(msg),
+      onTelemetry: (ev, detail) => this.addTelemetry(ev, detail),
+      onDebugEvent: this.watchTrace.getSink(),
+      onWatchTimeTick: () => this._updateWatchTimeUi(),
+      onAutoplayMuted: (isMuted) => {
+        if (this.el["btn-watch-autoplay-unmute"]) {
+          this.el["btn-watch-autoplay-unmute"].classList.toggle("hidden", !isMuted);
+        }
+      },
+      onLocalVolumeChange: () => this._updateWatchLocalVolUi(),
+      onTitleOverride: (title) => {
+        if (this.el["watch-panel-title"]) {
+          this.el["watch-panel-title"].textContent = title;
+        }
+      },
+      onWatchMediaChanged: () => {
+        if (this.el["btn-watch-autoplay-unmute"]) {
+          this.el["btn-watch-autoplay-unmute"].classList.add("hidden");
+        }
+      },
+      onIncomingVideo: (normalized, prev) => this._handleIncomingVideoMediaSync(normalized, prev),
+      onIncomingGif: (normalized, prev) => this._handleIncomingGifMediaSync(normalized, prev),
+      onDriftVideoTick: (nowMs) => this._runVideoBindingsDriftCorrection(nowMs),
+    });
+
+    // Single-source-of-truth view over MediaSyncController + DOM-only video/GIF/UI fields
+    const ctrl = this.mediaSyncController;
+    const mediaSyncView = {
+      states: ctrl.states,
       videoBindings: new Map(), // "vid:<msgId>:<idx>" -> binding obj
       gifBindings: new Map(), // "gif:<msgId>:<idx>" -> binding obj
       gifRafId: null,
       boundGifTick: () => this._tickSyncedGifs(),
-      driftTimer: null,
-      watchPlayer: null,
-      watchMinimized: false,
-      watchScrubbing: false,
       watchUiTimer: null,
-      watchTitleOverride: "",
-      watchDurationMs: 0,
-      watchPlaylistCount: 0,
-      watchPlaylistItems: [],
-      watchTracksOpen: false,
-      watchSpotifyTrackDetached: false,
-      watchSpotifySession: null,
-      watchSpotifySessionDismissed: false,
-      watchSpotifyPendingRefresh: false,
-      watchProviderNotice: null,
-      watchProviderNoticeDismissed: false,
-      watchProviderPendingRefresh: false,
-      watchProviderPendingRefreshKey: "",
-      watchTwitchOffline: false,
-      watchApplySource: "remote",
       lightboxVideoApplying: false,
       lightboxVideoSuppressUntil: 0,
     };
+    const delegatedKeys = [
+      "driftTimer",
+      "watchPlayer",
+      "watchMinimized",
+      "watchScrubbing",
+      "watchTitleOverride",
+      "watchDurationMs",
+      "watchPlaylistCount",
+      "watchPlaylistItems",
+      "watchTracksOpen",
+      "watchSpotifyTrackDetached",
+      "watchSpotifySession",
+      "watchSpotifySessionDismissed",
+      "watchSpotifyPendingRefresh",
+      "watchProviderNotice",
+      "watchProviderNoticeDismissed",
+      "watchProviderPendingRefresh",
+      "watchProviderPendingRefreshKey",
+      "watchTwitchOffline",
+      "watchApplySource",
+    ];
+    for (const key of delegatedKeys) {
+      Object.defineProperty(mediaSyncView, key, {
+        enumerable: true,
+        configurable: true,
+        get: () => ctrl[key],
+        set: (v) => {
+          ctrl[key] = v;
+        },
+      });
+    }
+    this.mediaSync = mediaSyncView;
     this.telemetry = [];
     this.toastTimer = null;
 
@@ -2060,6 +2139,10 @@ class P2PDirectApp {
       "telemetry-log",
       "btn-turn-test",
       "turn-test-status",
+      "watch-trace-box",
+      "watch-trace-status",
+      "btn-watch-trace-toggle",
+      "btn-watch-trace-export",
       "chat-panel",
       "chat-drop-overlay",
       "chat-composer-dropzone",
@@ -2185,6 +2268,12 @@ class P2PDirectApp {
     }
     if (this.el["btn-turn-test"]) {
       this.el["btn-turn-test"].addEventListener("click", () => this.runIceSelfTest());
+    }
+    if (this.el["btn-watch-trace-toggle"]) {
+      this.el["btn-watch-trace-toggle"].addEventListener("click", () => this.toggleWatchTraceRecording());
+    }
+    if (this.el["btn-watch-trace-export"]) {
+      this.el["btn-watch-trace-export"].addEventListener("click", () => this.exportWatchTrace());
     }
     this.el["lobby-create-form"].addEventListener("submit", (ev) => {
       ev.preventDefault();
@@ -2879,16 +2968,7 @@ class P2PDirectApp {
     }
     if (this.el["watch-spotify-open-login"]) {
       this.el["watch-spotify-open-login"].addEventListener("click", () => {
-        const cur = this.mediaSync.states.get("watch");
-        if (!cur || !cur.active || !cur.provider) return;
-        const canAutoReload =
-          cur.provider === "spotify"
-            ? Boolean(this.mediaSync.watchSpotifySession?.isPreview)
-            : Boolean(this.mediaSync.watchProviderNotice?.autoReloadOnReturn);
-        if (!canAutoReload) return;
-        this.mediaSync.watchProviderPendingRefresh = true;
-        this.mediaSync.watchProviderPendingRefreshKey = `${cur.provider}:${cur.mediaId}:${cur.playlistId || ""}`;
-        this.mediaSync.watchSpotifyPendingRefresh = cur.provider === "spotify";
+        this.mediaSyncController.markWatchProviderPendingRefresh();
       });
     }
     if (this.el["btn-watch-spotify-session-dismiss"]) {
@@ -3095,6 +3175,17 @@ class P2PDirectApp {
         clearInterval(this.topo.statsTimer);
         this.topo.statsTimer = null;
       }
+      if (this.mediaSync.watchUiTimer) {
+        clearInterval(this.mediaSync.watchUiTimer);
+        this.mediaSync.watchUiTimer = null;
+      }
+      if (this.mediaSyncController) {
+        try {
+          this.mediaSyncController.destroy();
+        } catch {
+          // ignore
+        }
+      }
       if (this.bc) {
         try {
           this.bc.close();
@@ -3167,6 +3258,8 @@ class P2PDirectApp {
     });
 
     window.__p2pDirect = this;
+    this._syncDebugHandle();
+    this._renderWatchTraceUi();
   }
 
   async runIceSelfTest() {
@@ -3727,6 +3820,8 @@ class P2PDirectApp {
     }
 
     this._syncTopologyTimers();
+    this._syncDebugHandle();
+    this._renderWatchTraceUi();
 
     if (this.status) {
       this.renderAll();
@@ -3743,6 +3838,223 @@ class P2PDirectApp {
 
   toggleAdvancedMode() {
     this.setAdvancedMode(!this.advancedMode, true);
+  }
+
+  _buildDebugSnapshot() {
+    const watchSt = this.mediaSyncController ? this.mediaSyncController.getWatchState() : null;
+    const watchState = watchSt
+      ? {
+          active: Boolean(watchSt.active),
+          playing: Boolean(watchSt.playing),
+          provider: watchSt.provider || "",
+          mediaId: watchSt.mediaId || "",
+          playlistId: watchSt.playlistId || "",
+          playlistIndex: Number(watchSt.playlistIndex) || 0,
+          trackUri: watchSt.trackUri || "",
+          positionMs: Number(watchSt.positionMs) || 0,
+          projectedPosMs: watchSt.active ? projectMediaPositionMs(watchSt, Date.now()) : 0,
+          rateMilli: Number(watchSt.rateMilli) || 1000,
+          loop: Boolean(watchSt.loop),
+          rev: Number(watchSt.rev) || 0,
+          epoch: Number(watchSt.epoch) || 0,
+          actor: watchSt.actor || "",
+          actorName: watchSt.actorName || "",
+          queueLength: Array.isArray(watchSt.queue) ? watchSt.queue.length : 0,
+        }
+      : null;
+    const watchNotice = this.mediaSyncController ? this.mediaSyncController.getWatchNotice() : null;
+    const peers = (this.status?.peers || []).map((p) => ({
+      peerId: p.peerId || "",
+      authorName: p.authorName || "",
+      inVoice: Boolean(p.inVoice),
+      connected: Boolean(this.directPeers.has(p.peerId) || this.relayPeers.has(p.peerId)),
+      transport: this.directPeers.has(p.peerId)
+        ? "direct"
+        : this.relayPeers.has(p.peerId)
+          ? "relay"
+          : "mesh",
+      rttMs: typeof p.rttMs === "number" && Number.isFinite(p.rttMs) ? Math.round(p.rttMs) : null,
+    }));
+    const sw = this.appVersionState || null;
+    const swState = sw
+      ? {
+          state: sw.state,
+          badge: sw.badge,
+          swVersion: sw.swVersion || null,
+          needsReload: Boolean(sw.needsReload),
+          severity: sw.severity,
+          supported: Boolean(sw.supported),
+        }
+      : null;
+    return Object.freeze({
+      appVersion: APP_VERSION,
+      peerId: this.status?.peerId || "",
+      roomId: this.activeRoom?.topic || this.status?.room || "",
+      peers,
+      watchState,
+      watchNotice,
+      swState,
+      traceCount: this.watchTrace ? this.watchTrace.count() : 0,
+      traceEnabled: this.watchTrace ? this.watchTrace.isEnabled() : false,
+    });
+  }
+
+  _syncDebugHandle() {
+    if (typeof window === "undefined") return;
+    const shouldExpose = Boolean(this._debugQueryEnabled || this.advancedMode);
+    if (!shouldExpose) {
+      if ("__P2P_DEBUG__" in window) {
+        try {
+          delete window.__P2P_DEBUG__;
+        } catch {
+          // ignore non-configurable
+        }
+      }
+      return;
+    }
+    if (!this._debugHandle) {
+      const app = this;
+      const handle = {};
+      Object.defineProperties(handle, {
+        appVersion: {
+          enumerable: true,
+          get: () => APP_VERSION,
+        },
+        peerId: {
+          enumerable: true,
+          get: () => app.status?.peerId || "",
+        },
+        roomId: {
+          enumerable: true,
+          get: () => app.activeRoom?.topic || app.status?.room || "",
+        },
+        peers: {
+          enumerable: true,
+          get: () => app._buildDebugSnapshot().peers,
+        },
+        watchState: {
+          enumerable: true,
+          get: () => app._buildDebugSnapshot().watchState,
+        },
+        watchNotice: {
+          enumerable: true,
+          get: () => app._buildDebugSnapshot().watchNotice,
+        },
+        swState: {
+          enumerable: true,
+          get: () => app._buildDebugSnapshot().swState,
+        },
+        traceCount: {
+          enumerable: true,
+          get: () => (app.watchTrace ? app.watchTrace.count() : 0),
+        },
+        traceEnabled: {
+          enumerable: true,
+          get: () => (app.watchTrace ? app.watchTrace.isEnabled() : false),
+        },
+        snapshot: {
+          enumerable: true,
+          value: () => app._buildDebugSnapshot(),
+        },
+        exportWatchTrace: {
+          enumerable: true,
+          value: () => app._buildWatchTraceExport(),
+        },
+      });
+      this._debugHandle = Object.freeze(handle);
+    }
+    try {
+      Object.defineProperty(window, "__P2P_DEBUG__", {
+        configurable: true,
+        enumerable: true,
+        writable: false,
+        value: this._debugHandle,
+      });
+    } catch {
+      // ignore restricted window environments
+    }
+  }
+
+  _scheduleWatchTraceUiUpdate() {
+    if (typeof requestAnimationFrame !== "function") {
+      this._renderWatchTraceUi();
+      return;
+    }
+    if (this._watchTraceUiRaf !== null) return;
+    this._watchTraceUiRaf = requestAnimationFrame(() => {
+      this._watchTraceUiRaf = null;
+      this._renderWatchTraceUi();
+    });
+  }
+
+  _renderWatchTraceUi() {
+    const box = this.el["watch-trace-box"];
+    const statusEl = this.el["watch-trace-status"];
+    const toggleBtn = this.el["btn-watch-trace-toggle"];
+    const exportBtn = this.el["btn-watch-trace-export"];
+    const recording = Boolean(this.watchTrace?.isEnabled());
+    const count = this.watchTrace ? this.watchTrace.count() : 0;
+    const dropped = this.watchTrace ? this.watchTrace.dropped() : 0;
+    if (box) {
+      box.classList.toggle("is-recording", recording);
+    }
+    if (statusEl) {
+      const prefix = recording ? "Rec" : "Off";
+      statusEl.textContent = dropped > 0 ? `${prefix} · ${count} (+${dropped} trimmed)` : `${prefix} · ${count}`;
+    }
+    if (toggleBtn) {
+      toggleBtn.classList.toggle("is-recording", recording);
+      toggleBtn.setAttribute("aria-pressed", String(recording));
+      toggleBtn.textContent = recording ? "Stop Watch Trace" : "Record Watch Trace";
+    }
+    if (exportBtn) {
+      exportBtn.disabled = count === 0;
+    }
+  }
+
+  toggleWatchTraceRecording() {
+    if (!this.watchTrace) return;
+    const next = !this.watchTrace.isEnabled();
+    this.watchTrace.setEnabled(next);
+    this.mediaSyncController?.setDebugEventSink(this.watchTrace.getSink());
+    this._renderWatchTraceUi();
+    this.addTelemetry(
+      "info",
+      next
+        ? "Watch Trace recording enabled (max 2,000 sanitized events)"
+        : `Watch Trace recording paused (${this.watchTrace.count()} event(s) buffered)`
+    );
+    this.showToast(
+      next
+        ? "Recording Watch Trace events"
+        : `Watch Trace paused (${this.watchTrace.count()} events)`
+    );
+  }
+
+  _buildWatchTraceExport() {
+    const snap = this._buildDebugSnapshot();
+    return this.watchTrace.exportTrace({
+      appVersion: APP_VERSION,
+      peerId: snap.peerId,
+      watchState: snap.watchState,
+      watchNotice: snap.watchNotice,
+    });
+  }
+
+  exportWatchTrace() {
+    if (!this.watchTrace || this.watchTrace.count() === 0) {
+      this.showToast("No Watch Trace events recorded yet");
+      return;
+    }
+    const payload = this._buildWatchTraceExport();
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `p2p-direct-watch-trace-${this.status?.peerId || "local"}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    this.showToast(`Exported ${payload.count} watch trace event(s)`);
   }
 
   syncLayoutAttributes() {
@@ -4393,125 +4705,54 @@ class P2PDirectApp {
    * Volume and mute are never transmitted.
    */
   publishMediaSync(partialState, opts = {}) {
-    if (!this.wasm || !partialState || !partialState.targetId) return null;
-    const nowMs = Date.now();
-    const prev = this.mediaSync.states.get(partialState.targetId);
-    const merged = {
-      targetId: partialState.targetId,
-      kind: partialState.kind || prev?.kind || "video",
-      rev: prev?.rev || 0,
-      active: partialState.active !== undefined ? Boolean(partialState.active) : true,
-      playing: partialState.playing !== undefined ? Boolean(partialState.playing) : Boolean(prev?.playing),
-      positionMs:
-        partialState.positionMs !== undefined
-          ? Math.max(0, Math.round(partialState.positionMs))
-          : prev
-            ? projectMediaPositionMs(prev, nowMs)
-            : 0,
-      rateMilli:
-        partialState.rateMilli !== undefined
-          ? Math.max(250, Math.min(4000, Math.round(partialState.rateMilli)))
-          : prev?.rateMilli || 1000,
-      loop: partialState.loop !== undefined ? Boolean(partialState.loop) : Boolean(prev?.loop),
-      epoch: partialState.epoch !== undefined ? Number(partialState.epoch) : prev?.epoch || 0,
-      url: partialState.url !== undefined ? partialState.url : prev?.url || "",
-      provider: partialState.provider !== undefined ? partialState.provider : prev?.provider || "",
-      mediaId: partialState.mediaId !== undefined ? partialState.mediaId : prev?.mediaId || "",
-      title: partialState.title !== undefined ? partialState.title : prev?.title || "",
-      sourceMsgId:
-        partialState.sourceMsgId !== undefined ? partialState.sourceMsgId : prev?.sourceMsgId || "",
-      playlistId:
-        partialState.playlistId !== undefined ? partialState.playlistId : prev?.playlistId || "",
-      playlistIndex:
-        partialState.playlistIndex !== undefined
-          ? Math.max(0, Math.min(10000, Math.floor(Number(partialState.playlistIndex) || 0)))
-          : Number(prev?.playlistIndex) || 0,
-      trackUri: partialState.trackUri !== undefined ? partialState.trackUri : prev?.trackUri || "",
-      queue: Array.isArray(partialState.queue) ? partialState.queue : prev?.queue || [],
-    };
-    const isWatchTarget = merged.targetId === "watch" || merged.kind === "watch";
-    const prevWatchSource = this.mediaSync.watchApplySource;
-    if (isWatchTarget) {
-      this.mediaSync.watchApplySource = opts?.source || "local-ui";
-    }
-    try {
-      const res = this.wasm.mediaSyncUpdate(merged, nowMs);
-      if (res && res.status) {
-        this.status = res.status;
-      }
-      if (res && Array.isArray(res.actions)) {
-        this.executeActions(res.actions);
-      }
-      return res?.state || null;
-    } catch (err) {
-      this.addTelemetry("error", `Media sync update failed: ${err.message}`);
-      return null;
-    } finally {
-      if (isWatchTarget) {
-        this.mediaSync.watchApplySource = prevWatchSource;
-      }
-    }
+    return this.mediaSyncController.publishMediaSync(partialState, opts);
   }
 
   /**
    * Handles a synchronized media state arriving from local mutation or a remote E2EE peer.
    */
   handleIncomingMediaSync(state) {
-    if (!state || !state.targetId) return;
-    const prev = this.mediaSync.states.get(state.targetId);
-    const normalized = {
-      ...state,
-      anchorMs: Date.now(),
-    };
-    this.mediaSync.states.set(state.targetId, normalized);
+    this.mediaSyncController.handleIncomingMediaSync(state);
+  }
 
-    if (state.targetId === "watch" || state.kind === "watch") {
-      this._applyWatchTogetherState(normalized, prev);
-      this._ensureMediaDriftTimer();
-      return;
+  _handleIncomingVideoMediaSync(normalized, prev) {
+    const bind = this.mediaSync.videoBindings.get(normalized.targetId);
+    if (bind) {
+      this._applyVideoSyncState(bind, normalized, prev);
     }
-
-    if (state.kind === "video" || state.targetId.startsWith("vid:")) {
-      const bind = this.mediaSync.videoBindings.get(state.targetId);
-      if (bind) {
-        this._applyVideoSyncState(bind, normalized, prev);
-      }
-      const isLocalLightboxEcho =
-        normalized.actor === this.status?.peerId &&
-        this.mediaSync.lightboxVideoSuppressUntil > performance.now();
-      if (
-        !isLocalLightboxEcho &&
-        this.lightboxState &&
-        this.lightboxState.kind === "video" &&
-        this.lightboxState.syncTargetId === state.targetId
-      ) {
-        this._applyLightboxVideoSyncState(normalized, prev);
-      }
-      this._ensureMediaDriftTimer();
-      return;
+    const isLocalLightboxEcho =
+      normalized.actor === this.status?.peerId &&
+      this.mediaSync.lightboxVideoSuppressUntil > performance.now();
+    if (
+      !isLocalLightboxEcho &&
+      this.lightboxState &&
+      this.lightboxState.kind === "video" &&
+      this.lightboxState.syncTargetId === normalized.targetId
+    ) {
+      this._applyLightboxVideoSyncState(normalized, prev);
     }
+  }
 
-    if (state.kind === "gif" || state.targetId.startsWith("gif:")) {
-      const bind = this.mediaSync.gifBindings.get(state.targetId);
-      if (bind) {
-        this._applyGifSyncState(bind, normalized, prev);
-      }
-      if (
-        normalized.actor !== this.status?.peerId &&
-        this.lightboxState &&
-        this.lightboxState.kind === "gif" &&
-        this.lightboxState.syncTargetId === state.targetId &&
-        normalized.epoch > 0 &&
-        (!prev || normalized.epoch > (prev.epoch || 0))
-      ) {
-        const imgEl = this.el["lightbox-img"];
-        if (imgEl && this.lightboxState.blob) {
-          const nextUrl = URL.createObjectURL(this.lightboxState.blob);
-          this._cleanupLightboxTempUrl();
-          this.lightboxState.tempUrl = nextUrl;
-          imgEl.src = nextUrl;
-          imgEl.dataset.replayCount = String((Number(imgEl.dataset.replayCount) || 0) + 1);
-        }
+  _handleIncomingGifMediaSync(normalized, prev) {
+    const bind = this.mediaSync.gifBindings.get(normalized.targetId);
+    if (bind) {
+      this._applyGifSyncState(bind, normalized, prev);
+    }
+    if (
+      normalized.actor !== this.status?.peerId &&
+      this.lightboxState &&
+      this.lightboxState.kind === "gif" &&
+      this.lightboxState.syncTargetId === normalized.targetId &&
+      normalized.epoch > 0 &&
+      (!prev || normalized.epoch > (prev.epoch || 0))
+    ) {
+      const imgEl = this.el["lightbox-img"];
+      if (imgEl && this.lightboxState.blob) {
+        const nextUrl = URL.createObjectURL(this.lightboxState.blob);
+        this._cleanupLightboxTempUrl();
+        this.lightboxState.tempUrl = nextUrl;
+        imgEl.src = nextUrl;
+        imgEl.dataset.replayCount = String((Number(imgEl.dataset.replayCount) || 0) + 1);
       }
     }
   }
@@ -4520,10 +4761,6 @@ class P2PDirectApp {
     if (this.mediaSync.gifRafId) {
       cancelAnimationFrame(this.mediaSync.gifRafId);
       this.mediaSync.gifRafId = null;
-    }
-    if (this.mediaSync.driftTimer) {
-      clearInterval(this.mediaSync.driftTimer);
-      this.mediaSync.driftTimer = null;
     }
     if (this.mediaSync.watchUiTimer) {
       clearInterval(this.mediaSync.watchUiTimer);
@@ -4534,20 +4771,7 @@ class P2PDirectApp {
     }
     this.mediaSync.gifBindings.clear();
     this.mediaSync.videoBindings.clear();
-    this.mediaSync.states.clear();
-    this.mediaSync.watchMinimized = false;
-    this.mediaSync.watchTitleOverride = "";
-    this.mediaSync.watchDurationMs = 0;
-    this.mediaSync.watchPlaylistCount = 0;
-    this.mediaSync.watchPlaylistItems = [];
-    this.mediaSync.watchTracksOpen = false;
-    this.mediaSync.watchSpotifyTrackDetached = false;
-    this._clearWatchProviderNoticeState();
-    this.mediaSync.watchTwitchOffline = false;
-    if (this.mediaSync.watchPlayer) {
-      this.mediaSync.watchPlayer.destroy();
-    }
-    this._syncWatchTogetherUi(null);
+    this.mediaSyncController.resetAll();
   }
 
   _disposeGifBinding(bind) {
@@ -5036,12 +5260,14 @@ class P2PDirectApp {
   }
 
   _ensureMediaDriftTimer() {
-    if (this.mediaSync.driftTimer) return;
-    this.mediaSync.driftTimer = setInterval(() => this._runMediaDriftCorrection(), 1200);
+    this.mediaSyncController.ensureMediaDriftTimer();
   }
 
   _runMediaDriftCorrection() {
-    const nowMs = Date.now();
+    this.mediaSyncController.runMediaDriftCorrection();
+  }
+
+  _runVideoBindingsDriftCorrection(nowMs = Date.now()) {
     let anyPlaying = false;
 
     for (const [id, bind] of this.mediaSync.videoBindings.entries()) {
@@ -5099,248 +5325,54 @@ class P2PDirectApp {
       }
     }
 
-    const watchSt = this.mediaSync.states.get("watch");
-    if (watchSt && watchSt.active && watchSt.playing) {
-      anyPlaying = true;
-      if (this.mediaSync.watchPlayer) {
-        this.mediaSync.watchPlayer.correctDrift(watchSt, nowMs);
-      }
-    }
-
-    if (!anyPlaying && this.mediaSync.driftTimer) {
-      clearInterval(this.mediaSync.driftTimer);
-      this.mediaSync.driftTimer = null;
-    }
+    return anyPlaying;
   }
 
   /* ---- Synced Watch Together (YouTube / YouTube Music / Spotify / SoundCloud / Twitch + Playlists) ---- */
 
   _watchProviderLabel(provider) {
-    if (provider === "ytmusic") return "YT MUSIC";
-    if (provider === "youtube") return "YOUTUBE";
-    if (provider === "spotify") return "SPOTIFY";
-    if (provider === "soundcloud") return "SOUNDCLOUD";
-    if (provider === "twitch") return "TWITCH";
-    return String(provider || "WATCH").toUpperCase();
+    return getWatchProviderLabel(provider);
   }
 
   _watchProviderFriendlyName(provider) {
-    if (provider === "ytmusic") return "YouTube Music";
-    if (provider === "youtube") return "YouTube";
-    if (provider === "spotify") return "Spotify";
-    if (provider === "soundcloud") return "SoundCloud";
-    if (provider === "twitch") return "Twitch";
-    return "Provider";
+    return getWatchProviderFriendlyName(provider);
   }
 
   _clearWatchProviderNoticeState() {
-    this.mediaSync.watchSpotifySession = null;
-    this.mediaSync.watchSpotifySessionDismissed = false;
-    this.mediaSync.watchSpotifyPendingRefresh = false;
-    this.mediaSync.watchProviderNotice = null;
-    this.mediaSync.watchProviderNoticeDismissed = false;
-    this.mediaSync.watchProviderPendingRefresh = false;
-    this.mediaSync.watchProviderPendingRefreshKey = "";
+    this.mediaSyncController.clearWatchProviderNoticeState();
   }
 
   _getTwitchEntityKind(state) {
-    if (!state || state.provider !== "twitch") return "";
-    const id = String(state.mediaId || "");
-    if (id.startsWith("channel:")) return "channel";
-    if (id.startsWith("clip:")) return "clip";
-    if (id.startsWith("collection:")) return "collection";
-    if (id.startsWith("video:")) return "video";
-    return "";
+    return getTwitchEntityKind(state);
   }
 
   _isWatchPlaylistState(state) {
-    return Boolean(
-      state &&
-        state.active &&
-        (state.playlistId || this.mediaSync.watchPlaylistCount > 1)
-    );
+    return this.mediaSyncController.isWatchPlaylistState(state);
   }
 
   _isIndexableWatchPlaylist(state) {
-    return (
-      this._isWatchPlaylistState(state) &&
-      state.provider !== "spotify" &&
-      state.provider !== "twitch"
-    );
+    return this.mediaSyncController.isIndexableWatchPlaylist(state);
   }
 
   _ensureWatchPlayer() {
-    if (this.mediaSync.watchPlayer) return this.mediaSync.watchPlayer;
-    const mountEl = this.el["watch-embed-stage"];
-    this.mediaSync.watchPlayer = new WatchTogetherPlayer(mountEl, {
-      getLocalPeerId: () => this.status?.peerId || "",
-      onUserAction: (ev) => {
-        const cur = this.mediaSync.states.get("watch");
-        if (!cur || !cur.active) return;
-        if (ev.ended) {
-          if (cur.loop) {
-            if (cur.playlistId && (cur.playlistIndex || 0) > 0 && this._isIndexableWatchPlaylist(cur)) {
-              this.selectWatchPlaylistTrack(0);
-            } else {
-              this.replayWatch();
-            }
-          } else if (Array.isArray(cur.queue) && cur.queue.length > 0) {
-            // Actor advances immediately; other peers act as backup after 900ms if actor disconnected
-            const isActor = cur.actor === this.status?.peerId;
-            const prevRev = cur.rev;
-            const delay = isActor ? 50 : 900;
-            setTimeout(() => {
-              const live = this.mediaSync.states.get("watch");
-              if (live && live.active && live.rev === prevRev && live.queue.length > 0) {
-                this.playNextWatchQueueItem();
-              }
-            }, delay);
-          } else if (cur.playing) {
-            this.publishMediaSync(
-              {
-                targetId: "watch",
-                kind: "watch",
-                playing: false,
-                positionMs: ev.positionMs || this.mediaSync.watchDurationMs || cur.positionMs,
-                playlistIndex: ev.playlistIndex !== undefined ? ev.playlistIndex : cur.playlistIndex || 0,
-                trackUri: ev.trackUri !== undefined ? ev.trackUri : cur.trackUri || "",
-              },
-              { source: "local-embed" }
-            );
-          }
-          return;
-        }
-        const update = {
-          targetId: "watch",
-          kind: "watch",
-          active: true,
-          playing: Boolean(ev.playing),
-          positionMs: Math.max(0, Math.round(ev.positionMs || 0)),
-          rateMilli: ev.rateMilli || cur.rateMilli || 1000,
-        };
-        if (ev.playlistIndex !== undefined) {
-          update.playlistIndex = ev.playlistIndex;
-        }
-        if (ev.trackUri !== undefined) {
-          update.trackUri = ev.trackUri;
-        }
-        this.publishMediaSync(update, { source: "local-embed" });
-      },
-      onNegotiateState: (ev) => {
-        const cur = this.mediaSync.states.get("watch");
-        if (!cur || !cur.active) return;
-        const update = {
-          targetId: "watch",
-          kind: "watch",
-          active: true,
-          playing: Boolean(ev.playing),
-          positionMs: Math.max(0, Math.round(ev.positionMs || 0)),
-          rateMilli: ev.rateMilli || cur.rateMilli || 1000,
-        };
-        if (ev.playlistIndex !== undefined) {
-          update.playlistIndex = ev.playlistIndex;
-        }
-        if (ev.trackUri !== undefined) {
-          update.trackUri = ev.trackUri;
-        }
-        this.addTelemetry(
-          "info",
-          `Watch Together negotiated shared state (${ev.reason || "divergence"})`
-        );
-        this.publishMediaSync(update, { source: "negotiated" });
-      },
-      onTelemetry: (meta) => {
-        if (meta.durationMs > 0) {
-          this.mediaSync.watchDurationMs = meta.durationMs;
-        }
-        if (meta.title) {
-          this.mediaSync.watchTitleOverride = meta.title;
-          if (this.el["watch-panel-title"]) {
-            this.el["watch-panel-title"].textContent = meta.title;
-          }
-        }
-        let uiMetaChanged = false;
-        if (typeof meta.playlistCount === "number" && meta.playlistCount !== this.mediaSync.watchPlaylistCount) {
-          this.mediaSync.watchPlaylistCount = meta.playlistCount;
-          uiMetaChanged = true;
-        }
-        if (Array.isArray(meta.playlistItems) && meta.playlistItems.length > 0) {
-          this.mediaSync.watchPlaylistItems = meta.playlistItems;
-          uiMetaChanged = true;
-        }
-        if (
-          typeof meta.spotifyTrackDetached === "boolean" &&
-          meta.spotifyTrackDetached !== this.mediaSync.watchSpotifyTrackDetached
-        ) {
-          this.mediaSync.watchSpotifyTrackDetached = meta.spotifyTrackDetached;
-          uiMetaChanged = true;
-        }
-        if (meta.spotifySession && typeof meta.spotifySession === "object") {
-          const prevSess = this.mediaSync.watchSpotifySession;
-          const nextSess = meta.spotifySession;
-          if (
-            !prevSess ||
-            prevSess.mode !== nextSess.mode ||
-            prevSess.browser !== nextSess.browser ||
-            prevSess.errorMessage !== nextSess.errorMessage
-          ) {
-            this.mediaSync.watchSpotifySession = nextSess;
-            if (nextSess.mode === "full") {
-              this.mediaSync.watchSpotifyPendingRefresh = false;
-              this.mediaSync.watchProviderPendingRefresh = false;
-              this.mediaSync.watchProviderPendingRefreshKey = "";
-            }
-            uiMetaChanged = true;
-          }
-        }
-        if ("providerNotice" in meta) {
-          const prevNotice = this.mediaSync.watchProviderNotice;
-          const nextNotice =
-            meta.providerNotice && typeof meta.providerNotice === "object"
-              ? meta.providerNotice
-              : null;
-          const noticeChanged =
-            Boolean(prevNotice) !== Boolean(nextNotice) ||
-            (prevNotice &&
-              nextNotice &&
-              (prevNotice.provider !== nextNotice.provider ||
-                prevNotice.code !== nextNotice.code ||
-                prevNotice.kind !== nextNotice.kind ||
-                prevNotice.message !== nextNotice.message));
-          if (noticeChanged) {
-            this.mediaSync.watchProviderNotice = nextNotice;
-            if (nextNotice) {
-              this.mediaSync.watchProviderNoticeDismissed = false;
-            } else {
-              this.mediaSync.watchProviderPendingRefresh = false;
-              this.mediaSync.watchProviderPendingRefreshKey = "";
-            }
-            uiMetaChanged = true;
-          }
-        }
-        if (
-          typeof meta.twitchOffline === "boolean" &&
-          meta.twitchOffline !== this.mediaSync.watchTwitchOffline
-        ) {
-          this.mediaSync.watchTwitchOffline = meta.twitchOffline;
-          uiMetaChanged = true;
-        }
-        if (uiMetaChanged) {
-          const cur = this.mediaSync.states.get("watch");
-          if (cur && cur.active) {
-            this._syncWatchTogetherUi(cur);
-          }
-        }
-        this._updateWatchTimeUi();
-      },
-      onAutoplayMuted: (isMuted) => {
-        if (this.el["btn-watch-autoplay-unmute"]) {
-          this.el["btn-watch-autoplay-unmute"].classList.toggle("hidden", !isMuted);
-        }
-        this._updateWatchLocalVolUi();
-      },
-    });
-    return this.mediaSync.watchPlayer;
+    return this.mediaSyncController.ensureWatchPlayer();
+  }
+
+  _handleWatchControllerUiSync(state, meta = {}) {
+    if (meta?.noticeDismissed) {
+      this._renderWatchProviderNoticeBar(state || null);
+      return;
+    }
+    const isActive = Boolean(state && state.active && state.provider && state.mediaId);
+    if (!isActive) {
+      if (this.mediaSync.watchUiTimer) {
+        clearInterval(this.mediaSync.watchUiTimer);
+        this.mediaSync.watchUiTimer = null;
+      }
+    } else if (!this.mediaSync.watchUiTimer) {
+      this.mediaSync.watchUiTimer = setInterval(() => this._updateWatchTimeUi(), 400);
+    }
+    this._syncWatchTogetherUi(state || null);
   }
 
   toggleWatchMinimize() {
@@ -5356,237 +5388,51 @@ class P2PDirectApp {
   }
 
   startWatchTogetherFromUrl(rawUrl, sourceMsgId = "") {
-    const parsed = parseWatchMediaUrl(rawUrl);
-    if (!parsed) {
-      this.showToast("Share a valid YouTube, YouTube Music, Spotify, SoundCloud, or Twitch link in chat");
-      return false;
-    }
-    const prev = this.mediaSync.states.get("watch");
-    this.mediaSync.watchMinimized = false;
-    this.mediaSync.watchTitleOverride = "";
-    this.mediaSync.watchDurationMs = 0;
-    this.mediaSync.watchPlaylistCount = 0;
-    this.mediaSync.watchPlaylistItems = [];
-    this.mediaSync.watchTracksOpen = false;
-    this.mediaSync.watchSpotifyTrackDetached = false;
-    this._clearWatchProviderNoticeState();
-    this.mediaSync.watchTwitchOffline = false;
-
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      playing: true,
-      positionMs: parsed.startMs || 0,
-      rateMilli: 1000,
-      loop: Boolean(prev?.loop),
-      epoch: (prev?.epoch || 0) + 1,
-      url: parsed.url,
-      provider: parsed.provider,
-      mediaId: parsed.mediaId,
-      title: parsed.title,
-      sourceMsgId: sourceMsgId || "",
-      playlistId: parsed.playlistId || "",
-      playlistIndex: parsed.playlistIndex || 0,
-      trackUri: parsed.trackUri || "",
-      queue: Array.isArray(prev?.queue) ? prev.queue : [],
-    });
-    const kindWord =
-      parsed.entityType === "channel"
-        ? " live stream"
-        : parsed.entityType === "clip"
-          ? " clip"
-          : parsed.entityType === "collection"
-            ? " collection"
-            : parsed.isPlaylist
-              ? " playlist"
-              : "";
-    this.showToast(`Started synced ${parsed.providerLabel}${kindWord} for room`);
-    return true;
+    return this.mediaSyncController.startWatchTogetherFromUrl(rawUrl, sourceMsgId);
   }
 
   enqueueWatchUrl(rawUrl) {
-    const parsed = parseWatchMediaUrl(rawUrl);
-    if (!parsed) {
-      this.showToast("Share a valid YouTube, YouTube Music, Spotify, SoundCloud, or Twitch link in chat");
-      return false;
-    }
-    const prev = this.mediaSync.states.get("watch");
-    if (!prev || !prev.active || !prev.mediaId) {
-      return this.startWatchTogetherFromUrl(rawUrl, "");
-    }
-    const nextQueue = Array.isArray(prev.queue) ? prev.queue.slice(0, 63) : [];
-    nextQueue.push({
-      id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      url: parsed.url,
-      provider: parsed.provider,
-      mediaId: parsed.mediaId,
-      title: parsed.title,
-      addedBy: this.status?.authorName || "Peer",
-      startMs: parsed.startMs || 0,
-      playlistId: parsed.playlistId || "",
-      playlistIndex: parsed.playlistIndex || 0,
-    });
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      queue: nextQueue,
-    });
-    const noun =
-      parsed.entityType === "channel"
-        ? "stream"
-        : parsed.entityType === "clip"
-          ? "clip"
-          : parsed.entityType === "collection"
-            ? "collection"
-            : parsed.isPlaylist
-              ? "playlist"
-              : "track";
-    this.showToast(`Queued ${parsed.providerLabel} ${noun} (#${nextQueue.length})`);
-    return true;
+    return this.mediaSyncController.enqueueWatchUrl(rawUrl);
   }
 
   toggleWatchPlay() {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active) return;
-    const tk = this._getTwitchEntityKind(cur);
-    if (tk === "clip") return;
-    const nowPos = tk === "channel" ? 0 : projectMediaPositionMs(cur, Date.now());
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      playing: !cur.playing,
-      positionMs: nowPos,
-    });
+    this.mediaSyncController.toggleWatchPlay();
   }
 
   seekWatchBy(deltaMs) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active) return;
-    const tk = this._getTwitchEntityKind(cur);
-    if (tk === "channel" || tk === "clip") return;
-    const nowPos = projectMediaPositionMs(cur, Date.now());
-    const dur = this.mediaSync.watchDurationMs || 0;
-    let nextPos = Math.max(0, nowPos + deltaMs);
-    if (dur > 0) nextPos = Math.min(nextPos, dur);
-    this.seekWatchTo(nextPos);
+    this.mediaSyncController.seekWatchBy(deltaMs);
   }
 
   seekWatchTo(posMs) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active) return;
-    const tk = this._getTwitchEntityKind(cur);
-    if (tk === "channel" || tk === "clip") return;
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      playing: cur.playing,
-      positionMs: Math.max(0, Math.round(posMs)),
-    });
+    this.mediaSyncController.seekWatchTo(posMs);
   }
 
   replayWatch() {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active) return;
-    if (this._getTwitchEntityKind(cur) === "channel") return;
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      playing: true,
-      positionMs: 0,
-      epoch: (cur.epoch || 0) + 1,
-    });
+    this.mediaSyncController.replayWatch();
   }
 
   toggleWatchLoop() {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active) return;
-    const tk = this._getTwitchEntityKind(cur);
-    if (tk === "channel" || tk === "clip") return;
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      loop: !cur.loop,
-    });
+    this.mediaSyncController.toggleWatchLoop();
+  }
+
+  setWatchPlaybackRate(rateMilli) {
+    this.mediaSyncController.setWatchPlaybackRate(rateMilli);
   }
 
   setWatchSpeed(rateMilli) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active) return;
-    const clamped = Math.max(250, Math.min(4000, Math.round(rateMilli || 1000)));
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      positionMs: projectMediaPositionMs(cur, Date.now()),
-      rateMilli: clamped,
-    });
+    this.mediaSyncController.setWatchPlaybackRate(rateMilli);
   }
 
   selectWatchPlaylistTrack(idx) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active || !this._isIndexableWatchPlaylist(cur)) return;
-    const count = this.mediaSync.watchPlaylistCount || 0;
-    let targetIdx = Math.max(0, Math.floor(Number(idx) || 0));
-    if (count > 0) {
-      targetIdx = Math.min(count - 1, targetIdx);
-    }
-    const item = this.mediaSync.watchPlaylistItems[targetIdx];
-    this.mediaSync.watchDurationMs = item?.durationMs > 0 ? item.durationMs : 0;
-    if (item?.title) {
-      this.mediaSync.watchTitleOverride = item.artist ? `${item.artist} — ${item.title}` : item.title;
-    }
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      playing: true,
-      positionMs: 0,
-      playlistIndex: targetIdx,
-      trackUri: item?.id && cur.provider !== "soundcloud" ? item.id : "",
-      epoch: (cur.epoch || 0) + 1,
-    });
+    this.mediaSyncController.selectWatchPlaylistTrack(idx);
   }
 
   playPrevWatchTrack() {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active || !this._isIndexableWatchPlaylist(cur)) return;
-    const curIdx = Math.max(0, Number(cur.playlistIndex) || 0);
-    const count = this.mediaSync.watchPlaylistCount || 0;
-    if (curIdx > 0) {
-      this.selectWatchPlaylistTrack(curIdx - 1);
-    } else if (cur.loop && count > 1) {
-      this.selectWatchPlaylistTrack(count - 1);
-    } else {
-      this.replayWatch();
-    }
+    this.mediaSyncController.playPrevWatchTrack();
   }
 
   playNextWatchTrackOrQueue() {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active) return;
-    if (this._isIndexableWatchPlaylist(cur)) {
-      const curIdx = Math.max(0, Number(cur.playlistIndex) || 0);
-      const count = this.mediaSync.watchPlaylistCount || 0;
-      if (count === 0 || curIdx + 1 < count) {
-        this.selectWatchPlaylistTrack(curIdx + 1);
-        return;
-      }
-      if (Array.isArray(cur.queue) && cur.queue.length > 0) {
-        this.playWatchQueueItemAt(0);
-        return;
-      }
-      if (cur.loop && count > 0) {
-        this.selectWatchPlaylistTrack(0);
-      }
-      return;
-    }
-    this.playNextWatchQueueItem();
+    this.mediaSyncController.playNextWatchTrackOrQueue();
   }
 
   toggleWatchPlaylistTracks() {
@@ -5596,45 +5442,19 @@ class P2PDirectApp {
   }
 
   showWatchSpotifyPlaylist() {
-    if (this.mediaSync.watchPlayer) {
-      this.mediaSync.watchPlayer.showSpotifyPlaylistView();
-    }
+    return this.mediaSyncController.showWatchSpotifyPlaylist();
   }
 
   async reloadWatchPlayerSession({ reason = "manual" } = {}) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active || !cur.provider || !this.mediaSync.watchPlayer) {
-      return false;
-    }
-    this._clearWatchProviderNoticeState();
-    this._syncWatchTogetherUi(cur);
-    const ok = await this.mediaSync.watchPlayer.reloadPlayerSession();
-    if (ok) {
-      const provName = this._watchProviderFriendlyName(cur.provider);
-      this.showToast(
-        reason === "focus"
-          ? `Reloaded ${provName} embed to pick up your browser session`
-          : cur.provider === "spotify"
-            ? "Reloaded Spotify session locally"
-            : `Reloaded ${provName} player locally`
-      );
-    }
-    return ok;
+    return this.mediaSyncController.reloadWatchPlayerSession({ reason });
   }
 
   async reloadWatchSpotifySession({ reason = "manual" } = {}) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active || cur.provider !== "spotify") {
-      return false;
-    }
-    return this.reloadWatchPlayerSession({ reason });
+    return this.mediaSyncController.reloadWatchSpotifySession({ reason });
   }
 
   dismissWatchProviderNoticeBar() {
-    this.mediaSync.watchProviderNoticeDismissed = true;
-    this.mediaSync.watchSpotifySessionDismissed = true;
-    const cur = this.mediaSync.states.get("watch");
-    this._renderWatchProviderNoticeBar(cur || null);
+    this.mediaSyncController.dismissWatchProviderNoticeBar();
   }
 
   dismissWatchSpotifySessionBar() {
@@ -5642,25 +5462,7 @@ class P2PDirectApp {
   }
 
   _maybeReloadWatchSessionOnFocus() {
-    if (!this.mediaSync.watchProviderPendingRefresh && !this.mediaSync.watchSpotifyPendingRefresh) {
-      return;
-    }
-    const expectedKey = this.mediaSync.watchProviderPendingRefreshKey || "";
-    this.mediaSync.watchProviderPendingRefresh = false;
-    this.mediaSync.watchProviderPendingRefreshKey = "";
-    this.mediaSync.watchSpotifyPendingRefresh = false;
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !cur.active || !cur.provider) return;
-    const curKey = `${cur.provider}:${cur.mediaId}:${cur.playlistId || ""}`;
-    if (expectedKey && curKey !== expectedKey) return;
-    if (cur.provider === "spotify") {
-      if (this.mediaSync.watchSpotifySession?.mode === "full") return;
-      if (!this.mediaSync.watchSpotifySession?.isPreview) return;
-    } else {
-      const notice = this.mediaSync.watchProviderNotice;
-      if (!notice || !notice.autoReloadOnReturn) return;
-    }
-    this.reloadWatchPlayerSession({ reason: "focus" });
+    this.mediaSyncController.maybeReloadWatchSessionOnFocus();
   }
 
   _maybeReloadSpotifySessionOnFocus() {
@@ -5758,103 +5560,35 @@ class P2PDirectApp {
   }
 
   playNextWatchQueueItem() {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !Array.isArray(cur.queue) || cur.queue.length === 0) return;
-    this.playWatchQueueItemAt(0);
+    this.mediaSyncController.playNextWatchQueueItem();
   }
 
   playWatchQueueItemAt(idx) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !Array.isArray(cur.queue) || idx < 0 || idx >= cur.queue.length) return;
-    const item = cur.queue[idx];
-    const remaining = cur.queue.slice(0, idx).concat(cur.queue.slice(idx + 1));
-    const parsedItem = parseWatchMediaUrl(item.url);
-    this.mediaSync.watchTitleOverride = "";
-    this.mediaSync.watchDurationMs = 0;
-    this.mediaSync.watchPlaylistCount = 0;
-    this.mediaSync.watchPlaylistItems = [];
-    this.mediaSync.watchTracksOpen = false;
-    this.mediaSync.watchSpotifyTrackDetached = false;
-    this._clearWatchProviderNoticeState();
-    this.mediaSync.watchTwitchOffline = false;
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: true,
-      playing: true,
-      positionMs: item.startMs || 0,
-      rateMilli: 1000,
-      epoch: (cur.epoch || 0) + 1,
-      url: item.url,
-      provider: item.provider,
-      mediaId: item.mediaId,
-      title: item.title,
-      sourceMsgId: "",
-      playlistId: item.playlistId || "",
-      playlistIndex: item.playlistIndex || 0,
-      trackUri: parsedItem?.trackUri || "",
-      queue: remaining,
-    });
+    this.mediaSyncController.playWatchQueueItemAt(idx);
+  }
+
+  removeWatchQueueItem(idx) {
+    this.mediaSyncController.removeWatchQueueItem(idx);
   }
 
   removeWatchQueueItemAt(idx) {
-    const cur = this.mediaSync.states.get("watch");
-    if (!cur || !Array.isArray(cur.queue) || idx < 0 || idx >= cur.queue.length) return;
-    const remaining = cur.queue.slice(0, idx).concat(cur.queue.slice(idx + 1));
-    this.publishMediaSync({
-      targetId: "watch",
-      kind: "watch",
-      active: cur.active,
-      queue: remaining,
-    });
+    this.mediaSyncController.removeWatchQueueItem(idx);
   }
 
   stopWatchTogetherForRoom() {
-    const cur = this.mediaSync.states.get("watch");
-    this.mediaSync.watchMinimized = false;
-    this.mediaSync.watchPlaylistCount = 0;
-    this.mediaSync.watchPlaylistItems = [];
-    this.mediaSync.watchTracksOpen = false;
-    this.mediaSync.watchSpotifyTrackDetached = false;
-    this._clearWatchProviderNoticeState();
-    this.mediaSync.watchTwitchOffline = false;
-    if (cur && cur.active) {
-      this.publishMediaSync({
-        targetId: "watch",
-        kind: "watch",
-        active: false,
-        playing: false,
-        positionMs: 0,
-        url: "",
-        provider: "",
-        mediaId: "",
-        title: "",
-        playlistId: "",
-        playlistIndex: 0,
-        trackUri: "",
-        queue: [],
-      });
-    } else {
-      this._syncWatchTogetherUi(null);
-    }
+    this.mediaSyncController.stopWatchTogetherForRoom();
   }
 
   setWatchLocalVolume(vol0To100) {
-    const player = this._ensureWatchPlayer();
-    player.setLocalVolume(vol0To100);
-    this._updateWatchLocalVolUi();
+    this.mediaSyncController.setWatchLocalVolume(vol0To100);
   }
 
   setWatchLocalMuted(muted) {
-    const player = this._ensureWatchPlayer();
-    player.setLocalMuted(muted);
-    this._updateWatchLocalVolUi();
+    this.mediaSyncController.setWatchLocalMuted(muted);
   }
 
   toggleWatchLocalMute() {
-    const player = this._ensureWatchPlayer();
-    player.setLocalMuted(!player.localMuted);
-    this._updateWatchLocalVolUi();
+    this.mediaSyncController.toggleWatchLocalMute();
   }
 
   _updateWatchLocalVolUi() {
@@ -5875,68 +5609,7 @@ class P2PDirectApp {
   }
 
   _applyWatchTogetherState(state, prev) {
-    if (!state || !state.active || !state.provider || !state.mediaId) {
-      if (prev && prev.active) {
-        this.mediaSync.watchMinimized = false;
-      }
-      if (this.mediaSync.watchPlayer) {
-        this.mediaSync.watchPlayer.destroy();
-      }
-      this.mediaSync.watchDurationMs = 0;
-      this.mediaSync.watchTitleOverride = "";
-      this.mediaSync.watchPlaylistCount = 0;
-      this.mediaSync.watchPlaylistItems = [];
-      this.mediaSync.watchTracksOpen = false;
-      this.mediaSync.watchSpotifyTrackDetached = false;
-      this._clearWatchProviderNoticeState();
-      this.mediaSync.watchTwitchOffline = false;
-      if (this.mediaSync.watchUiTimer) {
-        clearInterval(this.mediaSync.watchUiTimer);
-        this.mediaSync.watchUiTimer = null;
-      }
-      this._syncWatchTogetherUi(state);
-      return;
-    }
-
-    const mediaChanged =
-      !prev ||
-      prev.mediaId !== state.mediaId ||
-      prev.provider !== state.provider ||
-      (prev.playlistId || "") !== (state.playlistId || "");
-    const playlistTrackChanged =
-      !mediaChanged &&
-      Boolean(prev) &&
-      ((prev.playlistIndex || 0) !== (state.playlistIndex || 0) ||
-        (prev.trackUri || "") !== (state.trackUri || ""));
-    if (mediaChanged) {
-      this.mediaSync.watchTitleOverride = "";
-      this.mediaSync.watchDurationMs = 0;
-      this.mediaSync.watchPlaylistCount = 0;
-      this.mediaSync.watchPlaylistItems = [];
-      this.mediaSync.watchTracksOpen = false;
-      this.mediaSync.watchSpotifyTrackDetached = false;
-      this._clearWatchProviderNoticeState();
-      this.mediaSync.watchTwitchOffline = false;
-      this.mediaSync.watchMinimized = false;
-      if (this.el["btn-watch-autoplay-unmute"]) {
-        this.el["btn-watch-autoplay-unmute"].classList.add("hidden");
-      }
-    } else if (playlistTrackChanged) {
-      this.mediaSync.watchProviderNotice = null;
-      this.mediaSync.watchProviderNoticeDismissed = false;
-      this.mediaSync.watchProviderPendingRefresh = false;
-      this.mediaSync.watchProviderPendingRefreshKey = "";
-    }
-
-    this._syncWatchTogetherUi(state);
-    const player = this._ensureWatchPlayer();
-    player.applyState(state, Date.now(), {
-      source: this.mediaSync.watchApplySource || "remote",
-    });
-
-    if (!this.mediaSync.watchUiTimer) {
-      this.mediaSync.watchUiTimer = setInterval(() => this._updateWatchTimeUi(), 400);
-    }
+    this.mediaSyncController.applyWatchTogetherState(state, prev);
   }
 
   _syncChatWatchCardActiveStates(state) {
@@ -16933,7 +16606,7 @@ class P2PDirectApp {
   }
 }
 
-if (typeof document !== "undefined") {
+if (typeof document !== "undefined" && !globalThis.__P2P_NO_AUTO_BOOT__) {
   const app = new P2PDirectApp();
   app.init().catch((err) => {
     const box = document.getElementById("telemetry-log");

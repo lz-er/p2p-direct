@@ -100,7 +100,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v24</strong>
+            <strong id="app-version-display">v25</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -1539,6 +1539,32 @@
                   </button>
                 </div>
               </div>
+              <div class="watch-trace-box advanced-only" id="watch-trace-box">
+                <div class="watch-trace-meta">
+                  <span class="watch-trace-label">Watch Trace</span>
+                  <span class="watch-trace-status" id="watch-trace-status">Off · 0</span>
+                </div>
+                <div class="watch-trace-actions">
+                  <button
+                    type="button"
+                    id="btn-watch-trace-toggle"
+                    class="btn btn-sm"
+                    aria-pressed="false"
+                    title="Record Watch Together sync and player timing events (in-memory ring buffer, max 2,000)"
+                  >
+                    Record Watch Trace
+                  </button>
+                  <button
+                    type="button"
+                    id="btn-watch-trace-export"
+                    class="btn btn-sm"
+                    disabled
+                    title="Export sanitized Watch Trace JSON for debugging"
+                  >
+                    Export Trace
+                  </button>
+                </div>
+              </div>
               <div id="telemetry-log" class="telemetry-log">
                 <div class="telemetry-entry">Initializing local engine…</div>
               </div>
@@ -1554,7 +1580,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v24</span>
+                <span id="adv-version-number">v25</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>

@@ -439,7 +439,8 @@ html[data-advanced="true"] .app-shell {
   gap: 14px;
   padding: 0 22px;
   border-right: 2px solid rgba(255, 255, 255, 0.14);
-  min-width: 280px;
+  flex: 0 1 320px;
+  min-width: 0;
   transition: background-color 140ms ease;
 }
 
@@ -480,19 +481,21 @@ html[data-advanced="true"] .app-shell {
   border: none;
   border-bottom: 2px solid rgba(255, 255, 255, 0.28);
   color: #ffffff;
-  width: 220px;
+  width: 100%;
+  min-width: 84px;
+  max-width: 220px;
   padding: 4px 2px;
   font-family: var(--font-sans);
   font-size: 20px;
   font-weight: 700;
   letter-spacing: -0.02em;
   outline: none;
-  transition: border-color 140ms ease, width 180ms ease;
+  transition: border-color 140ms ease, max-width 180ms ease;
 }
 
 .name-hero-input:focus {
   border-bottom-color: var(--acid);
-  width: 260px;
+  max-width: 250px;
 }
 
 .name-edit-hint {
@@ -510,6 +513,7 @@ html[data-advanced="true"] .app-shell {
 .identity-bar {
   display: flex;
   align-items: stretch;
+  flex-shrink: 0;
   min-width: 0;
 }
 
@@ -4228,6 +4232,73 @@ input[type="checkbox"]:checked::after {
   color: var(--ink-primary);
 }
 
+.watch-trace-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 8px;
+  margin-bottom: 10px;
+  border: 2px solid var(--rule);
+  background: var(--bg-subtle);
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.watch-trace-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-secondary);
+}
+
+.watch-trace-label {
+  white-space: nowrap;
+}
+
+.watch-trace-status {
+  color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.watch-trace-box.is-recording {
+  border-left: 4px solid var(--coral);
+}
+
+.watch-trace-box.is-recording .watch-trace-status {
+  color: var(--coral);
+}
+
+.watch-trace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.watch-trace-actions .btn-sm {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#btn-watch-trace-toggle.is-recording {
+  background: var(--coral);
+  color: #ffffff;
+  border-color: var(--ink-primary);
+}
+
 .telemetry-log {
   max-height: 170px;
   overflow-y: auto;
@@ -5772,19 +5843,19 @@ input[type="checkbox"].metro-switch:checked::after {
 }
 
 /* ================= Responsive Breakpoints ================= */
-@media (max-width: 1260px) {
+@media (max-width: 1320px) {
   .name-hero-wrap {
-    min-width: 210px;
+    flex: 0 1 250px;
     padding: 0 14px;
     gap: 10px;
   }
 
   .name-hero-input {
-    width: 155px;
+    max-width: 165px;
   }
 
   .name-hero-input:focus {
-    width: 180px;
+    max-width: 185px;
   }
 
   .stat-chip {
@@ -5793,34 +5864,43 @@ input[type="checkbox"].metro-switch:checked::after {
   }
 
   .top-bar-btn {
-    padding: 0 14px;
+    padding: 0 13px;
   }
 
   .top-bar-icon {
-    padding: 0 14px;
+    padding: 0 13px;
   }
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 1140px) {
+  .chip-secondary {
+    display: none;
+  }
+
   .name-hero-wrap {
-    min-width: 165px;
+    flex: 0 1 215px;
     padding: 0 10px;
     gap: 8px;
   }
 
   .name-hero-input {
-    width: 115px;
+    min-width: 72px;
+    max-width: 130px;
     font-size: 17px;
   }
 
   .name-hero-input:focus {
-    width: 135px;
+    max-width: 145px;
   }
 
   .stat-chip {
     padding: 0 8px;
     gap: 4px;
     font-size: 10.5px;
+  }
+
+  .stat-chip.chip-version {
+    padding: 0 8px;
   }
 
   .top-bar-btn {
@@ -5830,6 +5910,50 @@ input[type="checkbox"].metro-switch:checked::after {
 
   .top-bar-icon {
     padding: 0 11px;
+  }
+}
+
+@media (max-width: 900px) {
+  .name-hero-wrap {
+    flex: 1 1 120px;
+    padding: 0 8px;
+    gap: 6px;
+  }
+
+  .name-hero-tag {
+    padding: 3px 6px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+  }
+
+  .name-hero-input {
+    min-width: 60px;
+    max-width: 120px;
+    font-size: 16px;
+  }
+
+  .name-hero-input:focus {
+    max-width: 130px;
+  }
+
+  .stat-chip {
+    padding: 0 7px;
+    gap: 4px;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+  }
+
+  .stat-chip.chip-version {
+    padding: 0 7px;
+  }
+
+  .top-bar-btn {
+    padding: 0 9px;
+    font-size: 10.5px;
+  }
+
+  .top-bar-icon {
+    padding: 0 10px;
   }
 }
 
@@ -7924,7 +8048,17 @@ html[data-watch-stage="true"] .join-listen-strip {
     }
 
     .watch-chat-split.is-watch-side-eligible .chat-panel .panel-header {
-      padding: 5px 10px;
+      padding: 4px 8px;
+      gap: 4px;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .log-toolbar,
+    .watch-chat-split.is-watch-side-eligible .chat-panel .composer-head {
+      display: none !important;
+    }
+
+    .watch-chat-split.is-watch-side-eligible .chat-panel .composer {
+      padding: 5px 8px;
     }
 
     .watch-chat-split.is-watch-side-eligible .chat-panel .inline-chip:not(.inline-chip-btn) {
@@ -7932,7 +8066,7 @@ html[data-watch-stage="true"] .join-listen-strip {
     }
 
     .watch-chat-split.is-watch-side-eligible .chat-panel .log-feed {
-      min-height: 0;
+      min-height: 72px;
       max-height: none;
     }
   }
