@@ -292,7 +292,7 @@ export async function fetchWeatherCard(
       wxUnit: unit,
       wxUpdatedAt: nowMs,
       subtitle: "WEATHER",
-      title: `${placeLabel} — ${tempStr}`,
+      title: `${placeLabel} · ${tempStr}`,
       badge: condStr.toUpperCase(),
       color: "cyan",
       fields,

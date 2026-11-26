@@ -82,7 +82,7 @@ describe("web_bots live card builders (mocked fetch)", () => {
 
     const cardC = await fetchWeatherCard({ enabled: true, cities: "Berlin, Tokyo", unit: "c" }, { fetchImpl: mockFetch });
     assert.equal(cardC.builtinBot, WEATHER_BOT_ID);
-    assert.match(cardC.title, /Berlin, DE — 10°C/);
+    assert.match(cardC.title, /Berlin, DE · 10°C/);
     assert.equal(cardC.badge, "PARTLY CLOUDY");
 
     const cardF = await fetchWeatherCard({ enabled: true, cities: "Berlin, Tokyo", unit: "f" }, { fetchImpl: mockFetch });
