@@ -2042,15 +2042,33 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
         media_id: "dQw4w9WgXcQ".into(),
         title: "Demo".into(),
         source_msg_id: "msg-1".into(),
-        queue: vec![WatchQueueItem {
-            id: "q1".into(),
-            url: "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT".into(),
-            provider: "spotify".into(),
-            media_id: "spotify:track:4cOdK2wGLETKBW3PvgPWqT".into(),
-            title: "Track".into(),
-            added_by: "Alice".into(),
-            start_ms: 0,
-        }],
+        playlist_id: "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf".into(),
+        playlist_index: 2,
+        track_uri: "dQw4w9WgXcQ".into(),
+        queue: vec![
+            WatchQueueItem {
+                id: "q1".into(),
+                url: "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M".into(),
+                provider: "spotify".into(),
+                media_id: "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M".into(),
+                title: "Spotify Playlist".into(),
+                added_by: "Alice".into(),
+                start_ms: 0,
+                playlist_id: "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M".into(),
+                playlist_index: 0,
+            },
+            WatchQueueItem {
+                id: "q2".into(),
+                url: "https://music.youtube.com/playlist?list=OLAK5uy_k9999999999".into(),
+                provider: "ytmusic".into(),
+                media_id: "ytpl:OLAK5uy_k9999999999".into(),
+                title: "YT Music Playlist".into(),
+                added_by: "Alice".into(),
+                start_ms: 0,
+                playlist_id: "OLAK5uy_k9999999999".into(),
+                playlist_index: 3,
+            },
+        ],
         anchor_local_ms: t_a0 + 100,
     };
     let (_, watch_acts) = a.update_media_sync(watch_init, t_a0 + 100);
@@ -2060,6 +2078,13 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
     // Despite 10-hour clock skew, Bob's projected position is 10_000 + 20ms one-way RTT = 10_020ms!
     let b_watch = b.media_states().get("watch").ok_or("missing watch on Bob")?;
     assert_eq!(b_watch.projected_position_ms(t_b0 + 120), 10_020);
+    assert_eq!(b_watch.playlist_id, "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf");
+    assert_eq!(b_watch.playlist_index, 2);
+    assert_eq!(b_watch.track_uri, "dQw4w9WgXcQ");
+    assert_eq!(b_watch.queue.len(), 2);
+    assert_eq!(b_watch.queue[1].provider, "ytmusic");
+    assert_eq!(b_watch.queue[1].playlist_id, "OLAK5uy_k9999999999");
+    assert_eq!(b_watch.queue[1].playlist_index, 3);
     // 5 seconds later on Bob's skewed clock, Bob is at 15_020ms!
     assert_eq!(b_watch.projected_position_ms(t_b0 + 5_120), 15_020);
 
@@ -2073,7 +2098,10 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
     let c_watch = c.media_states().get("watch").ok_or("missing watch on late joiner Carol")?;
     // Carol gets 15_020 + default 20ms one-way = 15_040ms (zero 20-hour skew error!)
     assert_eq!(c_watch.projected_position_ms(t_c0 + 5_140), 15_040);
-    assert_eq!(c_watch.queue.len(), 1);
+    assert_eq!(c_watch.playlist_id, "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf");
+    assert_eq!(c_watch.playlist_index, 2);
+    assert_eq!(c_watch.track_uri, "dQw4w9WgXcQ");
+    assert_eq!(c_watch.queue.len(), 2);
 
     // Chat video sync state gets pruned automatically when its message is CRDT-deleted
     let (chat_msg, pub_acts) = a.publish_local("chat".into(), parse_json(r#"{"text":"vid"}"#)?, t_a0 + 200, Some("m-vid-1".into()))?;
@@ -2095,6 +2123,9 @@ fn media_sync_clock_skew_independent_gossip_late_joiner_and_delete_pruning() -> 
         media_id: String::new(),
         title: String::new(),
         source_msg_id: chat_msg.id.clone(),
+        playlist_id: String::new(),
+        playlist_index: 0,
+        track_uri: String::new(),
         queue: Vec::new(),
         anchor_local_ms: t_a0 + 250,
     };

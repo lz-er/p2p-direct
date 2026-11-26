@@ -1389,6 +1389,10 @@ class P2PDirectApp {
       watchUiTimer: null,
       watchTitleOverride: "",
       watchDurationMs: 0,
+      watchPlaylistCount: 0,
+      watchPlaylistItems: [],
+      watchTracksOpen: false,
+      watchSpotifyTrackDetached: false,
       lightboxVideoApplying: false,
       lightboxVideoSuppressUntil: 0,
     };
@@ -1812,7 +1816,13 @@ class P2PDirectApp {
       "watch-stage-wrap",
       "watch-embed-stage",
       "btn-watch-autoplay-unmute",
+      "watch-playlist-bar",
+      "watch-playlist-status",
+      "btn-watch-spotify-playlist",
+      "btn-watch-tracks-toggle",
+      "watch-playlist-tracks",
       "watch-transport",
+      "btn-watch-prev",
       "btn-watch-play",
       "btn-watch-back10",
       "btn-watch-fwd10",
@@ -2480,6 +2490,9 @@ class P2PDirectApp {
     if (this.el["btn-watch-close"]) {
       this.el["btn-watch-close"].addEventListener("click", () => this.stopWatchTogetherForRoom());
     }
+    if (this.el["btn-watch-prev"]) {
+      this.el["btn-watch-prev"].addEventListener("click", () => this.playPrevWatchTrack());
+    }
     if (this.el["btn-watch-play"]) {
       this.el["btn-watch-play"].addEventListener("click", () => this.toggleWatchPlay());
     }
@@ -2493,7 +2506,13 @@ class P2PDirectApp {
       this.el["btn-watch-replay"].addEventListener("click", () => this.replayWatch());
     }
     if (this.el["btn-watch-next"]) {
-      this.el["btn-watch-next"].addEventListener("click", () => this.playNextWatchQueueItem());
+      this.el["btn-watch-next"].addEventListener("click", () => this.playNextWatchTrackOrQueue());
+    }
+    if (this.el["btn-watch-tracks-toggle"]) {
+      this.el["btn-watch-tracks-toggle"].addEventListener("click", () => this.toggleWatchPlaylistTracks());
+    }
+    if (this.el["btn-watch-spotify-playlist"]) {
+      this.el["btn-watch-spotify-playlist"].addEventListener("click", () => this.showWatchSpotifyPlaylist());
     }
     if (this.el["btn-watch-loop"]) {
       this.el["btn-watch-loop"].addEventListener("click", () => this.toggleWatchLoop());
@@ -3708,6 +3727,13 @@ class P2PDirectApp {
       title: partialState.title !== undefined ? partialState.title : prev?.title || "",
       sourceMsgId:
         partialState.sourceMsgId !== undefined ? partialState.sourceMsgId : prev?.sourceMsgId || "",
+      playlistId:
+        partialState.playlistId !== undefined ? partialState.playlistId : prev?.playlistId || "",
+      playlistIndex:
+        partialState.playlistIndex !== undefined
+          ? Math.max(0, Math.min(10000, Math.floor(Number(partialState.playlistIndex) || 0)))
+          : Number(prev?.playlistIndex) || 0,
+      trackUri: partialState.trackUri !== undefined ? partialState.trackUri : prev?.trackUri || "",
       queue: Array.isArray(partialState.queue) ? partialState.queue : prev?.queue || [],
     };
     try {
@@ -4380,7 +4406,23 @@ class P2PDirectApp {
     }
   }
 
-  /* ---- Synced Watch Together (YouTube / Spotify / SoundCloud) ---- */
+  /* ---- Synced Watch Together (YouTube / YouTube Music / Spotify / SoundCloud + Playlists) ---- */
+
+  _watchProviderLabel(provider) {
+    if (provider === "ytmusic") return "YT MUSIC";
+    if (provider === "youtube") return "YOUTUBE";
+    if (provider === "spotify") return "SPOTIFY";
+    if (provider === "soundcloud") return "SOUNDCLOUD";
+    return String(provider || "WATCH").toUpperCase();
+  }
+
+  _isWatchPlaylistState(state) {
+    return Boolean(
+      state &&
+        state.active &&
+        (state.playlistId || this.mediaSync.watchPlaylistCount > 1)
+    );
+  }
 
   _ensureWatchPlayer() {
     if (this.mediaSync.watchPlayer) return this.mediaSync.watchPlayer;
@@ -4391,7 +4433,11 @@ class P2PDirectApp {
         if (!cur || !cur.active) return;
         if (ev.ended) {
           if (cur.loop) {
-            this.replayWatch();
+            if (cur.playlistId && (cur.playlistIndex || 0) > 0 && cur.provider !== "spotify") {
+              this.selectWatchPlaylistTrack(0);
+            } else {
+              this.replayWatch();
+            }
           } else if (Array.isArray(cur.queue) && cur.queue.length > 0) {
             // Actor advances immediately; other peers act as backup after 900ms if actor disconnected
             const isActor = cur.actor === this.status?.peerId;
@@ -4409,18 +4455,27 @@ class P2PDirectApp {
               kind: "watch",
               playing: false,
               positionMs: ev.positionMs || this.mediaSync.watchDurationMs || cur.positionMs,
+              playlistIndex: ev.playlistIndex !== undefined ? ev.playlistIndex : cur.playlistIndex || 0,
+              trackUri: ev.trackUri !== undefined ? ev.trackUri : cur.trackUri || "",
             });
           }
           return;
         }
-        this.publishMediaSync({
+        const update = {
           targetId: "watch",
           kind: "watch",
           active: true,
           playing: Boolean(ev.playing),
           positionMs: Math.max(0, Math.round(ev.positionMs || 0)),
           rateMilli: ev.rateMilli || cur.rateMilli || 1000,
-        });
+        };
+        if (ev.playlistIndex !== undefined) {
+          update.playlistIndex = ev.playlistIndex;
+        }
+        if (ev.trackUri !== undefined) {
+          update.trackUri = ev.trackUri;
+        }
+        this.publishMediaSync(update);
       },
       onTelemetry: (meta) => {
         if (meta.durationMs > 0) {
@@ -4430,6 +4485,28 @@ class P2PDirectApp {
           this.mediaSync.watchTitleOverride = meta.title;
           if (this.el["watch-panel-title"]) {
             this.el["watch-panel-title"].textContent = meta.title;
+          }
+        }
+        let playlistMetaChanged = false;
+        if (typeof meta.playlistCount === "number" && meta.playlistCount !== this.mediaSync.watchPlaylistCount) {
+          this.mediaSync.watchPlaylistCount = meta.playlistCount;
+          playlistMetaChanged = true;
+        }
+        if (Array.isArray(meta.playlistItems) && meta.playlistItems.length > 0) {
+          this.mediaSync.watchPlaylistItems = meta.playlistItems;
+          playlistMetaChanged = true;
+        }
+        if (
+          typeof meta.spotifyTrackDetached === "boolean" &&
+          meta.spotifyTrackDetached !== this.mediaSync.watchSpotifyTrackDetached
+        ) {
+          this.mediaSync.watchSpotifyTrackDetached = meta.spotifyTrackDetached;
+          playlistMetaChanged = true;
+        }
+        if (playlistMetaChanged) {
+          const cur = this.mediaSync.states.get("watch");
+          if (cur && cur.active) {
+            this._syncWatchTogetherUi(cur);
           }
         }
         this._updateWatchTimeUi();
@@ -4471,7 +4548,7 @@ class P2PDirectApp {
   startWatchTogetherFromUrl(rawUrl, sourceMsgId = "") {
     const parsed = parseWatchMediaUrl(rawUrl);
     if (!parsed) {
-      this.showToast("Paste a valid YouTube, Spotify, or SoundCloud link");
+      this.showToast("Paste a valid YouTube, YouTube Music, Spotify, or SoundCloud link or playlist");
       return false;
     }
     const prev = this.mediaSync.states.get("watch");
@@ -4479,6 +4556,10 @@ class P2PDirectApp {
     this.mediaSync.watchPanelOpenManual = true;
     this.mediaSync.watchTitleOverride = "";
     this.mediaSync.watchDurationMs = 0;
+    this.mediaSync.watchPlaylistCount = 0;
+    this.mediaSync.watchPlaylistItems = [];
+    this.mediaSync.watchTracksOpen = false;
+    this.mediaSync.watchSpotifyTrackDetached = false;
 
     this.publishMediaSync({
       targetId: "watch",
@@ -4494,16 +4575,20 @@ class P2PDirectApp {
       mediaId: parsed.mediaId,
       title: parsed.title,
       sourceMsgId: sourceMsgId || "",
+      playlistId: parsed.playlistId || "",
+      playlistIndex: parsed.playlistIndex || 0,
+      trackUri: parsed.trackUri || "",
       queue: Array.isArray(prev?.queue) ? prev.queue : [],
     });
-    this.showToast(`Started synced ${parsed.providerLabel} for room`);
+    const kindWord = parsed.isPlaylist ? " playlist" : "";
+    this.showToast(`Started synced ${parsed.providerLabel}${kindWord} for room`);
     return true;
   }
 
   enqueueWatchUrl(rawUrl) {
     const parsed = parseWatchMediaUrl(rawUrl);
     if (!parsed) {
-      this.showToast("Paste a valid YouTube, Spotify, or SoundCloud link");
+      this.showToast("Paste a valid YouTube, YouTube Music, Spotify, or SoundCloud link or playlist");
       return false;
     }
     const prev = this.mediaSync.states.get("watch");
@@ -4519,6 +4604,8 @@ class P2PDirectApp {
       title: parsed.title,
       addedBy: this.status?.authorName || "Peer",
       startMs: parsed.startMs || 0,
+      playlistId: parsed.playlistId || "",
+      playlistIndex: parsed.playlistIndex || 0,
     });
     this.publishMediaSync({
       targetId: "watch",
@@ -4526,7 +4613,8 @@ class P2PDirectApp {
       active: true,
       queue: nextQueue,
     });
-    this.showToast(`Queued ${parsed.providerLabel} track (#${nextQueue.length})`);
+    const noun = parsed.isPlaylist ? "playlist" : "track";
+    this.showToast(`Queued ${parsed.providerLabel} ${noun} (#${nextQueue.length})`);
     return true;
   }
 
@@ -4602,6 +4690,80 @@ class P2PDirectApp {
     });
   }
 
+  selectWatchPlaylistTrack(idx) {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active || !this._isWatchPlaylistState(cur)) return;
+    const count = this.mediaSync.watchPlaylistCount || 0;
+    let targetIdx = Math.max(0, Math.floor(Number(idx) || 0));
+    if (count > 0) {
+      targetIdx = Math.min(count - 1, targetIdx);
+    }
+    const item = this.mediaSync.watchPlaylistItems[targetIdx];
+    this.mediaSync.watchDurationMs = item?.durationMs > 0 ? item.durationMs : 0;
+    if (item?.title) {
+      this.mediaSync.watchTitleOverride = item.artist ? `${item.artist} — ${item.title}` : item.title;
+    }
+    this.publishMediaSync({
+      targetId: "watch",
+      kind: "watch",
+      active: true,
+      playing: true,
+      positionMs: 0,
+      playlistIndex: targetIdx,
+      trackUri: item?.id && cur.provider !== "soundcloud" ? item.id : "",
+      epoch: (cur.epoch || 0) + 1,
+    });
+  }
+
+  playPrevWatchTrack() {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active || !this._isWatchPlaylistState(cur) || cur.provider === "spotify") return;
+    const curIdx = Math.max(0, Number(cur.playlistIndex) || 0);
+    const count = this.mediaSync.watchPlaylistCount || 0;
+    if (curIdx > 0) {
+      this.selectWatchPlaylistTrack(curIdx - 1);
+    } else if (cur.loop && count > 1) {
+      this.selectWatchPlaylistTrack(count - 1);
+    } else {
+      this.replayWatch();
+    }
+  }
+
+  playNextWatchTrackOrQueue() {
+    const cur = this.mediaSync.states.get("watch");
+    if (!cur || !cur.active) return;
+    const isIndexablePlaylist = this._isWatchPlaylistState(cur) && cur.provider !== "spotify";
+    if (isIndexablePlaylist) {
+      const curIdx = Math.max(0, Number(cur.playlistIndex) || 0);
+      const count = this.mediaSync.watchPlaylistCount || 0;
+      if (count === 0 || curIdx + 1 < count) {
+        this.selectWatchPlaylistTrack(curIdx + 1);
+        return;
+      }
+      if (Array.isArray(cur.queue) && cur.queue.length > 0) {
+        this.playWatchQueueItemAt(0);
+        return;
+      }
+      if (cur.loop && count > 0) {
+        this.selectWatchPlaylistTrack(0);
+      }
+      return;
+    }
+    this.playNextWatchQueueItem();
+  }
+
+  toggleWatchPlaylistTracks() {
+    this.mediaSync.watchTracksOpen = !this.mediaSync.watchTracksOpen;
+    const cur = this.mediaSync.states.get("watch");
+    this._renderWatchPlaylistBar(cur || null);
+  }
+
+  showWatchSpotifyPlaylist() {
+    if (this.mediaSync.watchPlayer) {
+      this.mediaSync.watchPlayer.showSpotifyPlaylistView();
+    }
+  }
+
   playNextWatchQueueItem() {
     const cur = this.mediaSync.states.get("watch");
     if (!cur || !Array.isArray(cur.queue) || cur.queue.length === 0) return;
@@ -4615,6 +4777,10 @@ class P2PDirectApp {
     const remaining = cur.queue.slice(0, idx).concat(cur.queue.slice(idx + 1));
     this.mediaSync.watchTitleOverride = "";
     this.mediaSync.watchDurationMs = 0;
+    this.mediaSync.watchPlaylistCount = 0;
+    this.mediaSync.watchPlaylistItems = [];
+    this.mediaSync.watchTracksOpen = false;
+    this.mediaSync.watchSpotifyTrackDetached = false;
     this.publishMediaSync({
       targetId: "watch",
       kind: "watch",
@@ -4628,6 +4794,9 @@ class P2PDirectApp {
       mediaId: item.mediaId,
       title: item.title,
       sourceMsgId: "",
+      playlistId: item.playlistId || "",
+      playlistIndex: item.playlistIndex || 0,
+      trackUri: "",
       queue: remaining,
     });
   }
@@ -4648,6 +4817,10 @@ class P2PDirectApp {
     const cur = this.mediaSync.states.get("watch");
     this.mediaSync.watchPanelOpenManual = false;
     this.mediaSync.watchMinimized = false;
+    this.mediaSync.watchPlaylistCount = 0;
+    this.mediaSync.watchPlaylistItems = [];
+    this.mediaSync.watchTracksOpen = false;
+    this.mediaSync.watchSpotifyTrackDetached = false;
     if (cur && cur.active) {
       this.publishMediaSync({
         targetId: "watch",
@@ -4659,6 +4832,9 @@ class P2PDirectApp {
         provider: "",
         mediaId: "",
         title: "",
+        playlistId: "",
+        playlistIndex: 0,
+        trackUri: "",
         queue: [],
       });
     } else {
@@ -4712,6 +4888,10 @@ class P2PDirectApp {
       }
       this.mediaSync.watchDurationMs = 0;
       this.mediaSync.watchTitleOverride = "";
+      this.mediaSync.watchPlaylistCount = 0;
+      this.mediaSync.watchPlaylistItems = [];
+      this.mediaSync.watchTracksOpen = false;
+      this.mediaSync.watchSpotifyTrackDetached = false;
       if (this.mediaSync.watchUiTimer) {
         clearInterval(this.mediaSync.watchUiTimer);
         this.mediaSync.watchUiTimer = null;
@@ -4720,9 +4900,18 @@ class P2PDirectApp {
       return;
     }
 
-    if (!prev || prev.mediaId !== state.mediaId || prev.provider !== state.provider) {
+    const mediaChanged =
+      !prev ||
+      prev.mediaId !== state.mediaId ||
+      prev.provider !== state.provider ||
+      (prev.playlistId || "") !== (state.playlistId || "");
+    if (mediaChanged) {
       this.mediaSync.watchTitleOverride = "";
       this.mediaSync.watchDurationMs = 0;
+      this.mediaSync.watchPlaylistCount = 0;
+      this.mediaSync.watchPlaylistItems = [];
+      this.mediaSync.watchTracksOpen = false;
+      this.mediaSync.watchSpotifyTrackDetached = false;
       this.mediaSync.watchMinimized = false;
       if (this.el["btn-watch-autoplay-unmute"]) {
         this.el["btn-watch-autoplay-unmute"].classList.add("hidden");
@@ -4752,7 +4941,15 @@ class P2PDirectApp {
     }
     if (!shouldShow) return;
 
-    panel.classList.remove("provider-youtube", "provider-spotify", "provider-soundcloud", "is-spotify-collection");
+    panel.classList.remove(
+      "provider-youtube",
+      "provider-ytmusic",
+      "provider-spotify",
+      "provider-soundcloud",
+      "is-playlist",
+      "is-spotify-collection",
+      "is-soundcloud-playlist"
+    );
     panel.classList.toggle("is-minimized", this.mediaSync.watchMinimized);
     if (this.el["btn-watch-minimize"]) {
       this.el["btn-watch-minimize"].textContent = this.mediaSync.watchMinimized ? "Expand" : "Minimize";
@@ -4763,9 +4960,11 @@ class P2PDirectApp {
       if (this.el["watch-provider-badge"]) this.el["watch-provider-badge"].textContent = "WATCH";
       if (this.el["watch-panel-title"]) this.el["watch-panel-title"].textContent = "Watch Together";
       if (this.el["watch-sync-meta"]) {
-        this.el["watch-sync-meta"].textContent = "Paste a YouTube, Spotify, or SoundCloud link to sync with everyone";
+        this.el["watch-sync-meta"].textContent =
+          "Paste a YouTube, YouTube Music, Spotify, or SoundCloud link or playlist to sync with everyone";
       }
       if (this.el["watch-stage-wrap"]) this.el["watch-stage-wrap"].classList.add("hidden");
+      if (this.el["watch-playlist-bar"]) this.el["watch-playlist-bar"].classList.add("hidden");
       if (this.el["watch-transport"]) this.el["watch-transport"].classList.add("hidden");
       if (this.el["watch-open-external"]) this.el["watch-open-external"].classList.add("hidden");
       if (this.el["btn-watch-close"]) this.el["btn-watch-close"].textContent = "Close";
@@ -4773,16 +4972,27 @@ class P2PDirectApp {
       return;
     }
 
+    const isPlaylist = this._isWatchPlaylistState(state);
     panel.classList.add(`provider-${state.provider}`);
+    if (isPlaylist) {
+      panel.classList.add("is-playlist");
+    }
     if (state.provider === "spotify") {
       const p = parseWatchMediaUrl(state.url);
-      if (p && (p.entityType === "playlist" || p.entityType === "album" || p.entityType === "show")) {
+      if (
+        isPlaylist ||
+        (p && (p.entityType === "playlist" || p.entityType === "album" || p.entityType === "show"))
+      ) {
         panel.classList.add("is-spotify-collection");
       }
     }
+    if (state.provider === "soundcloud" && isPlaylist) {
+      panel.classList.add("is-soundcloud-playlist");
+    }
 
     if (this.el["watch-provider-badge"]) {
-      this.el["watch-provider-badge"].textContent = state.provider.toUpperCase();
+      const baseBadge = this._watchProviderLabel(state.provider);
+      this.el["watch-provider-badge"].textContent = isPlaylist ? `${baseBadge} · PLAYLIST` : baseBadge;
     }
     if (this.el["watch-panel-title"]) {
       this.el["watch-panel-title"].textContent =
@@ -4793,7 +5003,9 @@ class P2PDirectApp {
       const statusText = state.playing ? "Playing" : "Paused";
       const hint =
         state.provider === "spotify"
-          ? " · Full track if logged into Spotify"
+          ? isPlaylist
+            ? " · Pick any track inside embed to sync room"
+            : " · Full track if logged into Spotify"
           : " · Volume is local-only";
       this.el["watch-sync-meta"].textContent = `SYNCED · ${statusText} · Last control: ${who}${hint}`;
     }
@@ -4813,24 +5025,125 @@ class P2PDirectApp {
       this.el["btn-watch-loop"].classList.toggle("is-active", Boolean(state.loop));
     }
     if (this.el["watch-speed-select"]) {
-      const showSpeed = state.provider === "youtube";
+      const showSpeed = state.provider === "youtube" || state.provider === "ytmusic";
       this.el["watch-speed-select"].classList.toggle("hidden", !showSpeed);
       if (showSpeed) {
         this.el["watch-speed-select"].value = String(state.rateMilli || 1000);
       }
     }
-    // Spotify Embed API does not expose external setVolume — keep local slider for YouTube & SoundCloud
+    // Spotify Embed API does not expose external setVolume — keep local slider for YouTube, YT Music & SoundCloud
     if (this.el["watch-local-vol-row"]) {
       this.el["watch-local-vol-row"].classList.toggle("hidden", state.provider === "spotify");
     }
     this._updateWatchLocalVolUi();
 
     const queue = Array.isArray(state.queue) ? state.queue : [];
-    if (this.el["btn-watch-next"]) {
-      this.el["btn-watch-next"].classList.toggle("hidden", queue.length === 0);
+    const indexablePlaylist = isPlaylist && state.provider !== "spotify";
+    if (this.el["btn-watch-prev"]) {
+      this.el["btn-watch-prev"].classList.toggle("hidden", !indexablePlaylist);
     }
+    if (this.el["btn-watch-next"]) {
+      this.el["btn-watch-next"].classList.toggle("hidden", !indexablePlaylist && queue.length === 0);
+    }
+
+    this._renderWatchPlaylistBar(state);
     this._renderWatchQueue(queue);
     this._updateWatchTimeUi();
+  }
+
+  _renderWatchPlaylistBar(state) {
+    const bar = this.el["watch-playlist-bar"];
+    const statusEl = this.el["watch-playlist-status"];
+    const tracksBtn = this.el["btn-watch-tracks-toggle"];
+    const spotifyBtn = this.el["btn-watch-spotify-playlist"];
+    const listEl = this.el["watch-playlist-tracks"];
+    if (!bar) return;
+
+    const isPlaylist = this._isWatchPlaylistState(state);
+    bar.classList.toggle("hidden", !isPlaylist);
+    if (!isPlaylist) {
+      if (listEl) {
+        listEl.classList.add("hidden");
+        listEl.innerHTML = "";
+      }
+      return;
+    }
+
+    const curIdx = Math.max(0, Number(state.playlistIndex) || 0);
+    const items = Array.isArray(this.mediaSync.watchPlaylistItems) ? this.mediaSync.watchPlaylistItems : [];
+    const count = this.mediaSync.watchPlaylistCount || items.length;
+
+    if (statusEl) {
+      if (state.provider === "spotify") {
+        const trackCode =
+          state.trackUri && state.trackUri !== state.playlistId
+            ? state.trackUri.split(":").pop().slice(0, 10)
+            : "";
+        statusEl.textContent = trackCode
+          ? `SPOTIFY PLAYLIST · SYNCED TRACK (${trackCode})`
+          : "SPOTIFY PLAYLIST · PICK ANY TRACK TO SYNC ROOM";
+      } else {
+        const trackCounter = count > 0 ? `TRACK ${curIdx + 1} / ${count}` : `TRACK #${curIdx + 1}`;
+        const curItem = items[curIdx];
+        const curLabel = curItem
+          ? curItem.artist
+            ? `${curItem.artist} — ${curItem.title}`
+            : curItem.title
+          : "";
+        statusEl.textContent = curLabel ? `${trackCounter} · ${curLabel}` : `PLAYLIST · ${trackCounter}`;
+      }
+    }
+
+    if (spotifyBtn) {
+      const showBack =
+        state.provider === "spotify" &&
+        Boolean(state.playlistId) &&
+        Boolean(this.mediaSync.watchSpotifyTrackDetached);
+      spotifyBtn.classList.toggle("hidden", !showBack);
+    }
+
+    if (tracksBtn) {
+      const hasTracks = items.length > 0 && state.provider !== "spotify";
+      tracksBtn.classList.toggle("hidden", !hasTracks);
+      if (hasTracks) {
+        tracksBtn.textContent = this.mediaSync.watchTracksOpen
+          ? `Tracks (${items.length}) ▴`
+          : `Tracks (${items.length}) ▾`;
+        tracksBtn.setAttribute("aria-expanded", String(this.mediaSync.watchTracksOpen));
+        tracksBtn.classList.toggle("is-active", this.mediaSync.watchTracksOpen);
+      }
+    }
+
+    if (listEl) {
+      const showList = this.mediaSync.watchTracksOpen && items.length > 0 && state.provider !== "spotify";
+      listEl.classList.toggle("hidden", !showList);
+      if (!showList) {
+        listEl.innerHTML = "";
+        return;
+      }
+      listEl.innerHTML = items
+        .map((it) => {
+          const isCurrent = it.index === curIdx;
+          const label = it.artist ? `${it.artist} — ${it.title}` : it.title;
+          const dur = it.durationMs > 0 ? formatClockTime(it.durationMs) : "";
+          return `
+            <li class="watch-playlist-track-item${isCurrent ? " is-current" : ""}">
+              <button type="button" class="watch-playlist-track-btn" data-watch-pl-idx="${it.index}">
+                <span class="watch-pl-num">${isCurrent ? "▶" : it.index + 1}</span>
+                <span class="watch-pl-title">${escapeHtml(label)}</span>
+                ${dur ? `<span class="watch-pl-dur">${escapeHtml(dur)}</span>` : ""}
+              </button>
+            </li>
+          `;
+        })
+        .join("");
+
+      for (const btn of listEl.querySelectorAll("[data-watch-pl-idx]")) {
+        btn.addEventListener("click", () =>
+          this.selectWatchPlaylistTrack(Number(btn.dataset.watchPlIdx))
+        );
+      }
+    }
   }
 
   _updateWatchTimeUi() {
@@ -4882,7 +5195,8 @@ class P2PDirectApp {
         (item, idx) => `
         <li class="watch-queue-item provider-${escapeHtml(item.provider)}">
           <div class="watch-queue-item-main">
-            <span class="chat-media-provider-tag">${escapeHtml(item.provider)}</span>
+            <span class="chat-media-provider-tag">${escapeHtml(this._watchProviderLabel(item.provider))}</span>
+            ${item.playlistId ? '<span class="watch-queue-pl-pill">PLAYLIST</span>' : ""}
             <span class="watch-queue-item-title">${escapeHtml(item.title || item.url)}</span>
             ${item.addedBy ? `<span class="watch-queue-item-by">by ${escapeHtml(item.addedBy)}</span>` : ""}
           </div>

@@ -599,14 +599,14 @@
             </div>
           </section>
 
-          <!-- Synced Watch Together Stage (YouTube / Spotify / SoundCloud — E2EE Room Sync, Local-Only Volume) -->
+          <!-- Synced Watch Together Stage (YouTube / YouTube Music / Spotify / SoundCloud — E2EE Room Sync, Local-Only Volume) -->
           <section class="panel watch-panel hidden" id="watch-panel" aria-labelledby="watch-panel-title">
             <div class="panel-header watch-header">
               <div class="watch-title-group">
                 <span class="watch-provider-badge" id="watch-provider-badge">WATCH</span>
                 <div class="watch-title-copy">
                   <h2 class="panel-title" id="watch-panel-title">Watch Together</h2>
-                  <span class="watch-sync-meta" id="watch-sync-meta">Paste a YouTube, Spotify, or SoundCloud link</span>
+                  <span class="watch-sync-meta" id="watch-sync-meta">Paste a YouTube, YouTube Music, Spotify, or SoundCloud link or playlist</span>
                 </div>
               </div>
               <div class="watch-header-actions">
@@ -646,13 +646,36 @@
                 </button>
               </div>
 
+              <div class="watch-playlist-bar hidden" id="watch-playlist-bar">
+                <div class="watch-playlist-head">
+                  <span class="watch-playlist-status" id="watch-playlist-status">PLAYLIST · TRACK 1</span>
+                  <div class="watch-playlist-actions">
+                    <button
+                      type="button"
+                      id="btn-watch-spotify-playlist"
+                      class="media-ctrl-btn hidden"
+                      title="Show full Spotify playlist tracklist locally"
+                    >☰ Show Playlist</button>
+                    <button
+                      type="button"
+                      id="btn-watch-tracks-toggle"
+                      class="media-ctrl-btn hidden"
+                      aria-expanded="false"
+                      title="Browse and jump to any track in this playlist for everyone"
+                    >Tracks ▾</button>
+                  </div>
+                </div>
+                <ol class="watch-playlist-tracks hidden" id="watch-playlist-tracks"></ol>
+              </div>
+
               <div class="watch-transport hidden" id="watch-transport">
                 <div class="watch-transport-main">
+                  <button type="button" id="btn-watch-prev" class="media-ctrl-btn hidden" title="Previous playlist track for everyone">⏮ Prev</button>
                   <button type="button" id="btn-watch-play" class="media-ctrl-btn watch-play-btn" title="Play or pause for everyone">▶ Play</button>
                   <button type="button" id="btn-watch-back10" class="media-ctrl-btn" title="Seek back 10s for everyone">-10s</button>
                   <button type="button" id="btn-watch-fwd10" class="media-ctrl-btn" title="Seek forward 10s for everyone">+10s</button>
                   <button type="button" id="btn-watch-replay" class="media-ctrl-btn" title="Restart from 0:00 for everyone">↺ 0:00</button>
-                  <button type="button" id="btn-watch-next" class="media-ctrl-btn hidden" title="Play next queued item for everyone">⏭ Next</button>
+                  <button type="button" id="btn-watch-next" class="media-ctrl-btn hidden" title="Next track or queued item for everyone">⏭ Next</button>
                   <button type="button" id="btn-watch-loop" class="media-ctrl-btn" title="Toggle synced loop">Loop: Off</button>
                   <select id="watch-speed-select" class="select-input watch-speed-select" aria-label="Synced playback speed" title="Synced playback speed">
                     <option value="500">0.5×</option>
@@ -701,7 +724,7 @@
                     id="watch-url-input"
                     class="text-input watch-url-input"
                     type="url"
-                    placeholder="Paste YouTube, Spotify, or SoundCloud link…"
+                    placeholder="Paste YouTube, YT Music, Spotify, or SoundCloud link or playlist…"
                     autocomplete="off"
                   />
                   <button type="submit" id="btn-watch-load-now" class="btn btn-primary btn-sm">Play Now</button>
@@ -734,7 +757,7 @@
                   type="button"
                   id="btn-open-watch-panel"
                   class="btn btn-sm watch-header-trigger"
-                  title="Open synced Watch Together for YouTube, Spotify, or SoundCloud"
+                  title="Open synced Watch Together for YouTube, YouTube Music, Spotify, or SoundCloud links & playlists"
                 >▶ Watch Together</button>
                 <div class="btn-row advanced-only" style="margin-top: 0">
                   <button type="button" id="btn-toggle-raw" class="btn btn-sm">Raw JSON</button>

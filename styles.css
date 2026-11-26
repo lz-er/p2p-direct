@@ -6280,6 +6280,10 @@ input[type="checkbox"].metro-switch:checked::after {
   border-left-color: #ff3b30;
 }
 
+.chat-media-link-card.provider-ytmusic {
+  border-left-color: #e11d48;
+}
+
 .chat-media-link-card.provider-spotify {
   border-left-color: #1db954;
 }
@@ -6316,6 +6320,11 @@ input[type="checkbox"].metro-switch:checked::after {
 
 .chat-media-link-card.provider-youtube .chat-media-provider-tag {
   background: #ff3b30;
+  color: #ffffff;
+}
+
+.chat-media-link-card.provider-ytmusic .chat-media-provider-tag {
+  background: #e11d48;
   color: #ffffff;
 }
 
@@ -6435,6 +6444,11 @@ input[type="checkbox"].metro-switch:checked::after {
   color: #ffffff;
 }
 
+.watch-panel.provider-ytmusic .watch-provider-badge {
+  background: #e11d48;
+  color: #ffffff;
+}
+
 .watch-panel.provider-spotify .watch-provider-badge {
   background: #1db954;
   color: #0e0f12;
@@ -6486,6 +6500,10 @@ input[type="checkbox"].metro-switch:checked::after {
   border-bottom: none;
 }
 
+.watch-panel.is-minimized .watch-playlist-bar {
+  display: none;
+}
+
 .watch-panel.is-minimized .watch-queue-section {
   display: none;
 }
@@ -6508,11 +6526,15 @@ input[type="checkbox"].metro-switch:checked::after {
 }
 
 .watch-panel.provider-spotify.is-spotify-collection .watch-embed-stage {
-  height: 200px;
+  height: clamp(260px, 38vh, 352px);
 }
 
 .watch-panel.provider-soundcloud .watch-embed-stage {
   height: 126px;
+}
+
+.watch-panel.provider-soundcloud.is-soundcloud-playlist .watch-embed-stage {
+  height: clamp(220px, 32vh, 290px);
 }
 
 .watch-embed-host,
@@ -6541,6 +6563,10 @@ input[type="checkbox"].metro-switch:checked::after {
 
 .watch-fallback-stage.provider-youtube {
   border-left-color: #ff3b30;
+}
+
+.watch-fallback-stage.provider-ytmusic {
+  border-left-color: #e11d48;
 }
 
 .watch-fallback-stage.provider-spotify {
@@ -6594,6 +6620,124 @@ input[type="checkbox"].metro-switch:checked::after {
 .watch-autoplay-banner:hover {
   background: var(--acid);
   color: #0e0f12;
+}
+
+/* Watch Together Synced Playlist Bar & Tracklist Drawer (Flat Metro Signal Blocks) */
+.watch-playlist-bar {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border-bottom: 2px solid var(--rule);
+}
+
+.watch-playlist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 14px;
+  background: var(--bg-inset);
+  flex-wrap: wrap;
+}
+
+.watch-playlist-status {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 180px;
+}
+
+.watch-playlist-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.watch-playlist-tracks {
+  list-style: none;
+  margin: 0;
+  padding: 6px 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 168px;
+  overflow-y: auto;
+  background: var(--bg-surface);
+  border-top: 2px solid var(--rule-soft);
+}
+
+.watch-playlist-track-item {
+  display: block;
+}
+
+.watch-playlist-track-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 2px solid var(--rule-soft);
+  border-left: 4px solid var(--rule-soft);
+  background: var(--bg-subtle);
+  color: var(--ink-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.watch-playlist-track-btn:hover {
+  background: var(--acid);
+  color: #0e0f12;
+  border-color: #0e0f12;
+  border-left-color: #0e0f12;
+}
+
+.watch-playlist-track-item.is-current .watch-playlist-track-btn {
+  background: var(--cobalt);
+  color: #ffffff;
+  border-color: var(--rule);
+  border-left-color: var(--acid);
+  font-weight: 700;
+}
+
+[data-theme="dark"] .watch-playlist-track-item.is-current .watch-playlist-track-btn {
+  background: var(--acid);
+  color: #0e0f12;
+  border-color: var(--acid);
+  border-left-color: #ffffff;
+}
+
+.watch-pl-num {
+  min-width: 22px;
+  font-weight: 700;
+  text-align: right;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.watch-pl-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.watch-pl-dur {
+  flex-shrink: 0;
+  font-size: 10px;
+  opacity: 0.78;
 }
 
 .watch-transport {
@@ -6753,6 +6897,15 @@ input[type="checkbox"].metro-switch:checked::after {
   color: #ffffff;
 }
 
+.watch-queue-item.provider-ytmusic {
+  border-left-color: #e11d48;
+}
+
+.watch-queue-item.provider-ytmusic .chat-media-provider-tag {
+  background: #e11d48;
+  color: #ffffff;
+}
+
 .watch-queue-item.provider-spotify {
   border-left-color: #1db954;
 }
@@ -6769,6 +6922,20 @@ input[type="checkbox"].metro-switch:checked::after {
 .watch-queue-item.provider-soundcloud .chat-media-provider-tag {
   background: #ff5500;
   color: #ffffff;
+}
+
+.watch-queue-pl-pill {
+  display: inline-block;
+  padding: 1px 5px;
+  border: 1px solid var(--rule);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  flex-shrink: 0;
 }
 
 .watch-queue-item-main {
@@ -6803,6 +6970,11 @@ input[type="checkbox"].metro-switch:checked::after {
 @media (max-width: 720px) {
   .watch-embed-stage {
     max-height: 220px;
+  }
+
+  .watch-panel.provider-spotify.is-spotify-collection .watch-embed-stage,
+  .watch-panel.provider-soundcloud.is-soundcloud-playlist .watch-embed-stage {
+    max-height: 260px;
   }
 
   .chat-media-link-card {

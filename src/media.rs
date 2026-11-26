@@ -196,6 +196,8 @@ pub struct WatchQueueItem {
     pub title: String,
     pub added_by: String,
     pub start_ms: u64,
+    pub playlist_id: String,
+    pub playlist_index: u32,
 }
 
 impl WatchQueueItem {
@@ -212,7 +214,13 @@ impl WatchQueueItem {
         write_json_string(out, &self.title);
         out.push_str(",\"addedBy\":");
         write_json_string(out, &self.added_by);
-        let _ = write!(out, ",\"startMs\":{}}}", self.start_ms);
+        let _ = write!(out, ",\"startMs\":{}", self.start_ms);
+        if !self.playlist_id.is_empty() {
+            out.push_str(",\"playlistId\":");
+            write_json_string(out, &self.playlist_id);
+            let _ = write!(out, ",\"playlistIndex\":{}", self.playlist_index);
+        }
+        out.push('}');
     }
 
     pub fn from_json_value(v: &JsonValue) -> Option<Self> {
@@ -221,7 +229,7 @@ impl WatchQueueItem {
             return None;
         }
         let provider = v.get_str("provider").unwrap_or("").trim();
-        if !matches!(provider, "youtube" | "spotify" | "soundcloud") {
+        if !matches!(provider, "youtube" | "ytmusic" | "spotify" | "soundcloud") {
             return None;
         }
         let media_id = v.get_str("mediaId").unwrap_or("").trim();
@@ -229,6 +237,8 @@ impl WatchQueueItem {
         let title = v.get_str("title").unwrap_or(url).trim();
         let added_by = v.get_str("addedBy").unwrap_or("").trim();
         let start_ms = v.get_u64("startMs").unwrap_or(0);
+        let playlist_id = v.get_str("playlistId").unwrap_or("").trim();
+        let playlist_index = v.get_u64("playlistIndex").unwrap_or(0).min(10_000) as u32;
         Some(Self {
             id: id.chars().take(96).collect(),
             url: url.to_owned(),
@@ -237,6 +247,8 @@ impl WatchQueueItem {
             title: title.chars().take(180).collect(),
             added_by: added_by.chars().take(48).collect(),
             start_ms,
+            playlist_id: playlist_id.chars().take(512).collect(),
+            playlist_index,
         })
     }
 }
@@ -264,6 +276,9 @@ pub struct MediaSyncState {
     pub media_id: String,
     pub title: String,
     pub source_msg_id: String,
+    pub playlist_id: String,
+    pub playlist_index: u32,
+    pub track_uri: String,
     pub queue: Vec<WatchQueueItem>,
     /// Local monotonic/wall anchor corresponding to `position_ms` (never compared across peers).
     pub anchor_local_ms: u64,
@@ -330,6 +345,17 @@ impl MediaSyncState {
             out.push_str(",\"sourceMsgId\":");
             write_json_string(out, &self.source_msg_id);
         }
+        if !self.playlist_id.is_empty() {
+            out.push_str(",\"playlistId\":");
+            write_json_string(out, &self.playlist_id);
+            let _ = write!(out, ",\"playlistIndex\":{}", self.playlist_index);
+        } else if self.playlist_index > 0 {
+            let _ = write!(out, ",\"playlistIndex\":{}", self.playlist_index);
+        }
+        if !self.track_uri.is_empty() {
+            out.push_str(",\"trackUri\":");
+            write_json_string(out, &self.track_uri);
+        }
         if !self.queue.is_empty() {
             out.push_str(",\"queue\":[");
             for (idx, item) in self.queue.iter().enumerate() {
@@ -385,6 +411,9 @@ impl MediaSyncState {
         let media_id = v.get_str("mediaId").unwrap_or("").trim();
         let title = v.get_str("title").unwrap_or("").trim();
         let source_msg_id = v.get_str("sourceMsgId").unwrap_or("").trim();
+        let playlist_id = v.get_str("playlistId").unwrap_or("").trim();
+        let playlist_index = v.get_u64("playlistIndex").unwrap_or(0).min(10_000) as u32;
+        let track_uri = v.get_str("trackUri").unwrap_or("").trim();
 
         let mut queue = Vec::new();
         if let Some(arr) = v.get("queue").and_then(JsonValue::as_array) {
@@ -412,6 +441,9 @@ impl MediaSyncState {
             media_id: media_id.chars().take(512).collect(),
             title: title.chars().take(180).collect(),
             source_msg_id: source_msg_id.chars().take(128).collect(),
+            playlist_id: playlist_id.chars().take(512).collect(),
+            playlist_index,
+            track_uri: track_uri.chars().take(256).collect(),
             queue,
             anchor_local_ms: receive_now_ms,
         })
