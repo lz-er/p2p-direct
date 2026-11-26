@@ -129,7 +129,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v28";
+export const APP_VERSION = "v29";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -8380,7 +8380,7 @@ export class P2PDirectApp {
         max: 6,
         maxLen: 44,
         itemWord: "options",
-        placeholder: "Add option… (comma-separated auto-splits)",
+        placeholder: "Add option…",
         chipsId: "list-chips-poll",
         countId: "list-count-poll",
         inputId: "setting-poll-choices-input",
@@ -8393,7 +8393,7 @@ export class P2PDirectApp {
         max: 12,
         maxLen: 64,
         itemWord: "items",
-        placeholder: "Add item… (comma-separated auto-splits)",
+        placeholder: "Add item…",
         chipsId: "list-chips-checklist",
         countId: "list-count-checklist",
         inputId: "setting-checklist-items-input",
@@ -8406,7 +8406,7 @@ export class P2PDirectApp {
         max: 12,
         maxLen: 48,
         itemWord: "options",
-        placeholder: "Add option… (comma-separated auto-splits)",
+        placeholder: "Add option…",
         chipsId: "list-chips-randomizer",
         countId: "list-count-randomizer",
         inputId: "setting-randomizer-choices-input",
@@ -8419,7 +8419,7 @@ export class P2PDirectApp {
         max: 4,
         maxLen: 48,
         itemWord: "cities",
-        placeholder: "Add city… (comma-separated auto-splits)",
+        placeholder: "Add city…",
         chipsId: "list-chips-weather",
         countId: "list-count-weather",
         inputId: "setting-weather-cities-input",

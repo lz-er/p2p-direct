@@ -100,7 +100,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v28</strong>
+            <strong id="app-version-display">v29</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -1616,7 +1616,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v28</span>
+                <span id="adv-version-number">v29</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>
@@ -1648,7 +1648,7 @@
       <div class="settings-modal-card">
         <div class="settings-modal-head">
           <div class="settings-modal-titles">
-            <span class="settings-modal-kicker">PREFERENCES &amp; PERSISTENT BOTS</span>
+            <span class="settings-modal-kicker">BOTS &amp; TOOLS</span>
             <h2 class="settings-modal-title" id="settings-modal-title">Settings</h2>
           </div>
           <button
@@ -1682,7 +1682,7 @@
             aria-selected="false"
             aria-controls="settings-panel-room"
           >
-            Room Tools · P2P <span class="settings-tab-count" id="settings-count-room"></span>
+            Room Tools <span class="settings-tab-count" id="settings-count-room"></span>
           </button>
           <button
             type="button"
@@ -1710,9 +1710,9 @@
                 <label class="audio-switch-row settings-switch-row" for="setting-wf-enabled">
                   <input id="setting-wf-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Warframe Worldstate Bot</span>
+                    <span class="audio-switch-title">Warframe Bot</span>
                     <span class="audio-switch-desc">
-                      Persistent dashboard message (Open Worlds, Fissures, Sortie &amp; Archon, Baro, Invasions) updated in place.
+                      Open Worlds, Fissures, Sortie, Archon, Baro &amp; Invasions.
                     </span>
                   </span>
                 </label>
@@ -1756,29 +1756,29 @@
                     id="btn-wf-post-now"
                     class="btn btn-sm btn-primary"
                     disabled
-                    title="Post or refresh the persistent Warframe dashboard message in the active room"
+                    title="Post or refresh the Warframe card"
                   >
-                    ↻ Post / Refresh Dashboard
+                    ↻ Post / Refresh
                   </button>
                   <button
                     type="button"
                     id="btn-wf-jump-msg"
                     class="btn btn-sm hidden"
-                    title="Scroll chat straight to the persistent Warframe dashboard message"
+                    title="Jump to Warframe card"
                   >
-                    Jump to Message
+                    Jump
                   </button>
                 </div>
 
                 <p class="settings-privacy-note" id="setting-wf-note">
-                  Zero requests sent to <code>api.warframestat.us</code> while disabled.
+                  Uses <code>api.warframestat.us</code> when on.
                 </p>
               </div>
             </section>
 
             <section class="settings-section" aria-labelledby="settings-sts2-heading">
               <div class="settings-section-head">
-                <span class="settings-section-kicker" id="settings-sts2-heading">Slay the Spire 2 · Spire Codex</span>
+                <span class="settings-section-kicker" id="settings-sts2-heading">Slay the Spire 2</span>
                 <span class="badge" id="setting-sts2-status-badge">Off</span>
               </div>
 
@@ -1788,7 +1788,7 @@
                   <span class="audio-switch-copy">
                     <span class="audio-switch-title">Slay the Spire 2 Bot</span>
                     <span class="audio-switch-desc">
-                      Persistent board with Meta &amp; Top Picks, Deadliest Encounters, Codex Lookup with rendered card art + Upgrade+, Patch Notes &amp; Beta Diff, 2P–4P Co-op Party Picker, and inline <code>[[Card Name]]</code> lookup.
+                      Meta, fights, card art lookup, patches &amp; co-op party picker.
                     </span>
                   </span>
                 </label>
@@ -1831,20 +1831,20 @@
 
                 <label class="settings-inline-check" for="setting-sts2-inline">
                   <input id="setting-sts2-inline" type="checkbox" checked />
-                  <span>Enable inline <code>[[Card Name]]</code> / <code>[[relic:Name]]</code> chat lookup (updates persistent board in place)</span>
+                  <span>Chat lookup via <code>[[Card]]</code> / <code>[[relic:Name]]</code></span>
                 </label>
 
                 <div class="settings-wf-actions">
                   <button type="button" id="btn-sts2-post-now" class="btn btn-sm btn-primary" disabled>
-                    + Post Persistent Board
+                    + Post Board
                   </button>
                   <button type="button" id="btn-sts2-jump-msg" class="btn btn-sm hidden">
-                    Jump to Message
+                    Jump
                   </button>
                 </div>
 
                 <p class="settings-privacy-note">
-                  Uses keyless CORS-enabled <code>spire-codex.com</code> API &amp; card art CDN only when enabled. Co-op Party Picker works 100% offline.
+                  Uses <code>spire-codex.com</code> when on.
                 </p>
               </div>
             </section>
@@ -1853,21 +1853,21 @@
           <!-- TAB 2: ROOM TOOLS (100% PURE P2P · ZERO EXTERNAL SERVERS) -->
           <div class="settings-tab-panel hidden" id="settings-panel-room" data-settings-panel="room" role="tabpanel">
             <p class="settings-p2p-banner">
-              <strong>ZERO EXTERNAL SERVERS · 100% E2EE</strong> — All five Room Tools run purely over your encrypted P2P room state. Any peer in the room can click buttons to update the persistent card live.
+              <strong>OFFLINE · NO EXTERNAL SERVERS</strong>
             </p>
 
             <!-- 1. Live Poll -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">1. Live Poll / Decision Maker</span>
+                <span class="settings-section-kicker">1. Poll</span>
                 <span class="badge" id="setting-poll-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-poll-enabled">
                   <input id="setting-poll-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Live Poll Card</span>
-                    <span class="audio-switch-desc">One-click voting with live bar meters, percentages, and voter names updated in place.</span>
+                    <span class="audio-switch-title">Live Poll</span>
+                    <span class="audio-switch-desc">Vote live with bar meters.</span>
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-1" id="settings-poll-options">
@@ -1886,7 +1886,7 @@
                         id="setting-poll-choices-input"
                         type="text"
                         class="text-input settings-list-input"
-                        placeholder="Add option… (comma-separated auto-splits)"
+                        placeholder="Add option…"
                         autocomplete="off"
                       />
                       <button type="button" id="btn-list-add-poll" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
@@ -1894,8 +1894,8 @@
                   </div>
                 </div>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-poll-post-now" class="btn btn-sm btn-primary" disabled>+ Post / Update Poll</button>
-                  <button type="button" id="btn-poll-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-poll-post-now" class="btn btn-sm btn-primary" disabled>+ Post / Update</button>
+                  <button type="button" id="btn-poll-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
               </div>
             </section>
@@ -1903,15 +1903,15 @@
             <!-- 2. Synced Pomodoro -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">2. Synced Pomodoro / Focus Timer</span>
+                <span class="settings-section-kicker">2. Pomodoro</span>
                 <span class="badge" id="setting-pomodoro-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-pomodoro-enabled">
                   <input id="setting-pomodoro-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Synced Pomodoro Timer</span>
-                    <span class="audio-switch-desc">Shared Focus / Short Break / Long Break countdown anchored to room timestamps.</span>
+                    <span class="audio-switch-title">Pomodoro Timer</span>
+                    <span class="audio-switch-desc">Shared focus &amp; break countdown.</span>
                   </span>
                 </label>
                 <div class="settings-grid" id="settings-pomodoro-options">
@@ -1929,8 +1929,8 @@
                   </div>
                 </div>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-pomodoro-post-now" class="btn btn-sm btn-primary" disabled>+ Post Timer Card</button>
-                  <button type="button" id="btn-pomodoro-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-pomodoro-post-now" class="btn btn-sm btn-primary" disabled>+ Post Timer</button>
+                  <button type="button" id="btn-pomodoro-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
               </div>
             </section>
@@ -1938,25 +1938,25 @@
             <!-- 3. Shared Checklist -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">3. Shared Checklist / Notes</span>
+                <span class="settings-section-kicker">3. Checklist</span>
                 <span class="badge" id="setting-checklist-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-checklist-enabled">
                   <input id="setting-checklist-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Shared Checklist Card</span>
-                    <span class="audio-switch-desc">Click items to check/uncheck in place. Type <code>+todo &lt;item&gt;</code> in chat to append new tasks.</span>
+                    <span class="audio-switch-title">Shared Checklist</span>
+                    <span class="audio-switch-desc">Shared to-do list. Add via <code>+todo &lt;item&gt;</code>.</span>
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-1" id="settings-checklist-options">
                   <div class="settings-field">
-                    <label class="settings-label" for="setting-checklist-title">Checklist Title</label>
+                    <label class="settings-label" for="setting-checklist-title">Title</label>
                     <input id="setting-checklist-title" type="text" class="text-input" maxlength="80" value="Room Checklist" />
                   </div>
                   <div class="settings-field settings-list-editor" id="list-editor-checklist" data-list-bot="checklist">
                     <div class="settings-list-head">
-                      <label class="settings-label" for="setting-checklist-items-input">Initial Items (1–12)</label>
+                      <label class="settings-label" for="setting-checklist-items-input">Items (1–12)</label>
                       <span class="settings-list-count" id="list-count-checklist">3 / 12</span>
                     </div>
                     <div class="settings-list-chips" id="list-chips-checklist" role="list" aria-label="Checklist items"></div>
@@ -1965,7 +1965,7 @@
                         id="setting-checklist-items-input"
                         type="text"
                         class="text-input settings-list-input"
-                        placeholder="Add item… (comma-separated auto-splits)"
+                        placeholder="Add item…"
                         autocomplete="off"
                       />
                       <button type="button" id="btn-list-add-checklist" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
@@ -1973,8 +1973,8 @@
                   </div>
                 </div>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-checklist-post-now" class="btn btn-sm btn-primary" disabled>+ Post / Reset Checklist</button>
-                  <button type="button" id="btn-checklist-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-checklist-post-now" class="btn btn-sm btn-primary" disabled>+ Post / Reset</button>
+                  <button type="button" id="btn-checklist-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
               </div>
             </section>
@@ -1982,21 +1982,21 @@
             <!-- 4. Randomizer & Dice -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">4. Randomizer, Tie-Breaker &amp; Dice</span>
+                <span class="settings-section-kicker">4. Randomizer &amp; Dice</span>
                 <span class="badge" id="setting-randomizer-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-randomizer-enabled">
                   <input id="setting-randomizer-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Randomizer &amp; Dice Tray</span>
-                    <span class="audio-switch-desc">Flip coin, pick a random connected room peer, draw from custom options, or roll d6 / d20 / 2d6 / d100.</span>
+                    <span class="audio-switch-title">Randomizer &amp; Dice</span>
+                    <span class="audio-switch-desc">Coin, random peer, options &amp; dice.</span>
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-1" id="settings-randomizer-options">
                   <div class="settings-field settings-list-editor" id="list-editor-randomizer" data-list-bot="randomizer">
                     <div class="settings-list-head">
-                      <label class="settings-label" for="setting-randomizer-choices-input">Custom Options Pool (1–12)</label>
+                      <label class="settings-label" for="setting-randomizer-choices-input">Options Pool (1–12)</label>
                       <span class="settings-list-count" id="list-count-randomizer">4 / 12</span>
                     </div>
                     <div class="settings-list-chips" id="list-chips-randomizer" role="list" aria-label="Randomizer options"></div>
@@ -2005,7 +2005,7 @@
                         id="setting-randomizer-choices-input"
                         type="text"
                         class="text-input settings-list-input"
-                        placeholder="Add option… (comma-separated auto-splits)"
+                        placeholder="Add option…"
                         autocomplete="off"
                       />
                       <button type="button" id="btn-list-add-randomizer" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
@@ -2013,8 +2013,8 @@
                   </div>
                 </div>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-randomizer-post-now" class="btn btn-sm btn-primary" disabled>+ Post Randomizer Card</button>
-                  <button type="button" id="btn-randomizer-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-randomizer-post-now" class="btn btn-sm btn-primary" disabled>+ Post Card</button>
+                  <button type="button" id="btn-randomizer-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
               </div>
             </section>
@@ -2022,33 +2022,33 @@
             <!-- 5. Group Scoreboard & 1-5★ Rating Board -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">5. Group Scoreboard &amp; 1–5★ Rating Board</span>
+                <span class="settings-section-kicker">5. Scoreboard &amp; Ratings</span>
                 <span class="badge" id="setting-scoreboard-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-scoreboard-enabled">
                   <input id="setting-scoreboard-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Scoreboard &amp; Watch Rating Board</span>
-                    <span class="audio-switch-desc">Track game-night points (+1 / -1 per peer) or switch to 1–5★ rating mode linked to your Watch Together title.</span>
+                    <span class="audio-switch-title">Scoreboard &amp; Ratings</span>
+                    <span class="audio-switch-desc">Points tracker &amp; 1–5★ ratings.</span>
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-2" id="settings-scoreboard-options">
                   <div class="settings-field">
-                    <label class="settings-label" for="setting-scoreboard-mode">Default Mode</label>
+                    <label class="settings-label" for="setting-scoreboard-mode">Mode</label>
                     <select id="setting-scoreboard-mode" class="select-input">
                       <option value="scores">Scoreboard (+1 / -1)</option>
-                      <option value="ratings">Rate It (1–5★)</option>
+                      <option value="ratings">Ratings (1–5★)</option>
                     </select>
                   </div>
                   <div class="settings-field">
-                    <label class="settings-label" for="setting-scoreboard-title">Rating Subject (blank = Watch Together title)</label>
+                    <label class="settings-label" for="setting-scoreboard-title">Rating Title</label>
                     <input id="setting-scoreboard-title" type="text" class="text-input" maxlength="90" placeholder="Auto from Watch Together" />
                   </div>
                 </div>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-scoreboard-post-now" class="btn btn-sm btn-primary" disabled>+ Post Scoreboard Card</button>
-                  <button type="button" id="btn-scoreboard-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-scoreboard-post-now" class="btn btn-sm btn-primary" disabled>+ Post Board</button>
+                  <button type="button" id="btn-scoreboard-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
               </div>
             </section>
@@ -2059,20 +2059,20 @@
             <!-- 1. Weather -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">Weather &amp; 3-Day Forecast · Open-Meteo</span>
+                <span class="settings-section-kicker">Weather</span>
                 <span class="badge" id="setting-weather-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-weather-enabled">
                   <input id="setting-weather-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Weather &amp; Forecast Bot</span>
-                    <span class="audio-switch-desc">Live conditions &amp; 3-day outlook across up to 4 pinned cities with in-card °C / °F toggle.</span>
+                    <span class="audio-switch-title">Weather Bot</span>
+                    <span class="audio-switch-desc">Live weather &amp; 3-day forecast.</span>
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-1" id="settings-weather-options">
                   <div class="settings-field">
-                    <label class="settings-label" for="setting-weather-unit">Temperature Unit</label>
+                    <label class="settings-label" for="setting-weather-unit">Unit</label>
                     <select id="setting-weather-unit" class="select-input">
                       <option value="c">Celsius (°C)</option>
                       <option value="f">Fahrenheit (°F)</option>
@@ -2080,7 +2080,7 @@
                   </div>
                   <div class="settings-field settings-list-editor" id="list-editor-weather" data-list-bot="weather">
                     <div class="settings-list-head">
-                      <label class="settings-label" for="setting-weather-cities-input">Pinned Cities (1–4)</label>
+                      <label class="settings-label" for="setting-weather-cities-input">Cities (1–4)</label>
                       <span class="settings-list-count" id="list-count-weather">3 / 4</span>
                     </div>
                     <div class="settings-list-chips" id="list-chips-weather" role="list" aria-label="Pinned weather cities"></div>
@@ -2089,7 +2089,7 @@
                         id="setting-weather-cities-input"
                         type="text"
                         class="text-input settings-list-input"
-                        placeholder="Add city… (comma-separated auto-splits)"
+                        placeholder="Add city…"
                         autocomplete="off"
                       />
                       <button type="button" id="btn-list-add-weather" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
@@ -2097,11 +2097,11 @@
                   </div>
                 </div>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-weather-post-now" class="btn btn-sm btn-primary" disabled>+ Post Weather Card</button>
-                  <button type="button" id="btn-weather-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-weather-post-now" class="btn btn-sm btn-primary" disabled>+ Post Weather</button>
+                  <button type="button" id="btn-weather-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
                 <p class="settings-privacy-note">
-                  Zero requests sent to <code>open-meteo.com</code> while disabled.
+                  Uses <code>open-meteo.com</code> when on.
                 </p>
               </div>
             </section>
@@ -2109,37 +2109,37 @@
             <!-- 2. Wikipedia -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">Wikipedia · Quick Reference</span>
+                <span class="settings-section-kicker">Wikipedia</span>
                 <span class="badge" id="setting-wikipedia-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-wikipedia-enabled">
                   <input id="setting-wikipedia-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">Wikipedia Reference Bot</span>
-                    <span class="audio-switch-desc">Featured article, Random discovery, On This Day history, and inline <code>[[wiki:Topic]]</code> lookup on one persistent card.</span>
+                    <span class="audio-switch-title">Wikipedia Bot</span>
+                    <span class="audio-switch-desc">Featured, random, history &amp; <code>[[wiki:Topic]]</code> lookup.</span>
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-1" id="settings-wikipedia-options">
                   <div class="settings-field">
                     <label class="settings-label" for="setting-wikipedia-tab">Default Tab</label>
                     <select id="setting-wikipedia-tab" class="select-input">
-                      <option value="featured">Today's Featured &amp; Trending</option>
+                      <option value="featured">Featured &amp; Trending</option>
                       <option value="random">Random Article</option>
-                      <option value="onthisday">On This Day in History</option>
+                      <option value="onthisday">On This Day</option>
                     </select>
                   </div>
                 </div>
                 <label class="settings-inline-check" for="setting-wikipedia-inline">
                   <input id="setting-wikipedia-inline" type="checkbox" checked />
-                  <span>Enable inline <code>[[wiki:Topic]]</code> lookup in chat</span>
+                  <span>Chat lookup via <code>[[wiki:Topic]]</code></span>
                 </label>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-wikipedia-post-now" class="btn btn-sm btn-primary" disabled>+ Post Wikipedia Card</button>
-                  <button type="button" id="btn-wikipedia-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-wikipedia-post-now" class="btn btn-sm btn-primary" disabled>+ Post Wikipedia</button>
+                  <button type="button" id="btn-wikipedia-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
                 <p class="settings-privacy-note">
-                  Zero requests sent to <code>en.wikipedia.org</code> while disabled.
+                  Uses <code>en.wikipedia.org</code> when on.
                 </p>
               </div>
             </section>
@@ -2147,37 +2147,37 @@
             <!-- 3. GitHub Repo & Release Tracker -->
             <section class="settings-section">
               <div class="settings-section-head">
-                <span class="settings-section-kicker">GitHub · Repo &amp; Release Tracker</span>
+                <span class="settings-section-kicker">GitHub</span>
                 <span class="badge" id="setting-github-status-badge">Off</span>
               </div>
               <div class="settings-bot-card">
                 <label class="audio-switch-row settings-switch-row" for="setting-github-enabled">
                   <input id="setting-github-enabled" class="metro-switch" type="checkbox" />
                   <span class="audio-switch-copy">
-                    <span class="audio-switch-title">GitHub Repo Tracker Bot</span>
-                    <span class="audio-switch-desc">Tracks repo overview, latest release tag, recent commits, and open issues/PRs on a persistent card.</span>
+                    <span class="audio-switch-title">GitHub Bot</span>
+                    <span class="audio-switch-desc">Releases, commits &amp; issues.</span>
                   </span>
                 </label>
                 <div class="settings-grid settings-grid-2" id="settings-github-options">
                   <div class="settings-field">
-                    <label class="settings-label" for="setting-github-repo">Public Repository (owner/repo)</label>
+                    <label class="settings-label" for="setting-github-repo">Repository</label>
                     <input id="setting-github-repo" type="text" class="text-input" value="lz-er/p2p-direct" placeholder="owner/repo" />
                   </div>
                   <div class="settings-field">
                     <label class="settings-label" for="setting-github-tab">Default Tab</label>
                     <select id="setting-github-tab" class="select-input">
-                      <option value="overview">Overview &amp; Latest Release</option>
-                      <option value="commits">Recent Commits</option>
-                      <option value="issues">Open Issues &amp; PRs</option>
+                      <option value="overview">Overview &amp; Release</option>
+                      <option value="commits">Commits</option>
+                      <option value="issues">Issues &amp; PRs</option>
                     </select>
                   </div>
                 </div>
                 <div class="settings-wf-actions">
-                  <button type="button" id="btn-github-post-now" class="btn btn-sm btn-primary" disabled>+ Post GitHub Card</button>
-                  <button type="button" id="btn-github-jump-msg" class="btn btn-sm hidden">Jump to Message</button>
+                  <button type="button" id="btn-github-post-now" class="btn btn-sm btn-primary" disabled>+ Post GitHub</button>
+                  <button type="button" id="btn-github-jump-msg" class="btn btn-sm hidden">Jump</button>
                 </div>
                 <p class="settings-privacy-note">
-                  Zero requests sent to <code>api.github.com</code> while disabled.
+                  Uses <code>api.github.com</code> when on.
                 </p>
               </div>
             </section>

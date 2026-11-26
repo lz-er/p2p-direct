@@ -307,7 +307,7 @@ function basePayload(state, overrides) {
     sts2Upgraded: Boolean(state.upgraded),
     sts2CoopSeats: state.coopSeats || {},
     sts2UpdatedAt: nowMs,
-    subtitle: "SLAY THE SPIRE 2 · SPIRE CODEX",
+    subtitle: "SLAY THE SPIRE 2",
     ...overrides,
   };
 }
@@ -364,10 +364,10 @@ export function buildSts2MetaCard(metricsData, state) {
     title: `Top ${c.label} ${kindLabel} · ${bracketLabel(state.bracket)}`,
     badge: totalRuns > 0 ? `${totalRuns.toLocaleString()} RUNS` : "META",
     color: c.accent,
-    text: `Baseline Win Rate: **${baseWr}** · Tip: type \`[[Card Name]]\` in chat to inspect any card on this board.`,
+    text: `Baseline WR **${baseWr}** · Lookup: \`[[Card]]\``,
     fields,
     buttons: [buildNavButtonRows("meta"), charRow, bracketRow, buildFooterControls()],
-    footer: `Spire Codex community meta · Updated ${formatUpdatedClock(state.nowMs || Date.now())}`,
+    footer: `Spire Codex · ${formatUpdatedClock(state.nowMs || Date.now())}`,
   });
 }
 
@@ -402,16 +402,15 @@ export function buildSts2EncountersCard(encData, state) {
             inline: true,
           };
         })
-      : [{ label: "Encounters", value: "No encounter telemetry available right now.", inline: false }];
+      : [{ label: "Encounters", value: "No data.", inline: false }];
 
   return basePayload(state, {
     title: "Deadliest Spire Encounters",
     badge: `${top.length} TRACKED`,
     color: "coral",
-    text: "Ranked by **run-ending fatal rate** across community runs (average damage taken & combat length).",
     fields,
     buttons: [buildNavButtonRows("encounters"), buildFooterControls()],
-    footer: `Spire Codex Encounter Telemetry · Updated ${formatUpdatedClock(state.nowMs || Date.now())}`,
+    footer: `Spire Codex · ${formatUpdatedClock(state.nowMs || Date.now())}`,
   });
 }
 
@@ -513,7 +512,7 @@ export function buildSts2CodexCard(entity, state, { kind = "card", metricRow = n
       text: desc.length > 520 ? `${desc.slice(0, 517)}…` : desc,
       fields,
       buttons: [buildNavButtonRows("codex"), codexRow, buildFooterControls()],
-      footer: `Type [[Card Name]] or [[relic:Name]] in chat · Updated ${formatUpdatedClock(state.nowMs || Date.now())}`,
+      footer: `Lookup: [[Card]] / [[relic:Name]] · ${formatUpdatedClock(state.nowMs || Date.now())}`,
     }
   );
   if (imgUrl) {
@@ -547,7 +546,7 @@ export function buildSts2NewsCard({ newsData, betaVersion, betaDiff }, state) {
       value:
         diffBits.length > 0
           ? diffBits.slice(0, 5).join(" · ")
-          : `Render ${betaVersion.render_version || "latest"} · Synced with Spire Codex`,
+          : `Render ${betaVersion.render_version || "latest"}`,
       inline: false,
     });
   }
@@ -565,7 +564,7 @@ export function buildSts2NewsCard({ newsData, betaVersion, betaDiff }, state) {
   }
 
   if (fields.length === 0) {
-    fields.push({ label: "Patch Feed", value: "No announcements available right now.", inline: false });
+    fields.push({ label: "Patch Feed", value: "No updates.", inline: false });
   }
 
   const extra = [];
@@ -578,10 +577,9 @@ export function buildSts2NewsCard({ newsData, betaVersion, betaDiff }, state) {
     title: "Patch Notes & Beta Diff",
     badge: betaVersion?.beta_version ? `BETA ${betaVersion.beta_version}` : "PATCHES",
     color: "cobalt",
-    text: "Latest **Slay the Spire 2** Steam announcements & live beta branch delta.",
     fields,
     buttons: [buildNavButtonRows("news"), buildFooterControls(extra)],
-    footer: `Spire Codex News & Beta Tracker · Updated ${formatUpdatedClock(state.nowMs || Date.now())}`,
+    footer: `Spire Codex · ${formatUpdatedClock(state.nowMs || Date.now())}`,
   });
 }
 
@@ -604,7 +602,7 @@ export function buildSts2CoopCard(state) {
     } else {
       fields.push({
         label: `Seat ${i + 1}`,
-        value: "_Open — click a character below_",
+        value: "_Open_",
         inline: true,
       });
     }
@@ -620,10 +618,10 @@ export function buildSts2CoopCard(state) {
 
   const summaryText =
     count === 0
-      ? "Claim your character seat for a **2P–4P Co-op** Spire climb — synced inside this E2EE message."
+      ? "Pick a character below."
       : dupes.length > 0
-        ? `**${count}/4** seated · Duplicate pick: **${dupes.join(", ")}** (click another character to swap).`
-        : `**${count}/4** seated · Unique party comp ready for the Spire!`;
+        ? `Duplicate: **${dupes.join(", ")}**`
+        : "Party ready.";
 
   const charRow = STS2_CHARACTERS.map((ch) => ({
     id: `${STS2_ACTION_PREFIX}coop:${ch.id}`,
@@ -644,7 +642,7 @@ export function buildSts2CoopCard(state) {
     text: summaryText,
     fields,
     buttons: [buildNavButtonRows("coop"), charRow, controlsRow],
-    footer: `100% P2P E2EE Party Roster · Updated ${formatUpdatedClock(state.nowMs || Date.now())}`,
+    footer: `Updated ${formatUpdatedClock(state.nowMs || Date.now())}`,
   });
 }
 

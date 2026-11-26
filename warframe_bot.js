@@ -353,7 +353,6 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       title: "Open World Cycles",
       badge: cetusIsDay ? `CETUS DAY · ${cetusLeft}` : `EIDOLON NIGHT · ${cetusLeft}`,
       color: cetusIsDay ? "ochre" : "cobalt",
-      text: "Live worldstate timers across Cetus, Orb Vallis, Cambion Drift, Zariman, and Duviri. Switch tabs below to update this card in place.",
       fields,
     };
   }

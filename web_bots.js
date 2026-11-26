@@ -291,13 +291,13 @@ export async function fetchWeatherCard(
       wxTempLabel: tempStr,
       wxUnit: unit,
       wxUpdatedAt: nowMs,
-      subtitle: "WEATHER & 3-DAY FORECAST · OPEN-METEO",
+      subtitle: "WEATHER",
       title: `${placeLabel} — ${tempStr}`,
       badge: condStr.toUpperCase(),
       color: "cyan",
       fields,
       buttons: [cityRow, controlRow],
-      footer: `Open-Meteo · Keyless live forecast · Updated ${formatClock(nowMs)}`,
+      footer: `Open-Meteo · ${formatClock(nowMs)}`,
     };
   } catch (err) {
     return {
@@ -308,13 +308,13 @@ export async function fetchWeatherCard(
       wxTempLabel: "",
       wxUnit: unit,
       wxUpdatedAt: nowMs,
-      subtitle: "WEATHER & 3-DAY FORECAST · OPEN-METEO",
+      subtitle: "WEATHER",
       title: `Weather Unavailable (${cityName})`,
       badge: "OFFLINE",
       color: "coral",
-      text: `Could not fetch Open-Meteo forecast: ${err?.message || "network error"}.`,
+      text: `Unavailable (${err?.message || "offline"}).`,
       buttons: [cityRow, controlRow],
-      footer: `Open-Meteo · Retry at ${formatClock(nowMs)}`,
+      footer: `Open-Meteo · ${formatClock(nowMs)}`,
     };
   }
 }
@@ -400,14 +400,13 @@ export async function fetchWikiCard(
         wikiTab: "onthisday",
         wikiTopic: `${mm}/${dd}`,
         wikiUpdatedAt: nowMs,
-        subtitle: "WIKIPEDIA · ON THIS DAY",
-        title: `Selected History — ${mm}/${dd}`,
+        subtitle: "WIKIPEDIA",
+        title: `On This Day — ${mm}/${dd}`,
         badge: "HISTORY",
         color: "cobalt",
-        text: "Type `[[wiki:Topic]]` in chat anytime to look up an article right on this card.",
-        fields: fields.length > 0 ? fields : [{ label: "Events", value: "No events returned.", inline: false }],
+        fields: fields.length > 0 ? fields : [{ label: "Events", value: "No events.", inline: false }],
         buttons: [wikiNavRow("onthisday"), baseControls(firstUrl)],
-        footer: `Wikimedia REST API · Updated ${formatClock(nowMs)}`,
+        footer: `Lookup: [[wiki:Topic]] · ${formatClock(nowMs)}`,
       };
     }
 
@@ -419,7 +418,7 @@ export async function fetchWikiCard(
       const tfa = data?.tfa || null;
       const mostread = Array.isArray(data?.mostread?.articles) ? data.mostread.articles.slice(0, 2) : [];
       const title = tfa?.titles?.normalized || tfa?.title || "Wikipedia Today";
-      const extract = String(tfa?.extract || "Featured article summary unavailable.").slice(0, 480);
+      const extract = String(tfa?.extract || "Summary unavailable.").slice(0, 480);
       const articleUrl = tfa?.content_urls?.desktop?.page || "https://en.wikipedia.org";
       const thumb = tfa?.thumbnail?.source || "";
 
@@ -429,7 +428,7 @@ export async function fetchWikiCard(
       }
       if (mostread.length > 0) {
         fields.push({
-          label: "Trending on Wikipedia",
+          label: "Trending",
           value: mostread
             .map((a) => `**${a.titles?.normalized || a.title}** (${Number(a.views || 0).toLocaleString()} views)`)
             .join(" · "),
@@ -443,14 +442,14 @@ export async function fetchWikiCard(
         wikiTab: "featured",
         wikiTopic: title,
         wikiUpdatedAt: nowMs,
-        subtitle: "WIKIPEDIA · TODAY'S FEATURED",
+        subtitle: "WIKIPEDIA",
         title,
         badge: "FEATURED",
         color: "cobalt",
         text: extract,
         fields,
         buttons: [wikiNavRow("featured"), baseControls(articleUrl)],
-        footer: `Type [[wiki:Topic]] in chat for instant lookup · Updated ${formatClock(nowMs)}`,
+        footer: `Lookup: [[wiki:Topic]] · ${formatClock(nowMs)}`,
       };
       if (thumb && /^https:\/\//i.test(thumb)) {
         payload.image = { url: thumb, alt: title };
@@ -490,13 +489,13 @@ export async function fetchWikiCard(
           wikiTopic: query,
           wikiQuery: query,
           wikiUpdatedAt: nowMs,
-          subtitle: "WIKIPEDIA · QUICK LOOKUP",
+          subtitle: "WIKIPEDIA",
           title: `Not Found: "${query}"`,
           badge: "NO MATCH",
           color: "ochre",
-          text: `No Wikipedia summary found for **${query}**. Try \`[[wiki:Another Topic]]\` or click **Random**.`,
+          text: `No article found for **${query}**.`,
           buttons: [wikiNavRow("random"), baseControls()],
-          footer: `Wikimedia REST API · ${formatClock(nowMs)}`,
+          footer: `Wikipedia · ${formatClock(nowMs)}`,
         };
       }
     } else {
@@ -508,7 +507,7 @@ export async function fetchWikiCard(
     }
 
     const title = summary?.titles?.normalized || summary?.title || "Wikipedia";
-    const extract = String(summary?.extract || "No summary text available.").slice(0, 520);
+    const extract = String(summary?.extract || "No summary.").slice(0, 520);
     const articleUrl = summary?.content_urls?.desktop?.page || "https://en.wikipedia.org";
     const thumb = summary?.thumbnail?.source || "";
 
@@ -519,14 +518,14 @@ export async function fetchWikiCard(
       wikiTopic: title,
       wikiQuery: query || null,
       wikiUpdatedAt: nowMs,
-      subtitle: activeTab === "lookup" ? "WIKIPEDIA · QUICK LOOKUP" : "WIKIPEDIA · RANDOM ARTICLE",
+      subtitle: "WIKIPEDIA",
       title,
       badge: activeTab === "lookup" ? "LOOKUP" : "RANDOM",
       color: "cobalt",
       text: extract,
       fields: summary?.description ? [{ label: "Summary", value: `**${summary.description}**`, inline: false }] : [],
       buttons: [wikiNavRow(activeTab), baseControls(articleUrl)],
-      footer: `Type [[wiki:Topic]] in chat · Updated ${formatClock(nowMs)}`,
+      footer: `Lookup: [[wiki:Topic]] · ${formatClock(nowMs)}`,
     };
     if (thumb && /^https:\/\//i.test(thumb)) {
       payload.image = { url: thumb, alt: title };
@@ -539,13 +538,13 @@ export async function fetchWikiCard(
       wikiTab: activeTab,
       wikiTopic: query || activeTab,
       wikiUpdatedAt: nowMs,
-      subtitle: "WIKIPEDIA · QUICK REFERENCE",
-      title: "Wikipedia Temporarily Unavailable",
+      subtitle: "WIKIPEDIA",
+      title: "Wikipedia Unavailable",
       badge: "OFFLINE",
       color: "coral",
-      text: `Could not reach Wikimedia REST API (${err?.message || "network error"}).`,
+      text: `Unavailable (${err?.message || "offline"}).`,
       buttons: [wikiNavRow(activeTab), baseControls()],
-      footer: `Wikimedia REST API · Retry at ${formatClock(nowMs)}`,
+      footer: `Wikipedia · ${formatClock(nowMs)}`,
     };
   }
 }
@@ -635,13 +634,13 @@ export async function fetchGithubCard(
         ghRepo: repo,
         ghTab: "commits",
         ghUpdatedAt: nowMs,
-        subtitle: `GITHUB TRACKER · ${repo.toUpperCase()}`,
+        subtitle: `GITHUB · ${repo.toUpperCase()}`,
         title: `${repo} — Recent Commits`,
         badge: `${list.length} LATEST`,
         color: "ink",
-        fields: fields.length > 0 ? fields : [{ label: "Commits", value: "No commits found.", inline: false }],
+        fields: fields.length > 0 ? fields : [{ label: "Commits", value: "No commits.", inline: false }],
         buttons: [ghNavRow("commits"), controlsRow(`${repoWebUrl}/commits`, "All Commits")],
-        footer: `GitHub Public REST API · Updated ${formatClock(nowMs)}`,
+        footer: `GitHub · ${formatClock(nowMs)}`,
       };
     }
 
@@ -665,16 +664,16 @@ export async function fetchGithubCard(
         ghRepo: repo,
         ghTab: "issues",
         ghUpdatedAt: nowMs,
-        subtitle: `GITHUB TRACKER · ${repo.toUpperCase()}`,
+        subtitle: `GITHUB · ${repo.toUpperCase()}`,
         title: `${repo} — Open Issues & PRs`,
         badge: `${list.length} OPEN`,
         color: "mint",
         fields:
           fields.length > 0
             ? fields
-            : [{ label: "Clean Slate", value: "No open issues or pull requests right now.", inline: false }],
+            : [{ label: "Open Issues", value: "None.", inline: false }],
         buttons: [ghNavRow("issues"), controlsRow(`${repoWebUrl}/issues`, "Open Issues")],
-        footer: `GitHub Public REST API · Updated ${formatClock(nowMs)}`,
+        footer: `GitHub · ${formatClock(nowMs)}`,
       };
     }
 
@@ -694,35 +693,38 @@ export async function fetchGithubCard(
         inline: false,
       },
       {
-        label: "Default Branch & Activity",
-        value: `\`${info.default_branch || "main"}\` · Last push **${formatShortDate(info.pushed_at)}**${info.language ? ` · ${info.language}` : ""}`,
+        label: "Branch",
+        value: `\`${info.default_branch || "main"}\` · Push **${formatShortDate(info.pushed_at)}**${info.language ? ` · ${info.language}` : ""}`,
         inline: true,
       },
       {
         label: "Latest Release",
         value: release
           ? `**${release.tag_name || release.name}** (${formatShortDate(release.published_at)})`
-          : "No published releases yet",
+          : "None yet",
         inline: true,
       },
     ];
 
     const relUrl = release?.html_url || info.html_url || repoWebUrl;
-    return {
+    const overviewCard = {
       builtinBot: GITHUB_BOT_ID,
       persistent: true,
       ghRepo: repo,
       ghTab: "overview",
       ghUpdatedAt: nowMs,
-      subtitle: "GITHUB REPO & RELEASE TRACKER",
+      subtitle: "GITHUB",
       title: info.full_name || repo,
       badge: release?.tag_name ? String(release.tag_name).toUpperCase() : "REPO",
       color: "ink",
-      text: info.description || "Public repository overview tracked via GitHub REST API.",
       fields,
       buttons: [ghNavRow("overview"), controlsRow(relUrl, release ? "View Release" : "Open Repo")],
-      footer: `GitHub Public REST API · Updated ${formatClock(nowMs)}`,
+      footer: `GitHub · ${formatClock(nowMs)}`,
     };
+    if (info.description) {
+      overviewCard.text = info.description;
+    }
+    return overviewCard;
   } catch (err) {
     return {
       builtinBot: GITHUB_BOT_ID,
@@ -730,13 +732,13 @@ export async function fetchGithubCard(
       ghRepo: repo,
       ghTab: activeTab,
       ghUpdatedAt: nowMs,
-      subtitle: "GITHUB REPO & RELEASE TRACKER",
+      subtitle: "GITHUB",
       title: `GitHub Unavailable (${repo})`,
       badge: "OFFLINE",
       color: "coral",
-      text: `Could not query GitHub API (${err?.message || "network error"}). Check that \`${repo}\` is a public repo.`,
+      text: `Unavailable (${err?.message || "offline"}).`,
       buttons: [ghNavRow(activeTab), controlsRow()],
-      footer: `GitHub Public REST API · Retry at ${formatClock(nowMs)}`,
+      footer: `GitHub · ${formatClock(nowMs)}`,
     };
   }
 }

@@ -255,14 +255,13 @@ export function buildPollCard(stateInput, { nowMs = Date.now() } = {}) {
     persistent: true,
     botState: state,
     botUpdatedAt: nowMs,
-    subtitle: "LIVE POLL · 100% P2P E2EE",
+    subtitle: "POLL",
     title: state.question || DEFAULT_POLL_SETTINGS.question,
     badge: `${totalVotes} ${totalVotes === 1 ? "VOTE" : "VOTES"}`,
     color: "cobalt",
-    text: "Click an option below to vote or switch your pick (click again to retract).",
     fields,
     buttons: btnRows,
-    footer: `Zero external servers · Updated ${formatClock(nowMs)}`,
+    footer: `Updated ${formatClock(nowMs)}`,
   };
 }
 
@@ -392,14 +391,13 @@ export function buildPomodoroCard(stateInput, { nowMs = Date.now() } = {}) {
     persistent: true,
     botState: s,
     botUpdatedAt: nowMs,
-    subtitle: "SYNCED POMODORO · 100% P2P E2EE",
+    subtitle: "POMODORO",
     title: `${modeLabel} — ${clock}`,
     badge: `${statusLabel} · ${clock}`,
     color: s.mode === "focus" ? (s.running ? "coral" : "ochre") : "mint",
-    text: `Shared group timer anchored to room timestamp — ticks smoothly on every peer's screen without edit spam.`,
     fields: [
       { label: "Countdown", value: `\`${clock}\` · ${renderBar(pct / 100, 10)} **${pct}%**`, inline: true },
-      { label: "Sessions Completed", value: `**${Number(s.sessionsCompleted) || 0}** focus blocks`, inline: true },
+      { label: "Completed", value: `**${Number(s.sessionsCompleted) || 0}** sessions`, inline: true },
     ],
     buttons: [
       [
@@ -417,7 +415,7 @@ export function buildPomodoroCard(stateInput, { nowMs = Date.now() } = {}) {
         { id: "pomo:dismiss", label: "✕ Hide", style: "danger" },
       ],
     ],
-    footer: `Zero external servers · Updated ${formatClock(nowMs)}`,
+    footer: `Updated ${formatClock(nowMs)}`,
   };
 }
 
@@ -526,14 +524,14 @@ export function buildChecklistCard(stateInput, { nowMs = Date.now() } = {}) {
     persistent: true,
     botState: state,
     botUpdatedAt: nowMs,
-    subtitle: "SHARED CHECKLIST · 100% P2P E2EE",
+    subtitle: "CHECKLIST",
     title: state.title || DEFAULT_CHECKLIST_SETTINGS.title,
     badge: `${doneCount}/${items.length} DONE`,
     color: allDone ? "mint" : "cyan",
-    text: "Click any item button to check/uncheck it in place. Tip: type `+todo <item>` in chat to add one.",
+    text: "Add via `+todo <item>`",
     fields,
     buttons: rows,
-    footer: `Zero external servers · Updated ${formatClock(nowMs)}`,
+    footer: `Updated ${formatClock(nowMs)}`,
   };
 }
 
@@ -653,11 +651,10 @@ export function buildRandomizerCard(stateInput, { nowMs = Date.now() } = {}) {
     persistent: true,
     botState: state,
     botUpdatedAt: nowMs,
-    subtitle: "RANDOMIZER & DICE · 100% P2P E2EE",
-    title: state.lastResult ? `${state.lastLabel}: ${state.lastResult}` : "Randomizer, Tie-Breaker & Dice",
+    subtitle: "RANDOMIZER",
+    title: state.lastResult ? `${state.lastLabel}: ${state.lastResult}` : "Randomizer & Dice",
     badge: state.lastResult ? String(state.lastResult).slice(0, 14).toUpperCase() : "READY",
     color: "ochre",
-    text: "Fair instant coin flip, room peer picker, option tie-breaker, and tabletop dice.",
     fields,
     buttons: [
       [
@@ -676,7 +673,7 @@ export function buildRandomizerCard(stateInput, { nowMs = Date.now() } = {}) {
         { id: "rng:dismiss", label: "✕ Hide", style: "danger" },
       ],
     ],
-    footer: `Zero external servers · Updated ${formatClock(nowMs)}`,
+    footer: `Updated ${formatClock(nowMs)}`,
   };
 }
 
@@ -805,11 +802,10 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
       persistent: true,
       botState: state,
       botUpdatedAt: nowMs,
-      subtitle: "GROUP RATING BOARD · 100% P2P E2EE",
+      subtitle: "RATINGS",
       title: `Rate It: ${state.ratingTitle || "Tonight's Watch / Pick"}`,
       badge: list.length > 0 ? `★ ${avg} / 5 (${list.length})` : "RATE 1–5★",
       color: "ochre",
-      text: "Click a star rating below to record or update your score.",
       fields,
       buttons: [
         [
@@ -821,12 +817,12 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
         ],
         [
           { id: "score:use_watch", label: "Use Watch Title", style: "secondary" },
-          { id: "score:mode:scores", label: "Scoreboard Mode", style: "secondary" },
+          { id: "score:mode:scores", label: "Scoreboard", style: "secondary" },
           { id: "score:reset", label: "↺ Clear", style: "warning" },
           { id: "score:dismiss", label: "✕ Hide", style: "danger" },
         ],
       ],
-      footer: `Zero external servers · Updated ${formatClock(nowMs)}`,
+      footer: `Updated ${formatClock(nowMs)}`,
     };
   }
 
@@ -843,7 +839,7 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
           value: `**${Number(e.score) || 0} pts**`,
           inline: true,
         }))
-      : [{ label: "No Players", value: "Click Sync Room Peers to add everyone.", inline: false }];
+      : [{ label: "No Players", value: "Click Sync Peers.", inline: false }];
 
   const scoreBtns = [];
   for (let i = 0; i < Math.min(4, entries.length); i++) {
@@ -857,7 +853,7 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
   }
   btnRows.push([
     { id: "score:sync_peers", label: "+ Sync Peers", style: "primary" },
-    { id: "score:mode:ratings", label: "★ 1–5 Rating Mode", style: "warning" },
+    { id: "score:mode:ratings", label: "★ 1–5 Ratings", style: "warning" },
     { id: "score:reset", label: "↺ Reset", style: "secondary" },
     { id: "score:dismiss", label: "✕ Hide", style: "danger" },
   ]);
@@ -868,14 +864,13 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
     persistent: true,
     botState: state,
     botUpdatedAt: nowMs,
-    subtitle: "GROUP SCOREBOARD · 100% P2P E2EE",
+    subtitle: "SCOREBOARD",
     title: "Room Scoreboard",
     badge: leader ? `LEAD: ${leader.name.slice(0, 10).toUpperCase()} (${leader.score})` : "0 PTS",
     color: "mint",
-    text: "Track game night points or switch to **1–5★ Rating Mode** for Watch Together picks.",
     fields,
     buttons: btnRows,
-    footer: `Zero external servers · Updated ${formatClock(nowMs)}`,
+    footer: `Updated ${formatClock(nowMs)}`,
   };
 }
 
