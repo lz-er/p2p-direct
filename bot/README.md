@@ -95,8 +95,26 @@ bot.on("voiceAudio", ({ peerId, rms, pcm }) => { /* Int16Array @ 16 kHz */ });
 
 ## Local WebSocket Bridge Protocol (`bot/bridge.mjs`)
 
-Connect any WebSocket client to `ws://127.0.0.1:8765`:
+Start in standby mode (`node bridge.mjs --port 8765`, no `--room` required) or pre-connected with `--room`, then connect any WebSocket client to `ws://127.0.0.1:8765`:
 
-- **Events received (JSON)**: `ready`, `message`, `message_update`, `message_delete`, `interaction`, `peer_join`, `peer_leave`, `voice_state`, `audio_end`, `voice_audio` (opt-in), `reply`.
-- **Commands sent (JSON text frame)**: `send_text`, `send_bot_message`, `edit_message`, `update_bot_message`, `delete_message`, `get_raw_log`, `join_voice`, `leave_voice`, `set_voice_muted`, `set_audio_gain`, `play_audio_file`, `play_tone`, `pause_audio`, `resume_audio`, `stop_audio`, `subscribe_voice_audio`, `get_status`.
-- **Audio streaming (binary WebSocket frame)**: send raw 16 kHz mono `Int16LE` PCM bytes directly as binary WebSocket frames and the bridge paces and encrypts them into the room's voice channel automatically.
+- **Events received (JSON)**: `ready`, `room_state`, `message`, `message_update`, `message_delete`, `interaction`, `peer_join`, `peer_leave`, `voice_state`, `audio_start`, `audio_end`, `voice_audio` (opt-in), `reply`.
+- **Mixed inbound voice audio (binary WebSocket frames, server -> client)**: send `subscribe_mixed_audio { enabled: true }` to receive continuous silence-gap-filled 20 ms 16 kHz mono `Int16LE` PCM frames (640 bytes each) with automatic TTS echo suppression and speaker locking (`lock_speaker` / `unlock_speaker`).
+- **Commands sent (JSON text frame)**: `connect_room`, `disconnect_room`, `send_text`, `send_bot_message`, `update_bot_message`, `edit_message`, `delete_message`, `get_raw_log`, `join_voice`, `leave_voice`, `set_voice_muted`, `set_audio_gain`, `set_pcm_input_format`, `mark_audio_stream_end`, `play_audio_file`, `play_tone`, `play_chime`, `pause_audio`, `resume_audio`, `stop_audio`, `subscribe_voice_audio`, `subscribe_mixed_audio`, `lock_speaker`, `unlock_speaker`, `set_allowed_speakers`, `get_status`.
+- **Outbound audio streaming (binary WebSocket frames, client -> server)**: send raw `Int16LE` PCM bytes (default 16 kHz mono, or call `set_pcm_input_format { sampleRate, channels }` for e.g. 22050/24000 Hz TTS); the bridge resamples, paces, and E2EE-encrypts them into the room's voice channel automatically.
+
+## Home Assistant Voice Assistant (`bot/ha-assistant.mjs`)
+
+Exposes a full **Wyoming Voice Satellite** (`:10700`), watches a Home Assistant `input_text` room-link helper, and serves an Ingress-ready Flat Metro **Control Panel** (`:8787`):
+
+```bash
+node ha-assistant.mjs \
+  --ha-url "http://homeassistant.local:8123" \
+  --ha-token "<LONG_LIVED_ACCESS_TOKEN>" \
+  --room-helper "input_text.p2p_voice_room_link" \
+  --wyoming-port 10700 \
+  --ui-port 8787
+```
+
+- Add **Settings → Devices & Services → Add Integration → Wyoming Protocol** pointing at `<host>:10700`.
+- Paste any `https://voice.dequ.org/#room=P2P1:...` invite link into `input_text.p2p_voice_room_link` (or the Control Panel UI) and the assistant joins voice immediately with both **wake-word activation**, **button activation** (`Listen Now`), **LLM/entity control**, and **live ticking Flat Metro timer cards** (`{ type: "timer" }`).
+

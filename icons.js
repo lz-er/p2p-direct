@@ -44,6 +44,13 @@ const ICON_PATHS = {
   "bar-chart": '<rect x="3" y="12" width="4" height="9"/><rect x="10" y="7" width="4" height="14"/><rect x="17" y="3" width="4" height="18"/>',
   info: '<rect x="3" y="3" width="18" height="18"/><line x1="12" y1="11" x2="12" y2="17"/><rect x="10.9" y="7" width="2.2" height="2.2" fill="currentColor" stroke="none"/>',
   alert: '<polygon points="12 3 22 20 2 20"/><line x1="12" y1="9" x2="12" y2="14"/><rect x="10.9" y="16" width="2.2" height="2.2" fill="currentColor" stroke="none"/>',
+  home: '<polyline points="3 11 12 3 21 11"/><path d="M5 10v10h14V10"/><rect x="9.5" y="14" width="5" height="6"/>',
+  mic: '<rect x="9" y="2.5" width="6" height="11"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/>',
+  "mic-off": '<line x1="2" y1="2" x2="22" y2="22"/><path d="M9 5V2.5h6v8.5"/><path d="M9 9.5v4h4"/><path d="M5 11a7 7 0 0 0 11.9 5"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/>',
+  volume: '<polygon points="3 9 8 9 13 4.5 13 19.5 8 15 3 15"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/><path d="M19.5 5.5a9 9 0 0 1 0 13"/>',
+  bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M10 21h4"/>',
+  bolt: '<polygon points="13 2 4 14 11 14 10 22 20 10 13 10 13 2"/>',
+  lamp: '<path d="M9 18h6"/><path d="M10 22h4"/><path d="M8.5 14.5C7 13 6 11.2 6 9a6 6 0 1 1 12 0c0 2.2-1 4-2.5 5.5L15 18H9l-.5-3.5z"/>',
 };
 
 const EMOJI_TO_ICON_PREFIX = [
@@ -89,6 +96,15 @@ const EMOJI_TO_ICON_PREFIX = [
   ["ℹ", "info"],
   ["✏", "edit"],
   ["🗑", "trash"],
+  ["🏠", "home"],
+  ["🏡", "home"],
+  ["🎤", "mic"],
+  ["🎙", "mic"],
+  ["🔇", "mic-off"],
+  ["🔊", "volume"],
+  ["🔔", "bell"],
+  ["⚡", "bolt"],
+  ["💡", "lamp"],
 ];
 
 // Matches Unicode pictorial emojis, variation selectors, keycap marks, and ZWJ emoji joiners.

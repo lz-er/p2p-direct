@@ -142,7 +142,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v35";
+export const APP_VERSION = "v36";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -1051,6 +1051,15 @@ function isSafeVideoDataUrl(src) {
 function isSafeImageSrc(src) {
   if (typeof src !== "string") return false;
   return isSafeImageDataUrl(src) || /^https:\/\/[^\s<>"']+$/i.test(src);
+}
+
+export function formatBotTimerClock(remainingSec) {
+  const clamped = Math.max(0, Math.ceil(Number(remainingSec) || 0));
+  const hrs = Math.floor(clamped / 3600);
+  const mins = Math.floor((clamped % 3600) / 60);
+  const secs = clamped % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return hrs > 0 ? `${hrs}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
 }
 
 export function formatBotRichText(raw) {
@@ -2062,6 +2071,7 @@ export class P2PDirectApp {
       bootstrapTimer: null,
     };
     this._pomoTickTimer = null;
+    this._botBlockTickTimer = null;
     this._seenTriggerMsgIds = new Set();
     this.el = {};
   }
@@ -8887,6 +8897,10 @@ export class P2PDirectApp {
       clearInterval(this._pomoTickTimer);
       this._pomoTickTimer = null;
     }
+    if (this._botBlockTickTimer) {
+      clearInterval(this._botBlockTickTimer);
+      this._botBlockTickTimer = null;
+    }
   }
 
   scheduleBuiltinBotsBootstrap({ delayMs = 180 } = {}) {
@@ -9472,6 +9486,56 @@ export class P2PDirectApp {
         if (progVal) progVal.textContent = `${clock} · ${pct}%`;
         const progFill = entryEl.querySelector(".bot-blk-progress-fill");
         if (progFill) progFill.style.width = `${pct}%`;
+      }
+    }, 1000);
+  }
+
+  _syncBotBlockTimersTicker() {
+    const feed = this.el?.["log-feed"];
+    const tick = () => {
+      if (!feed) return false;
+      const nodes = feed.querySelectorAll('.bot-blk-timer[data-bot-timer-running="1"]');
+      if (nodes.length === 0) return false;
+      const nowMs = Date.now();
+      let anyStillRunning = false;
+      for (const el of nodes) {
+        const endsAtMs = Number(el.dataset.botTimerEndsAt) || 0;
+        const totalSec = Math.max(1, Number(el.dataset.botTimerTotalSec) || 1);
+        const doneLabel = el.dataset.botTimerDoneLabel || "DONE";
+        const remSec = Math.max(0, (endsAtMs - nowMs) / 1000);
+        const elapsed = Math.max(0, totalSec - remSec);
+        const pct = Math.max(0, Math.min(100, Math.round((elapsed / totalSec) * 100)));
+        const valEl = el.querySelector(".bot-blk-progress-val");
+        if (valEl) {
+          valEl.textContent = remSec <= 0 ? doneLabel : `${formatBotTimerClock(remSec)} · ${pct}%`;
+        }
+        const fillEl = el.querySelector(".bot-blk-progress-fill");
+        if (fillEl) {
+          fillEl.style.width = `${pct}%`;
+        }
+        if (remSec <= 0) {
+          el.dataset.botTimerRunning = "0";
+          el.classList.add("is-done");
+        } else {
+          anyStillRunning = true;
+        }
+      }
+      return anyStillRunning;
+    };
+
+    const hasRunning = tick();
+    if (!hasRunning) {
+      if (this._botBlockTickTimer) {
+        clearInterval(this._botBlockTickTimer);
+        this._botBlockTickTimer = null;
+      }
+      return;
+    }
+    if (this._botBlockTickTimer) return;
+    this._botBlockTickTimer = setInterval(() => {
+      if (!tick()) {
+        clearInterval(this._botBlockTickTimer);
+        this._botBlockTickTimer = null;
       }
     }, 1000);
   }
@@ -17846,6 +17910,73 @@ export class P2PDirectApp {
             </div>
           `);
         }
+      } else if (type === "timer") {
+        const totalSec = Math.max(1, Number(blk.totalSec ?? blk.durationSec) || 60);
+        const paused = Boolean(blk.paused);
+        const nowMs = Date.now();
+        const endsAtMs = Number(blk.endsAtMs) || (paused ? 0 : nowMs + (Number(blk.remainingSec ?? totalSec) || 0) * 1000);
+        const remSec = paused
+          ? Math.max(0, Number(blk.remainingSec ?? totalSec) || 0)
+          : Math.max(0, (endsAtMs - nowMs) / 1000);
+        const elapsed = Math.max(0, totalSec - remSec);
+        const pct = Math.max(0, Math.min(100, Math.round((elapsed / totalSec) * 100)));
+        const barColor = allowedColors.has(blk.color) ? blk.color : "cobalt";
+        const doneLabel = stripBotEmojis(blk.doneLabel || "DONE") || "DONE";
+        const pausedLabel = stripBotEmojis(blk.pausedLabel || "PAUSED") || "PAUSED";
+        const running = !paused && remSec > 0;
+        const disp = paused
+          ? `${formatBotTimerClock(remSec)} · ${pausedLabel}`
+          : remSec <= 0
+            ? doneLabel
+            : `${formatBotTimerClock(remSec)} · ${pct}%`;
+        const resolved = resolveIconAndText(blk.label || "Timer", blk.icon || "timer");
+        const iconSvg = resolved.icon ? renderIconSvg(resolved.icon, { size: 13, className: "bot-blk-icon" }) : "";
+        const dataAttrs =
+          `data-bot-timer-running="${running ? "1" : "0"}" ` +
+          `data-bot-timer-ends-at="${Math.round(endsAtMs)}" ` +
+          `data-bot-timer-total-sec="${Math.round(totalSec)}" ` +
+          `data-bot-timer-done-label="${escapeHtml(doneLabel)}"`;
+        const actId = blk.actionId || blk.id || "";
+        const isClickable = Boolean(
+          actId || blk.editPatch || blk.editPayload || (typeof blk.url === "string" && blk.url.trim())
+        );
+        const doneCls = remSec <= 0 ? " is-done" : "";
+        if (isClickable) {
+          const idx = flatButtons.length;
+          flatButtons.push({
+            id: actId || `timer_${idx}`,
+            label: resolved.text || "Timer",
+            value: blk.value !== undefined ? blk.value : null,
+            url: blk.url || null,
+            editPatch: blk.editPatch || null,
+            editPayload: blk.editPayload || null,
+            disabled: Boolean(blk.disabled),
+          });
+          const disabledAttr = blk.disabled ? " disabled" : "";
+          out.push(`
+            <button type="button" class="bot-blk-progress bot-blk-timer is-clickable is-${barColor}${doneCls}" ${dataAttrs} data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(actId)}"${disabledAttr}>
+              <span class="bot-blk-progress-head">
+                <span class="bot-blk-progress-label">${iconSvg}<span>${escapeHtml(resolved.text)}</span></span>
+                <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
+              </span>
+              <span class="bot-blk-progress-track">
+                <span class="bot-blk-progress-fill is-${barColor}" style="width:${pct}%"></span>
+              </span>
+            </button>
+          `);
+        } else {
+          out.push(`
+            <div class="bot-blk-progress bot-blk-timer${doneCls}" ${dataAttrs}>
+              <div class="bot-blk-progress-head">
+                <span class="bot-blk-progress-label">${iconSvg}<span>${formatBotRichText(resolved.text)}</span></span>
+                <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
+              </div>
+              <div class="bot-blk-progress-track">
+                <div class="bot-blk-progress-fill is-${barColor}" style="width:${pct}%"></div>
+              </div>
+            </div>
+          `);
+        }
       } else if (type === "stats" && Array.isArray(blk.items) && blk.items.length > 0) {
         const tiles = blk.items
           .slice(0, 8)
@@ -19731,6 +19862,7 @@ export class P2PDirectApp {
     }
 
     this.logRenderState = { mode: "chat", key: chatKey };
+    this._syncBotBlockTimersTicker();
 
     if (prevMode !== "chat" || wasNearBottom || addedSelfMessage) {
       feed.scrollTop = feed.scrollHeight;

@@ -2,18 +2,21 @@
 /**
  * Local WebSocket Bot Bridge for p2p-direct (`voice.dequ.org`).
  *
- * Connects to any room as an ordinary E2EE WebRTC peer and exposes a dead-simple local
- * JSON + binary PCM WebSocket interface on 127.0.0.1 so bots written in Python, Rust, Go,
- * C#, or Node.js can send custom bot cards with buttons, delete messages, and stream audio
- * in voice channels without reimplementing WebRTC or cryptography.
+ * Connects to any room as an ordinary E2EE WebRTC peer (or starts in standby mode waiting
+ * for a dynamic `connect_room` command — ideal for Home Assistant Apps / Add-ons watching
+ * a room-link helper) and exposes a JSON + binary PCM WebSocket interface on localhost.
  *
  * Usage:
- *   node bot/bridge.mjs --room "https://voice.dequ.org/#room=P2P1:..." --name "MyBot" --port 8765
+ *   # Connect immediately to a room:
+ *   node bot/bridge.mjs --room "https://voice.dequ.org/#room=P2P1:..." --name "Assist" --port 8765
+ *
+ *   # Start in standby mode (connect/switch rooms dynamically via WebSocket `connect_room`):
+ *   node bot/bridge.mjs --name "Assist" --port 8765
  */
 
 import { WebSocketServer } from "ws";
 import { fileURLToPath } from "node:url";
-import { P2PBot } from "./sdk.mjs";
+import { P2PBot, VOICE_SAMPLE_RATE } from "./sdk.mjs";
 
 export function parseCliArgs(argv) {
   const args = {
@@ -24,6 +27,7 @@ export function parseCliArgs(argv) {
     host: process.env.P2P_BRIDGE_HOST || "127.0.0.1",
     port: Number(process.env.P2P_BRIDGE_PORT || 8765),
     peerId: process.env.P2P_PEER_ID || "",
+    autoJoinVoice: process.env.P2P_AUTO_JOIN_VOICE === "1",
   };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
@@ -49,6 +53,8 @@ export function parseCliArgs(argv) {
     } else if (flag === "--peer-id" && next) {
       args.peerId = next;
       i++;
+    } else if (flag === "--join-voice") {
+      args.autoJoinVoice = true;
     } else if (flag === "--help" || flag === "-h") {
       args.help = true;
     }
@@ -57,23 +63,41 @@ export function parseCliArgs(argv) {
 }
 
 export class P2PBotBridge {
-  constructor({ roomLink, passphrase = "", name = "P2PBot", relay = "", peerId = "", host = "127.0.0.1", port = 8765, wasmPath }) {
+  constructor({
+    roomLink = "",
+    passphrase = "",
+    name = "P2PBot",
+    relay = "",
+    peerId = "",
+    host = "127.0.0.1",
+    port = 8765,
+    wasmPath,
+    autoJoinVoice = false,
+  } = {}) {
     this.host = host;
     this.port = port;
-    this.bot = new P2PBot({
-      roomLink,
-      passphrase,
-      name,
-      relay: relay || undefined,
-      peerId: peerId || undefined,
-      wasmPath,
-    });
+    this.defaultName = name || "P2PBot";
+    this.defaultRelay = relay || "";
+    this.defaultPeerId = peerId || "";
+    this.wasmPath = wasmPath;
+    this.initialRoomLink = roomLink || "";
+    this.initialPassphrase = passphrase || "";
+    this.initialAutoJoinVoice = Boolean(autoJoinVoice);
+
+    this.bot = null;
+    this.mixer = null;
+    this.roomState = "disconnected"; // disconnected | connecting | connected | error
+    this.lastError = "";
     this.wss = null;
-    this.clients = new Map(); // ws -> { voiceAudioSubscribed: boolean }
+    this.clients = new Map(); // ws -> { voiceAudioSubscribed, mixedAudioSubscribed, pcmInputRate, pcmInputChannels }
+    this._mixerOpts = {
+      echoSuppression: true,
+      echoTailMs: 350,
+      allowedSpeakers: null,
+    };
   }
 
   async start() {
-    const ready = await this.bot.connect();
     await new Promise((resolve, reject) => {
       const wss = new WebSocketServer({ host: this.host, port: this.port });
       this.wss = wss;
@@ -88,33 +112,105 @@ export class P2PBotBridge {
       wss.on("connection", (ws) => this._onClient(ws));
     });
 
-    this.bot.on("message", (message) => this._broadcast({ event: "message", message }));
-    this.bot.on("messageUpdate", (message) => this._broadcast({ event: "message_update", message }));
-    this.bot.on("messageDelete", (ev) => this._broadcast({ event: "message_delete", ...ev }));
-    this.bot.on("interaction", (ev) => this._broadcast({ event: "interaction", ...ev }));
-    this.bot.on("peerJoin", (ev) => this._broadcast({ event: "peer_join", ...ev }));
-    this.bot.on("peerLeave", (ev) => this._broadcast({ event: "peer_leave", ...ev }));
-    this.bot.on("voiceState", (ev) => this._broadcast({ event: "voice_state", ...ev }));
-    this.bot.on("audioEnd", () => this._broadcast({ event: "audio_end" }));
-    this.bot.on("voiceAudio", ({ peerId, rms, pcm }) => {
-      for (const [ws, meta] of this.clients.entries()) {
-        if (meta.voiceAudioSubscribed && ws.readyState === 1) {
-          const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-          this._sendJson(ws, {
-            event: "voice_audio",
-            peerId,
-            rms,
-            sampleRate: 16000,
-            pcmBase64: buf.toString("base64"),
-          });
-        }
-      }
-    });
+    let ready = {
+      peerId: this.defaultPeerId || "",
+      authorName: this.defaultName,
+      room: "",
+      roomTopic: "",
+      relayUrls: [],
+    };
+    if (this.initialRoomLink) {
+      ready = await this.connectRoom({
+        roomLink: this.initialRoomLink,
+        passphrase: this.initialPassphrase,
+        name: this.defaultName,
+        relay: this.defaultRelay,
+        peerId: this.defaultPeerId,
+        autoJoinVoice: this.initialAutoJoinVoice,
+      });
+    }
 
     return {
       ...ready,
+      state: this.roomState,
       wsUrl: `ws://${this.host}:${this.port}`,
     };
+  }
+
+  async connectRoom({
+    roomLink,
+    passphrase = "",
+    name,
+    relay,
+    peerId,
+    autoJoinVoice = false,
+  } = {}) {
+    const cleanLink = String(roomLink || "").trim();
+    if (!cleanLink) {
+      throw new Error("connect_room requires a non-empty roomLink");
+    }
+
+    await this.disconnectRoom({ silent: true });
+
+    this.roomState = "connecting";
+    this.lastError = "";
+    this._broadcastRoomState();
+
+    const bot = new P2PBot({
+      roomLink: cleanLink,
+      passphrase: String(passphrase || ""),
+      name: String(name || this.defaultName || "P2PBot"),
+      relay: relay || this.defaultRelay || undefined,
+      peerId: peerId || this.defaultPeerId || undefined,
+      wasmPath: this.wasmPath,
+    });
+    this.bot = bot;
+    this._bindBotEvents(bot);
+
+    try {
+      const ready = await bot.connect();
+      this.roomState = "connected";
+      if (autoJoinVoice) {
+        bot.joinVoice({ muted: false });
+      }
+      this._syncMixerLifecycle();
+      this._broadcastRoomState();
+      return ready;
+    } catch (err) {
+      this.roomState = "error";
+      this.lastError = err?.message || String(err);
+      try {
+        await bot.disconnect();
+      } catch {
+        // ignore
+      }
+      if (this.bot === bot) {
+        this.bot = null;
+      }
+      this._broadcastRoomState();
+      throw err;
+    }
+  }
+
+  async disconnectRoom({ silent = false } = {}) {
+    if (this.mixer) {
+      this.mixer.destroy();
+      this.mixer = null;
+    }
+    if (this.bot) {
+      const prev = this.bot;
+      this.bot = null;
+      try {
+        await prev.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+    this.roomState = "disconnected";
+    this.lastError = "";
+    if (!silent) {
+      this._broadcastRoomState();
+    }
   }
 
   async stop() {
@@ -130,7 +226,80 @@ export class P2PBotBridge {
       await new Promise((resolve) => this.wss.close(() => resolve()));
       this.wss = null;
     }
-    await this.bot.disconnect();
+    await this.disconnectRoom({ silent: true });
+  }
+
+  _bindBotEvents(bot) {
+    bot.on("message", (message) => this._broadcast({ event: "message", message }));
+    bot.on("messageUpdate", (message) => this._broadcast({ event: "message_update", message }));
+    bot.on("messageDelete", (ev) => this._broadcast({ event: "message_delete", ...ev }));
+    bot.on("interaction", (ev) => this._broadcast({ event: "interaction", ...ev }));
+    bot.on("peerJoin", (ev) => this._broadcast({ event: "peer_join", ...ev }));
+    bot.on("peerLeave", (ev) => this._broadcast({ event: "peer_leave", ...ev }));
+    bot.on("voiceState", (ev) => this._broadcast({ event: "voice_state", ...ev }));
+    bot.on("audioStart", () => this._broadcast({ event: "audio_start" }));
+    bot.on("audioEnd", () => this._broadcast({ event: "audio_end" }));
+    bot.on("voiceAudio", ({ peerId, rms, pcm }) => {
+      for (const [ws, meta] of this.clients.entries()) {
+        if (meta.voiceAudioSubscribed && ws.readyState === 1) {
+          const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+          this._sendJson(ws, {
+            event: "voice_audio",
+            peerId,
+            rms,
+            sampleRate: VOICE_SAMPLE_RATE,
+            pcmBase64: buf.toString("base64"),
+          });
+        }
+      }
+    });
+  }
+
+  _syncMixerLifecycle() {
+    let anySubscribed = false;
+    for (const meta of this.clients.values()) {
+      if (meta.mixedAudioSubscribed) {
+        anySubscribed = true;
+        break;
+      }
+    }
+    if (!anySubscribed || !this.bot) {
+      if (this.mixer) {
+        this.mixer.destroy();
+        this.mixer = null;
+      }
+      return;
+    }
+    if (!this.mixer) {
+      this.mixer = this.bot.createVoiceMixer(this._mixerOpts);
+      this.mixer.on("frame", (frame) => {
+        for (const [ws, meta] of this.clients.entries()) {
+          if (meta.mixedAudioSubscribed && ws.readyState === 1) {
+            ws.send(frame.buffer, { binary: true });
+          }
+        }
+      });
+      this.mixer.start();
+    }
+  }
+
+  _roomStatePayload() {
+    return {
+      event: "room_state",
+      state: this.roomState,
+      peerId: this.bot?.peerId || this.defaultPeerId || "",
+      authorName: this.bot?.name || this.defaultName,
+      room: this.bot?.activeRoom?.name || "",
+      inVoice: Boolean(this.bot?.inVoice),
+      voiceMuted: Boolean(this.bot?.voiceMuted),
+      peers: this.bot ? this.bot.getPeers() : [],
+      lockedSpeaker: this.mixer?.lockedPeerId || null,
+      error: this.lastError || "",
+    };
+  }
+
+  _broadcastRoomState() {
+    this._broadcast(this._roomStatePayload());
   }
 
   _sendJson(ws, obj) {
@@ -148,23 +317,40 @@ export class P2PBotBridge {
     }
   }
 
+  _requireBot() {
+    if (!this.bot || this.roomState !== "connected") {
+      throw new Error("Bridge is in standby mode — send `connect_room` with a roomLink first");
+    }
+    return this.bot;
+  }
+
   _onClient(ws) {
-    const meta = { voiceAudioSubscribed: false };
+    const meta = {
+      voiceAudioSubscribed: false,
+      mixedAudioSubscribed: false,
+      pcmInputRate: VOICE_SAMPLE_RATE,
+      pcmInputChannels: 1,
+    };
     this.clients.set(ws, meta);
 
     this._sendJson(ws, {
       event: "ready",
-      peerId: this.bot.peerId,
-      authorName: this.bot.name,
-      room: this.bot.activeRoom?.name || "",
-      inVoice: this.bot.inVoice,
-      peers: this.bot.getPeers(),
+      state: this.roomState,
+      peerId: this.bot?.peerId || this.defaultPeerId || "",
+      authorName: this.bot?.name || this.defaultName,
+      room: this.bot?.activeRoom?.name || "",
+      inVoice: Boolean(this.bot?.inVoice),
+      peers: this.bot ? this.bot.getPeers() : [],
     });
 
     ws.on("message", (data, isBinary) => {
       if (isBinary) {
-        // Raw 16 kHz mono Int16LE PCM bytes -> stream directly into E2EE voice channel
-        this.bot.pushPcmBytes(Buffer.isBuffer(data) ? data : Buffer.from(data));
+        if (!this.bot || this.roomState !== "connected") return;
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        this.bot.pushPcmBytes(buf, {
+          sampleRate: meta.pcmInputRate,
+          channels: meta.pcmInputChannels,
+        });
         return;
       }
       let req;
@@ -174,15 +360,23 @@ export class P2PBotBridge {
         this._sendJson(ws, { event: "reply", ok: false, error: `Invalid JSON: ${err.message}` });
         return;
       }
-      this._handleCommand(ws, meta, req);
+      this._handleCommand(ws, meta, req).catch((err) => {
+        this._sendJson(ws, {
+          event: "reply",
+          reqId: req?.reqId ?? null,
+          ok: false,
+          error: err?.message || String(err),
+        });
+      });
     });
 
     ws.on("close", () => {
       this.clients.delete(ws);
+      this._syncMixerLifecycle();
     });
   }
 
-  _handleCommand(ws, meta, req) {
+  async _handleCommand(ws, meta, req) {
     const reqId = req.reqId ?? null;
     const replyOk = (data = {}) => this._sendJson(ws, { event: "reply", reqId, ok: true, data });
     const replyErr = (err) =>
@@ -190,16 +384,33 @@ export class P2PBotBridge {
 
     try {
       switch (req.cmd) {
+        case "connect_room": {
+          const info = await this.connectRoom({
+            roomLink: req.roomLink || req.room,
+            passphrase: req.passphrase || "",
+            name: req.name,
+            relay: req.relay,
+            peerId: req.peerId,
+            autoJoinVoice: Boolean(req.autoJoinVoice),
+          });
+          replyOk({ ...info, state: this.roomState });
+          break;
+        }
+        case "disconnect_room": {
+          await this.disconnectRoom();
+          replyOk({ state: this.roomState });
+          break;
+        }
         case "send_text": {
-          replyOk(this.bot.sendText(req.text));
+          replyOk(this._requireBot().sendText(req.text));
           break;
         }
         case "send_bot_message": {
-          replyOk(this.bot.sendBotMessage(req.card || req.payload));
+          replyOk(this._requireBot().sendBotMessage(req.card || req.payload));
           break;
         }
         case "update_bot_message": {
-          replyOk(this.bot.updateBotMessage(req.targetId, req.card || req.payload));
+          replyOk(this._requireBot().updateBotMessage(req.targetId, req.card || req.payload));
           break;
         }
         case "edit_message": {
@@ -211,41 +422,57 @@ export class P2PBotBridge {
                 : typeof req.text === "string"
                   ? { text: req.text }
                   : null;
-          replyOk(this.bot.editMessage(req.targetId, editPayload));
+          replyOk(this._requireBot().editMessage(req.targetId, editPayload));
           break;
         }
         case "get_raw_log": {
-          replyOk({ rawLog: this.bot.getRawLog({ compactMedia: Boolean(req.compactMedia) }) });
+          replyOk({ rawLog: this._requireBot().getRawLog({ compactMedia: Boolean(req.compactMedia) }) });
           break;
         }
         case "delete_message": {
-          replyOk(this.bot.deleteMessage(req.targetId));
+          replyOk(this._requireBot().deleteMessage(req.targetId));
           break;
         }
         case "send_raw": {
-          replyOk(this.bot.sendRaw(req.type, req.payload, req.id));
+          replyOk(this._requireBot().sendRaw(req.type, req.payload, req.id));
           break;
         }
         case "join_voice": {
-          replyOk({ voice: this.bot.joinVoice({ muted: Boolean(req.muted) }) });
+          replyOk({ voice: this._requireBot().joinVoice({ muted: Boolean(req.muted) }) });
+          this._broadcastRoomState();
           break;
         }
         case "leave_voice": {
-          replyOk({ voice: this.bot.leaveVoice() });
+          replyOk({ voice: this._requireBot().leaveVoice() });
+          this._broadcastRoomState();
           break;
         }
         case "set_voice_muted": {
-          this.bot.setVoiceMuted(Boolean(req.muted));
-          replyOk({ muted: this.bot.voiceMuted });
+          const bot = this._requireBot();
+          bot.setVoiceMuted(Boolean(req.muted));
+          replyOk({ muted: bot.voiceMuted });
+          this._broadcastRoomState();
           break;
         }
         case "set_audio_gain": {
-          this.bot.setAudioGain(req.gain);
-          replyOk({ gain: this.bot.pacer.gain });
+          const bot = this._requireBot();
+          bot.setAudioGain(req.gain);
+          replyOk({ gain: bot.pacer.gain });
+          break;
+        }
+        case "set_pcm_input_format": {
+          meta.pcmInputRate = Math.max(4000, Number(req.sampleRate) || VOICE_SAMPLE_RATE);
+          meta.pcmInputChannels = Math.max(1, Math.min(8, Math.round(Number(req.channels) || 1)));
+          replyOk({ sampleRate: meta.pcmInputRate, channels: meta.pcmInputChannels });
+          break;
+        }
+        case "mark_audio_stream_end": {
+          this._requireBot().markAudioStreamEnd();
+          replyOk({ ended: true });
           break;
         }
         case "play_audio_file": {
-          this.bot.playAudioFile(req.input, {
+          this._requireBot().playAudioFile(req.input, {
             ffmpegPath: req.ffmpegPath || "ffmpeg",
             gain: req.gain ?? 1.0,
           });
@@ -253,7 +480,7 @@ export class P2PBotBridge {
           break;
         }
         case "play_tone": {
-          this.bot.playTone({
+          this._requireBot().playTone({
             freqHz: req.freqHz ?? 440,
             durationMs: req.durationMs ?? 1200,
             amplitude: req.amplitude ?? 0.25,
@@ -261,18 +488,25 @@ export class P2PBotBridge {
           replyOk({ playing: "tone" });
           break;
         }
+        case "play_chime": {
+          this._requireBot().playChime(req.kind || "awake", {
+            amplitude: req.amplitude ?? 0.22,
+          });
+          replyOk({ playing: req.kind || "awake" });
+          break;
+        }
         case "pause_audio": {
-          this.bot.pauseAudio();
+          this._requireBot().pauseAudio();
           replyOk({ paused: true });
           break;
         }
         case "resume_audio": {
-          this.bot.resumeAudio();
+          this._requireBot().resumeAudio();
           replyOk({ paused: false });
           break;
         }
         case "stop_audio": {
-          this.bot.stopAudio();
+          this._requireBot().stopAudio();
           replyOk({ stopped: true });
           break;
         }
@@ -281,10 +515,65 @@ export class P2PBotBridge {
           replyOk({ subscribed: meta.voiceAudioSubscribed });
           break;
         }
+        case "subscribe_mixed_audio": {
+          meta.mixedAudioSubscribed = Boolean(req.enabled);
+          if (req.echoSuppression !== undefined) {
+            this._mixerOpts.echoSuppression = Boolean(req.echoSuppression);
+          }
+          if (req.echoTailMs !== undefined) {
+            this._mixerOpts.echoTailMs = Math.max(0, Number(req.echoTailMs) || 0);
+          }
+          if (Array.isArray(req.allowedSpeakers)) {
+            this._mixerOpts.allowedSpeakers = req.allowedSpeakers;
+          }
+          if (this.mixer) {
+            this.mixer.echoSuppression = this._mixerOpts.echoSuppression;
+            this.mixer.echoTailMs = this._mixerOpts.echoTailMs;
+            this.mixer.setAllowedSpeakers(this._mixerOpts.allowedSpeakers);
+          }
+          this._syncMixerLifecycle();
+          replyOk({
+            subscribed: meta.mixedAudioSubscribed,
+            sampleRate: VOICE_SAMPLE_RATE,
+            channels: 1,
+            frameBytes: 640,
+            echoSuppression: this._mixerOpts.echoSuppression,
+          });
+          break;
+        }
+        case "lock_speaker": {
+          if (!this.mixer) {
+            replyOk({ lockedPeerId: null });
+            break;
+          }
+          const lockedPeerId = req.peerId
+            ? this.mixer.lockSpeaker(req.peerId)
+            : this.mixer.lockToLastActiveSpeaker(req.maxAgeMs ?? 3000);
+          replyOk({ lockedPeerId });
+          break;
+        }
+        case "unlock_speaker": {
+          if (this.mixer) this.mixer.unlockSpeaker();
+          replyOk({ lockedPeerId: null });
+          break;
+        }
+        case "set_allowed_speakers": {
+          const list = Array.isArray(req.speakers) ? req.speakers : [];
+          this._mixerOpts.allowedSpeakers = list.length > 0 ? list : null;
+          if (this.mixer) {
+            this.mixer.setAllowedSpeakers(this._mixerOpts.allowedSpeakers);
+          }
+          replyOk({ allowedSpeakers: this._mixerOpts.allowedSpeakers || [] });
+          break;
+        }
         case "get_status": {
           replyOk({
-            status: this.bot.getStatus(),
-            messages: this.bot.getMessages(),
+            state: this.roomState,
+            error: this.lastError || "",
+            status: this.bot ? this.bot.getStatus() : null,
+            messages: this.bot ? this.bot.getMessages() : [],
+            inVoice: Boolean(this.bot?.inVoice),
+            lockedSpeaker: this.mixer?.lockedPeerId || null,
           });
           break;
         }
@@ -301,24 +590,25 @@ export class P2PBotBridge {
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
   const args = parseCliArgs(process.argv.slice(2));
-  if (args.help || !args.room) {
+  if (args.help) {
     console.log(
       [
         "p2p-direct Local WebSocket Bot Bridge",
         "",
         "Usage:",
-        '  node bot/bridge.mjs --room "<room-invite-url>" [--name "MyBot"] [--passphrase "..."] [--port 8765]',
+        '  node bot/bridge.mjs [--room "<room-invite-url>"] [--name "MyBot"] [--passphrase "..."] [--port 8765]',
         "",
         "Options:",
-        "  --room, -r       Room invite link (#room=P2P1:...) or raw P2P1: code (or env P2P_ROOM)",
+        "  --room, -r       Optional room invite link (#room=P2P1:...); omit for standby mode",
         "  --name, -n       Bot display name shown in chat & voice (default: P2PBot)",
         "  --passphrase, -p Optional shared room passphrase (or env P2P_PASSPHRASE)",
+        "  --join-voice     Automatically join the room voice channel after connecting",
         "  --port           Local WebSocket port (default: 8765)",
         "  --host           Bind address (default: 127.0.0.1)",
         "  --relay          Optional custom MQTT WebSocket relay URL",
       ].join("\n")
     );
-    process.exit(args.help ? 0 : 1);
+    process.exit(0);
   }
 
   const bridge = new P2PBotBridge({
@@ -329,12 +619,17 @@ if (isMain) {
     peerId: args.peerId,
     host: args.host,
     port: args.port,
+    autoJoinVoice: args.autoJoinVoice,
   });
 
   bridge
     .start()
     .then((info) => {
-      console.log(`[bridge] Connected as ${info.authorName} (${info.peerId}) to room "${info.room}"`);
+      if (info.room) {
+        console.log(`[bridge] Connected as ${info.authorName} (${info.peerId}) to room "${info.room}"`);
+      } else {
+        console.log(`[bridge] Started in standby mode as "${info.authorName}" (waiting for connect_room)`);
+      }
       console.log(`[bridge] Local WebSocket API listening on ${info.wsUrl}`);
     })
     .catch((err) => {

@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 globalThis.__P2P_NO_AUTO_BOOT__ = true;
-const { formatBotRichText } = await import("../app.js");
+const { formatBotRichText, formatBotTimerClock } = await import("../app.js");
 const { renderIconSvg, resolveIconAndText, stripBotEmojis } = await import("../icons.js");
 
 describe("Interactive Bot Card UI Kit — formatBotRichText & Flat Metro SVG Icons", () => {
@@ -33,10 +33,22 @@ describe("Interactive Bot Card UI Kit — formatBotRichText & Flat Metro SVG Ico
     assert.equal(stripBotEmojis("🎲 Roll d20 🔥💧"), "Roll d20");
     assert.deepEqual(resolveIconAndText("🪙 Flip Coin"), { icon: "coin", text: "Flip Coin" });
     assert.deepEqual(resolveIconAndText("🔥 Hot Deal", "trophy"), { icon: "trophy", text: "Hot Deal" });
+    assert.deepEqual(resolveIconAndText("🏠 Home Assistant"), { icon: "home", text: "Home Assistant" });
+    assert.deepEqual(resolveIconAndText("🎤 Listen Now"), { icon: "mic", text: "Listen Now" });
+    assert.deepEqual(resolveIconAndText("🔔 Pasta Done"), { icon: "bell", text: "Pasta Done" });
     assert.match(renderIconSvg("dice"), /<svg class="metro-icon"/);
+    assert.match(renderIconSvg("home"), /<svg class="metro-icon"/);
+    assert.match(renderIconSvg("mic-off"), /<svg class="metro-icon"/);
     assert.equal(renderIconSvg("unknown-nonexistent-icon"), "");
     const cleanHtml = formatBotRichText("Rain 💧 70% 🚀");
     assert.doesNotMatch(cleanHtml, /\p{Extended_Pictographic}/u);
     assert.match(cleanHtml, /Rain 70%/);
+  });
+
+  it("formats declarative live bot timer countdowns cleanly as MM:SS and H:MM:SS", () => {
+    assert.equal(formatBotTimerClock(0), "00:00");
+    assert.equal(formatBotTimerClock(-5), "00:00");
+    assert.equal(formatBotTimerClock(65), "01:05");
+    assert.equal(formatBotTimerClock(3661), "1:01:01");
   });
 });

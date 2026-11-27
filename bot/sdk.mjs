@@ -87,22 +87,85 @@ export function parseRoomLink(rawInput) {
 }
 
 /**
+ * Converts arbitrary signed 16-bit little-endian PCM (any sample rate & channel count)
+ * into 16 kHz mono Int16LE PCM for direct E2EE voice streaming without spawning ffmpeg.
+ */
+export function resamplePcm16(pcmBuffer, { sampleRate = VOICE_SAMPLE_RATE, channels = 1, targetRate = VOICE_SAMPLE_RATE } = {}) {
+  const buf = Buffer.isBuffer(pcmBuffer) ? pcmBuffer : Buffer.from(pcmBuffer);
+  const srcRate = Math.max(4000, Number(sampleRate) || VOICE_SAMPLE_RATE);
+  const ch = Math.max(1, Math.min(8, Math.round(Number(channels) || 1)));
+  const dstRate = Math.max(4000, Number(targetRate) || VOICE_SAMPLE_RATE);
+  if (buf.length < 2 * ch) return Buffer.alloc(0);
+  if (srcRate === dstRate && ch === 1) {
+    return (buf.length & 1) === 0 ? buf : buf.subarray(0, buf.length - 1);
+  }
+
+  const totalFrames = Math.floor(buf.length / (2 * ch));
+  if (totalFrames === 0) return Buffer.alloc(0);
+
+  // Downmix to mono Int16 first
+  const mono = new Float32Array(totalFrames);
+  if (ch === 1) {
+    for (let i = 0; i < totalFrames; i++) {
+      mono[i] = buf.readInt16LE(i * 2);
+    }
+  } else {
+    for (let i = 0; i < totalFrames; i++) {
+      let acc = 0;
+      const base = i * ch * 2;
+      for (let c = 0; c < ch; c++) {
+        acc += buf.readInt16LE(base + c * 2);
+      }
+      mono[i] = acc / ch;
+    }
+  }
+
+  if (srcRate === dstRate) {
+    const out = Buffer.allocUnsafe(totalFrames * 2);
+    for (let i = 0; i < totalFrames; i++) {
+      out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(mono[i]))), i * 2);
+    }
+    return out;
+  }
+
+  const ratio = srcRate / dstRate;
+  const outSamples = Math.max(1, Math.round(totalFrames / ratio));
+  const out = Buffer.allocUnsafe(outSamples * 2);
+  for (let i = 0; i < outSamples; i++) {
+    const srcPos = i * ratio;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const s0 = mono[Math.min(idx, totalFrames - 1)];
+    const s1 = mono[Math.min(idx + 1, totalFrames - 1)];
+    const sample = s0 + (s1 - s0) * frac;
+    out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(sample))), i * 2);
+  }
+  return out;
+}
+
+/**
  * Real-time drift-compensated 20ms (16 kHz mono Int16LE) voice audio pacer.
  * Accepts arbitrary PCM chunks (e.g., from ffmpeg stdout, WebSocket binary frames, or synth)
  * and feeds exact 320-sample frames into `onFrame(Int16Array)` every 20 ms.
  */
 class VoiceAudioPacer {
-  constructor({ onFrame, onDrain, gain = 1.0 }) {
+  constructor({ onFrame, onStart, onDrain, gain = 1.0 }) {
     this.onFrame = onFrame;
+    this.onStart = onStart;
     this.onDrain = onDrain;
     this.gain = gain;
     this.queue = [];
     this.queuedBytes = 0;
     this.paused = false;
+    this.active = false;
     this.timer = null;
     this.nextTickAt = 0;
     this.ending = false;
     this.activeChild = null;
+  }
+
+  isActive() {
+    return Boolean(this.active || (!this.paused && (this.queuedBytes >= VOICE_FRAME_BYTES || this.timer || this.activeChild)));
   }
 
   pushBytes(chunk) {
@@ -146,8 +209,10 @@ class VoiceAudioPacer {
   }
 
   stop() {
+    const wasActive = this.active;
     this.paused = false;
     this.ending = false;
+    this.active = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -162,6 +227,9 @@ class VoiceAudioPacer {
     }
     this.queue = [];
     this.queuedBytes = 0;
+    if (wasActive && this.onDrain) {
+      this.onDrain();
+    }
   }
 
   _takeBytes(count) {
@@ -190,6 +258,10 @@ class VoiceAudioPacer {
   _ensureRunning() {
     if (this.paused || this.timer) return;
     if (this.queuedBytes < VOICE_FRAME_BYTES && !this.ending) return;
+    if (!this.active) {
+      this.active = true;
+      if (this.onStart) this.onStart();
+    }
     this.nextTickAt = Date.now();
     this._step();
   }
@@ -221,11 +293,15 @@ class VoiceAudioPacer {
 
     if (this.ending) {
       this._finish();
+    } else if (this.active) {
+      this.active = false;
+      if (this.onDrain) this.onDrain();
     }
   }
 
   _finish() {
     this.ending = false;
+    this.active = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -233,6 +309,264 @@ class VoiceAudioPacer {
     if (this.onDrain) {
       this.onDrain();
     }
+  }
+}
+
+/**
+ * Continuous 20ms (16 kHz mono Int16LE) room voice mixer tailored for voice assistants
+ * (Home Assistant Wyoming Satellite, openWakeWord, Whisper STT).
+ *
+ * Solves three P2P multi-speaker voice-room challenges out of the box:
+ * 1. Silence-gap filling: browser peers stop sending packets when their noise gate closes;
+ *    this mixer maintains a steady 50 Hz 16 kHz PCM clock with zero-PCM silence frames so
+ *    wake-word and STT VAD detectors stay synced and detect end-of-speech cleanly.
+ * 2. Speaker locking: tracks per-peer audio so once a wake word or button triggers a turn,
+ *    STT can lock onto the single active speaker without crosstalk from other room peers.
+ * 3. Echo/TTS suppression: automatically mutes/zeroes inbound audio while the bot is speaking
+ *    (plus a configurable echo tail) so peers' speakers never re-trigger wake words.
+ */
+export class VoiceRoomMixer extends EventEmitter {
+  constructor({
+    bot = null,
+    echoSuppression = true,
+    echoTailMs = 350,
+    maxBufferedFramesPerPeer = 12,
+    allowedSpeakers = null,
+    speechRmsThreshold = 140,
+  } = {}) {
+    super();
+    this.bot = bot;
+    this.echoSuppression = Boolean(echoSuppression);
+    this.echoTailMs = Math.max(0, Number(echoTailMs) || 0);
+    this.maxBufferedFramesPerPeer = Math.max(2, Number(maxBufferedFramesPerPeer) || 12);
+    this.speechRmsThreshold = Math.max(0, Number(speechRmsThreshold) || 140);
+
+    this.peerBuffers = new Map(); // peerId -> { queue: Int16Array[], lastRms, lastVoiceAtMs }
+    this.lockedPeerId = null;
+    this.allowedSpeakers = null; // Set<string> lowercase peerId or authorName, or null = allow all
+    if (Array.isArray(allowedSpeakers) && allowedSpeakers.length > 0) {
+      this.setAllowedSpeakers(allowedSpeakers);
+    }
+
+    this.lastActivePeerId = null;
+    this.lastActivePeerName = "";
+    this.lastActiveAtMs = 0;
+    this.botSpeaking = false;
+    this.botSpokeUntilMs = 0;
+    this.running = false;
+    this.timer = null;
+    this.nextTickAt = 0;
+
+    this._onVoiceAudio = (ev) => this.pushPeerAudio(ev.peerId, ev.pcm, ev.rms);
+    this._onAudioStart = () => {
+      this.botSpeaking = true;
+    };
+    this._onAudioEnd = () => {
+      this.botSpeaking = false;
+      this.botSpokeUntilMs = Date.now() + this.echoTailMs;
+    };
+
+    if (this.bot) {
+      this.bot.on("voiceAudio", this._onVoiceAudio);
+      this.bot.on("audioStart", this._onAudioStart);
+      this.bot.on("audioEnd", this._onAudioEnd);
+    }
+  }
+
+  setAllowedSpeakers(list) {
+    if (!Array.isArray(list) || list.length === 0) {
+      this.allowedSpeakers = null;
+      return;
+    }
+    const clean = list
+      .map((s) => String(s || "").trim().toLowerCase())
+      .filter(Boolean);
+    this.allowedSpeakers = clean.length > 0 ? new Set(clean) : null;
+  }
+
+  isPeerAllowed(peerId) {
+    if (!this.allowedSpeakers) return true;
+    const pid = String(peerId || "").toLowerCase();
+    if (this.allowedSpeakers.has(pid)) return true;
+    const peerName = this.getPeerName(peerId).toLowerCase();
+    return Boolean(peerName && this.allowedSpeakers.has(peerName));
+  }
+
+  getPeerName(peerId) {
+    if (!peerId) return "";
+    if (this.bot && typeof this.bot.getPeers === "function") {
+      const peer = this.bot.getPeers().find((p) => p.peerId === peerId);
+      if (peer?.authorName) return peer.authorName;
+    }
+    return String(peerId);
+  }
+
+  lockSpeaker(peerId) {
+    this.lockedPeerId = peerId ? String(peerId) : null;
+    return this.lockedPeerId;
+  }
+
+  lockToLastActiveSpeaker(maxAgeMs = 3000) {
+    if (this.lastActivePeerId && Date.now() - this.lastActiveAtMs <= maxAgeMs) {
+      this.lockedPeerId = this.lastActivePeerId;
+    }
+    return this.lockedPeerId;
+  }
+
+  unlockSpeaker() {
+    this.lockedPeerId = null;
+  }
+
+  setExternalSpeaking(isSpeaking) {
+    if (isSpeaking) {
+      this.botSpeaking = true;
+    } else {
+      this.botSpeaking = false;
+      this.botSpokeUntilMs = Date.now() + this.echoTailMs;
+    }
+  }
+
+  pushPeerAudio(peerId, pcm, rms = 0) {
+    if (!peerId || !pcm || pcm.length === 0) return;
+    if (!this.isPeerAllowed(peerId)) return;
+    const samples = pcm instanceof Int16Array ? pcm : new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+    let st = this.peerBuffers.get(peerId);
+    if (!st) {
+      st = { queue: [], lastRms: 0, lastVoiceAtMs: 0 };
+      this.peerBuffers.set(peerId, st);
+    }
+
+    // Slice arbitrary-sized packets into exact 320-sample (20ms) frames
+    for (let off = 0; off < samples.length; off += VOICE_FRAME_SAMPLES) {
+      const slice = samples.subarray(off, Math.min(samples.length, off + VOICE_FRAME_SAMPLES));
+      let frame;
+      if (slice.length === VOICE_FRAME_SAMPLES) {
+        frame = new Int16Array(slice);
+      } else {
+        frame = new Int16Array(VOICE_FRAME_SAMPLES);
+        frame.set(slice);
+      }
+      st.queue.push(frame);
+      if (st.queue.length > this.maxBufferedFramesPerPeer) {
+        st.queue.shift();
+      }
+    }
+
+    const now = Date.now();
+    st.lastRms = Number(rms) || 0;
+    st.lastVoiceAtMs = now;
+    if (st.lastRms >= this.speechRmsThreshold) {
+      this.lastActivePeerId = peerId;
+      this.lastActivePeerName = this.getPeerName(peerId);
+      this.lastActiveAtMs = now;
+    }
+  }
+
+  /**
+   * Produces a single 20ms mixed 16 kHz mono Int16LE frame immediately (also useful for deterministic unit tests).
+   */
+  produceFrame(nowMs = Date.now()) {
+    const suppressed =
+      this.echoSuppression &&
+      (this.botSpeaking || (this.bot && this.bot.isPlayingAudio()) || nowMs < this.botSpokeUntilMs);
+
+    const mixed = new Int16Array(VOICE_FRAME_SAMPLES);
+    const activePeerIds = [];
+    let dominantPeerId = null;
+    let dominantRms = -1;
+
+    if (suppressed) {
+      // Drain buffered frames while suppressed so stale echo audio isn't played back after TTS ends
+      for (const st of this.peerBuffers.values()) {
+        if (st.queue.length > 0) st.queue.shift();
+      }
+    } else {
+      const accum = new Int32Array(VOICE_FRAME_SAMPLES);
+      for (const [peerId, st] of this.peerBuffers.entries()) {
+        if (st.queue.length === 0) continue;
+        if (this.lockedPeerId && peerId !== this.lockedPeerId) {
+          st.queue.shift(); // keep non-locked peer buffers fresh without mixing
+          continue;
+        }
+        const frame = st.queue.shift();
+        activePeerIds.push(peerId);
+        if (st.lastRms > dominantRms) {
+          dominantRms = st.lastRms;
+          dominantPeerId = peerId;
+        }
+        for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
+          accum[i] += frame[i];
+        }
+      }
+      if (activePeerIds.length > 0) {
+        for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
+          mixed[i] = Math.max(-32768, Math.min(32767, accum[i]));
+        }
+      }
+    }
+
+    let sumSq = 0;
+    for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
+      sumSq += mixed[i] * mixed[i];
+    }
+    const rms = Math.round(Math.sqrt(sumSq / VOICE_FRAME_SAMPLES));
+    const buffer = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
+
+    return {
+      pcm: mixed,
+      buffer,
+      sampleRate: VOICE_SAMPLE_RATE,
+      channels: 1,
+      activePeerIds,
+      dominantPeerId,
+      dominantPeerName: dominantPeerId ? this.getPeerName(dominantPeerId) : "",
+      lockedPeerId: this.lockedPeerId,
+      rms,
+      isSilence: activePeerIds.length === 0 || suppressed,
+      suppressed,
+      ts: nowMs,
+    };
+  }
+
+  start() {
+    if (this.running) return;
+    this.running = true;
+    this.nextTickAt = Date.now();
+    this._tick();
+  }
+
+  stop() {
+    this.running = false;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.peerBuffers.clear();
+  }
+
+  destroy() {
+    this.stop();
+    if (this.bot) {
+      this.bot.off("voiceAudio", this._onVoiceAudio);
+      this.bot.off("audioStart", this._onAudioStart);
+      this.bot.off("audioEnd", this._onAudioEnd);
+      this.bot = null;
+    }
+  }
+
+  _tick() {
+    this.timer = null;
+    if (!this.running) return;
+    const now = Date.now();
+    const frameObj = this.produceFrame(now);
+    this.emit("frame", frameObj);
+
+    this.nextTickAt += 20;
+    if (this.nextTickAt < now - 100) {
+      this.nextTickAt = now;
+    }
+    const delay = Math.max(1, this.nextTickAt - Date.now());
+    this.timer = setTimeout(() => this._tick(), delay);
   }
 }
 
@@ -297,6 +631,7 @@ export class P2PBot extends EventEmitter {
 
     this.pacer = new VoiceAudioPacer({
       onFrame: (int16) => this.sendVoicePcm(int16),
+      onStart: () => this.emit("audioStart"),
       onDrain: () => this.emit("audioEnd"),
       gain: 1.0,
     });
@@ -622,13 +957,41 @@ export class P2PBot extends EventEmitter {
   }
 
   /**
-   * Pushes raw signed 16-bit little-endian 16 kHz mono PCM bytes into the paced voice sender.
+   * Pushes signed 16-bit little-endian PCM bytes into the paced voice sender.
+   * Automatically downmixes and resamples non-16kHz / multi-channel PCM (e.g. 22050/24000 Hz TTS).
    */
-  pushPcmBytes(buf) {
+  pushPcmBytes(buf, { sampleRate = VOICE_SAMPLE_RATE, channels = 1 } = {}) {
+    if (!buf || buf.length === 0) return;
     if (!this.inVoice) {
       this.joinVoice({ muted: false });
     }
-    this.pacer.pushBytes(buf);
+    const pcm16k =
+      sampleRate === VOICE_SAMPLE_RATE && channels === 1
+        ? buf
+        : resamplePcm16(buf, { sampleRate, channels, targetRate: VOICE_SAMPLE_RATE });
+    if (pcm16k.length > 0) {
+      this.pacer.pushBytes(pcm16k);
+    }
+  }
+
+  /**
+   * Signals the end of a streamed PCM utterance so `audioEnd` fires cleanly once the final
+   * buffered frame has been transmitted.
+   */
+  markAudioStreamEnd() {
+    this.pacer.markInputEnded();
+  }
+
+  isPlayingAudio() {
+    return this.pacer.isActive();
+  }
+
+  /**
+   * Creates a VoiceRoomMixer attached to this bot for continuous 16 kHz wake-word / STT capture
+   * with automatic silence-gap filling, speaker locking, and TTS echo suppression.
+   */
+  createVoiceMixer(options = {}) {
+    return new VoiceRoomMixer({ ...options, bot: this });
   }
 
   setAudioGain(gain) {
@@ -710,6 +1073,35 @@ export class P2PBot extends EventEmitter {
    */
   playTone({ freqHz = 440, durationMs = 1200, amplitude = 0.28 } = {}) {
     return this.playMelody([{ freqHz, durationMs }], { amplitude });
+  }
+
+  /**
+   * Plays a crisp built-in assistant chime ("awake" | "done" | "timer" | "error") with zero audio files.
+   */
+  playChime(kind = "awake", { amplitude = 0.22 } = {}) {
+    const presets = {
+      awake: [
+        { freqHz: 587.33, durationMs: 85 },
+        { freqHz: 880.0, durationMs: 120 },
+      ],
+      done: [
+        { freqHz: 783.99, durationMs: 75 },
+        { freqHz: 523.25, durationMs: 110 },
+      ],
+      timer: [
+        { freqHz: 880.0, durationMs: 120 },
+        { freqHz: 0, durationMs: 60 },
+        { freqHz: 880.0, durationMs: 120 },
+        { freqHz: 0, durationMs: 60 },
+        { freqHz: 1174.66, durationMs: 240 },
+      ],
+      error: [
+        { freqHz: 330.0, durationMs: 120 },
+        { freqHz: 246.94, durationMs: 180 },
+      ],
+    };
+    const notes = presets[String(kind || "").toLowerCase()] || presets.awake;
+    return this.playMelody(notes, { amplitude });
   }
 
   /**

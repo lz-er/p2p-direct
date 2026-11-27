@@ -5,13 +5,17 @@
   "type": "module",
   "main": "./sdk.mjs",
   "exports": {
-    ".": "./sdk.mjs"
+    ".": "./sdk.mjs",
+    "./bridge": "./bridge.mjs",
+    "./wyoming": "./wyoming.mjs",
+    "./ha-assistant": "./ha-assistant.mjs"
   },
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
     "bridge": "node ./bridge.mjs",
+    "ha-assistant": "node ./ha-assistant.mjs",
     "warframe": "node ./examples/warframe-bot.mjs",
     "music": "node ./examples/music-bot.mjs"
   },
