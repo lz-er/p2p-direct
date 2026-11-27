@@ -245,6 +245,49 @@ describe("Voice-Channel Bot Controls — sanitization & extraction", () => {
         buttons: [base.buttons[0], { ...base.buttons[1], label: "Wake: Off", style: "secondary" }],
       })
     );
+    assert.notEqual(sigBase, buildVoiceControlsSignature({ ...base, activity: "thinking" }));
+  });
+
+  it("preserves explicit/inferred activity and renders thinking dots + is-bot-thinking tile class", () => {
+    const explicit = sanitizeBotVoiceControls({
+      status: "Thinking...",
+      statusIcon: "mic",
+      statusTone: "cyan",
+      activity: "thinking",
+    });
+    assert.equal(explicit.activity, "thinking");
+
+    const inferred = sanitizeBotVoiceControls({
+      status: "Thinking...",
+      statusTone: "cyan",
+    });
+    assert.equal(inferred.activity, "thinking");
+
+    const html = renderVoiceBotControlsHtml("bot-ha", { messageId: "m1", ...explicit });
+    assert.match(html, /class="voice-bot-status is-tone-cyan is-thinking"/);
+    assert.match(html, /class="voice-bot-thinking-dots" aria-hidden="true"><span><\/span><span><\/span><span><\/span><\/span>/);
+
+    const idleHtml = renderVoiceBotControlsHtml("bot-ha", {
+      messageId: "m2",
+      ...sanitizeBotVoiceControls({ status: "Hey Jarvis", statusTone: "cobalt" }),
+    });
+    assert.doesNotMatch(idleHtml, /is-thinking|voice-bot-thinking-dots/);
+
+    const app = createTestApp({
+      inVoice: true,
+      peers: [{ peerId: "bot-ha", authorName: "Home Assistant", inVoice: true, isBot: true }],
+      logMessages: [
+        {
+          id: "m-think",
+          type: "bot",
+          author: "bot-ha",
+          payload: { voiceControls: { status: "Thinking...", statusTone: "cyan", activity: "thinking" } },
+        },
+      ],
+    });
+    app.renderVoicePanel();
+    assert.match(app.el["voice-participant-list"].innerHTML, /is-bot-thinking/);
+    assert.match(app.el["voice-participant-list"].innerHTML, /voice-bot-thinking-dots/);
   });
 
   it("renders XSS-safe Flat Metro HTML with SVG icons, zero emojis, and data attributes", () => {

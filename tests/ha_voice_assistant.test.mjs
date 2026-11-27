@@ -1,10 +1,24 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "../bot/node_modules/ws/wrapper.mjs";
+import { SafeRustWasmMesh } from "../wasm_client.js";
 import {
+  P2PBot,
+  StreamingPcmResampler,
   VOICE_FRAME_SAMPLES,
+  VOICE_HD_OUT_FRAME_BYTES,
+  VOICE_HD_OUT_FRAME_SAMPLES,
+  VOICE_HD_OUT_SAMPLE_RATE,
+  VOICE_SAMPLE_RATE,
+  VOICE_V2_CODEC_PCM16,
+  VOICE_V2_HEADER_BYTES,
   resamplePcm16,
   VoiceRoomMixer,
 } from "../bot/sdk.mjs";
@@ -49,6 +63,342 @@ describe("Bot SDK Voice Assistant DSP — resamplePcm16 & VoiceRoomMixer", () =>
     const pcm48Stereo = makeSinePcm(48000, 50, 2);
     const out48 = resamplePcm16(pcm48Stereo, { sampleRate: 48000, channels: 2 });
     assert.equal(out48.length, 1600);
+
+    // Cubic interpolation accuracy check (22050 -> 24000 Hz 440 Hz sine wave)
+    const src22k = makeSinePcm(22050, 100, 1, 16000);
+    const up24k = resamplePcm16(src22k, { sampleRate: 22050, channels: 1, targetRate: VOICE_HD_OUT_SAMPLE_RATE });
+    const nOut = up24k.length / 2;
+    assert.ok(Math.abs(nOut - 2400) <= 2, `expected ~2400 samples, got ${nOut}`);
+    let sumSqErr = 0;
+    let sumSqRef = 0;
+    for (let i = 20; i < nOut - 20; i++) {
+      const ref = Math.sin((2 * Math.PI * 440 * i) / 24000) * 16000;
+      const got = up24k.readInt16LE(i * 2);
+      sumSqErr += (got - ref) ** 2;
+      sumSqRef += ref ** 2;
+    }
+    const relErr = Math.sqrt(sumSqErr / sumSqRef);
+    assert.ok(relErr < 0.005, `expected cubic resampling relative error < 0.5%, got ${(relErr * 100).toFixed(3)}%`);
+  });
+
+  it("streams chunked 22.05 kHz & 48 kHz stereo PCM through StreamingPcmResampler without boundary clicks or drift", () => {
+    assert.equal(VOICE_HD_OUT_SAMPLE_RATE, 24000);
+    assert.equal(VOICE_HD_OUT_FRAME_SAMPLES, 480);
+    assert.equal(VOICE_HD_OUT_FRAME_BYTES, 960);
+    assert.equal(VOICE_V2_CODEC_PCM16, 2);
+    assert.equal(VOICE_V2_HEADER_BYTES, 8);
+
+    // 1. Chunked 22,050 Hz -> 24,000 Hz (2 seconds split into Wyoming-style 2,048-byte chunks)
+    const resampler = new StreamingPcmResampler({ targetRate: VOICE_HD_OUT_SAMPLE_RATE });
+    const full22kSec1 = makeSinePcm(22050, 1000, 1, 14000);
+    const full22kSec2 = Buffer.alloc(22050 * 2);
+    for (let i = 0; i < 22050; i++) {
+      const s = Math.round(Math.sin((2 * Math.PI * 440 * (22050 + i)) / 22050) * 14000);
+      full22kSec2.writeInt16LE(s, i * 2);
+    }
+
+    const sec1Chunks = [];
+    const boundaryOffsets = [];
+    let runningSamples = 0;
+    for (let off = 0; off < full22kSec1.length; off += 2048) {
+      const piece = full22kSec1.subarray(off, Math.min(full22kSec1.length, off + 2048));
+      const out = resampler.push(piece, { sampleRate: 22050, channels: 1 });
+      if (runningSamples > 0 && out.length > 0) boundaryOffsets.push(runningSamples);
+      runningSamples += out.length / 2;
+      sec1Chunks.push(out);
+    }
+    const sec1Out = Buffer.concat(sec1Chunks);
+    const sec1Samples = sec1Out.length / 2;
+    assert.ok(Math.abs(sec1Samples - 24000) <= 4, `expected ~24000 samples for 1st second, got ${sec1Samples}`);
+
+    const sec2Chunks = [];
+    for (let off = 0; off < full22kSec2.length; off += 2048) {
+      const piece = full22kSec2.subarray(off, Math.min(full22kSec2.length, off + 2048));
+      const out = resampler.push(piece, { sampleRate: 22050, channels: 1 });
+      if (out.length > 0) boundaryOffsets.push(runningSamples);
+      runningSamples += out.length / 2;
+      sec2Chunks.push(out);
+    }
+    const sec2Out = Buffer.concat(sec2Chunks);
+    const sec2Samples = sec2Out.length / 2;
+    assert.equal(sec2Samples, 24000, "expected exact 24,000 samples on steady-state 2nd second (zero drift)");
+
+    // Verify smooth sine wave continuity across every single chunk boundary (zero clicks)
+    const combined22k = Buffer.concat([sec1Out, sec2Out]);
+    const total22kSamples = combined22k.length / 2;
+    const maxExpectedDelta = Math.ceil((2 * Math.PI * 440 * 14000) / 24000) + 120;
+    for (const bIdx of boundaryOffsets) {
+      if (bIdx > 1 && bIdx < total22kSamples - 1) {
+        const prev = combined22k.readInt16LE((bIdx - 1) * 2);
+        const curr = combined22k.readInt16LE(bIdx * 2);
+        const delta = Math.abs(curr - prev);
+        assert.ok(
+          delta <= maxExpectedDelta,
+          `click detected at chunk boundary ${bIdx}: delta=${delta} > ${maxExpectedDelta}`
+        );
+      }
+    }
+
+    // 2. Chunked 48,000 Hz stereo -> 24,000 Hz mono (auto-reset on format change + anti-aliasing + zero drift)
+    const stereo48Sec1 = makeSinePcm(48000, 1000, 2, 12000);
+    const stereo48Sec2 = Buffer.alloc(48000 * 4);
+    for (let i = 0; i < 48000; i++) {
+      const s = Math.round(Math.sin((2 * Math.PI * 440 * (48000 + i)) / 48000) * 12000);
+      stereo48Sec2.writeInt16LE(s, i * 4);
+      stereo48Sec2.writeInt16LE(s, i * 4 + 2);
+    }
+    const out48Sec1Parts = [];
+    for (let off = 0; off < stereo48Sec1.length; off += 3840) {
+      out48Sec1Parts.push(
+        resampler.push(stereo48Sec1.subarray(off, Math.min(stereo48Sec1.length, off + 3840)), {
+          sampleRate: 48000,
+          channels: 2,
+        })
+      );
+    }
+    const out48Sec2Parts = [];
+    for (let off = 0; off < stereo48Sec2.length; off += 3840) {
+      out48Sec2Parts.push(
+        resampler.push(stereo48Sec2.subarray(off, Math.min(stereo48Sec2.length, off + 3840)), {
+          sampleRate: 48000,
+          channels: 2,
+        })
+      );
+    }
+    const out48Sec1 = Buffer.concat(out48Sec1Parts);
+    const out48Sec2 = Buffer.concat(out48Sec2Parts);
+    assert.ok(Math.abs(out48Sec1.length / 2 - 24000) <= 4);
+    assert.equal(out48Sec2.length / 2, 24000, "expected exact 24,000 samples on steady-state 48k->24k 2nd second");
+
+    // Verify 48k->24k anti-aliasing pre-filter attenuates high-frequency (20 kHz) above 12 kHz Nyquist
+    const hfResampler = new StreamingPcmResampler({ targetRate: VOICE_HD_OUT_SAMPLE_RATE });
+    const hf48k = Buffer.alloc(4800 * 2);
+    for (let i = 0; i < 4800; i++) {
+      hf48k.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 20000 * i) / 48000) * 16000), i * 2);
+    }
+    const hfOut = hfResampler.push(hf48k, { sampleRate: 48000, channels: 1 });
+    let hfSumSq = 0;
+    for (let i = 20; i < hfOut.length / 2 - 20; i++) {
+      const v = hfOut.readInt16LE(i * 2);
+      hfSumSq += v * v;
+    }
+    const hfRms = Math.sqrt(hfSumSq / (hfOut.length / 2 - 40));
+    const inputRms = 16000 / Math.SQRT2;
+    assert.ok(hfRms < inputRms * 0.35, `expected 20 kHz aliasing component attenuated (<35%), got ${Math.round((hfRms / inputRms) * 100)}%`);
+
+    // 3. Fast-path 24 kHz mono pass-through (trims stray odd byte cleanly) + reset()
+    resampler.reset();
+    const raw24kOdd = Buffer.concat([makeSinePcm(24000, 20, 1, 10000), Buffer.from([0x7f])]);
+    const pass24k = resampler.push(raw24kOdd, { sampleRate: 24000, channels: 1 });
+    assert.equal(pass24k.length, VOICE_HD_OUT_FRAME_BYTES);
+    assert.deepEqual(pass24k, raw24kOdd.subarray(0, VOICE_HD_OUT_FRAME_BYTES));
+  });
+
+  it("routes P2PBot V2 lossless 24 kHz PCM to v2pcm peers and V1 16 kHz ADPCM to legacy peers without cross-sending", async () => {
+    const wasmPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "p2p_mesh.wasm");
+    const wasmBytes = fs.readFileSync(wasmPath);
+
+    const makePeerWasm = async (peerId, authorName, meshKey) => {
+      const m = await SafeRustWasmMesh.loadFromBytes(wasmBytes);
+      const init = m.call({
+        cmd: "init",
+        peerId,
+        authorName,
+        room: "hd-voice-test",
+        autoMeshEnabled: false,
+        meshKey,
+        passphraseMode: false,
+        x25519Secret: crypto.randomBytes(32).toString("base64url"),
+        entropy: crypto.randomBytes(32).toString("base64url"),
+      });
+      return { wasm: m, status: init.status, pubKey: init.status.e2ee.publicKey };
+    };
+
+    const sharedKey = crypto.randomBytes(32).toString("base64url");
+    const botNode = await makePeerWasm("bot-hd-1", "Home Assistant", sharedKey);
+    const modernNode = await makePeerWasm("peer-modern", "Alice", sharedKey);
+    const legacyNode = await makePeerWasm("peer-legacy", "Bob", sharedKey);
+
+    // Connect both peers to botNode in Rust WASM and exchange voice-join state
+    const connectPair = (a, b) => {
+      const rA = a.wasm.call({
+        cmd: "peer_connected",
+        peerId: b.status.peerId,
+        authorName: b.status.authorName,
+        peerPubKey: b.pubKey,
+      });
+      const rB = b.wasm.call({
+        cmd: "peer_connected",
+        peerId: a.status.peerId,
+        authorName: a.status.authorName,
+        peerPubKey: a.pubKey,
+      });
+      const relay = (from, to, actions) => {
+        for (const act of actions || []) {
+          if (act.action === "send_wire" && act.peerId === to.status.peerId) {
+            to.status = to.wasm.wireMessage(from.status.peerId, act.frame, Date.now()).status;
+          }
+        }
+      };
+      a.status = rA.status;
+      b.status = rB.status;
+      relay(a, b, rA.actions);
+      relay(b, a, rB.actions);
+    };
+
+    connectPair(botNode, modernNode);
+    connectPair(botNode, legacyNode);
+
+    const setVoiceAndDeliver = (sender, receivers) => {
+      const res = sender.wasm.call({ cmd: "set_voice_state", inVoice: true, muted: false });
+      sender.status = res.status;
+      for (const act of res.actions || []) {
+        if (act.action === "send_wire") {
+          const target = receivers.find((r) => r.status.peerId === act.peerId);
+          if (target) {
+            target.status = target.wasm.wireMessage(sender.status.peerId, act.frame, Date.now()).status;
+          }
+        }
+      }
+    };
+    setVoiceAndDeliver(botNode, [modernNode, legacyNode]);
+    setVoiceAndDeliver(modernNode, [botNode]);
+    setVoiceAndDeliver(legacyNode, [botNode]);
+
+    const bot = new P2PBot({ roomLink: "P2P1:placeholder", peerId: "bot-hd-1", name: "Home Assistant" });
+    bot.wasm = botNode.wasm;
+    bot.status = botNode.status;
+    bot.inVoice = true;
+    bot.voiceMuted = false;
+
+    assert.equal(bot.pacer.sampleRate, VOICE_HD_OUT_SAMPLE_RATE);
+    assert.equal(bot.pacer.frameSamples, VOICE_HD_OUT_FRAME_SAMPLES);
+    assert.equal(bot.pacer.frameBytes, VOICE_HD_OUT_FRAME_BYTES);
+
+    // Signal capability tracking
+    bot._recordPeerVoiceCapsFromSignal({ from: "peer-modern", v2pcm: true, vcodec: "opus48" });
+    bot._recordPeerVoiceCapsFromSignal({ from: "peer-legacy", vcodec: "opus48" });
+    assert.deepEqual(bot.peerVoiceCaps.get("peer-modern"), { v2pcm: true, vcodec: "opus48" });
+    assert.deepEqual(bot.peerVoiceCaps.get("peer-legacy"), { v2pcm: false, vcodec: "opus48" });
+
+    // Build two distinct 480-sample 24 kHz frames
+    const frame1 = new Int16Array(VOICE_HD_OUT_FRAME_SAMPLES);
+    const frame2 = new Int16Array(VOICE_HD_OUT_FRAME_SAMPLES);
+    let expectedSumSq1 = 0;
+    for (let i = 0; i < VOICE_HD_OUT_FRAME_SAMPLES; i++) {
+      frame1[i] = Math.round(Math.sin((2 * Math.PI * 523.25 * i) / VOICE_HD_OUT_SAMPLE_RATE) * 14000);
+      frame2[i] = Math.round(Math.sin((2 * Math.PI * 659.25 * i) / VOICE_HD_OUT_SAMPLE_RATE) * 10000);
+      expectedSumSq1 += frame1[i] * frame1[i];
+    }
+    const expectedRms1 = Math.round(Math.sqrt(expectedSumSq1 / VOICE_HD_OUT_FRAME_SAMPLES));
+
+    // Spy on sealVoicePcm & sealVoiceRaw counts
+    let v1Encodes = 0;
+    let v2Encodes = 0;
+    const origSealV1 = bot.wasm.sealVoicePcm.bind(bot.wasm);
+    const origSealV2 = bot.wasm.sealVoiceRaw.bind(bot.wasm);
+    bot.wasm.sealVoicePcm = (...args) => {
+      v1Encodes += 1;
+      return origSealV1(...args);
+    };
+    bot.wasm.sealVoiceRaw = (...args) => {
+      v2Encodes += 1;
+      return origSealV2(...args);
+    };
+
+    const modernRx = [];
+    const legacyRx = [];
+    const modernDc = { readyState: "open", bufferedAmount: 0, send: (b) => modernRx.push(new Uint8Array(b)) };
+    const legacyDc = { readyState: "open", bufferedAmount: 0, send: (b) => legacyRx.push(new Uint8Array(b)) };
+
+    // A. V2-only room: modern peer receives V2 lossless 24 kHz PCM; V1 ADPCM is NEVER encoded!
+    bot.voiceChannels.set("peer-modern", modernDc);
+    assert.equal(bot.sendVoicePcm24k(frame1), 1);
+    assert.equal(bot.sendVoicePcm24k(frame2), 1);
+    assert.equal(v2Encodes, 2);
+    assert.equal(v1Encodes, 0, "V1 ADPCM must NOT be encoded when all voice peers support v2pcm");
+    assert.equal(modernRx.length, 2);
+
+    // Decrypt both V2 packets with real SafeRustWasmMesh.openVoiceRaw() and assert bit-exact round-trip
+    for (let idx = 0; idx < 2; idx++) {
+      const pkt = modernRx[idx];
+      assert.equal(pkt[0], 0x56); // 'V'
+      assert.equal(pkt[1], 0x32); // '2'
+      const plain = modernNode.wasm.openVoiceRaw("bot-hd-1", pkt);
+      assert.ok(plain, `expected valid V2 packet decryption for frame ${idx}`);
+      assert.equal(plain.byteLength, VOICE_V2_HEADER_BYTES + VOICE_HD_OUT_FRAME_BYTES);
+      assert.equal(plain[0], VOICE_V2_CODEC_PCM16);
+      assert.equal(plain[1], 24);
+      const dv = new DataView(plain.buffer, plain.byteOffset, plain.byteLength);
+      if (idx === 0) {
+        assert.equal(dv.getUint16(2, true), expectedRms1);
+        assert.equal(dv.getUint32(4, true), 0);
+      } else {
+        assert.equal(dv.getUint32(4, true), VOICE_HD_OUT_FRAME_SAMPLES);
+      }
+      const expectedFrame = idx === 0 ? frame1 : frame2;
+      for (let s = 0; s < VOICE_HD_OUT_FRAME_SAMPLES; s++) {
+        assert.equal(
+          dv.getInt16(VOICE_V2_HEADER_BYTES + s * 2, true),
+          expectedFrame[s],
+          `PCM mismatch at frame ${idx} sample ${s}`
+        );
+      }
+    }
+
+    // B. Legacy-only room: legacy peer receives V1 16 kHz ADPCM; V2 is NOT encoded!
+    modernRx.length = 0;
+    legacyRx.length = 0;
+    v1Encodes = 0;
+    v2Encodes = 0;
+    bot.voiceChannels.clear();
+    bot.voiceChannels.set("peer-legacy", legacyDc);
+    assert.equal(bot.sendVoicePcm24k(frame1), 1);
+    assert.equal(v2Encodes, 0, "V2 must NOT be encoded when only legacy peers are in voice");
+    assert.equal(v1Encodes, 1);
+    assert.equal(legacyRx.length, 1);
+    assert.equal(legacyRx[0][0], 0x56);
+    assert.equal(legacyRx[0][1], 0x31); // 'V1'
+    const openedV1 = legacyNode.wasm.openVoicePacket("bot-hd-1", legacyRx[0]);
+    assert.ok(openedV1);
+    assert.equal(openedV1.pcm.length, VOICE_FRAME_SAMPLES);
+    assert.ok(openedV1.rms > 2000, `expected non-silent decoded V1 fallback audio, got rms=${openedV1.rms}`);
+
+    // C. Mixed room (v2pcm peer + legacy peer): V2 goes ONLY to modern, V1 goes ONLY to legacy (zero cross-sending!)
+    modernRx.length = 0;
+    legacyRx.length = 0;
+    v1Encodes = 0;
+    v2Encodes = 0;
+    bot.voiceChannels.set("peer-modern", modernDc);
+    bot.voiceChannels.set("peer-legacy", legacyDc);
+    assert.equal(bot.sendVoicePcm24k(frame1), 2);
+    assert.equal(v2Encodes, 1);
+    assert.equal(v1Encodes, 1);
+    assert.equal(modernRx.length, 1);
+    assert.equal(legacyRx.length, 1);
+    assert.equal(modernRx[0][1], 0x32); // V2 only
+    assert.equal(legacyRx[0][1], 0x31); // V1 only
+    const mixedPlain = modernNode.wasm.openVoiceRaw("bot-hd-1", modernRx[0]);
+    assert.equal(mixedPlain[0], VOICE_V2_CODEC_PCM16);
+    assert.equal(mixedPlain[1], 24);
+    const mixedLegacy = legacyNode.wasm.openVoicePacket("bot-hd-1", legacyRx[0]);
+    assert.equal(mixedLegacy.pcm.length, VOICE_FRAME_SAMPLES);
+
+    // D. VoiceAudioPacer 3 ms cosine fade-in (72 samples @ 24 kHz) & soft-knee peak limiting when gain !== 1
+    const pacedFrames = [];
+    bot.pacer.onFrame = (s) => pacedFrames.push(new Int16Array(s));
+    bot.setAudioGain(1.35);
+    const loudDc = Buffer.alloc(VOICE_HD_OUT_FRAME_BYTES);
+    for (let i = 0; i < VOICE_HD_OUT_FRAME_SAMPLES; i++) loudDc.writeInt16LE(25000, i * 2);
+    bot.pacer.pushBytes(loudDc);
+    bot.pacer.stop();
+    assert.equal(pacedFrames.length, 1);
+    assert.equal(pacedFrames[0][0], 0, "sample 0 must start at 0 via 3 ms cosine fade-in (no DC click)");
+    assert.ok(pacedFrames[0][36] > 10000 && pacedFrames[0][36] < 25000, "midpoint of 72-sample fade-in must ramp smoothly");
+    assert.ok(
+      pacedFrames[0][100] > 30145 && pacedFrames[0][100] < 32650,
+      `soft-knee limiter should compress 33750 gently into (30145, 32650), got ${pacedFrames[0][100]}`
+    );
   });
 
   it("fills silence gaps, supports speaker locking, allowlists, and TTS echo suppression", () => {
@@ -235,19 +585,25 @@ describe("Wyoming Voice Satellite Protocol & Server", () => {
     });
 
     try {
-      // 1. Handshake: describe -> info
+      // 1. Handshake: describe -> info (advertises 24 kHz TTS snd_format while mic capture stays 16 kHz)
       client.write(encodeWyomingEvent("describe"));
       const infoEv = await waitEvent("info");
       assert.equal(infoEv.data.satellite.name, "test-p2p-sat");
       assert.equal(infoEv.data.satellite.area, "Office");
       assert.equal(infoEv.data.satellite.supports_trigger, true);
+      assert.deepEqual(infoEv.data.satellite.snd_format, { rate: 24000, width: 2, channels: 1 });
 
-      // 2. HA starts satellite -> satellite arms wake-word pipeline
+      // 2. HA starts satellite -> satellite arms wake-word pipeline with 16 kHz mic capture
       client.write(encodeWyomingEvent("run-satellite"));
       const wakeRun = await waitEvent("run-pipeline");
       assert.equal(wakeRun.data.start_stage, "wake");
       assert.equal(wakeRun.data.end_stage, "tts");
-      await waitEvent("audio-start");
+      const wakeAudioStartEv = await waitEvent("audio-start");
+      assert.equal(wakeAudioStartEv.data.rate, 16000);
+      assert.equal(sat.sendAudioChunk(Buffer.alloc(640)), true);
+      const micChunkEv = await waitEvent("audio-chunk");
+      assert.equal(micChunkEv.data.rate, 16000);
+      assert.equal(micChunkEv.payload.length, 640);
 
       // 3. Button activation skips wake word -> start_stage = "asr", restart_on_end = false
       assert.equal(sat.triggerListenNow({ wakeWordName: "button" }), true);
@@ -754,6 +1110,7 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       assert.equal(waitingCard.voiceControls.status, "Waiting HA");
       assert.equal(waitingCard.voiceControls.statusIcon, "mic");
       assert.equal(waitingCard.voiceControls.statusTone, "ochre");
+      assert.equal(waitingCard.voiceControls.activity, "idle");
       assert.equal(waitingCard.voiceControls.buttons.length, 3);
       assert.equal(waitingCard.voiceControls.buttons[0].id, "ha:listen");
       assert.equal(waitingCard.voiceControls.buttons[0].disabled, true);
@@ -767,12 +1124,13 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       assert.equal(wakeCard.voiceControls.status, "Okay Nabu");
       assert.equal(wakeCard.voiceControls.statusIcon, "bolt");
       assert.equal(wakeCard.voiceControls.statusTone, "cobalt");
+      assert.equal(wakeCard.voiceControls.activity, "idle");
       assert.equal(wakeCard.voiceControls.buttons[0].disabled, false);
       assert.equal(wakeCard.voiceControls.buttons[1].id, "ha:toggle_wake");
       assert.equal(wakeCard.voiceControls.buttons[2].id, "ha:stop_audio");
       const wakeStat = wakeCard.blocks[0].items.find((i) => i.label === "Wake Word");
       assert.equal(wakeStat.value, "Okay Nabu");
-      assert.match(wakeCard.footer, /Say "Okay Nabu", click Listen Now, or type \/ha <msg>/);
+      assert.match(wakeCard.footer, /Say "Okay Nabu", click Listen Now, or type \/ai <msg>/);
 
       // Live state_changed on select.voice_room_p2p_direct_voice_assistant -> "Office Assist" (hey_jarvis_v0.1)
       wyEvents.length = 0;
@@ -805,31 +1163,49 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
         "expected run-pipeline(wake, restart_on_end=false) reload when wake word changed"
       );
 
-      // Verify updated voiceControls & card states (Hey Jarvis, Listening..., Speaking, Muted, Button Only)
+      // Verify updated voiceControls & card states (Hey Jarvis, Listening..., Thinking..., Speaking, Muted, Button Only)
       const jarvisCard = assistant.buildChatCard();
       assert.equal(jarvisCard.voiceControls.status, "Hey Jarvis");
       assert.equal(jarvisCard.voiceControls.statusIcon, "bolt");
       assert.equal(jarvisCard.voiceControls.statusTone, "cobalt");
-      assert.match(jarvisCard.footer, /Say "Hey Jarvis", click Listen Now, or type \/ha <msg>/);
+      assert.equal(jarvisCard.voiceControls.activity, "idle");
+      assert.match(jarvisCard.footer, /Say "Hey Jarvis", click Listen Now, or type \/ai <msg>/);
 
       assistant.setMuted(true);
       const mutedCard = assistant.buildChatCard();
       assert.equal(mutedCard.voiceControls.status, "Muted");
       assert.equal(mutedCard.voiceControls.statusIcon, "mic-off");
       assert.equal(mutedCard.voiceControls.statusTone, "coral");
+      assert.equal(mutedCard.voiceControls.activity, "idle");
       assistant.setMuted(false);
 
       assistant.wyoming.pipelineMode = "asr";
-      assert.equal(assistant.buildChatCard().voiceControls.status, "Listening...");
+      const asrCard = assistant.buildChatCard();
+      assert.equal(asrCard.voiceControls.status, "Listening...");
+      assert.equal(asrCard.voiceControls.activity, "listening");
+      assert.equal(assistant.getApiState().thinking, false);
+
+      assistant.wyoming.pipelineMode = "processing";
+      const thinkingCard = assistant.buildChatCard();
+      assert.equal(thinkingCard.badge, "THINKING");
+      assert.equal(thinkingCard.color, "cyan");
+      assert.equal(thinkingCard.voiceControls.status, "Thinking...");
+      assert.equal(thinkingCard.voiceControls.statusTone, "cyan");
+      assert.equal(thinkingCard.voiceControls.activity, "thinking");
+      assert.equal(assistant.getApiState().thinking, true);
+
       assistant.wyoming.pipelineMode = "speaking";
       const speakingVc = assistant.buildChatCard().voiceControls;
       assert.equal(speakingVc.status, "Speaking");
       assert.equal(speakingVc.statusIcon, "volume");
+      assert.equal(speakingVc.activity, "speaking");
+      assert.equal(assistant.getApiState().thinking, false);
 
       assistant.wyoming.pipelineMode = "idle";
       assistant.setWakeWordEnabled(false);
       const btnOnlyCard = assistant.buildChatCard();
       assert.equal(btnOnlyCard.voiceControls.status, "Button Only");
+      assert.equal(btnOnlyCard.voiceControls.activity, "idle");
       assert.equal(btnOnlyCard.voiceControls.buttons[1].label, "Wake: Off");
 
       // Verify HomeAssistantWsClient standalone export + named selector matching
@@ -1461,7 +1837,7 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
     }
   });
 
-  it("parses WAV PCM16 headers cleanly, runs /ha through assist_pipeline/run (WAV TTS + MP3 announce fallback + normal chat reply), and handles /listen + resilience retries", async () => {
+  it("parses WAV PCM16 headers cleanly, runs /ai (and legacy /ha) through assist_pipeline/run with live thinking activity transitions, WAV TTS + MP3 fallback + chat reply, and /listen", async () => {
     const buildWav = ({ sampleRate = 22050, channels = 1, bitsPerSample = 16, audioFormat = 1, pcmBytes, extraChunks = [] }) => {
       const fmt = Buffer.alloc(16);
       fmt.writeUInt16LE(audioFormat, 0);
@@ -1542,6 +1918,8 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
     const pipelineRequests = [];
     const serviceCalls = [];
     let mode = "wav"; // wav | mp3 | tts_fail_once | thinking_fail_once | unknown_cmd
+    const heldPipelineResolvers = [];
+    let holdPipeline = false;
 
     wss.on("connection", (ws) => {
       ws.send(JSON.stringify({ type: "auth_required" }));
@@ -1616,46 +1994,53 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
             return;
           }
 
-          ws.send(JSON.stringify({
-            id: m.id,
-            type: "event",
-            event: {
-              type: "intent-end",
-              data: {
-                intent_output: {
-                  conversation_id: m.conversation_id || "conv-fresh-1",
-                  response: {
-                    response_type: "action_done",
-                    speech: { plain: { speech: `Handled: ${m.input.text}` } },
-                  },
-                },
-              },
-            },
-          }));
-          if (m.end_stage === "tts") {
+          const finishPipelineRun = () => {
             ws.send(JSON.stringify({
               id: m.id,
               type: "event",
               event: {
-                type: "tts-end",
+                type: "intent-end",
                 data: {
-                  tts_output:
-                    mode === "mp3"
-                      ? {
-                          media_id: "media-source://tts/google_mp3_1",
-                          url: "/api/tts_proxy/reply.mp3",
-                          mime_type: "audio/mpeg",
-                        }
-                      : {
-                          media_id: "media-source://tts/piper_wav_1",
-                          url: "/api/tts_proxy/reply.wav",
-                          mime_type: "audio/wav",
-                        },
+                  intent_output: {
+                    conversation_id: m.conversation_id || "conv-fresh-1",
+                    response: {
+                      response_type: "action_done",
+                      speech: { plain: { speech: `Handled: ${m.input.text}` } },
+                    },
+                  },
                 },
               },
             }));
+            if (m.end_stage === "tts") {
+              ws.send(JSON.stringify({
+                id: m.id,
+                type: "event",
+                event: {
+                  type: "tts-end",
+                  data: {
+                    tts_output:
+                      mode === "mp3"
+                        ? {
+                            media_id: "media-source://tts/google_mp3_1",
+                            url: "/api/tts_proxy/reply.mp3",
+                            mime_type: "audio/mpeg",
+                          }
+                        : {
+                            media_id: "media-source://tts/piper_wav_1",
+                            url: "/api/tts_proxy/reply.wav",
+                            mime_type: "audio/wav",
+                          },
+                  },
+                },
+              }));
+            }
+            ws.send(JSON.stringify({ id: m.id, type: "event", event: { type: "run-end", data: {} } }));
+          };
+          if (holdPipeline) {
+            heldPipelineResolvers.push(finishPipelineRun);
+          } else {
+            finishPipelineRun();
           }
-          ws.send(JSON.stringify({ id: m.id, type: "event", event: { type: "run-end", data: {} } }));
         } else if (m.type === "conversation/process") {
           ws.send(JSON.stringify({
             id: m.id,
@@ -1705,13 +2090,15 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       assert.deepEqual(card.assistantMeta, {
         pipelineName: "Assist LLM",
         wakeWordLabel: "Hey Jarvis",
-        commands: ["/ha", "/listen"],
+        commands: ["/ai", "/listen"],
       });
+      assert.equal(card.voiceControls.activity, "idle");
 
       // Attach mock room bot capturing PCM playback, chat sends, and card syncs
       const pushedPcm = [];
       let audioEndMarked = 0;
       const rawChatSends = [];
+      const cardUpdates = [];
       let cardSent = 0;
       let listenTriggers = 0;
       assistant.wyoming.triggerListenNow = () => {
@@ -1724,6 +2111,7 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
         inVoice: true,
         getPeers: () => [],
         stopAudio: () => {},
+        setVoiceMuted: () => {},
         pushPcmBytes: (buf, opts) => pushedPcm.push({ buf, opts }),
         markAudioStreamEnd: () => { audioEndMarked += 1; },
         playChime: () => {},
@@ -1735,17 +2123,20 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
           cardSent += 1;
           return { id: `card-${cardSent}` };
         },
-        updateBotMessage: () => {},
+        updateBotMessage: (_id, updatedCard) => {
+          cardUpdates.push(updatedCard);
+        },
       };
       assistant.roomState = "connected";
+      assistant.controlMsgId = "card-initial";
 
-      // 3. `/ha <message>` triggers assist_pipeline/run -> WAV PCM16 playback + normal chat reply with replyTo
+      // 3. `/ai <message>` triggers assist_pipeline/run -> WAV PCM16 playback + normal chat reply with replyTo
       mode = "wav";
       assistant._onRoomMessage({
         type: "chat",
         author: "peer-alice",
         authorName: "Alice",
-        payload: { text: "/ha Turn on the desk lamp" },
+        payload: { text: "/ai Turn on the desk lamp" },
       });
       await new Promise((r) => setTimeout(r, 120));
 
@@ -1771,6 +2162,65 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
         pipeline: "Assist LLM",
         spoken: true,
       });
+
+      // 3b. In-flight askText() transitions voiceControls.activity: idle -> thinking -> idle (even for overlapping calls & when muted)
+      assert.equal(assistant.buildChatCard().voiceControls.activity, "idle");
+      assert.equal(assistant.getApiState().thinking, false);
+      cardUpdates.length = 0;
+      holdPipeline = true;
+      const ask1 = assistant.askText("First held query", { speakerName: "Alice", speak: false });
+      await new Promise((r) => setTimeout(r, 40));
+      assert.equal(heldPipelineResolvers.length, 1);
+      const midCard1 = assistant.buildChatCard();
+      assert.equal(midCard1.badge, "THINKING");
+      assert.equal(midCard1.color, "cyan");
+      assert.equal(midCard1.voiceControls.status, "Thinking...");
+      assert.equal(midCard1.voiceControls.statusTone, "cyan");
+      assert.equal(midCard1.voiceControls.activity, "thinking");
+      assert.equal(assistant.getApiState().thinking, true);
+      assert.equal(assistant.textThinking, true);
+      assert.ok(
+        cardUpdates.some((c) => c.voiceControls?.activity === "thinking"),
+        "expected syncChatCard to broadcast activity='thinking' while askText is in-flight"
+      );
+
+      // Even if muted during a text query, thinking badge/activity remains active
+      assistant.setMuted(true);
+      assert.equal(assistant.buildChatCard().voiceControls.activity, "thinking");
+      assert.equal(assistant.buildChatCard().badge, "THINKING");
+      assert.equal(assistant.buildChatCard().voiceControls.status, "Thinking...");
+      assistant.setMuted(false);
+
+      // Overlapping second query keeps thinking active until BOTH resolve
+      const ask2 = assistant.askText("Second held query", { speakerName: "Alice", speak: false });
+      await new Promise((r) => setTimeout(r, 40));
+      assert.equal(heldPipelineResolvers.length, 2);
+
+      // Finish first query -> still thinking because second is still in flight!
+      heldPipelineResolvers.shift()();
+      await ask1;
+      assert.equal(assistant.buildChatCard().voiceControls.activity, "thinking");
+      assert.equal(assistant.getApiState().thinking, true);
+
+      // Finish second query -> transitions back to idle cleanly!
+      heldPipelineResolvers.shift()();
+      await ask2;
+      holdPipeline = false;
+      assert.equal(assistant.buildChatCard().voiceControls.activity, "idle");
+      assert.equal(assistant.getApiState().thinking, false);
+      assert.equal(assistant.textThinking, false);
+      assert.equal(cardUpdates.at(-1)?.voiceControls?.activity, "idle");
+
+      // If runTextPipeline throws/rejects, thinking counter still unwinds to idle cleanly
+      const origRunTextPipeline = assistant.haClient.runTextPipeline.bind(assistant.haClient);
+      assistant.haClient.runTextPipeline = async () => {
+        assert.equal(assistant.buildChatCard().voiceControls.activity, "thinking");
+        throw new Error("Simulated pipeline failure");
+      };
+      await assert.rejects(() => assistant.askText("Failing query", { speakerName: "Alice", speak: false }), /Simulated pipeline failure/);
+      assistant.haClient.runTextPipeline = origRunTextPipeline;
+      assert.equal(assistant.buildChatCard().voiceControls.activity, "idle");
+      assert.equal(assistant.getApiState().thinking, false);
 
       // 4. Non-WAV MP3 fallback -> calls assist_satellite.announce(preannounce: false, media_id)
       mode = "mp3";
@@ -1813,7 +2263,7 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       const fbRes = await assistant.askText("Legacy ping", { speakerName: "Alice" });
       assert.equal(fbRes.text, "Fallback: Legacy ping");
 
-      // 8. `/listen` and `/ha` (no args) slash commands
+      // 8. `/listen`, `/ai` (refresh), and legacy `/ha` & `/ha <message>` backwards-compatible aliases
       assistant._onRoomMessage({
         type: "chat",
         author: "peer-alice",
@@ -1822,14 +2272,34 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       });
       assert.equal(listenTriggers, 1);
 
-      const cardsBeforeHa = cardSent;
+      const cardsBeforeAi = cardSent;
+      assistant._onRoomMessage({
+        type: "chat",
+        author: "peer-alice",
+        authorName: "Alice",
+        payload: { text: "/ai" },
+      });
+      assert.equal(cardSent, cardsBeforeAi + 1);
+
       assistant._onRoomMessage({
         type: "chat",
         author: "peer-alice",
         authorName: "Alice",
         payload: { text: "/ha" },
       });
-      assert.equal(cardSent, cardsBeforeHa + 1);
+      assert.equal(cardSent, cardsBeforeAi + 2);
+
+      mode = "wav";
+      pipelineRequests.length = 0;
+      assistant._onRoomMessage({
+        type: "chat",
+        author: "peer-alice",
+        authorName: "Alice",
+        payload: { text: "/ha Legacy alias check" },
+      });
+      await new Promise((r) => setTimeout(r, 120));
+      assert.equal(pipelineRequests.length, 1);
+      assert.deepEqual(pipelineRequests[0].input, { text: "Legacy alias check" });
 
       assistant.bot = null;
       assistant.roomState = "disconnected";
@@ -1837,6 +2307,369 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       await assistant.stop();
       await new Promise((r) => wss.close(r));
       await new Promise((r) => httpServer.close(r));
+    }
+  });
+
+  it("enforces admin-only Disable Entity Controls via chat-only pipeline switching, room lockdown, state persistence, restore, and fail-closed strict lock", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p2p-ha-lock-"));
+    const stateFile = path.join(tmpDir, "p2p-voice-state.json");
+
+    const cliLock = parseHaCliArgs(["--no-control-pipeline", "Custom Chat Only", "--state-file", stateFile]);
+    assert.equal(cliLock.noControlPipeline, "Custom Chat Only");
+    assert.equal(cliLock.stateFile, stateFile);
+
+    // 1. Mock HA WS with normal pipeline + auto-discovered "P2P Chat Only (No Controls)" pipeline + timer_list
+    const mockHaWss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise((r) => mockHaWss.once("listening", r));
+    const haPort = mockHaWss.address().port;
+
+    let currentSelectState = "Assist LLM";
+    let includeNoControlPipeline = true;
+    const serviceCalls = [];
+    const pipelineRuns = [];
+
+    mockHaWss.on("connection", (ws) => {
+      ws.send(JSON.stringify({ type: "auth_required" }));
+      ws.on("message", (raw) => {
+        const m = JSON.parse(raw.toString("utf8"));
+        if (m.type === "auth") {
+          ws.send(JSON.stringify({ type: "auth_ok" }));
+        } else if (m.type === "subscribe_events") {
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        } else if (m.type === "get_states") {
+          const selectOpts = includeNoControlPipeline
+            ? ["preferred", "Assist LLM", "P2P Chat Only (No Controls)"]
+            : ["preferred", "Assist LLM"];
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: [
+              {
+                entity_id: "select.voice_room_p2p_direct_voice_assistant",
+                state: currentSelectState,
+                attributes: { options: selectOpts },
+              },
+              {
+                entity_id: "timer_list.kitchen_timers",
+                state: "1",
+                attributes: {
+                  friendly_name: "Kitchen Timers",
+                  supported_features:
+                    TIMER_LIST_FEATURES.CREATE_TIMER |
+                    TIMER_LIST_FEATURES.PAUSE_TIMER |
+                    TIMER_LIST_FEATURES.CANCEL_TIMER |
+                    TIMER_LIST_FEATURES.ADD_TIME,
+                },
+              },
+            ],
+          }));
+        } else if (m.type === "assist_pipeline/pipeline/list") {
+          const pipelines = [
+            {
+              id: "p-assist",
+              name: "Assist LLM",
+              tts_engine: "tts.piper",
+              wake_word_entity: "wake_word.openwakeword",
+              wake_word_id: "hey_jarvis",
+            },
+          ];
+          if (includeNoControlPipeline) {
+            pipelines.push({
+              id: "p-no-ctrl",
+              name: "P2P Chat Only (No Controls)",
+              tts_engine: "tts.piper",
+              wake_word_entity: "wake_word.openwakeword",
+              wake_word_id: "hey_jarvis",
+            });
+          }
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: { preferred_pipeline: "p-assist", pipelines },
+          }));
+        } else if (m.type === "timer_list/item/subscribe") {
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "event",
+            event: {
+              type: "timers",
+              timers: [
+                {
+                  timer_id: "t-pasta",
+                  name: "Pasta",
+                  status: "active",
+                  created_duration: 300,
+                  total_duration: 300,
+                  finishes_at: new Date(Date.now() + 240_000).toISOString(),
+                  remaining: 240,
+                },
+              ],
+            },
+          }));
+        } else if (m.type === "call_service") {
+          serviceCalls.push(m);
+          if (m.domain === "select" && m.service === "select_option") {
+            currentSelectState = m.service_data.option;
+          }
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        } else if (m.type === "assist_pipeline/run") {
+          pipelineRuns.push(m);
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "event",
+            event: {
+              type: "intent-end",
+              data: {
+                intent_output: {
+                  conversation_id: "conv-safe-1",
+                  response: {
+                    response_type: "action_done",
+                    speech: { plain: { speech: `Reply via ${m.pipeline}` } },
+                  },
+                },
+              },
+            },
+          }));
+          ws.send(JSON.stringify({ id: m.id, type: "event", event: { type: "run-end", data: {} } }));
+        }
+      });
+    });
+
+    let a1 = null;
+    let a2 = null;
+    let a3 = null;
+    try {
+      // Instance 1: auto-discovers "P2P Chat Only (No Controls)", locks via POST /api/entity-controls
+      a1 = new HomeAssistantVoiceAssistant({
+        wyomingHost: "127.0.0.1",
+        wyomingPort: 0,
+        uiHost: "127.0.0.1",
+        uiPort: 0,
+        haUrl: `http://127.0.0.1:${haPort}`,
+        haToken: "tok",
+        stateFile,
+      });
+      const { ui: ui1 } = await a1.start();
+      await new Promise((r) => setTimeout(r, 140));
+
+      assert.equal(a1.haClient.noControlPipeline?.id, "p-no-ctrl");
+      assert.equal(a1.haClient.noControlPipeline?.name, "P2P Chat Only (No Controls)");
+
+      // Check Control Panel HTML contains admin controls bar, `/ai` strict-lock hint & strictly relative ./api/
+      const html = await fetch(`http://127.0.0.1:${ui1.port}/`).then((r) => r.text());
+      assert.match(html, /id="controls-banner"/);
+      assert.match(html, /id="btn-entity-controls"/);
+      assert.match(html, /api\("entity-controls"/);
+      assert.match(html, /Voice & \/ai blocked/);
+      assert.equal(html.includes('"/api/'), false);
+
+      // Attach mock room bot & ready Wyoming
+      const chatPosts = [];
+      a1.wyoming.isReady = () => true;
+      a1.wyoming.triggerListenNow = () => true;
+      a1.bot = {
+        peerId: "bot-1",
+        inVoice: true,
+        getPeers: () => [],
+        playChime: () => {},
+        sendRaw: (type, payload) => {
+          chatPosts.push({ type, payload });
+          return { id: `c-${chatPosts.length}` };
+        },
+        updateBotMessage: () => {},
+        sendBotMessage: () => ({ id: "card-1" }),
+      };
+      a1.roomState = "connected";
+      a1.conversationId = "old-tool-bearing-conv";
+
+      // Lock entity controls via Ingress API
+      const lockRes = await fetch(`http://127.0.0.1:${ui1.port}/api/entity-controls`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ disabled: true }),
+      }).then((r) => r.json());
+
+      assert.equal(lockRes.ok, true);
+      assert.deepEqual(lockRes.state.entityControls, {
+        disabled: true,
+        mode: "chat_only_pipeline",
+        noControlPipelineName: "P2P Chat Only (No Controls)",
+        previousPipelineName: "Assist LLM",
+      });
+      assert.equal(a1.conversationId, null, "conversationId must reset when locking");
+
+      // Switched select.*_assistant via select.select_option
+      const selCall = serviceCalls.find((c) => c.domain === "select" && c.service === "select_option");
+      assert.ok(selCall);
+      assert.equal(selCall.target.entity_id, "select.voice_room_p2p_direct_voice_assistant");
+      assert.equal(selCall.service_data.option, "P2P Chat Only (No Controls)");
+
+      // `/ai` is forced onto no-control pipeline ID
+      pipelineRuns.length = 0;
+      const askRes = await a1.askText("Turn off the kitchen lights", { speakerName: "Alice" });
+      assert.equal(pipelineRuns.length, 1);
+      assert.equal(pipelineRuns[0].pipeline, "p-no-ctrl");
+      assert.equal(askRes.text, "Reply via p-no-ctrl");
+      assert.equal(chatPosts[0].payload.replyTo.pipeline, "P2P Chat Only (No Controls)");
+
+      // Listen Now still works safely in chat-only pipeline mode
+      assert.equal(a1.triggerListenNow({ speakerName: "Alice" }).ok, true);
+
+      // buildChatCard() strips all ha:tl:* actions, notes disabled in footer, NEVER exposes unlock button
+      const lockedCard = a1.buildChatCard();
+      assert.equal(lockedCard.timers.length, 1);
+      assert.equal(lockedCard.timers[0].label, "Pasta");
+      assert.deepEqual(lockedCard.timers[0].actions, []);
+      assert.match(lockedCard.footer, /Entity controls disabled · Chat only/);
+      const allCardBtnIds = [
+        ...lockedCard.voiceControls.buttons.map((b) => b.id),
+        ...lockedCard.buttons.flatMap((g) => g.buttons.map((b) => b.id)),
+      ];
+      assert.equal(
+        allCardBtnIds.some((id) => /control|lock|unlock|enable/i.test(id)),
+        false,
+        "public room card must NEVER expose entity-controls unlock button"
+      );
+
+      // Room timer interactions (pause/cancel) are blocked
+      serviceCalls.length = 0;
+      a1._onRoomInteraction({ mode: "action", actionId: "ha:tl:pause:timer_list.kitchen_timers:t-pasta" });
+      a1._onRoomInteraction({ mode: "action", actionId: "ha:tl:cancel:timer_list.kitchen_timers:t-pasta" });
+      await new Promise((r) => setTimeout(r, 40));
+      assert.equal(serviceCalls.filter((c) => c.domain === "timer_list").length, 0);
+
+      // Detach mock bot & stop instance 1
+      a1.bot = null;
+      a1.roomState = "disconnected";
+      await a1.stop();
+      a1 = null;
+
+      // Verify state file persisted cleanly
+      const saved = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      assert.deepEqual(saved, {
+        entityControlsDisabled: true,
+        previousPipelineName: "Assist LLM",
+      });
+
+      // 2. Fresh instance 2 sharing same stateFile enforces lock on startup even if HA reverted selector
+      currentSelectState = "Assist LLM";
+      serviceCalls.length = 0;
+      a2 = new HomeAssistantVoiceAssistant({
+        wyomingHost: "127.0.0.1",
+        wyomingPort: 0,
+        uiHost: "127.0.0.1",
+        uiPort: 0,
+        haUrl: `http://127.0.0.1:${haPort}`,
+        haToken: "tok",
+        stateFile,
+      });
+      assert.equal(a2.entityControlsDisabled, true);
+      assert.equal(a2.previousPipelineName, "Assist LLM");
+      const { ui: ui2 } = await a2.start();
+      await new Promise((r) => setTimeout(r, 160));
+
+      assert.ok(
+        serviceCalls.some(
+          (c) =>
+            c.domain === "select" &&
+            c.service === "select_option" &&
+            c.service_data.option === "P2P Chat Only (No Controls)"
+        ),
+        "expected persisted lock to enforce chat-only pipeline on startup"
+      );
+
+      // Re-enable entity controls via POST /api/entity-controls { disabled: false }
+      serviceCalls.length = 0;
+      const unlockRes = await fetch(`http://127.0.0.1:${ui2.port}/api/entity-controls`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ disabled: false }),
+      }).then((r) => r.json());
+      assert.equal(unlockRes.ok, true);
+      assert.equal(unlockRes.state.entityControls.disabled, false);
+      assert.equal(unlockRes.state.entityControls.mode, "enabled");
+      assert.equal(unlockRes.state.entityControls.previousPipelineName, "");
+      assert.ok(
+        serviceCalls.some(
+          (c) => c.domain === "select" && c.service === "select_option" && c.service_data.option === "Assist LLM"
+        ),
+        "expected unlocking to restore previous pipeline via select.select_option"
+      );
+
+      // Room timer controls & card timer actions are re-enabled
+      const unlockedCard = a2.buildChatCard();
+      assert.equal(unlockedCard.timers[0].actions.length, 3);
+      serviceCalls.length = 0;
+      a2._onRoomInteraction({ mode: "action", actionId: "ha:tl:pause:timer_list.kitchen_timers:t-pasta" });
+      await new Promise((r) => setTimeout(r, 50));
+      assert.ok(serviceCalls.some((c) => c.domain === "timer_list" && c.service === "pause_timer"));
+
+      await a2.stop();
+      a2 = null;
+
+      // 3. Fail-closed strict lock when NO chat-only/no-control pipeline exists on HA
+      includeNoControlPipeline = false;
+      currentSelectState = "Assist LLM";
+      pipelineRuns.length = 0;
+      a3 = new HomeAssistantVoiceAssistant({
+        wyomingHost: "127.0.0.1",
+        wyomingPort: 0,
+        uiHost: "127.0.0.1",
+        uiPort: 0,
+        haUrl: `http://127.0.0.1:${haPort}`,
+        haToken: "tok",
+      });
+      const { ui: ui3 } = await a3.start();
+      await new Promise((r) => setTimeout(r, 140));
+      assert.equal(a3.haClient.noControlPipeline, null);
+      a3.wyoming.isReady = () => true;
+      a3.wyoming.triggerListenNow = () => true;
+
+      const strictRes = await fetch(`http://127.0.0.1:${ui3.port}/api/entity-controls`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: false }),
+      }).then((r) => r.json());
+      assert.equal(strictRes.ok, true);
+      assert.equal(strictRes.state.entityControls.disabled, true);
+      assert.equal(strictRes.state.entityControls.mode, "strict_lock");
+      assert.equal(a3.wyoming.wakeWordEnabled, false, "strict lock must pause Wyoming wake listening");
+
+      // Room attempt to re-enable wake word must remain paused under strict lock
+      a3.setWakeWordEnabled(true);
+      assert.equal(a3.wyoming.wakeWordEnabled, false);
+
+      // triggerListenNow and askText both fail closed without calling HA
+      const listenBlocked = a3.triggerListenNow({ speakerName: "Alice" });
+      assert.equal(listenBlocked.ok, false);
+      assert.match(listenBlocked.error, /Entity controls are disabled/i);
+
+      const askBlocked = await a3.askText("Unlock front door", { speakerName: "Alice" });
+      assert.equal(askBlocked.blocked, true);
+      assert.match(askBlocked.text, /Entity controls are currently disabled/i);
+      assert.equal(pipelineRuns.length, 0, "strict lock must never call HA assist_pipeline/run");
+
+      // Re-enabling restores wake listening cleanly
+      const strictUnlock = await fetch(`http://127.0.0.1:${ui3.port}/api/entity-controls`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      }).then((r) => r.json());
+      assert.equal(strictUnlock.state.entityControls.disabled, false);
+      assert.equal(a3.wyoming.wakeWordEnabled, true);
+
+      await a3.stop();
+      a3 = null;
+    } finally {
+      if (a1) await a1.stop();
+      if (a2) await a2.stop();
+      if (a3) await a3.stop();
+      await new Promise((r) => mockHaWss.close(r));
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

@@ -23,6 +23,12 @@ export const VOICE_SAMPLE_RATE = 16000;
 export const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16 kHz mono
 export const VOICE_FRAME_BYTES = VOICE_FRAME_SAMPLES * 2; // Int16LE
 
+export const VOICE_HD_OUT_SAMPLE_RATE = 24000;
+export const VOICE_HD_OUT_FRAME_SAMPLES = 480; // 20ms @ 24 kHz mono
+export const VOICE_HD_OUT_FRAME_BYTES = VOICE_HD_OUT_FRAME_SAMPLES * 2; // 960 bytes Int16LE
+export const VOICE_V2_CODEC_PCM16 = 2;
+export const VOICE_V2_HEADER_BYTES = 8; // [codecId:u8, sampleRateKhz:u8, rms:u16le, tsSamples:u32le]
+
 export const DEFAULT_ICE_SERVERS = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
@@ -86,9 +92,313 @@ export function parseRoomLink(rawInput) {
   return { code, relayFromQuery };
 }
 
+function buildHammingLowpass5(srcRate, dstRate) {
+  const fc = Math.max(0.05, Math.min(0.48, 0.45 * (dstRate / srcRate)));
+  const taps = new Float64Array(5);
+  let sum = 0;
+  for (let n = 0; n < 5; n++) {
+    const k = n - 2;
+    const sinc = k === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * k) / (Math.PI * k);
+    const win = 0.54 - 0.46 * Math.cos((2 * Math.PI * n) / 4);
+    taps[n] = sinc * win;
+    sum += taps[n];
+  }
+  for (let n = 0; n < 5; n++) {
+    taps[n] /= sum;
+  }
+  return taps;
+}
+
+function catmullRom(y0, y1, y2, y3, t) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return (
+    0.5 *
+    (2 * y1 +
+      (-y0 + y2) * t +
+      (2 * y0 - 5 * y1 + 4 * y2 - y3) * t2 +
+      (-y0 + 3 * y1 - 3 * y2 + y3) * t3)
+  );
+}
+
+/**
+ * Stateful streaming 16-bit PCM resampler using 5-tap Hamming-windowed anti-aliasing low-pass
+ * pre-filtering (when downsampling) and 4-point Catmull-Rom cubic interpolation carrying
+ * boundary history + fractional phase seamlessly across consecutive chunks.
+ */
+export class StreamingPcmResampler {
+  constructor({ targetRate = VOICE_HD_OUT_SAMPLE_RATE } = {}) {
+    this.targetRate = Math.max(4000, Number(targetRate) || VOICE_HD_OUT_SAMPLE_RATE);
+    this.reset();
+  }
+
+  reset() {
+    this._srcRate = 0;
+    this._channels = 0;
+    this._taps = null;
+    this._aaHasHistory = false;
+    this._aaHist0 = 0;
+    this._aaHist1 = 0;
+    this._aaHist2 = 0;
+    this._aaHist3 = 0;
+    this._aaInitBuf = [];
+    this._hasHistory = false;
+    this._prev0 = 0;
+    this._prev1 = 0;
+    this._prev2 = 0;
+    this._phase = 1.0;
+    this._cubicInitBuf = [];
+    this._framePrevRaw2 = 0;
+    this._framePrevRaw1 = 0;
+    this._framePrevFilt = 0;
+    this._frameHasHistory = false;
+  }
+
+  _downmixToMonoFloat(buf, ch) {
+    const totalFrames = Math.floor(buf.length / (2 * ch));
+    const mono = new Float32Array(totalFrames);
+    if (ch === 1) {
+      for (let i = 0; i < totalFrames; i++) {
+        mono[i] = buf.readInt16LE(i * 2);
+      }
+    } else {
+      for (let i = 0; i < totalFrames; i++) {
+        let acc = 0;
+        const base = i * ch * 2;
+        for (let c = 0; c < ch; c++) {
+          acc += buf.readInt16LE(base + c * 2);
+        }
+        mono[i] = acc / ch;
+      }
+    }
+    return mono;
+  }
+
+  _applyStreamingAntiAlias(mono) {
+    const n = mono.length;
+    if (n === 0 || !this._taps) return mono;
+    const t0 = this._taps[0];
+    const t1 = this._taps[1];
+    const t2 = this._taps[2];
+    const t3 = this._taps[3];
+    const t4 = this._taps[4];
+
+    let raw;
+    if (!this._aaHasHistory) {
+      const combinedLen = this._aaInitBuf.length + n;
+      if (combinedLen < 3) {
+        for (let i = 0; i < n; i++) this._aaInitBuf.push(mono[i]);
+        return new Float32Array(0);
+      }
+      const first = this._aaInitBuf.length > 0 ? this._aaInitBuf[0] : mono[0];
+      raw = new Float32Array(2 + combinedLen);
+      raw[0] = first;
+      raw[1] = first;
+      let off = 2;
+      for (let i = 0; i < this._aaInitBuf.length; i++) raw[off++] = this._aaInitBuf[i];
+      this._aaInitBuf.length = 0;
+      raw.set(mono, off);
+      this._aaHasHistory = true;
+    } else {
+      raw = new Float32Array(4 + n);
+      raw[0] = this._aaHist0;
+      raw[1] = this._aaHist1;
+      raw[2] = this._aaHist2;
+      raw[3] = this._aaHist3;
+      raw.set(mono, 4);
+    }
+
+    const rLen = raw.length;
+    const outLen = Math.max(0, rLen - 4);
+    const filtered = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const c = i + 2;
+      filtered[i] =
+        t0 * raw[c - 2] +
+        t1 * raw[c - 1] +
+        t2 * raw[c] +
+        t3 * raw[c + 1] +
+        t4 * raw[c + 2];
+    }
+    this._aaHist0 = raw[rLen - 4];
+    this._aaHist1 = raw[rLen - 3];
+    this._aaHist2 = raw[rLen - 2];
+    this._aaHist3 = raw[rLen - 1];
+    return filtered;
+  }
+
+  push(pcmBuffer, { sampleRate = VOICE_SAMPLE_RATE, channels = 1 } = {}) {
+    if (!pcmBuffer || pcmBuffer.length === 0) return Buffer.alloc(0);
+    const buf = Buffer.isBuffer(pcmBuffer) ? pcmBuffer : Buffer.from(pcmBuffer);
+    const srcRate = Math.max(4000, Number(sampleRate) || VOICE_SAMPLE_RATE);
+    const ch = Math.max(1, Math.min(8, Math.round(Number(channels) || 1)));
+    const dstRate = this.targetRate;
+
+    if (buf.length < 2 * ch) return Buffer.alloc(0);
+
+    // Auto-reset history when sampleRate or channels changes on a new stream
+    if (this._srcRate !== srcRate || this._channels !== ch) {
+      this.reset();
+      this._srcRate = srcRate;
+      this._channels = ch;
+      this._taps = srcRate > dstRate ? buildHammingLowpass5(srcRate, dstRate) : null;
+    }
+
+    // Fast-path direct copy when sampleRate already matches targetRate and mono
+    if (srcRate === dstRate && ch === 1) {
+      const evenLen = buf.length & ~1;
+      return evenLen === 0 ? Buffer.alloc(0) : Buffer.from(buf.subarray(0, evenLen));
+    }
+
+    const mono = this._downmixToMonoFloat(buf, ch);
+    if (mono.length === 0) return Buffer.alloc(0);
+
+    if (srcRate === dstRate) {
+      const out = Buffer.allocUnsafe(mono.length * 2);
+      for (let i = 0; i < mono.length; i++) {
+        out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(mono[i]))), i * 2);
+      }
+      return out;
+    }
+
+    const src = srcRate > dstRate ? this._applyStreamingAntiAlias(mono) : mono;
+    if (src.length === 0) return Buffer.alloc(0);
+
+    let v;
+    if (!this._hasHistory) {
+      const combinedLen = this._cubicInitBuf.length + src.length;
+      if (combinedLen < 2) {
+        for (let i = 0; i < src.length; i++) this._cubicInitBuf.push(src[i]);
+        return Buffer.alloc(0);
+      }
+      const first = this._cubicInitBuf.length > 0 ? this._cubicInitBuf[0] : src[0];
+      v = new Float32Array(1 + combinedLen);
+      v[0] = first;
+      let off = 1;
+      for (let i = 0; i < this._cubicInitBuf.length; i++) v[off++] = this._cubicInitBuf[i];
+      this._cubicInitBuf.length = 0;
+      v.set(src, off);
+      this._phase = 1.0;
+      this._hasHistory = true;
+    } else {
+      v = new Float32Array(3 + src.length);
+      v[0] = this._prev0;
+      v[1] = this._prev1;
+      v[2] = this._prev2;
+      v.set(src, 3);
+    }
+
+    const step = srcRate / dstRate;
+    const limit = v.length - 2;
+    const estOut = this._phase < limit ? Math.ceil((limit - this._phase) / step) + 2 : 0;
+    const outSamples = new Int16Array(estOut);
+    let outCount = 0;
+    let pos = this._phase;
+
+    while (pos < limit) {
+      const idx = Math.floor(pos);
+      const frac = pos - idx;
+      const sample = catmullRom(v[idx - 1], v[idx], v[idx + 1], v[idx + 2], frac);
+      outSamples[outCount++] = Math.max(-32768, Math.min(32767, Math.round(sample)));
+      pos += step;
+    }
+
+    this._prev0 = v[v.length - 3];
+    this._prev1 = v[v.length - 2];
+    this._prev2 = v[v.length - 1];
+    this._phase = pos - (v.length - 3);
+
+    if (outCount === 0) return Buffer.alloc(0);
+    const outBuf = Buffer.allocUnsafe(outCount * 2);
+    for (let i = 0; i < outCount; i++) {
+      outBuf.writeInt16LE(outSamples[i], i * 2);
+    }
+    return outBuf;
+  }
+
+  /**
+   * Frame-aligned cubic resampler (e.g., 480 samples @ 24 kHz -> exact 320 samples @ 16 kHz)
+   * carrying left-edge history across consecutive 20 ms ticks for legacy V1 fallback without drift.
+   */
+  resampleFrameInt16(int16Input, { sampleRate = VOICE_HD_OUT_SAMPLE_RATE } = {}) {
+    if (!int16Input || int16Input.length === 0) return new Int16Array(0);
+    const srcRate = Math.max(4000, Number(sampleRate) || VOICE_HD_OUT_SAMPLE_RATE);
+    const dstRate = this.targetRate;
+    const n = int16Input.length;
+    if (srcRate === dstRate) {
+      return new Int16Array(int16Input);
+    }
+    if (this._srcRate !== srcRate || this._channels !== 1) {
+      this.reset();
+      this._srcRate = srcRate;
+      this._channels = 1;
+      this._taps = srcRate > dstRate ? buildHammingLowpass5(srcRate, dstRate) : null;
+    }
+
+    const prevRaw2 = this._frameHasHistory ? this._framePrevRaw2 : int16Input[0];
+    const prevRaw1 = this._frameHasHistory ? this._framePrevRaw1 : int16Input[0];
+    let src;
+    if (srcRate > dstRate && this._taps) {
+      const t0 = this._taps[0];
+      const t1 = this._taps[1];
+      const t2 = this._taps[2];
+      const t3 = this._taps[3];
+      const t4 = this._taps[4];
+      src = new Float32Array(n);
+      const getRaw = (idx) => {
+        if (idx === -2) return prevRaw2;
+        if (idx === -1) return prevRaw1;
+        if (idx >= n) return int16Input[n - 1];
+        return int16Input[idx];
+      };
+      for (let i = 0; i < n; i++) {
+        src[i] =
+          t0 * getRaw(i - 2) +
+          t1 * getRaw(i - 1) +
+          t2 * getRaw(i) +
+          t3 * getRaw(i + 1) +
+          t4 * getRaw(i + 2);
+      }
+    } else {
+      src = new Float32Array(n);
+      for (let i = 0; i < n; i++) src[i] = int16Input[i];
+    }
+
+    const prevFilt = this._frameHasHistory ? this._framePrevFilt : src[0];
+    const ratio = srcRate / dstRate;
+    const outSamples = Math.max(1, Math.round(n / ratio));
+    const out = new Int16Array(outSamples);
+    const getSrc = (idx) => {
+      if (idx < 0) return prevFilt;
+      if (idx >= n) return src[n - 1];
+      return src[idx];
+    };
+    for (let i = 0; i < outSamples; i++) {
+      const pos = i * ratio;
+      const idx = Math.floor(pos);
+      const frac = pos - idx;
+      const sample = catmullRom(
+        getSrc(idx - 1),
+        getSrc(idx),
+        getSrc(idx + 1),
+        getSrc(idx + 2),
+        frac
+      );
+      out[i] = Math.max(-32768, Math.min(32767, Math.round(sample)));
+    }
+
+    this._framePrevRaw2 = n >= 2 ? int16Input[n - 2] : int16Input[0];
+    this._framePrevRaw1 = int16Input[n - 1];
+    this._framePrevFilt = src[n - 1];
+    this._frameHasHistory = true;
+    return out;
+  }
+}
+
 /**
  * Converts arbitrary signed 16-bit little-endian PCM (any sample rate & channel count)
- * into 16 kHz mono Int16LE PCM for direct E2EE voice streaming without spawning ffmpeg.
+ * into mono Int16LE PCM using 5-tap Hamming anti-aliasing (when downsampling) +
+ * 4-point Catmull-Rom cubic interpolation without spawning ffmpeg.
  */
 export function resamplePcm16(pcmBuffer, { sampleRate = VOICE_SAMPLE_RATE, channels = 1, targetRate = VOICE_SAMPLE_RATE } = {}) {
   const buf = Buffer.isBuffer(pcmBuffer) ? pcmBuffer : Buffer.from(pcmBuffer);
@@ -103,7 +413,7 @@ export function resamplePcm16(pcmBuffer, { sampleRate = VOICE_SAMPLE_RATE, chann
   const totalFrames = Math.floor(buf.length / (2 * ch));
   if (totalFrames === 0) return Buffer.alloc(0);
 
-  // Downmix to mono Int16 first
+  // Downmix to mono Float32
   const mono = new Float32Array(totalFrames);
   if (ch === 1) {
     for (let i = 0; i < totalFrames; i++) {
@@ -128,32 +438,61 @@ export function resamplePcm16(pcmBuffer, { sampleRate = VOICE_SAMPLE_RATE, chann
     return out;
   }
 
+  let src = mono;
+  if (srcRate > dstRate) {
+    const taps = buildHammingLowpass5(srcRate, dstRate);
+    const t0 = taps[0];
+    const t1 = taps[1];
+    const t2 = taps[2];
+    const t3 = taps[3];
+    const t4 = taps[4];
+    const lastIdx = totalFrames - 1;
+    const filtered = new Float32Array(totalFrames);
+    for (let i = 0; i < totalFrames; i++) {
+      const m2 = i >= 2 ? mono[i - 2] : mono[0];
+      const m1 = i >= 1 ? mono[i - 1] : mono[0];
+      const p1 = i + 1 <= lastIdx ? mono[i + 1] : mono[lastIdx];
+      const p2 = i + 2 <= lastIdx ? mono[i + 2] : mono[lastIdx];
+      filtered[i] = t0 * m2 + t1 * m1 + t2 * mono[i] + t3 * p1 + t4 * p2;
+    }
+    src = filtered;
+  }
+
   const ratio = srcRate / dstRate;
   const outSamples = Math.max(1, Math.round(totalFrames / ratio));
   const out = Buffer.allocUnsafe(outSamples * 2);
+  const lastIdx = totalFrames - 1;
   for (let i = 0; i < outSamples; i++) {
     const srcPos = i * ratio;
     const idx = Math.floor(srcPos);
     const frac = srcPos - idx;
-    const s0 = mono[Math.min(idx, totalFrames - 1)];
-    const s1 = mono[Math.min(idx + 1, totalFrames - 1)];
-    const sample = s0 + (s1 - s0) * frac;
+    const y0 = src[idx > 0 ? Math.min(idx - 1, lastIdx) : 0];
+    const y1 = src[Math.min(idx, lastIdx)];
+    const y2 = src[Math.min(idx + 1, lastIdx)];
+    const y3 = src[Math.min(idx + 2, lastIdx)];
+    const sample = catmullRom(y0, y1, y2, y3, frac);
     out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(sample))), i * 2);
   }
   return out;
 }
 
 /**
- * Real-time drift-compensated 20ms (16 kHz mono Int16LE) voice audio pacer.
- * Accepts arbitrary PCM chunks (e.g., from ffmpeg stdout, WebSocket binary frames, or synth)
- * and feeds exact 320-sample frames into `onFrame(Int16Array)` every 20 ms.
+ * Real-time drift-compensated 20ms mono Int16LE voice audio pacer (defaults to 24 kHz HD PCM).
+ * Accepts arbitrary PCM chunks (e.g., from ffmpeg stdout, Wyoming TTS, or synth), applies a
+ * gentle 3 ms cosine utterance fade-in + soft-knee peak limiting when gain !== 1, and feeds
+ * exact 20 ms Int16Array frames into `onFrame(Int16Array)` every 20 ms.
  */
 class VoiceAudioPacer {
-  constructor({ onFrame, onStart, onDrain, gain = 1.0 }) {
+  constructor({ onFrame, onStart, onDrain, gain = 1.0, sampleRate = VOICE_HD_OUT_SAMPLE_RATE }) {
     this.onFrame = onFrame;
     this.onStart = onStart;
     this.onDrain = onDrain;
     this.gain = gain;
+    this.sampleRate = Math.max(4000, Number(sampleRate) || VOICE_HD_OUT_SAMPLE_RATE);
+    this.frameSamples = Math.max(1, Math.round(this.sampleRate * 0.02));
+    this.frameBytes = this.frameSamples * 2;
+    this.fadeInTotalSamples = Math.max(1, Math.round(this.sampleRate * 0.003)); // 3 ms (72 samples @ 24 kHz)
+    this._fadeInPos = this.fadeInTotalSamples;
     this.queue = [];
     this.queuedBytes = 0;
     this.paused = false;
@@ -165,7 +504,7 @@ class VoiceAudioPacer {
   }
 
   isActive() {
-    return Boolean(this.active || (!this.paused && (this.queuedBytes >= VOICE_FRAME_BYTES || this.timer || this.activeChild)));
+    return Boolean(this.active || (!this.paused && (this.queuedBytes >= this.frameBytes || this.timer || this.activeChild)));
   }
 
   pushBytes(chunk) {
@@ -188,7 +527,7 @@ class VoiceAudioPacer {
 
   markInputEnded() {
     this.ending = true;
-    if (this.queuedBytes < VOICE_FRAME_BYTES && !this.paused) {
+    if (this.queuedBytes < this.frameBytes && !this.paused) {
       this._finish();
     }
   }
@@ -213,6 +552,7 @@ class VoiceAudioPacer {
     this.paused = false;
     this.ending = false;
     this.active = false;
+    this._fadeInPos = this.fadeInTotalSamples;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -257,9 +597,10 @@ class VoiceAudioPacer {
 
   _ensureRunning() {
     if (this.paused || this.timer) return;
-    if (this.queuedBytes < VOICE_FRAME_BYTES && !this.ending) return;
+    if (this.queuedBytes < this.frameBytes && !this.ending) return;
     if (!this.active) {
       this.active = true;
+      this._fadeInPos = 0;
       if (this.onStart) this.onStart();
     }
     this.nextTickAt = Date.now();
@@ -270,14 +611,31 @@ class VoiceAudioPacer {
     this.timer = null;
     if (this.paused) return;
 
-    if (this.queuedBytes >= VOICE_FRAME_BYTES || (this.ending && this.queuedBytes > 0)) {
-      const frameBytes = this._takeBytes(VOICE_FRAME_BYTES);
-      const samples = new Int16Array(VOICE_FRAME_SAMPLES);
+    if (this.queuedBytes >= this.frameBytes || (this.ending && this.queuedBytes > 0)) {
+      const frameBytes = this._takeBytes(this.frameBytes);
+      const samples = new Int16Array(this.frameSamples);
       const g = this.gain;
-      for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
-        const raw = frameBytes.readInt16LE(i * 2);
-        const scaled = g === 1 ? raw : Math.max(-32768, Math.min(32767, Math.round(raw * g)));
-        samples[i] = scaled;
+      const fadeTotal = this.fadeInTotalSamples;
+      const knee = 0.92 * 32767;
+      const ceiling = 0.995 * 32767;
+      const headroom = ceiling - knee;
+      for (let i = 0; i < this.frameSamples; i++) {
+        let val = frameBytes.readInt16LE(i * 2);
+        if (g !== 1) {
+          val *= g;
+          const abs = Math.abs(val);
+          if (abs > knee) {
+            const excess = abs - knee;
+            const limited = knee + headroom * Math.tanh(excess / headroom);
+            val = val < 0 ? -limited : limited;
+          }
+        }
+        if (this._fadeInPos < fadeTotal) {
+          const env = 0.5 * (1 - Math.cos((Math.PI * this._fadeInPos) / fadeTotal));
+          val *= env;
+          this._fadeInPos += 1;
+        }
+        samples[i] = Math.max(-32768, Math.min(32767, Math.round(val)));
       }
       this.onFrame(samples);
 
@@ -295,6 +653,7 @@ class VoiceAudioPacer {
       this._finish();
     } else if (this.active) {
       this.active = false;
+      this._fadeInPos = this.fadeInTotalSamples;
       if (this.onDrain) this.onDrain();
     }
   }
@@ -302,6 +661,7 @@ class VoiceAudioPacer {
   _finish() {
     this.ending = false;
     this.active = false;
+    this._fadeInPos = this.fadeInTotalSamples;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -708,14 +1068,21 @@ export class P2PBot extends EventEmitter {
     // Tracking diffs for clean events
     this.knownMessages = new Map(); // msgId -> { msg, rev }
     this.knownPeers = new Map(); // peerId -> { authorName, inVoice, voiceMuted, isBot }
+    this.peerVoiceCaps = new Map(); // peerId -> { v2pcm: boolean, vcodec: string }
     this.inVoice = false;
     this.voiceMuted = false;
 
     this.keepaliveTimer = null;
     this.keepaliveTicks = 0;
 
+    this._txResampler = new StreamingPcmResampler({ targetRate: VOICE_HD_OUT_SAMPLE_RATE });
+    this._v1FallbackResampler = new StreamingPcmResampler({ targetRate: VOICE_SAMPLE_RATE });
+    this._voiceV2TxSamples = 0;
+    this._voiceV2TxBuf = new Uint8Array(VOICE_V2_HEADER_BYTES + VOICE_HD_OUT_FRAME_BYTES);
+
     this.pacer = new VoiceAudioPacer({
-      onFrame: (int16) => this.sendVoicePcm(int16),
+      sampleRate: VOICE_HD_OUT_SAMPLE_RATE,
+      onFrame: (int16) => this.sendVoicePcm24k(int16),
       onStart: () => this.emit("audioStart"),
       onDrain: () => this.emit("audioEnd"),
       gain: 1.0,
@@ -849,6 +1216,7 @@ export class P2PBot extends EventEmitter {
     }
     this.directPeers.clear();
     this.voiceChannels.clear();
+    this.peerVoiceCaps.clear();
     for (const [, entry] of this.roomDialing) {
       if (entry.fallbackTimer) clearTimeout(entry.fallbackTimer);
       if (entry.hardTimer) clearTimeout(entry.hardTimer);
@@ -1020,6 +1388,144 @@ export class P2PBot extends EventEmitter {
   }
 
   /**
+   * Records a remote peer's negotiated voice capabilities (e.g., `{ v2pcm: true, vcodec: "opus48" }`).
+   */
+  setPeerVoiceCaps(peerId, caps = {}) {
+    const pid = String(peerId || "").trim();
+    if (!pid) return;
+    const prev = this.peerVoiceCaps.get(pid) || { v2pcm: false, vcodec: "adpcm16" };
+    const v2pcm = caps && typeof caps.v2pcm === "boolean" ? caps.v2pcm : prev.v2pcm;
+    const vcodec =
+      caps && typeof caps.vcodec === "string" && caps.vcodec.trim()
+        ? caps.vcodec.trim()
+        : prev.vcodec;
+    this.peerVoiceCaps.set(pid, { v2pcm, vcodec });
+  }
+
+  _recordPeerVoiceCapsFromSignal(msg) {
+    if (!msg || !msg.from) return;
+    const prev = this.peerVoiceCaps.get(msg.from);
+    const v2pcm = typeof msg.v2pcm === "boolean" ? msg.v2pcm : Boolean(prev?.v2pcm);
+    const vcodec =
+      typeof msg.vcodec === "string" && msg.vcodec.trim()
+        ? msg.vcodec.trim()
+        : prev?.vcodec || "adpcm16";
+    this.peerVoiceCaps.set(msg.from, { v2pcm, vcodec });
+  }
+
+  /**
+   * Encodes a 24 kHz mono Int16Array PCM frame (480 samples = 20 ms) into E2EE V2 lossless
+   * 16-bit PCM packets (`VOICE_V2_CODEC_PCM16 = 2`) for `v39+` peers advertising `v2pcm: true`,
+   * with automatic 16 kHz V1 IMA-ADPCM fallback strictly for legacy (`v38`) peers.
+   */
+  sendVoicePcm24k(int16Pcm24k) {
+    if (!this.inVoice || this.voiceMuted || !this.wasm) return 0;
+    if (!int16Pcm24k || int16Pcm24k.length === 0) return 0;
+    const samples =
+      int16Pcm24k instanceof Int16Array
+        ? int16Pcm24k
+        : new Int16Array(
+            int16Pcm24k.buffer,
+            int16Pcm24k.byteOffset,
+            Math.floor(int16Pcm24k.byteLength / 2)
+          );
+    if (samples.length === 0) return 0;
+
+    const statusPeers = Array.isArray(this.status?.peers) ? this.status.peers : null;
+    let statusPeerMap = null;
+    if (statusPeers && statusPeers.length > 0) {
+      statusPeerMap = new Map();
+      for (const p of statusPeers) {
+        if (p && p.peerId) statusPeerMap.set(p.peerId, p);
+      }
+    }
+
+    let hasV2PcmPeers = false;
+    let hasLegacyPeers = false;
+    for (const [pid, vdc] of this.voiceChannels.entries()) {
+      if (!vdc || vdc.readyState !== "open") continue;
+      const sp = statusPeerMap ? statusPeerMap.get(pid) : null;
+      if (sp && !sp.inVoice) continue;
+      if (this.peerVoiceCaps.get(pid)?.v2pcm === true) {
+        hasV2PcmPeers = true;
+      } else {
+        hasLegacyPeers = true;
+      }
+    }
+
+    if (!hasV2PcmPeers && !hasLegacyPeers) return 0;
+
+    let sent = 0;
+
+    if (hasV2PcmPeers) {
+      let sumSq = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        sumSq += s * s;
+      }
+      const rms = Math.min(65535, Math.round(Math.sqrt(sumSq / samples.length))) | 0;
+      const payloadBytes = samples.length * 2;
+      const totalLen = VOICE_V2_HEADER_BYTES + payloadBytes;
+      if (!this._voiceV2TxBuf || this._voiceV2TxBuf.length < totalLen) {
+        this._voiceV2TxBuf = new Uint8Array(totalLen);
+      }
+      const buf = this._voiceV2TxBuf;
+      const tsU32 = this._voiceV2TxSamples >>> 0;
+      buf[0] = VOICE_V2_CODEC_PCM16;
+      buf[1] = Math.round(VOICE_HD_OUT_SAMPLE_RATE / 1000) & 0xff;
+      buf[2] = rms & 0xff;
+      buf[3] = (rms >>> 8) & 0xff;
+      buf[4] = tsU32 & 0xff;
+      buf[5] = (tsU32 >>> 8) & 0xff;
+      buf[6] = (tsU32 >>> 16) & 0xff;
+      buf[7] = (tsU32 >>> 24) & 0xff;
+
+      const dv = new DataView(buf.buffer, buf.byteOffset + VOICE_V2_HEADER_BYTES, payloadBytes);
+      for (let i = 0; i < samples.length; i++) {
+        dv.setInt16(i * 2, samples[i], true);
+      }
+
+      this._voiceV2TxSamples = (this._voiceV2TxSamples + samples.length) >>> 0;
+      const packets = this.wasm.sealVoiceRaw(buf.subarray(0, totalLen));
+      for (const { peerId, data } of packets) {
+        if (this.peerVoiceCaps.get(peerId)?.v2pcm !== true) continue;
+        const vdc = this.voiceChannels.get(peerId);
+        if (vdc && vdc.readyState === "open" && (vdc.bufferedAmount || 0) < 65536) {
+          try {
+            vdc.send(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+            sent += 1;
+          } catch {
+            // drop frame cleanly under congestion
+          }
+        }
+      }
+    }
+
+    if (hasLegacyPeers) {
+      const pcm16k = this._v1FallbackResampler.resampleFrameInt16(samples, {
+        sampleRate: VOICE_HD_OUT_SAMPLE_RATE,
+      });
+      if (pcm16k.length > 0) {
+        const { packets } = this.wasm.sealVoicePcm(pcm16k);
+        for (const { peerId, data } of packets) {
+          if (this.peerVoiceCaps.get(peerId)?.v2pcm === true) continue;
+          const vdc = this.voiceChannels.get(peerId);
+          if (vdc && vdc.readyState === "open" && (vdc.bufferedAmount || 0) < 32768) {
+            try {
+              vdc.send(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+              sent += 1;
+            } catch {
+              // drop frame cleanly under congestion
+            }
+          }
+        }
+      }
+    }
+
+    return sent;
+  }
+
+  /**
    * Encodes a 16 kHz mono Int16Array PCM frame (typically 320 samples = 20ms) into E2EE V1
    * IMA-ADPCM voice packets and transmits them over every open `p2p-voice` DataChannel.
    */
@@ -1042,20 +1548,18 @@ export class P2PBot extends EventEmitter {
   }
 
   /**
-   * Pushes signed 16-bit little-endian PCM bytes into the paced voice sender.
-   * Automatically downmixes and resamples non-16kHz / multi-channel PCM (e.g. 22050/24000 Hz TTS).
+   * Pushes signed 16-bit little-endian PCM bytes into the paced 24 kHz voice sender.
+   * Seamlessly downmixes and streaming-cubic-resamples any input rate (16/22.05/24/48 kHz)
+   * into lossless 24 kHz mono PCM with zero chunk-boundary clicks.
    */
   pushPcmBytes(buf, { sampleRate = VOICE_SAMPLE_RATE, channels = 1 } = {}) {
     if (!buf || buf.length === 0) return;
     if (!this.inVoice) {
       this.joinVoice({ muted: false });
     }
-    const pcm16k =
-      sampleRate === VOICE_SAMPLE_RATE && channels === 1
-        ? buf
-        : resamplePcm16(buf, { sampleRate, channels, targetRate: VOICE_SAMPLE_RATE });
-    if (pcm16k.length > 0) {
-      this.pacer.pushBytes(pcm16k);
+    const pcm24k = this._txResampler.push(buf, { sampleRate, channels });
+    if (pcm24k.length > 0) {
+      this.pacer.pushBytes(pcm24k);
     }
   }
 
@@ -1064,6 +1568,8 @@ export class P2PBot extends EventEmitter {
    * buffered frame has been transmitted.
    */
   markAudioStreamEnd() {
+    this._txResampler.reset();
+    this._v1FallbackResampler.reset();
     this.pacer.markInputEnded();
   }
 
@@ -1095,18 +1601,20 @@ export class P2PBot extends EventEmitter {
   }
 
   stopAudio() {
+    this._txResampler.reset();
+    this._v1FallbackResampler.reset();
     this.pacer.stop();
   }
 
   /**
-   * Transcodes any local audio file or HTTP audio stream with ffmpeg into 16 kHz mono PCM
+   * Transcodes any local audio file or HTTP audio stream with ffmpeg into 24 kHz mono PCM
    * and streams it live into the E2EE voice channel.
    */
   playAudioFile(inputPathOrUrl, { ffmpegPath = "ffmpeg", gain = 1.0 } = {}) {
     if (!this.inVoice) {
       this.joinVoice({ muted: false });
     }
-    this.pacer.stop();
+    this.stopAudio();
     this.setAudioGain(gain);
 
     const args = [
@@ -1121,7 +1629,7 @@ export class P2PBot extends EventEmitter {
       "-acodec",
       "pcm_s16le",
       "-ar",
-      String(VOICE_SAMPLE_RATE),
+      String(VOICE_HD_OUT_SAMPLE_RATE),
       "-ac",
       "1",
       "pipe:1",
@@ -1196,23 +1704,30 @@ export class P2PBot extends EventEmitter {
     if (!this.inVoice) {
       this.joinVoice({ muted: false });
     }
-    this.pacer.stop();
+    this.stopAudio();
     this.setAudioGain(1.0);
 
     const chunks = [];
+    const sr = VOICE_HD_OUT_SAMPLE_RATE;
     for (const note of notes) {
       const durMs = Math.max(20, Number(note.durationMs) || 200);
-      const totalSamples = Math.round((VOICE_SAMPLE_RATE * durMs) / 1000);
+      const totalSamples = Math.round((sr * durMs) / 1000);
       const freq = Number(note.freqHz) || 0;
       const buf = Buffer.alloc(totalSamples * 2);
-      const fadeSamples = Math.min(160, Math.floor(totalSamples / 5));
+      const fadeSamples = Math.min(Math.round(sr * 0.01), Math.floor(totalSamples / 4));
       for (let i = 0; i < totalSamples; i++) {
         let env = 1;
-        if (i < fadeSamples) env = i / fadeSamples;
-        else if (i > totalSamples - fadeSamples) env = (totalSamples - i) / fadeSamples;
+        if (fadeSamples > 0) {
+          if (i < fadeSamples) {
+            env = 0.5 * (1 - Math.cos((Math.PI * i) / fadeSamples));
+          } else if (i >= totalSamples - fadeSamples) {
+            const tailIdx = totalSamples - 1 - i;
+            env = 0.5 * (1 - Math.cos((Math.PI * tailIdx) / fadeSamples));
+          }
+        }
         const val =
           freq > 0
-            ? Math.sin((2 * Math.PI * freq * i) / VOICE_SAMPLE_RATE) * amplitude * env
+            ? Math.sin((2 * Math.PI * freq * i) / sr) * amplitude * env
             : 0;
         const s16 = Math.max(-32768, Math.min(32767, Math.round(val * 32767)));
         buf.writeInt16LE(s16, i * 2);
@@ -1341,6 +1856,7 @@ export class P2PBot extends EventEmitter {
     switch (msg.t) {
       case "hello": {
         if (!msg.from || !msg.pk) return;
+        this._recordPeerVoiceCapsFromSignal(msg);
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
         const existing = this.directPeers.get(msg.from);
@@ -1371,6 +1887,7 @@ export class P2PBot extends EventEmitter {
         break;
       }
       case "offer": {
+        this._recordPeerVoiceCapsFromSignal(msg);
         await this._ensureRoomMyTag();
         if (msg.from && msg.pk) {
           await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
@@ -1379,6 +1896,7 @@ export class P2PBot extends EventEmitter {
         break;
       }
       case "answer": {
+        this._recordPeerVoiceCapsFromSignal(msg);
         await this._applyRoomAnswer(msg);
         break;
       }
@@ -1396,6 +1914,7 @@ export class P2PBot extends EventEmitter {
       }
       case "relay-open": {
         if (!msg.from || !msg.pk) return;
+        this._recordPeerVoiceCapsFromSignal(msg);
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
         const existing = this.directPeers.get(msg.from);
@@ -1416,6 +1935,7 @@ export class P2PBot extends EventEmitter {
       }
       case "relay-ack": {
         if (!msg.from || !msg.pk) return;
+        this._recordPeerVoiceCapsFromSignal(msg);
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
         const pending = this.relayPendingOpens.get(msg.from);
@@ -2001,6 +2521,9 @@ export class P2PBot extends EventEmitter {
   }
 
   async _applyRoomAnswer(msg) {
+    if (msg?.from) {
+      this._recordPeerVoiceCapsFromSignal(msg);
+    }
     const entry = this.roomDialing.get(msg.from);
     if (!entry || !msg.sdp) return;
     if (msg.from && msg.relays) {
@@ -2454,6 +2977,7 @@ export class P2PBot extends EventEmitter {
       const isOwning = this.directPeers.get(peerId) === peerEntry;
       if (isOwning) {
         this.directPeers.delete(peerId);
+        this.peerVoiceCaps.delete(peerId);
       }
       if (this.voiceChannels.get(peerId) === peerEntry.voiceDc) {
         this.voiceChannels.delete(peerId);

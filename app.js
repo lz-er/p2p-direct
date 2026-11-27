@@ -140,6 +140,7 @@ import {
   highlightCodeToHtml,
   normalizeCodeBlockInfo,
 } from "./code_highlight.js";
+import { createUiSoundPlayer } from "./ui_sounds.js";
 
 export { MediaSyncController, WatchTraceRecorder, highlightCodeToHtml, normalizeCodeBlockInfo };
 
@@ -147,7 +148,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v38";
+export const APP_VERSION = "v39";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -453,11 +454,79 @@ const VOICE_SAMPLE_RATE = 16000;
 const VOICE_FRAME_SAMPLES = 320; // 20ms @ 16kHz legacy ADPCM V1 (bots & fallback browsers)
 const VOICE_HD_SAMPLE_RATE = 48000;
 const VOICE_HD_FRAME_SAMPLES = 960; // 20ms @ 48kHz fullband Opus V2
-const VOICE_V2_CODEC_OPUS48 = 1;
-const VOICE_V2_HEADER_BYTES = 8; // [codecId:u8, sampleRateKhz:u8, rms:u16le, tsSamples:u32le]
+export const VOICE_V2_CODEC_OPUS48 = 1;
+export const VOICE_V2_CODEC_PCM16 = 2;
+export const VOICE_V2_HEADER_BYTES = 8; // [codecId:u8, sampleRateKhz:u8, rms:u16le, tsSamples:u32le]
 const VOICE_OPUS_BITRATE_DIRECT = 96000; // 96 kbps VBR fullband 48kHz mono (~240B/frame)
 const VOICE_OPUS_BITRATE_RAW = 128000;   // 128 kbps VBR studio/music preset on Direct P2P
 const VOICE_OPUS_BITRATE_RELAY = 48000;  // 48 kbps VBR fullband 48kHz mono (~120B/frame; crisp voice, light relay load)
+
+export function decodeVoiceV2Pcm16Payload(plain) {
+  if (!plain) return null;
+  const bytes =
+    plain instanceof Uint8Array
+      ? plain
+      : ArrayBuffer.isView(plain)
+        ? new Uint8Array(plain.buffer, plain.byteOffset, plain.byteLength)
+        : plain instanceof ArrayBuffer
+          ? new Uint8Array(plain)
+          : null;
+  if (!bytes || bytes.byteLength <= VOICE_V2_HEADER_BYTES) return null;
+  if (bytes[0] !== VOICE_V2_CODEC_PCM16) return null;
+
+  const sampleCount = Math.floor((bytes.byteLength - VOICE_V2_HEADER_BYTES) / 2);
+  if (sampleCount <= 0) return null;
+
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const sampleRateKhz = Math.max(8, Math.min(48, bytes[1] || 24));
+  const sampleRate = sampleRateKhz * 1000;
+  const rms = dv.getUint16(2, true);
+  const tsSamples = dv.getUint32(4, true);
+
+  const float32 = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    float32[i] = dv.getInt16(VOICE_V2_HEADER_BYTES + i * 2, true) / 32768;
+  }
+
+  const codec = sampleRate >= 48000 ? "pcm48" : sampleRate >= 24000 ? "pcm24" : "pcm16";
+  return {
+    codec,
+    sampleRate,
+    sampleRateKhz,
+    rms,
+    tsSamples,
+    float32,
+  };
+}
+
+export function formatVoiceCodecLabel(
+  codec,
+  { verbose = false, pill = false, isRelayed = false, opusBitrateKbps = null } = {}
+) {
+  const normalized = String(codec || "").toLowerCase();
+  if (verbose) {
+    if (normalized === "opus48") {
+      const explicitKbps = Number(opusBitrateKbps);
+      const kbps =
+        Number.isFinite(explicitKbps) && explicitKbps > 0
+          ? Math.round(explicitKbps)
+          : isRelayed
+            ? Math.round(VOICE_OPUS_BITRATE_RELAY / 1000)
+            : Math.round(VOICE_OPUS_BITRATE_DIRECT / 1000);
+      return `48 kHz Opus · ${kbps} kbps (V2)`;
+    }
+    if (normalized === "pcm48") return "48 kHz Lossless PCM (V2)";
+    if (normalized === "pcm24") return "24 kHz Lossless PCM (V2)";
+    if (normalized === "pcm16") return "16 kHz Lossless PCM (V2)";
+    return "16 kHz IMA-ADPCM (V1)";
+  }
+  let shortLabel = "ADPCM 16K";
+  if (normalized === "opus48") shortLabel = "OPUS 48K";
+  else if (normalized === "pcm48") shortLabel = "PCM 48K";
+  else if (normalized === "pcm24") shortLabel = "PCM 24K";
+  else if (normalized === "pcm16") shortLabel = "PCM 16K";
+  return pill ? shortLabel.toLowerCase() : shortLabel;
+}
 
 const AUDIO_PRESETS = Object.freeze({
   voice: {
@@ -1142,6 +1211,17 @@ export function formatBotRichText(raw) {
 const VOICE_BOT_CONTROL_MAX_BUTTONS = 4;
 const VOICE_BOT_CONTROL_ALLOWED_TONES = new Set(["cobalt", "mint", "ochre", "coral", "cyan", "ink"]);
 const VOICE_BOT_CONTROL_ALLOWED_STYLES = new Set(["primary", "success", "warning", "danger", "secondary"]);
+const VOICE_BOT_CONTROL_ALLOWED_ACTIVITIES = new Set(["idle", "listening", "thinking", "speaking"]);
+
+function inferVoiceControlActivity(rawActivity, statusText) {
+  const explicit = typeof rawActivity === "string" ? rawActivity.trim().toLowerCase() : "";
+  if (VOICE_BOT_CONTROL_ALLOWED_ACTIVITIES.has(explicit)) return explicit;
+  const s = String(statusText || "").trim();
+  if (/^thinking\b/i.test(s)) return "thinking";
+  if (/^listening\b/i.test(s)) return "listening";
+  if (/^speaking\b/i.test(s)) return "speaking";
+  return "idle";
+}
 
 /**
  * Sanitizes an optional `voiceControls` object from a bot card payload into a safe, bounded
@@ -1160,6 +1240,7 @@ export function sanitizeBotVoiceControls(rawVc) {
 
   const rawTone = typeof rawVc.statusTone === "string" ? rawVc.statusTone.trim().toLowerCase() : "";
   const statusTone = VOICE_BOT_CONTROL_ALLOWED_TONES.has(rawTone) ? rawTone : "cobalt";
+  const activity = inferVoiceControlActivity(rawVc.activity, status);
 
   const buttons = [];
   if (Array.isArray(rawVc.buttons)) {
@@ -1229,7 +1310,7 @@ export function sanitizeBotVoiceControls(rawVc) {
   }
 
   if (!status && buttons.length === 0) return null;
-  return { status, statusIcon, statusTone, buttons };
+  return { status, statusIcon, statusTone, activity, buttons };
 }
 
 function getRawVoiceControlsFromMessage(msg) {
@@ -1283,6 +1364,7 @@ export function extractPeerVoiceControls(messages, peerId) {
         status: clean.status,
         statusIcon: clean.statusIcon,
         statusTone: clean.statusTone,
+        activity: clean.activity,
         buttons: clean.buttons,
       };
     }
@@ -1301,6 +1383,7 @@ export function buildVoiceControlsSignature(vc) {
     vc.status || "",
     vc.statusIcon || "",
     vc.statusTone || "cobalt",
+    vc.activity || "idle",
     Array.isArray(vc.buttons)
       ? vc.buttons.map((b) => [
           b.id || "",
@@ -1325,6 +1408,7 @@ export function renderVoiceBotControlsHtml(peerId, vc) {
   if (!vc || typeof vc !== "object") return "";
   const safePeerId = escapeHtml(peerId || "");
   const safeMsgId = escapeHtml(vc.messageId || "");
+  const isThinking = vc.activity === "thinking";
   const parts = [];
 
   if (vc.status) {
@@ -1333,11 +1417,15 @@ export function renderVoiceBotControlsHtml(peerId, vc) {
       : "";
     const safeStatus = escapeHtml(vc.status);
     const tone = VOICE_BOT_CONTROL_ALLOWED_TONES.has(vc.statusTone) ? vc.statusTone : "cobalt";
+    const thinkingDotsHtml = isThinking
+      ? '<span class="voice-bot-thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span>'
+      : "";
     parts.push(`
       <div class="voice-bot-status-row">
-        <span class="voice-bot-status is-tone-${tone}" title="${safeStatus}">
+        <span class="voice-bot-status is-tone-${tone}${isThinking ? " is-thinking" : ""}" title="${safeStatus}">
           ${statusSvg}
           <span class="voice-bot-status-label">${safeStatus}</span>
+          ${thinkingDotsHtml}
         </span>
       </div>
     `);
@@ -2428,7 +2516,7 @@ export function detectRoomAssistant(messages, peers) {
     const rawCmds =
       meta && Array.isArray(meta.commands) && meta.commands.length > 0
         ? meta.commands
-        : ["/ha", "/listen"];
+        : ["/ai", "/listen"];
     const commands = rawCmds
       .map((c) => String(c || "").trim())
       .filter((c) => /^[/!][a-z0-9_-]{1,20}$/i.test(c))
@@ -2439,7 +2527,7 @@ export function detectRoomAssistant(messages, peers) {
       name,
       pipelineName,
       wakeWordLabel,
-      commands: commands.length > 0 ? commands : ["/ha", "/listen"],
+      commands: commands.length > 0 ? commands : ["/ai", "/listen"],
     };
   }
 
@@ -2447,18 +2535,18 @@ export function detectRoomAssistant(messages, peers) {
 }
 
 /**
- * Recognizes leading assistant/voice slash & bang commands (`/ha`, `/assist`, `!ha`, `!assist`,
- * `/listen`, `!listen`) in normal chat messages.
+ * Recognizes leading assistant/voice slash & bang commands (`/ai`, `!ai`, `/assist`, `!assist`,
+ * `/listen`, `!listen`, plus legacy `/ha`, `!ha`) in normal chat messages.
  */
 export function parseChatCommandPrefix(text) {
   const raw = String(text ?? "");
-  const m = raw.match(/^\s*([/!])(ha|assist|listen)(?:\s+([\s\S]*))?$/i);
+  const m = raw.match(/^\s*([/!])(ai|assist|listen|ha)(?:\s+([\s\S]*))?$/i);
   if (!m) return null;
   const prefix = m[1];
   const word = m[2].toLowerCase();
   const cmd = `${prefix}${word}`;
   const rest = (m[3] || "").trim();
-  const isAssistantPrompt = (word === "ha" || word === "assist") && rest.length > 0;
+  const isAssistantPrompt = (word === "ai" || word === "assist" || word === "ha") && rest.length > 0;
   return {
     cmd,
     displayCmd: cmd,
@@ -2481,17 +2569,17 @@ export function getSlashCommandSuggestions(
   const candidates = [];
 
   if (assistant && typeof assistant === "object") {
-    const name = stripBotEmojis(assistant.name || "Home Assistant").trim() || "Home Assistant";
+    const name = stripBotEmojis(assistant.name || "Assistant").trim() || "Assistant";
     const pipe = stripBotEmojis(assistant.pipelineName || "").trim();
     const pipeSuffix = pipe ? ` (${pipe})` : "";
     candidates.push(
       {
-        command: "/ha ",
-        label: "/ha <message>",
+        command: "/ai ",
+        label: "/ai <message>",
         desc: `Ask ${name}${pipeSuffix} — answers in voice + chat`,
         submit: false,
         icon: "home",
-        keywords: ["/ha", "/assist"],
+        keywords: ["/ai", "/assist", "/ha"],
       },
       {
         command: "/listen",
@@ -2502,12 +2590,12 @@ export function getSlashCommandSuggestions(
         keywords: ["/listen"],
       },
       {
-        command: "/ha",
-        label: "/ha",
-        desc: "Show or refresh Home Assistant status card",
+        command: "/ai",
+        label: "/ai",
+        desc: `Show or refresh ${name} status card`,
         submit: true,
         icon: "refresh",
-        keywords: ["/ha", "/assist"],
+        keywords: ["/ai", "/assist", "/ha"],
       }
     );
   }
@@ -3154,6 +3242,13 @@ export class P2PDirectApp {
 
     // Personal audio settings (session-only; zero permanent storage)
     this.audioSettings = loadSessionAudioSettings();
+    this.uiSounds = createUiSoundPlayer({
+      getEnabled: () => this.audioSettings?.uiSounds !== false,
+      getOutputDeviceId: () => this.audioSettings?.outputDeviceId || "",
+    });
+    this._soundKnownRoomPeers = new Set();
+    this._soundKnownVoicePeers = new Set();
+    this._soundSuppressUntilMs = Date.now() + 1500;
 
     // Negotiated voice codec capability per peer ("opus48" | "adpcm16")
     this.peerVoiceCodec = new Map();
@@ -3456,6 +3551,7 @@ export class P2PDirectApp {
       "audio-ec",
       "audio-ns",
       "audio-agc",
+      "audio-ui-sounds",
       "voice-join-card",
       "btn-voice-join",
       "btn-voice-listen",
@@ -3602,9 +3698,10 @@ export class P2PDirectApp {
       "chat-panel",
       "chat-drop-overlay",
       "chat-composer-dropzone",
+      "chat-thinking-bar",
       "chat-slash-menu",
       "composer-agent-pill",
-      "btn-composer-ha",
+      "btn-composer-ai",
       "chat-image-tray",
       "chat-image-input",
       "btn-attach-image",
@@ -4105,6 +4202,13 @@ export class P2PDirectApp {
       this.el["audio-agc"].addEventListener("change", () =>
         this.updateAudioSetting("autoGainControl", this.el["audio-agc"].checked, {
           applyTrackConstraints: true,
+        })
+      );
+    }
+    if (this.el["audio-ui-sounds"]) {
+      this.el["audio-ui-sounds"].addEventListener("change", () =>
+        this.updateAudioSetting("uiSounds", this.el["audio-ui-sounds"].checked, {
+          keepPreset: true,
         })
       );
     }
@@ -4669,8 +4773,8 @@ export class P2PDirectApp {
       }
     });
 
-    if (this.el["btn-composer-ha"]) {
-      this.el["btn-composer-ha"].addEventListener("click", () => {
+    if (this.el["btn-composer-ai"]) {
+      this.el["btn-composer-ai"].addEventListener("click", () => {
         this.setComposerAgentMode(!this.composerAgentMode, { focus: true });
       });
     }
@@ -4744,7 +4848,7 @@ export class P2PDirectApp {
       this.closeSlashMenu();
       let text = this.el["chat-text-input"].value.trim();
       if (this.composerAgentMode && text && !/^[/!]/.test(text)) {
-        text = `/ha ${text}`;
+        text = `/ai ${text}`;
       }
       const images = [];
       const videos = [];
@@ -8183,6 +8287,7 @@ export class P2PDirectApp {
       peerCount: this.directPeers.size,
       logCount: this.logMessages.length,
       vcodec: this.getLocalVoiceCodec(),
+      v2pcm: true,
       requestReply: Boolean(requestReply),
     });
   }
@@ -9018,6 +9123,7 @@ export class P2PDirectApp {
     this.voice.joinOrder = [];
     this.voice.lastRosterKey = "";
     this.voice.renderedKeys.clear();
+    this._resetPeerPresenceSoundState();
 
     for (const entry of this.roomDialing.values()) {
       try {
@@ -9348,6 +9454,7 @@ export class P2PDirectApp {
     this._lastRoomTimersSig = "";
     this.composerAgentMode = false;
     this._detectedAssistant = null;
+    this._resetPeerPresenceSoundState();
     this.closeSlashMenu();
     this.warframeBot.dismissedInRoomTopic = null;
     this.builtinBots.dismissedByRoom = {};
@@ -11875,6 +11982,7 @@ export class P2PDirectApp {
       peers: Array.from(this.directPeers.keys()),
       relays: status.connectedUrls || [],
       vcodec: this.getLocalVoiceCodec(),
+      v2pcm: true,
       reply: Boolean(requestReply),
       ts: Date.now(),
     });
@@ -11990,6 +12098,7 @@ export class P2PDirectApp {
           pk: this.status.e2ee.publicKey,
           relays: status?.connectedUrls || [],
           vcodec: this.getLocalVoiceCodec(),
+          v2pcm: true,
         });
         await this.openRelayVirtualPeer(msg.from, msg.name || "Peer", msg.pk);
         break;
@@ -12068,6 +12177,7 @@ export class P2PDirectApp {
         pk: this.status.e2ee.publicKey,
         relays: status?.connectedUrls || [],
         vcodec: this.getLocalVoiceCodec(),
+        v2pcm: true,
       });
     };
 
@@ -12842,6 +12952,7 @@ export class P2PDirectApp {
         pk: this.status.e2ee.publicKey,
         relays: status?.connectedUrls || [],
         vcodec: this.getLocalVoiceCodec(),
+        v2pcm: true,
         sdp: fullSdp,
       });
 
@@ -12986,6 +13097,7 @@ export class P2PDirectApp {
         pk: this.status.e2ee.publicKey,
         relays: status?.connectedUrls || [],
         vcodec: this.getLocalVoiceCodec(),
+        v2pcm: true,
         sdp: fullSdp,
       });
 
@@ -13590,6 +13702,9 @@ export class P2PDirectApp {
     }
     if (this.el["audio-agc"]) {
       this.el["audio-agc"].checked = Boolean(s.autoGainControl);
+    }
+    if (this.el["audio-ui-sounds"]) {
+      this.el["audio-ui-sounds"].checked = s.uiSounds !== false;
     }
     for (const btn of document.querySelectorAll("[data-audio-preset]")) {
       btn.classList.toggle("active", btn.dataset.audioPreset === s.preset);
@@ -14803,6 +14918,7 @@ export class P2PDirectApp {
       this.updateVoiceCodecMeta();
       this.syncAudioSettingsUI();
       this.renderAll();
+      this.uiSounds?.play("self_join");
       this.showToast(
         effectiveListenOnly
           ? "Joined voice channel (listen-only)"
@@ -15075,12 +15191,62 @@ export class P2PDirectApp {
       if (!this.voice.inVoice || !this.wasm || !pktBytes || pktBytes.byteLength < 4) return;
       const isRelayed = direct?.transport === "relay";
 
-      // V2 High-Definition 48 kHz Opus E2EE packet ("V2")
+      // V2 High-Definition E2EE packet ("V2": 48 kHz Opus or Lossless 16/24/48 kHz PCM16)
       if (pktBytes[0] === 0x56 && pktBytes[1] === 0x32) {
-        this.recordPeerVoiceCodec(peerId, "opus48");
         const plain = this.wasm.openVoiceRaw(peerId, pktBytes);
         if (!plain || plain.byteLength <= VOICE_V2_HEADER_BYTES) return;
-        if (plain[0] !== VOICE_V2_CODEC_OPUS48) return;
+        const codecId = plain[0];
+
+        if (codecId === VOICE_V2_CODEC_PCM16) {
+          // IMPORTANT: Do NOT call recordPeerVoiceCodec(peerId, "opus48") here!
+          // Keep the peer's negotiated TX codec unchanged (e.g. "adpcm16" for bots)
+          // so browser mic capture stays on 16 kHz V1 ADPCM for Wyoming wake-word/STT.
+          const decoded = decodeVoiceV2Pcm16Payload(plain);
+          if (!decoded) return;
+
+          const mixer = this.ensurePeerVoiceMixer(peerId);
+          const nowPerf = performance.now();
+          const frameSamples = Math.max(160, Math.round(decoded.sampleRate * 0.02));
+          if (mixer.lastTsSamples !== null && nowPerf - mixer.lastTsAt < 260) {
+            const delta = (decoded.tsSamples - mixer.lastTsSamples) | 0;
+            if (delta > frameSamples * 1.5 && delta < frameSamples * 25) {
+              mixer.lostFrames += Math.max(0, Math.round(delta / frameSamples) - 1);
+            } else if (delta < 0 && delta > -frameSamples * 25) {
+              mixer.lostFrames = Math.max(0, mixer.lostFrames - 1);
+            }
+          }
+          if (
+            mixer.lastTsSamples === null ||
+            ((decoded.tsSamples - mixer.lastTsSamples) | 0) > 0 ||
+            nowPerf - mixer.lastTsAt >= 260
+          ) {
+            mixer.lastTsSamples = decoded.tsSamples;
+          }
+          mixer.lastTsAt = nowPerf;
+          const prevCodec = mixer.codec;
+          mixer.codec = decoded.codec;
+          mixer.rms = decoded.rms;
+          mixer.peakRms = Math.max(decoded.rms, Math.round((mixer.peakRms || 0) * 0.88));
+          mixer.packetsReceived += 1;
+          mixer.decodedFrames += 1;
+          mixer.lastPktBytes = pktBytes.byteLength;
+          mixer.lastAudioAt = Date.now();
+          this._recordRateSample(mixer.rxWindow, pktBytes.byteLength, nowPerf);
+          this.recordTopologyPacket(peerId, "rx", "voice", pktBytes.byteLength);
+
+          if (prevCodec !== decoded.codec) {
+            if (this.el?.["peer-list"]) this.renderPeers();
+            if (this.el?.["topology-inspector"]) this.renderTopologyInspector();
+          }
+
+          if (!this.voice.deafened && !mixer.muted && this.voice.audioCtx) {
+            this._pushDecodedPcmToMixer(mixer, decoded.float32, decoded.sampleRate, isRelayed);
+          }
+          return;
+        }
+
+        if (codecId !== VOICE_V2_CODEC_OPUS48) return;
+        this.recordPeerVoiceCodec(peerId, "opus48");
 
         const dv = new DataView(plain.buffer, plain.byteOffset, VOICE_V2_HEADER_BYTES);
         const sampleRate = (plain[1] || 48) * 1000;
@@ -15215,6 +15381,7 @@ export class P2PDirectApp {
     this.renderVoicePanel(true);
     this.renderHeader();
     this.updateVoiceMeters();
+    this.uiSounds?.play(this.voice.muted ? "mute" : "unmute");
   }
 
   toggleVoiceDeafen() {
@@ -15236,6 +15403,7 @@ export class P2PDirectApp {
     }
     this.renderVoicePanel(true);
     this.updateVoiceMeters();
+    this.uiSounds?.play(this.voice.deafened ? "deafen" : "undeafen");
   }
 
   setPeerVoiceVolume(peerId, vol) {
@@ -15362,6 +15530,7 @@ export class P2PDirectApp {
     if (!silent) {
       this.el["voice-notice"].classList.add("hidden");
       this.renderAll();
+      this.uiSounds?.play("self_leave");
       this.showToast("Left voice channel");
     }
   }
@@ -16834,33 +17003,89 @@ export class P2PDirectApp {
 
   /* ================= Rendering ================= */
 
+  _resetPeerPresenceSoundState(suppressMs = 1500) {
+    this._soundKnownRoomPeers = new Set();
+    this._soundKnownVoicePeers = new Set();
+    this._soundSuppressUntilMs = Date.now() + Math.max(0, Number(suppressMs) || 0);
+  }
+
+  _syncPeerPresenceSounds(nowMs = Date.now()) {
+    const peers = Array.isArray(this.status?.peers) ? this.status.peers : [];
+    const selfId = this.status?.peerId || "";
+    const nextRoomIds = new Set();
+    const nextVoiceIds = new Set();
+    for (const p of peers) {
+      if (!p || !p.peerId || p.peerId === selfId) continue;
+      nextRoomIds.add(p.peerId);
+      if (p.inVoice) nextVoiceIds.add(p.peerId);
+    }
+
+    const prevRoom = this._soundKnownRoomPeers || new Set();
+    const prevVoice = this._soundKnownVoicePeers || new Set();
+    this._soundKnownRoomPeers = nextRoomIds;
+    this._soundKnownVoicePeers = nextVoiceIds;
+
+    if (nowMs < (this._soundSuppressUntilMs || 0)) return;
+    if (this.voice?.deafened) return;
+
+    let hasNewVoiceJoin = false;
+    for (const id of nextVoiceIds) {
+      if (!prevVoice.has(id)) {
+        hasNewVoiceJoin = true;
+        break;
+      }
+    }
+    let hasVoiceLeave = false;
+    for (const id of prevVoice) {
+      if (!nextVoiceIds.has(id)) {
+        hasVoiceLeave = true;
+        break;
+      }
+    }
+    let hasNewRoomJoin = false;
+    for (const id of nextRoomIds) {
+      if (!prevRoom.has(id)) {
+        hasNewRoomJoin = true;
+        break;
+      }
+    }
+
+    if (hasNewVoiceJoin) {
+      this.uiSounds?.play("voice_join");
+    } else if (hasNewRoomJoin) {
+      this.uiSounds?.play("peer_join");
+    } else if (hasVoiceLeave) {
+      this.uiSounds?.play("voice_leave");
+    }
+  }
+
   syncAssistantComposerUi() {
-    const assistant = detectRoomAssistant(
-      this._getMessagesForVoiceControls(),
-      this.status?.peers || []
-    );
+    const messages = this._getMessagesForVoiceControls();
+    const peers = this.status?.peers || [];
+    const assistant = detectRoomAssistant(messages, peers);
     this._detectedAssistant = assistant;
     if (!assistant && this.composerAgentMode) {
       this.composerAgentMode = false;
     }
 
     const active = Boolean(assistant && this.composerAgentMode);
-    const haBtn = this.el?.["btn-composer-ha"];
+    const aiBtn = this.el?.["btn-composer-ai"];
     const pill = this.el?.["composer-agent-pill"];
     const form = this.el?.["chat-composer-form"];
     const input = this.el?.["chat-text-input"];
+    const thinkingBar = this.el?.["chat-thinking-bar"];
 
-    if (haBtn) {
-      haBtn.classList.toggle("hidden", !assistant);
-      haBtn.classList.toggle("is-active", active);
-      if (typeof haBtn.setAttribute === "function") {
-        haBtn.setAttribute("aria-pressed", active ? "true" : "false");
+    if (aiBtn) {
+      aiBtn.classList.toggle("hidden", !assistant);
+      aiBtn.classList.toggle("is-active", active);
+      if (typeof aiBtn.setAttribute === "function") {
+        aiBtn.setAttribute("aria-pressed", active ? "true" : "false");
       }
       if (assistant) {
         const pipe = assistant.pipelineName ? ` (${assistant.pipelineName})` : "";
-        haBtn.title = active
-          ? `Direct Assistant mode active (${assistant.name}${pipe}) — click or press Esc to return to normal chat`
-          : `Toggle /ha mode — ask ${assistant.name}${pipe} in voice + chat`;
+        aiBtn.title = active
+          ? `Direct /ai mode active (${assistant.name}${pipe}) — click or press Esc to return to normal chat`
+          : `Toggle /ai mode — ask ${assistant.name}${pipe} in voice + chat`;
       }
     }
     if (pill) {
@@ -16877,6 +17102,40 @@ export class P2PDirectApp {
         input.placeholder = `Ask ${assistant.name} (${pipePart})…`;
       } else {
         input.placeholder = "Write a message…";
+      }
+    }
+
+    if (thinkingBar) {
+      let thinkingBot = null;
+      for (const p of peers) {
+        if (!p || !p.peerId) continue;
+        const vc = extractPeerVoiceControls(messages, p.peerId);
+        if (vc && vc.activity === "thinking") {
+          const isDetected = assistant && assistant.peerId === p.peerId;
+          thinkingBot = {
+            name: stripBotEmojis(p.authorName || (isDetected ? assistant.name : "Assistant")).trim() || "Assistant",
+            pipelineName: isDetected ? assistant.pipelineName : "",
+          };
+          break;
+        }
+      }
+      if (thinkingBot) {
+        const pipeHtml = thinkingBot.pipelineName
+          ? `<span class="chat-thinking-pipeline">${escapeHtml(thinkingBot.pipelineName)}</span>`
+          : "";
+        const nextHtml =
+          `<span class="voice-bot-thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span>` +
+          `<span class="chat-thinking-label"><strong>${escapeHtml(thinkingBot.name)}</strong> is thinking</span>` +
+          pipeHtml;
+        if (thinkingBar.innerHTML !== nextHtml) {
+          thinkingBar.innerHTML = nextHtml;
+        }
+        thinkingBar.classList.remove("hidden");
+      } else {
+        thinkingBar.classList.add("hidden");
+        if (thinkingBar.innerHTML !== "") {
+          thinkingBar.innerHTML = "";
+        }
       }
     }
   }
@@ -16987,6 +17246,7 @@ export class P2PDirectApp {
 
   renderAll() {
     const colorsChanged = this._syncPeerColorsFromStatus();
+    this._syncPeerPresenceSounds();
     this.syncLayoutAttributes();
     this.renderHeader();
     this.renderRoomCard();
@@ -17419,6 +17679,8 @@ export class P2PDirectApp {
         ? renderVoiceBotControlsHtml(p.peerId, voiceControls)
         : "";
       const botControlsCls = botControlsHtml ? " has-bot-controls" : "";
+      const botThinkingCls =
+        voiceControls && voiceControls.activity === "thinking" ? " is-bot-thinking" : "";
 
       if (this.voice.inVoice) {
         const mixer = this.voice.peerMixers.get(p.peerId);
@@ -17432,7 +17694,7 @@ export class P2PDirectApp {
             : "Live";
 
         items.push(`
-          <li class="voice-card ${peerTheme}${peerColorMuted ? " is-color-muted" : ""}${botControlsCls}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
+          <li class="voice-card ${peerTheme}${peerColorMuted ? " is-color-muted" : ""}${botControlsCls}${botThinkingCls}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
             <div class="voice-tile-top">
               <span class="tile-mono">${initials}</span>
               <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span></span>
@@ -17469,7 +17731,7 @@ export class P2PDirectApp {
       } else {
         const previewStateText = p.voiceMuted ? "Muted" : "In Voice";
         items.push(`
-          <li class="voice-card is-channel-preview ${peerTheme}${p.voiceMuted ? " is-color-muted" : ""}${botControlsCls}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
+          <li class="voice-card is-channel-preview ${peerTheme}${p.voiceMuted ? " is-color-muted" : ""}${botControlsCls}${botThinkingCls}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
             <div class="voice-tile-top">
               <span class="tile-mono">${initials}</span>
               <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${previewStateText}</span></span>
@@ -17707,7 +17969,7 @@ export class P2PDirectApp {
     const tech = this._getPeerTechInfo(peer.peerId);
     const isRelayed = tech.transport === "relay";
     const codec = mixer?.codec || this.getPeerVoiceCodec(peer.peerId);
-    const codecLabel = codec === "opus48" ? "OPUS 48K" : "ADPCM 16K";
+    const codecLabel = formatVoiceCodecLabel(codec);
     const transportTone = isRelayed ? "is-warn" : "is-ok";
 
     const vdc = this.voiceChannels.get(peer.peerId);
@@ -18438,8 +18700,9 @@ export class P2PDirectApp {
       const originBadge = isRelayed
         ? `<span class="badge relay" title="${escapeHtml(tech.detailLabel)}">e2ee relay</span>`
         : `<span class="badge direct" title="${escapeHtml(tech.detailLabel)}">${escapeHtml(tech.shortLabel.toLowerCase())}</span>`;
+      const livePeerCodec = this.voice.peerMixers.get(p.peerId)?.codec || this.getPeerVoiceCodec(p.peerId);
       const voiceBadge = p.inVoice
-        ? `<span class="badge voice-tag">${p.voiceMuted ? "voice · muted" : this.getPeerVoiceCodec(p.peerId) === "opus48" ? "opus 48k" : "adpcm 16k"}</span>`
+        ? `<span class="badge voice-tag">${p.voiceMuted ? "voice · muted" : escapeHtml(formatVoiceCodecLabel(livePeerCodec, { pill: true }))}</span>`
         : "";
       const effRtt = typeof p.rttMs === "number" ? p.rttMs : tech.statsRttMs;
       const rttLabel = typeof effRtt === "number" ? ` · ${effRtt}ms` : "";
@@ -18842,13 +19105,16 @@ export class P2PDirectApp {
 
     const effRtt = typeof peer.rttMs === "number" ? peer.rttMs : tech.statsRttMs;
     const rttText = typeof effRtt === "number" ? `${effRtt} ms` : "measuring…";
-    const peerCodec = this.getPeerVoiceCodec(selId);
+    const peerCodec = this.voice.peerMixers.get(selId)?.codec || this.getPeerVoiceCodec(selId);
+    const opusBitrateKbps = Math.round(
+      (isRelayed
+        ? VOICE_OPUS_BITRATE_RELAY
+        : this.audioSettings.preset === "raw"
+          ? VOICE_OPUS_BITRATE_RAW
+          : VOICE_OPUS_BITRATE_DIRECT) / 1000
+    );
     const voiceText = peer.inVoice
-      ? peerCodec === "opus48"
-        ? isRelayed
-          ? `48 kHz Opus · ${Math.round(VOICE_OPUS_BITRATE_RELAY / 1000)} kbps (V2)`
-          : `48 kHz Opus · ${Math.round((this.audioSettings.preset === "raw" ? VOICE_OPUS_BITRATE_RAW : VOICE_OPUS_BITRATE_DIRECT) / 1000)} kbps (V2)`
-        : "16 kHz IMA-ADPCM (V1)"
+      ? formatVoiceCodecLabel(peerCodec, { verbose: true, isRelayed, opusBitrateKbps })
       : "Not in voice";
     const flowText = st
       ? `TX ${st.txPps}/s · RX ${st.rxPps}/s (${st.kbps} kbps)`

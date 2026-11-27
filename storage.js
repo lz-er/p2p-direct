@@ -46,6 +46,7 @@ export const DEFAULT_AUDIO_SETTINGS = Object.freeze({
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true,
+  uiSounds: true,
 });
 
 function clampNum(val, min, max, fallback) {
@@ -84,6 +85,8 @@ export function sanitizeAudioSettings(raw) {
       typeof src.autoGainControl === "boolean"
         ? src.autoGainControl
         : DEFAULT_AUDIO_SETTINGS.autoGainControl,
+    uiSounds:
+      typeof src.uiSounds === "boolean" ? src.uiSounds : DEFAULT_AUDIO_SETTINGS.uiSounds,
   };
 }
 

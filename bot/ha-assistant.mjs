@@ -16,12 +16,25 @@
  * using `SUPERVISOR_TOKEN` automatically.
  */
 
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { P2PBot, VOICE_SAMPLE_RATE } from "./sdk.mjs";
 import { WyomingSatelliteServer } from "./wyoming.mjs";
+
+const NO_CONTROL_PIPELINE_RE = /no[\s_-]*control|chat[\s_-]*only|read[\s_-]*only/i;
+
+function resolveDefaultStateFile() {
+  try {
+    fs.accessSync("/data", fs.constants.W_OK);
+    return "/data/p2p-voice-state.json";
+  } catch {
+    return "";
+  }
+}
 
 export const TIMER_LIST_FEATURES = Object.freeze({
   CREATE_TIMER: 1,
@@ -273,6 +286,8 @@ export function parseHaCliArgs(argv) {
     passphraseHelper: env.HA_PASSPHRASE_HELPER || "input_text.p2p_voice_room_passphrase",
     wakeWordEnabled: env.WAKE_WORD_ENABLED !== "0",
     wakeWordLabel: env.WAKE_WORD_LABEL || "",
+    noControlPipeline: env.HA_NO_CONTROL_PIPELINE || "",
+    stateFile: env.P2P_STATE_FILE !== undefined ? env.P2P_STATE_FILE : resolveDefaultStateFile(),
     timerListEntities: env.HA_TIMER_LIST_ENTITIES
       ? env.HA_TIMER_LIST_ENTITIES.split(",").map((s) => s.trim()).filter(Boolean)
       : [],
@@ -301,6 +316,8 @@ export function parseHaCliArgs(argv) {
     else if (f === "--passphrase-helper" && next) { args.passphraseHelper = next; i++; }
     else if (f === "--no-wake-word") { args.wakeWordEnabled = false; }
     else if (f === "--wake-word-label" && next) { args.wakeWordLabel = next; i++; }
+    else if (f === "--no-control-pipeline" && next) { args.noControlPipeline = next; i++; }
+    else if (f === "--state-file" && next) { args.stateFile = next; i++; }
     else if (f === "--timer-list-entities" && next) {
       args.timerListEntities = next.split(",").map((s) => s.trim()).filter(Boolean);
       i++;
@@ -326,6 +343,7 @@ export class HomeAssistantWsClient extends EventEmitter {
     passphraseHelper = "",
     wyomingName = "p2p-direct-voice",
     timerListEntities = [],
+    noControlPipeline = "",
   } = {}) {
     super();
     this.haUrl = String(haUrl || "").replace(/\/+$/, "");
@@ -333,6 +351,7 @@ export class HomeAssistantWsClient extends EventEmitter {
     this.roomHelper = String(roomHelper || "").trim();
     this.passphraseHelper = String(passphraseHelper || "").trim();
     this.wyomingName = String(wyomingName || "p2p-direct-voice").trim() || "p2p-direct-voice";
+    this.configuredNoControlPipeline = String(noControlPipeline || "").trim();
     this._assistantSelectPattern = buildAssistantSelectPattern(this.wyomingName);
     this._satelliteEntityPattern = buildSatelliteEntityPattern(this.wyomingName);
     const cleanedTimerEntities = Array.isArray(timerListEntities)
@@ -352,6 +371,9 @@ export class HomeAssistantWsClient extends EventEmitter {
     this.helperPassphrase = "";
     this.assistantSelectEntity = "";
     this.assistantSelectState = "";
+    this.assistantSelectOptions = [];
+    this.pipelines = [];
+    this.noControlPipeline = null; // { id, name, ttsEngine } | null
     this.pipelineId = "";
     this.pipelineName = "";
     this.pipelineTtsEngine = "";
@@ -570,6 +592,11 @@ export class HomeAssistantWsClient extends EventEmitter {
       ) {
         this.assistantSelectEntity = entityId;
         this.assistantSelectState = cleaned;
+        if (Array.isArray(d.new_state?.attributes?.options)) {
+          this.assistantSelectOptions = d.new_state.attributes.options
+            .map((o) => String(o ?? "").trim())
+            .filter(Boolean);
+        }
         this.refreshWakeWordInfo({ skipGetStates: true }).catch(() => {});
       } else if (this._satelliteEntityPattern.test(String(entityId || ""))) {
         if (entityId !== this.satelliteEntityId) {
@@ -802,6 +829,11 @@ export class HomeAssistantWsClient extends EventEmitter {
         } else if (this._assistantSelectPattern.test(String(st.entity_id || ""))) {
           this.assistantSelectEntity = st.entity_id;
           this.assistantSelectState = cleaned;
+          if (Array.isArray(st?.attributes?.options)) {
+            this.assistantSelectOptions = st.attributes.options
+              .map((o) => String(o ?? "").trim())
+              .filter(Boolean);
+          }
         } else if (this._satelliteEntityPattern.test(String(st.entity_id || ""))) {
           this.satelliteEntityId = st.entity_id;
         } else if (this._isTimerListAllowed(st.entity_id)) {
@@ -822,6 +854,7 @@ export class HomeAssistantWsClient extends EventEmitter {
     if (availableTimerLists.length > 0) {
       await Promise.allSettled(availableTimerLists.map((eid) => this._subscribeTimerList(eid)));
     }
+    this.emit("bootstrapped");
   }
 
   async refreshWakeWordInfo({ skipGetStates = false } = {}) {
@@ -836,6 +869,11 @@ export class HomeAssistantWsClient extends EventEmitter {
               const val = String(st.state ?? "").trim();
               this.assistantSelectEntity = st.entity_id;
               this.assistantSelectState = /^(unknown|unavailable|none|off)$/i.test(val) ? "" : val;
+              if (Array.isArray(st?.attributes?.options)) {
+                this.assistantSelectOptions = st.attributes.options
+                  .map((o) => String(o ?? "").trim())
+                  .filter(Boolean);
+              }
             } else if (this._satelliteEntityPattern.test(eid)) {
               if (this.satelliteEntityId !== st.entity_id) {
                 this.satelliteEntityId = st.entity_id;
@@ -853,6 +891,28 @@ export class HomeAssistantWsClient extends EventEmitter {
       const res = await this.call("assist_pipeline/pipeline/list", {}, { timeoutMs: 4000 });
       const pipelines = Array.isArray(res?.pipelines) ? res.pipelines : [];
       const preferredId = String(res?.preferred_pipeline || "").trim();
+      this.pipelines = pipelines.map((p) => ({
+        id: String(p?.id || "").trim(),
+        name: String(p?.name || "").trim(),
+        ttsEngine: String(p?.tts_engine || "").trim(),
+        wakeWordId: String(p?.wake_word_id || "").trim(),
+        wakeWordEntity: String(p?.wake_word_entity || "").trim(),
+      }));
+
+      let resolvedNoControl = null;
+      if (this.configuredNoControlPipeline) {
+        const target = this.configuredNoControlPipeline.toLowerCase();
+        resolvedNoControl =
+          this.pipelines.find((p) => p.name.toLowerCase() === target) ||
+          this.pipelines.find((p) => p.id.toLowerCase() === target) ||
+          null;
+      } else {
+        resolvedNoControl = this.pipelines.find((p) => NO_CONTROL_PIPELINE_RE.test(p.name)) || null;
+      }
+      this.noControlPipeline = resolvedNoControl
+        ? { id: resolvedNoControl.id, name: resolvedNoControl.name, ttsEngine: resolvedNoControl.ttsEngine }
+        : null;
+
       if (pipelines.length === 0) return null;
 
       const selector = String(this.assistantSelectState || "").trim();
@@ -904,6 +964,7 @@ export class HomeAssistantWsClient extends EventEmitter {
         assistantSelectEntity: this.assistantSelectEntity,
         satelliteEntityId: this.satelliteEntityId,
         satelliteDeviceId: this.satelliteDeviceId,
+        noControlPipeline: this.noControlPipeline,
       };
       if (changed) {
         this.emit("wakeWordInfoChanged", info);
@@ -913,6 +974,20 @@ export class HomeAssistantWsClient extends EventEmitter {
       // Best-effort: older/mock HA instances without assist_pipeline/pipeline/list stay unaffected
       return null;
     }
+  }
+
+  async setAssistantPipeline(optionName) {
+    const opt = String(optionName || "").trim();
+    if (!opt) throw new Error("Pipeline option name is required");
+    if (!this.assistantSelectEntity) throw new Error("Assistant select entity not discovered");
+    await this.call("call_service", {
+      domain: "select",
+      service: "select_option",
+      target: { entity_id: this.assistantSelectEntity },
+      service_data: { option: opt },
+    });
+    this.assistantSelectState = opt;
+    return true;
   }
 
   async _resolveSatelliteDeviceId() {
@@ -967,13 +1042,14 @@ export class HomeAssistantWsClient extends EventEmitter {
     }
   }
 
-  async _executePipelineOnce(cleanText, { endStage, conversationId, timeoutMs }) {
+  async _executePipelineOnce(cleanText, { endStage, conversationId, timeoutMs, pipelineId = "" }) {
     const payload = {
       start_stage: "intent",
       end_stage: endStage,
       input: { text: cleanText },
     };
-    if (this.pipelineId) payload.pipeline = this.pipelineId;
+    const effectivePipelineId = String(pipelineId || this.pipelineId || "").trim();
+    if (effectivePipelineId) payload.pipeline = effectivePipelineId;
     if (conversationId) payload.conversation_id = conversationId;
     if (this.satelliteDeviceId) payload.device_id = this.satelliteDeviceId;
 
@@ -1028,10 +1104,22 @@ export class HomeAssistantWsClient extends EventEmitter {
     return streamPromise;
   }
 
-  async runTextPipeline(text, { conversationId = null, speak = true, timeoutMs = 45000 } = {}) {
+  async runTextPipeline(
+    text,
+    {
+      conversationId = null,
+      speak = true,
+      timeoutMs = 45000,
+      pipelineIdOverride = "",
+      ttsEngineOverride = undefined,
+    } = {}
+  ) {
     const clean = String(text || "").trim();
     if (!clean) throw new Error("Question is empty");
-    let endStage = Boolean(speak && this.pipelineTtsEngine) ? "tts" : "intent";
+    const forcedPipelineId = String(pipelineIdOverride || "").trim();
+    const effectiveTtsEngine =
+      ttsEngineOverride !== undefined ? String(ttsEngineOverride || "").trim() : this.pipelineTtsEngine;
+    let endStage = Boolean(speak && effectiveTtsEngine) ? "tts" : "intent";
     let activeConvId = conversationId || null;
 
     const isUnknownCmd = (err) =>
@@ -1059,9 +1147,10 @@ export class HomeAssistantWsClient extends EventEmitter {
           endStage,
           conversationId: activeConvId,
           timeoutMs,
+          pipelineId: forcedPipelineId,
         });
       } catch (err) {
-        if (isUnknownCmd(err)) {
+        if (!forcedPipelineId && isUnknownCmd(err)) {
           return this.askConversation(clean, { conversationId: activeConvId });
         }
         if (endStage === "tts" && !retriedWithoutTts && isTtsError(err)) {
@@ -1274,6 +1363,8 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       passphraseHelper: options.passphraseHelper || "input_text.p2p_voice_room_passphrase",
       wakeWordEnabled: options.wakeWordEnabled !== false,
       wakeWordLabel: options.wakeWordLabel || "",
+      noControlPipeline: options.noControlPipeline || "",
+      stateFile: options.stateFile !== undefined ? String(options.stateFile || "") : "",
       timerListEntities: Array.isArray(options.timerListEntities) ? options.timerListEntities : [],
       allowedSpeakers: Array.isArray(options.allowedSpeakers) ? options.allowedSpeakers : [],
       wasmPath: options.wasmPath,
@@ -1291,6 +1382,14 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     this.pipelineName = "";
     this.wakeWordId = "";
     this.wakeWordLabel = String(this.options.wakeWordLabel || "").trim();
+    this.entityControlsDisabled = false;
+    this.previousPipelineName = "";
+    this._wakeEnabledBeforeLock = null;
+    this._enforcingLock = false;
+    this._loadPersistedState();
+    if (this.entityControlsDisabled) {
+      this._wakeEnabledBeforeLock = this.wakeWordEnabled;
+    }
     this.muted = false;
     this.activeTimers = new Map(); // id -> { id, name, totalSeconds, endsAtMs, paused, remainingSec, commandText }
     this.recentLog = []; // [{ ts, kind, speaker, text }]
@@ -1299,6 +1398,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     this.lastSpeaker = "";
     this.conversationId = null;
     this._awaitingAudioDoneForWyoming = false;
+    this._textThinkingCount = 0;
     this.audioStats = {
       lastRms: 0,
       peakRms: 0,
@@ -1313,7 +1413,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       port: this.options.wyomingPort,
       name: this.options.wyomingName,
       area: this.options.wyomingArea,
-      wakeWordEnabled: this.wakeWordEnabled,
+      wakeWordEnabled: this.entityControlsDisabled ? false : this.wakeWordEnabled,
     });
     this._wireWyomingEvents();
 
@@ -1324,6 +1424,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       passphraseHelper: this.options.passphraseHelper,
       wyomingName: this.options.wyomingName,
       timerListEntities: this.options.timerListEntities,
+      noControlPipeline: this.options.noControlPipeline,
     });
     this.haClient.on("roomHelperChanged", ({ roomLink, passphrase }) => {
       if (roomLink) {
@@ -1341,15 +1442,24 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       this.pipelineName = pipelineName || "";
       this.wakeWordId = wakeWordId || "";
       this.wakeWordLabel = wakeWordLabel || String(this.options.wakeWordLabel || "").trim();
+      if (this.entityControlsDisabled) {
+        this._enforceEntityControlsLock({ actor: "Startup" }).catch(() => {});
+      }
       this.syncChatCard(false);
       if (
         this.wakeWordEnabled &&
+        (!this.entityControlsDisabled || this.haClient.noControlPipeline) &&
         this.wyoming.isReady() &&
         this.wyoming.pipelineMode === "wake" &&
         prevWakeWordId &&
         this.wakeWordId !== prevWakeWordId
       ) {
         this.wyoming.startWakeListening();
+      }
+    });
+    this.haClient.on("bootstrapped", () => {
+      if (this.entityControlsDisabled) {
+        this._enforceEntityControlsLock({ actor: "Startup" }).catch(() => {});
       }
     });
     this.haClient.on("timerListUpdated", () => {
@@ -1523,7 +1633,207 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     }
   }
 
+  _loadPersistedState() {
+    const filePath = this.options.stateFile;
+    if (!filePath) return;
+    try {
+      if (!fs.existsSync(filePath)) return;
+      const raw = fs.readFileSync(filePath, "utf8").trim();
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        if (typeof parsed.entityControlsDisabled === "boolean") {
+          this.entityControlsDisabled = parsed.entityControlsDisabled;
+        }
+        if (typeof parsed.previousPipelineName === "string") {
+          this.previousPipelineName = parsed.previousPipelineName.trim();
+        }
+      }
+    } catch {
+      // Ignore unreadable/corrupt state file
+    }
+  }
+
+  _savePersistedState() {
+    const filePath = this.options.stateFile;
+    if (!filePath) return;
+    const content = `${JSON.stringify(
+      {
+        entityControlsDisabled: Boolean(this.entityControlsDisabled),
+        previousPipelineName: String(this.previousPipelineName || ""),
+      },
+      null,
+      2
+    )}\n`;
+    try {
+      const dir = path.dirname(filePath);
+      if (dir) fs.mkdirSync(dir, { recursive: true });
+      const tmpPath = `${filePath}.tmp.${process.pid}`;
+      fs.writeFileSync(tmpPath, content, "utf8");
+      fs.renameSync(tmpPath, filePath);
+    } catch {
+      try {
+        fs.writeFileSync(filePath, content, "utf8");
+      } catch {
+        // Ignore persistence errors
+      }
+    }
+  }
+
+  _isNoControlPipelineName(nameOrId, noControl = this.haClient.noControlPipeline) {
+    const raw = String(nameOrId || "").trim();
+    if (!raw) return false;
+    if (noControl) {
+      const lower = raw.toLowerCase();
+      if (lower === noControl.name.toLowerCase() || lower === noControl.id.toLowerCase()) {
+        return true;
+      }
+    }
+    return NO_CONTROL_PIPELINE_RE.test(raw);
+  }
+
+  getEntityControlsState() {
+    const noControl = this.haClient.noControlPipeline;
+    return {
+      disabled: Boolean(this.entityControlsDisabled),
+      mode: !this.entityControlsDisabled
+        ? "enabled"
+        : noControl
+          ? "chat_only_pipeline"
+          : "strict_lock",
+      noControlPipelineName: noControl?.name || "",
+      previousPipelineName: this.previousPipelineName || "",
+    };
+  }
+
+  async _enforceEntityControlsLock({ actor = "Startup" } = {}) {
+    if (!this.entityControlsDisabled || this._enforcingLock) return;
+    this._enforcingLock = true;
+    try {
+      const noControl = this.haClient.noControlPipeline;
+      if (noControl) {
+        if (!this.previousPipelineName) {
+          const currentOpt = String(this.haClient.assistantSelectState || this.pipelineName || "").trim();
+          if (currentOpt && !this._isNoControlPipelineName(currentOpt, noControl)) {
+            this.previousPipelineName = currentOpt;
+            this._savePersistedState();
+          }
+        }
+        if (this.haClient.assistantSelectEntity) {
+          const curSel = String(this.haClient.assistantSelectState || "").trim().toLowerCase();
+          if (curSel !== noControl.name.toLowerCase()) {
+            try {
+              await this.haClient.setAssistantPipeline(noControl.name);
+            } catch (err) {
+              this._pushLog("error", actor, err?.message || String(err));
+            }
+          }
+        }
+        this.pipelineName = noControl.name;
+        this.haClient.pipelineId = noControl.id;
+        this.haClient.pipelineTtsEngine = noControl.ttsEngine || "";
+        if (this.wakeWordEnabled) {
+          this.wyoming.setWakeWordEnabled(true);
+        }
+      } else {
+        if (this._wakeEnabledBeforeLock === null) {
+          this._wakeEnabledBeforeLock = this.wakeWordEnabled;
+        }
+        this.wyoming.setWakeWordEnabled(false);
+      }
+      this.syncChatCard(false);
+    } finally {
+      this._enforcingLock = false;
+    }
+  }
+
+  async setEntityControlsDisabled(disabled, { actor = "Control Panel" } = {}) {
+    const next = Boolean(disabled);
+    if (next) {
+      if (this.haClient.authenticated && this.haClient.pipelines.length === 0) {
+        await this.haClient.refreshWakeWordInfo().catch(() => {});
+      }
+      const noControl = this.haClient.noControlPipeline;
+      if (!this.entityControlsDisabled) {
+        const current = String(this.haClient.assistantSelectState || this.pipelineName || "").trim();
+        if (current && !this._isNoControlPipelineName(current, noControl)) {
+          this.previousPipelineName = current;
+        }
+        this._wakeEnabledBeforeLock = this.wakeWordEnabled;
+      }
+      this.entityControlsDisabled = true;
+      this.conversationId = null;
+      this._savePersistedState();
+
+      if (noControl) {
+        if (this.haClient.assistantSelectEntity) {
+          try {
+            await this.haClient.setAssistantPipeline(noControl.name);
+          } catch (err) {
+            this._pushLog("error", actor, err?.message || String(err));
+          }
+        }
+        this.pipelineName = noControl.name;
+        this.haClient.pipelineId = noControl.id;
+        this.haClient.pipelineTtsEngine = noControl.ttsEngine || "";
+        if (this.wakeWordEnabled) {
+          this.wyoming.setWakeWordEnabled(true);
+        }
+        this._pushLog("system", actor, `Entity controls DISABLED — switched to "${noControl.name}"`);
+      } else {
+        this.wyoming.setWakeWordEnabled(false);
+        this._pushLog("system", actor, "Entity controls DISABLED (strict lock — no chat-only pipeline configured)");
+      }
+      this.syncChatCard(false);
+      return this.getEntityControlsState();
+    }
+
+    const toRestore = String(this.previousPipelineName || "").trim();
+    this.entityControlsDisabled = false;
+    this.conversationId = null;
+    this._savePersistedState();
+
+    let restored = "";
+    if (toRestore && this.haClient.assistantSelectEntity) {
+      const opts = this.haClient.assistantSelectOptions;
+      const matchedOpt =
+        opts.length > 0
+          ? opts.find((o) => o.toLowerCase() === toRestore.toLowerCase()) || ""
+          : toRestore;
+      if (matchedOpt) {
+        try {
+          await this.haClient.setAssistantPipeline(matchedOpt);
+          restored = matchedOpt;
+          await this.haClient.refreshWakeWordInfo({ skipGetStates: true }).catch(() => {});
+        } catch (err) {
+          this._pushLog("error", actor, err?.message || String(err));
+        }
+      }
+    }
+    this.previousPipelineName = "";
+    this._savePersistedState();
+
+    if (this._wakeEnabledBeforeLock !== null) {
+      if (this.wakeWordEnabled) {
+        this.wyoming.setWakeWordEnabled(true);
+      }
+      this._wakeEnabledBeforeLock = null;
+    }
+    this._pushLog(
+      "system",
+      actor,
+      restored ? `Entity controls ENABLED — restored "${restored}"` : "Entity controls ENABLED"
+    );
+    this.syncChatCard(false);
+    return this.getEntityControlsState();
+  }
+
   triggerListenNow({ speakerPeerId = null, speakerName = "" } = {}) {
+    if (this.entityControlsDisabled && !this.haClient.noControlPipeline) {
+      const errMsg = "Entity controls are disabled by the Home Assistant admin.";
+      this._pushLog("system", "Controls", errMsg);
+      return { ok: false, error: errMsg };
+    }
     if (!this.wyoming.isReady()) {
       return { ok: false, error: "Home Assistant Wyoming Satellite is not connected yet" };
     }
@@ -1546,7 +1856,11 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
 
   setWakeWordEnabled(enabled) {
     this.wakeWordEnabled = Boolean(enabled);
-    this.wyoming.setWakeWordEnabled(this.wakeWordEnabled);
+    if (this.entityControlsDisabled && !this.haClient.noControlPipeline) {
+      this.wyoming.setWakeWordEnabled(false);
+    } else {
+      this.wyoming.setWakeWordEnabled(this.wakeWordEnabled);
+    }
     this.syncChatCard(false);
   }
 
@@ -1591,13 +1905,39 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     return { ok: true, chunks: ids.length, ids };
   }
 
+  get textThinking() {
+    return this._textThinkingCount > 0;
+  }
+
   async askText(question, { speakerName = "User", replyInChat = true, speak = true } = {}) {
     const clean = String(question || "").trim();
     if (!clean) throw new Error("Question is empty");
     this.lastSpeaker = speakerName;
     this.lastTranscript = clean;
     this._pushLog("user", speakerName, clean);
-    this.syncChatCard(false);
+
+    if (this.entityControlsDisabled && !this.haClient.noControlPipeline) {
+      const refused = "Entity controls are currently disabled by the Home Assistant admin.";
+      this.lastReply = refused;
+      this._pushLog("system", "Controls", refused);
+      let postedToChat = false;
+      if (replyInChat && this.bot && this.roomState === "connected") {
+        this.bot.sendRaw("chat", {
+          text: refused,
+          replyTo: {
+            toName: speakerName,
+            botName: this.options.name,
+            label: "Controls Locked",
+            pipeline: "",
+            spoken: false,
+          },
+          assistant: true,
+        });
+        postedToChat = true;
+      }
+      this.syncChatCard(false);
+      return { text: refused, spoken: false, postedToChat, blocked: true };
+    }
 
     if (!this.haClient.authenticated) {
       this.lastReply = "Home Assistant WebSocket API is not configured — use voice or set HA_URL/HA_TOKEN.";
@@ -1605,11 +1945,22 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       return { text: this.lastReply, spoken: false, postedToChat: false };
     }
 
+    const forcedNoControl = this.entityControlsDisabled ? this.haClient.noControlPipeline : null;
     const canSpeak = Boolean(speak && this.bot && this.bot.inVoice && !this.muted);
-    const res = await this.haClient.runTextPipeline(clean, {
-      conversationId: this.conversationId,
-      speak: canSpeak,
-    });
+    this._textThinkingCount += 1;
+    this.syncChatCard(false);
+    let res;
+    try {
+      res = await this.haClient.runTextPipeline(clean, {
+        conversationId: this.conversationId,
+        speak: canSpeak,
+        pipelineIdOverride: forcedNoControl ? forcedNoControl.id : "",
+        ttsEngineOverride: forcedNoControl ? forcedNoControl.ttsEngine : undefined,
+      });
+    } finally {
+      this._textThinkingCount = Math.max(0, this._textThinkingCount - 1);
+      this.syncChatCard(false);
+    }
     this.conversationId = res.conversationId || this.conversationId;
     const replyText = String(res.text || "").trim();
     this.lastReply = replyText || "Done.";
@@ -1647,11 +1998,12 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     let postedToChat = false;
     if (replyInChat && this.bot && this.roomState === "connected" && replyText) {
       const chunks = splitChatChunks(replyText, 12000);
+      const effectivePipelineName = forcedNoControl ? forcedNoControl.name : this.pipelineName;
       const replyMeta = {
         toName: speakerName,
         botName: this.options.name,
-        label: this.pipelineName || "Assist",
-        pipeline: this.pipelineName || "",
+        label: effectivePipelineName || "Assist",
+        pipeline: effectivePipelineName || "",
         spoken,
       };
       for (let i = 0; i < chunks.length; i++) {
@@ -1803,13 +2155,20 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     if (msg.author && this.bot && msg.author === this.bot.peerId) return;
     const raw = msg.payload.text.trim();
     const lower = raw.toLowerCase();
-    if (lower === "/ha" || lower === "/assist" || lower === "!ha" || lower === "!assist") {
+    if (
+      lower === "/ai" ||
+      lower === "!ai" ||
+      lower === "/assist" ||
+      lower === "!assist" ||
+      lower === "/ha" ||
+      lower === "!ha"
+    ) {
       this.controlMsgId = null;
       this.syncChatCard(true);
     } else if (lower === "/listen" || lower === "!listen" || lower === "/ask" || lower === "!ask") {
       this.triggerListenNow({ speakerPeerId: msg.author, speakerName: msg.authorName });
-    } else if (/^[/!](ha|assist)\s+/i.test(raw)) {
-      const q = raw.replace(/^[/!](ha|assist)\s+/i, "").trim();
+    } else if (/^[/!](ai|assist|ha)\s+/i.test(raw)) {
+      const q = raw.replace(/^[/!](ai|assist|ha)\s+/i, "").trim();
       if (q) {
         this.askText(q, { speakerName: msg.authorName, replyInChat: true, speak: true }).catch((err) => {
           this._pushLog("error", "Assist", err.message);
@@ -1837,6 +2196,11 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
         });
       }
     } else if (id.startsWith("ha:tl:")) {
+      if (this.entityControlsDisabled) {
+        this._pushLog("system", "Controls", "Blocked room timer action (entity controls disabled)");
+        this.syncChatCard(false);
+        return;
+      }
       const rest = id.slice("ha:tl:".length);
       const firstColon = rest.indexOf(":");
       if (firstColon > 0) {
@@ -1908,9 +2272,21 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
   buildChatCard() {
     const wyConnected = this.wyoming.isReady();
     const mode = this.wyoming.pipelineMode;
+    const textThinking = this._textThinkingCount > 0;
+    const isThinking = mode === "processing" || textThinking;
+    const voiceActivity = isThinking
+      ? "thinking"
+      : mode === "asr"
+        ? "listening"
+        : mode === "speaking"
+          ? "speaking"
+          : "idle";
     let badge = "WAITING HA";
     let color = "ochre";
-    if (!wyConnected) {
+    if (textThinking) {
+      badge = "THINKING";
+      color = "cyan";
+    } else if (!wyConnected) {
       badge = "WAITING HA";
       color = "ochre";
     } else if (this.muted) {
@@ -1919,7 +2295,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     } else if (mode === "asr") {
       badge = "LISTENING";
       color = "mint";
-    } else if (mode === "processing") {
+    } else if (isThinking) {
       badge = "THINKING";
       color = "cyan";
     } else if (mode === "speaking") {
@@ -1938,20 +2314,27 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       : 0;
 
     const allTimers = this.getAllActiveTimers();
+    const controlsLocked = Boolean(this.entityControlsDisabled);
+    const strictLocked = controlsLocked && !this.haClient.noControlPipeline;
+
+    const statItems = [
+      { label: "Satellite", value: wyConnected ? "Online" : "Offline", accent: wyConnected ? "mint" : "coral" },
+      {
+        label: "Wake Word",
+        value: this.wakeWordEnabled && !strictLocked ? (this.wakeWordLabel || "Active") : "Off",
+        accent: this.wakeWordEnabled && !strictLocked ? "cobalt" : "ink",
+      },
+      { label: "Timers", value: String(allTimers.length), accent: allTimers.length > 0 ? "ochre" : "ink" },
+      { label: "In Voice", value: String(voicePeers), accent: "cyan" },
+    ];
+    if (controlsLocked) {
+      statItems.push({ label: "Controls", value: "Locked", accent: "coral" });
+    }
 
     const blocks = [
       {
         type: "stats",
-        items: [
-          { label: "Satellite", value: wyConnected ? "Online" : "Offline", accent: wyConnected ? "mint" : "coral" },
-          {
-            label: "Wake Word",
-            value: this.wakeWordEnabled ? (this.wakeWordLabel || "Active") : "Off",
-            accent: this.wakeWordEnabled ? "cobalt" : "ink",
-          },
-          { label: "Timers", value: String(allTimers.length), accent: allTimers.length > 0 ? "ochre" : "ink" },
-          { label: "In Voice", value: String(voicePeers), accent: "cyan" },
-        ],
+        items: statItems,
       },
     ];
 
@@ -1960,31 +2343,33 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       const actions = [];
       let blockActionId = "";
       if (timer.source === "timer_list") {
-        const feats = Number(timer.supportedFeatures) || 0;
-        if (feats & TIMER_LIST_FEATURES.PAUSE_TIMER) {
-          actions.push({
-            id: `ha:tl:${timer.paused ? "unpause" : "pause"}:${timer.entityId}:${timer.id}`,
-            label: timer.paused ? "Resume" : "Pause",
-            icon: timer.paused ? "play" : "pause",
-            style: timer.paused ? "success" : "secondary",
-          });
-        }
-        if (feats & TIMER_LIST_FEATURES.ADD_TIME) {
-          actions.push({
-            id: `ha:tl:add60:${timer.entityId}:${timer.id}`,
-            label: "+1m",
-            icon: "plus",
-            style: "secondary",
-          });
-        }
-        if (feats & TIMER_LIST_FEATURES.CANCEL_TIMER) {
-          blockActionId = `ha:tl:cancel:${timer.entityId}:${timer.id}`;
-          actions.push({
-            id: blockActionId,
-            label: "Cancel",
-            icon: "close",
-            style: "danger",
-          });
+        if (!controlsLocked) {
+          const feats = Number(timer.supportedFeatures) || 0;
+          if (feats & TIMER_LIST_FEATURES.PAUSE_TIMER) {
+            actions.push({
+              id: `ha:tl:${timer.paused ? "unpause" : "pause"}:${timer.entityId}:${timer.id}`,
+              label: timer.paused ? "Resume" : "Pause",
+              icon: timer.paused ? "play" : "pause",
+              style: timer.paused ? "success" : "secondary",
+            });
+          }
+          if (feats & TIMER_LIST_FEATURES.ADD_TIME) {
+            actions.push({
+              id: `ha:tl:add60:${timer.entityId}:${timer.id}`,
+              label: "+1m",
+              icon: "plus",
+              style: "secondary",
+            });
+          }
+          if (feats & TIMER_LIST_FEATURES.CANCEL_TIMER) {
+            blockActionId = `ha:tl:cancel:${timer.entityId}:${timer.id}`;
+            actions.push({
+              id: blockActionId,
+              label: "Cancel",
+              icon: "close",
+              style: "danger",
+            });
+          }
         }
       } else {
         blockActionId = `ha:timer:dismiss:${timer.id}`;
@@ -2051,7 +2436,10 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
 
     let voiceStatus = "Button Only";
     let voiceStatusIcon = "mic";
-    if (!wyConnected) {
+    if (textThinking) {
+      voiceStatus = "Thinking...";
+      voiceStatusIcon = "mic";
+    } else if (!wyConnected) {
       voiceStatus = "Waiting HA";
       voiceStatusIcon = this.muted ? "mic-off" : "mic";
     } else if (this.muted) {
@@ -2060,7 +2448,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     } else if (mode === "asr") {
       voiceStatus = "Listening...";
       voiceStatusIcon = "mic";
-    } else if (mode === "processing") {
+    } else if (isThinking) {
       voiceStatus = "Thinking...";
       voiceStatusIcon = "mic";
     } else if (mode === "speaking") {
@@ -2077,10 +2465,13 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       voiceStatusIcon = "mic";
     }
 
-    const footerHint =
-      this.wakeWordEnabled && this.wakeWordLabel
-        ? `Say "${this.wakeWordLabel}", click Listen Now, or type /ha <msg>`
-        : "Say wake word, click Listen Now, or type /ha <msg>";
+    const footerHint = controlsLocked
+      ? strictLocked
+        ? "Entity controls disabled · Chat only (locked)"
+        : "Entity controls disabled · Chat only"
+      : this.wakeWordEnabled && this.wakeWordLabel
+        ? `Say "${this.wakeWordLabel}", click Listen Now, or type /ai <msg>`
+        : "Say wake word, click Listen Now, or type /ai <msg>";
 
     return {
       subtitle: "HOME ASSISTANT VOICE",
@@ -2093,14 +2484,15 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       assistantMeta: {
         pipelineName: this.pipelineName || "",
         wakeWordLabel: this.wakeWordLabel || "",
-        commands: ["/ha", "/listen"],
+        commands: ["/ai", "/listen"],
       },
       voiceControls: {
         status: voiceStatus,
         statusIcon: voiceStatusIcon,
         statusTone: color,
+        activity: voiceActivity,
         buttons: [
-          { id: "ha:listen", label: "Listen Now", icon: "mic", style: "primary", disabled: !wyConnected },
+          { id: "ha:listen", label: "Listen Now", icon: "mic", style: "primary", disabled: !wyConnected || strictLocked },
           {
             id: "ha:toggle_wake",
             label: this.wakeWordEnabled ? "Wake: On" : "Wake: Off",
@@ -2114,7 +2506,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
         {
           kind: "grid",
           buttons: [
-            { id: "ha:listen", label: "Listen Now", icon: "mic", style: "primary", disabled: !wyConnected },
+            { id: "ha:listen", label: "Listen Now", icon: "mic", style: "primary", disabled: !wyConnected || strictLocked },
             {
               id: "ha:toggle_wake",
               label: this.wakeWordEnabled ? "Wake: On" : "Wake: Off",
@@ -2159,12 +2551,14 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
 
   getApiState() {
     const timers = this.getAllActiveTimers();
+    const isThinking = this.wyoming.pipelineMode === "processing" || this._textThinkingCount > 0;
     return {
       roomState: this.roomState,
       roomError: this.roomError,
       roomName: this.bot?.activeRoom?.name || "",
       inVoice: Boolean(this.bot?.inVoice),
       muted: this.muted,
+      thinking: isThinking,
       wakeWordEnabled: this.wakeWordEnabled,
       wakeWord: {
         id: this.wakeWordId,
@@ -2176,6 +2570,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
         name: this.pipelineName || "",
         ttsEngine: this.haClient.pipelineTtsEngine || "",
       },
+      entityControls: this.getEntityControlsState(),
       peers: this.bot ? this.bot.getPeers() : [],
       wyoming: {
         host: this.wyoming.host,
@@ -2289,6 +2684,18 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     }
     if (req.method === "POST" && urlPath.endsWith("/api/stop-audio")) {
       this.stopAudio();
+      sendJson(200, { ok: true, state: this.getApiState() });
+      return;
+    }
+    if (req.method === "POST" && urlPath.endsWith("/api/entity-controls")) {
+      const body = await this._readJsonBody(req);
+      const nextDisabled =
+        body.disabled !== undefined
+          ? Boolean(body.disabled)
+          : body.enabled !== undefined
+            ? !Boolean(body.enabled)
+            : !this.entityControlsDisabled;
+      await this.setEntityControlsDisabled(nextDisabled, { actor: "Control Panel" });
       sendJson(200, { ok: true, state: this.getApiState() });
       return;
     }
@@ -2437,6 +2844,11 @@ function renderControlPanelHtml() {
   .timer-clock { font: 700 14px/1 monospace; font-variant-numeric: tabular-nums; margin-right: 4px; }
   .timer-create { display: grid; grid-template-columns: 1fr 110px auto; gap: 8px; }
   .timer-create.has-select { grid-template-columns: minmax(120px, 160px) 1fr 100px auto; }
+  .controls-bar { border: 2px solid var(--rule); border-left: 6px solid var(--mint); padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; background: var(--bg); }
+  .controls-bar.locked { border-color: var(--coral); border-left-width: 6px; background: rgba(229, 57, 53, 0.12); }
+  .controls-title { font: 700 12px/1.2 monospace; text-transform: uppercase; letter-spacing: 0.04em; }
+  .controls-bar.locked .controls-title { color: var(--coral); }
+  .controls-desc { font: 12px/1.35 monospace; color: var(--muted); margin-top: 3px; }
   .hidden { display: none !important; }
   @media (max-width: 600px) { .grid4, .btns { grid-template-columns: repeat(2, minmax(0, 1fr)); } .timer-create, .timer-create.has-select { grid-template-columns: 1fr 1fr; } }
 </style>
@@ -2470,6 +2882,13 @@ function renderControlPanelHtml() {
       <button id="btn-wake">Wake: On</button>
       <button id="btn-mute">Mute</button>
       <button id="btn-stop">Stop Audio</button>
+    </div>
+    <div id="controls-banner" class="controls-bar">
+      <div>
+        <div id="controls-title" class="controls-title">Entity Controls: ENABLED</div>
+        <div id="controls-desc" class="controls-desc">Smart-home actions active</div>
+      </div>
+      <button id="btn-entity-controls" class="danger">Disable Entity Controls</button>
     </div>
     <div class="row">
       <input id="ask-input" placeholder="Ask Home Assistant (text fallback)..." />
@@ -2579,11 +2998,33 @@ function render(s) {
   badge.className = "badge " + (s.roomState === "connected" ? "ok" : s.roomState === "error" ? "err" : "warn");
   $("st-room").textContent = s.roomName || "Standby";
   $("st-wy").textContent = s.wyoming.ready ? "Online :" + s.wyoming.port : "Waiting :" + s.wyoming.port;
-  $("st-mode").textContent = (s.wyoming.mode || "idle") + (s.wakeWord && s.wakeWord.label ? " · " + s.wakeWord.label : "");
+  $("st-mode").textContent = (s.thinking ? "thinking" : (s.wyoming.mode || "idle")) + (s.wakeWord && s.wakeWord.label ? " · " + s.wakeWord.label : "");
   $("st-ha").textContent = s.homeAssistant.authenticated ? "Synced" : s.homeAssistant.configured ? "Connecting" : "Manual";
-  $("btn-listen").disabled = !s.wyoming.ready;
+  const ec = s.entityControls || { disabled: false, mode: "enabled", noControlPipelineName: "" };
+  const strictLock = Boolean(ec.disabled && ec.mode === "strict_lock");
+  $("btn-listen").disabled = !s.wyoming.ready || strictLock;
   $("btn-wake").textContent = s.wakeWordEnabled ? (s.wakeWord && s.wakeWord.label ? "Wake: " + s.wakeWord.label : "Wake: On") : "Wake: Off";
   $("btn-mute").textContent = s.muted ? "Unmute" : "Mute";
+  const cBanner = $("controls-banner");
+  const cTitle = $("controls-title");
+  const cDesc = $("controls-desc");
+  const cBtn = $("btn-entity-controls");
+  if (ec.disabled) {
+    cBanner.className = "controls-bar locked";
+    cTitle.textContent = "ENTITY CONTROLS DISABLED";
+    cDesc.textContent = ec.mode === "chat_only_pipeline"
+      ? 'Locked to "' + ec.noControlPipelineName + '" (chat only) · Room timer controls blocked'
+      : "Strict lock (no chat-only pipeline) · Voice & /ai blocked";
+    cBtn.textContent = "Re-enable Entity Controls";
+    cBtn.className = "success";
+  } else {
+    cBanner.className = "controls-bar";
+    cTitle.textContent = "Entity Controls: ENABLED";
+    const pName = (s.pipeline && s.pipeline.name) || (s.wakeWord && s.wakeWord.pipelineName) || "Default pipeline";
+    cDesc.textContent = "Pipeline: " + pName + (ec.noControlPipelineName ? ' · Chat-only pipeline: "' + ec.noControlPipelineName + '"' : "");
+    cBtn.textContent = "Disable Entity Controls";
+    cBtn.className = "danger";
+  }
   renderTimers(s);
   $("log").innerHTML = (s.recentLog || []).slice().reverse().map((e) =>
     '<div>[' + esc(e.ts.slice(11, 19)) + '] <b>' + esc(e.speaker) + '</b>: ' + esc(e.text) + '</div>'
@@ -2645,6 +3086,11 @@ $("btn-stop").onclick = async () => {
   const out = await api("stop-audio", {});
   if (out.state) render(out.state);
 };
+$("btn-entity-controls").onclick = async () => {
+  const currentlyDisabled = Boolean(curState && curState.entityControls && curState.entityControls.disabled);
+  const out = await api("entity-controls", { disabled: !currentlyDisabled });
+  if (out.state) render(out.state);
+};
 $("btn-ask").onclick = async () => {
   const text = $("ask-input").value.trim();
   if (!text) return;
@@ -2683,6 +3129,8 @@ if (isMain) {
         "  --room-helper        HA input_text entity to watch (HA_ROOM_HELPER, default: input_text.p2p_voice_room_link)",
         "  --passphrase-helper  Optional HA input_text for room passphrase (HA_PASSPHRASE_HELPER)",
         "  --no-wake-word          Disable always-on wake-word streaming (button activation only)",
+        "  --no-control-pipeline   HA pipeline name/ID used when entity controls are disabled (HA_NO_CONTROL_PIPELINE)",
+        "  --state-file            JSON file persisting admin lock state (P2P_STATE_FILE)",
         "  --timer-list-entities   Comma-separated allowlist of HA timer_list.* entities (HA_TIMER_LIST_ENTITIES)",
         "  --allowed-speakers      Comma-separated allowlist of speaker names/peerIds (ALLOWED_SPEAKERS)",
       ].join("\n")

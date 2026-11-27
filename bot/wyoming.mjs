@@ -147,6 +147,7 @@ export class WyomingSatelliteServer extends EventEmitter {
     description = "End-to-end encrypted p2p-direct voice room satellite",
     wakeWordEnabled = true,
     sampleRate = 16000,
+    ttsSampleRate = 24000,
     rearmDelayMs = 450,
     audioStartDelayMs = 60,
     interruptDelayMs = 150,
@@ -160,6 +161,7 @@ export class WyomingSatelliteServer extends EventEmitter {
     this.description = String(description || "p2p-direct voice satellite");
     this.wakeWordEnabled = Boolean(wakeWordEnabled);
     this.sampleRate = Number(sampleRate) || 16000;
+    this.ttsSampleRate = Number(ttsSampleRate) || 24000;
     this.rearmDelayMs = Math.max(100, Number(rearmDelayMs) || 450);
     const parsedAudioDelay = Number(audioStartDelayMs);
     this.audioStartDelayMs = Number.isFinite(parsedAudioDelay) ? Math.max(0, parsedAudioDelay) : 60;
@@ -174,7 +176,7 @@ export class WyomingSatelliteServer extends EventEmitter {
     this.streamingToHa = false;
     this.pipelineMode = "idle"; // idle | wake | asr | processing | speaking
     this.receivingTts = false;
-    this.ttsFormat = { rate: 16000, width: 2, channels: 1 };
+    this.ttsFormat = { rate: this.ttsSampleRate, width: 2, channels: 1 };
     this._rearmTimer = null;
     this._audioStartTimer = null;
     this._pipelineStartTimer = null;
@@ -201,7 +203,7 @@ export class WyomingSatelliteServer extends EventEmitter {
         version: "1.0.0",
         area: this.area,
         snd_format: {
-          rate: this.sampleRate,
+          rate: this.ttsSampleRate,
           width: 2,
           channels: 1,
         },
@@ -689,7 +691,7 @@ export class WyomingSatelliteServer extends EventEmitter {
         this.stopAudioStream();
         this.receivingTts = true;
         this.ttsFormat = {
-          rate: Number(data?.rate) || 16000,
+          rate: Number(data?.rate) || this.ttsSampleRate || 16000,
           width: Number(data?.width) || 2,
           channels: Number(data?.channels) || 1,
         };
@@ -701,7 +703,7 @@ export class WyomingSatelliteServer extends EventEmitter {
       case "audio-chunk": {
         if (payload && payload.length > 0) {
           const fmt = {
-            rate: Number(data?.rate) || this.ttsFormat.rate || 16000,
+            rate: Number(data?.rate) || this.ttsFormat.rate || this.ttsSampleRate || 16000,
             width: Number(data?.width) || this.ttsFormat.width || 2,
             channels: Number(data?.channels) || this.ttsFormat.channels || 1,
           };
