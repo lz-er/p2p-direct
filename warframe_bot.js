@@ -224,20 +224,21 @@ function buildWarframeButtons(activeView, fissureFilter = "normal") {
       { id: "wf:fissures:normal", label: "Normal Relics", style: fStyle("normal") },
       { id: "wf:fissures:steel", label: "Steel Path", style: fStyle("steel") },
       { id: "wf:fissures:storm", label: "Void Storms", style: fStyle("storm") },
-      { id: "wf:refresh:fissures", label: "↻ Refresh", style: "secondary" },
-      { id: "wf:dismiss", label: "Remove", style: "danger" },
+      { id: "wf:refresh:fissures", icon: "refresh", label: "Refresh", style: "secondary" },
+      { id: "wf:dismiss", icon: "close", label: "Remove", style: "danger" },
     ]);
   } else {
     rows.push([
-      { id: `wf:refresh:${activeView}`, label: "↻ Refresh", style: "success" },
+      { id: `wf:refresh:${activeView}`, icon: "refresh", label: "Refresh", style: "success" },
       {
         id: "wf:lfg",
+        icon: "users",
         label: "Squad Up!",
         style: "warning",
         mode: "reply",
         replyText: "Who wants to squad up for Warframe?",
       },
-      { id: "wf:dismiss", label: "Remove", style: "danger" },
+      { id: "wf:dismiss", icon: "close", label: "Remove", style: "danger" },
     ]);
   }
 
@@ -383,6 +384,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
     const blocks = [
       {
         type: "progress",
+        icon: cetusIsDay ? "sun" : "moon",
         label: `Cetus (Plains) · ${cetusIsDay ? "Day" : "Night"}`,
         value: cetusBar.value,
         max: cetusBar.max,
@@ -391,6 +393,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       },
       {
         type: "progress",
+        icon: vallisIsWarm ? "flame" : "wind",
         label: `Orb Vallis · ${vallisIsWarm ? "Warm" : "Cold"}`,
         value: vallisBar.value,
         max: vallisBar.max,
@@ -399,6 +402,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       },
       {
         type: "progress",
+        icon: cambionIsFass ? "sun" : "moon",
         label: `Cambion Drift · ${cambionState}`,
         value: cambionBar.value,
         max: cambionBar.max,
@@ -407,6 +411,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       },
       {
         type: "progress",
+        icon: "shield",
         label: `Zariman · ${zarimanState}`,
         value: zarimanBar.value,
         max: zarimanBar.max,
@@ -415,6 +420,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       },
       {
         type: "progress",
+        icon: "clock",
         label: `Duviri Spiral · ${duviriMood}`,
         value: duviriBar.value,
         max: duviriBar.max,

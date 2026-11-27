@@ -217,8 +217,8 @@ export async function fetchWeatherCard(
   const nextUnit = unit === "f" ? "c" : "f";
   const controlRow = [
     { id: `${WEATHER_ACTION_PREFIX}unit:${nextUnit}`, label: `Switch to °${nextUnit.toUpperCase()}`, style: "secondary" },
-    { id: `${WEATHER_ACTION_PREFIX}refresh`, label: "↻ Refresh", style: "secondary" },
-    { id: `${WEATHER_ACTION_PREFIX}dismiss`, label: "✕ Hide", style: "danger" },
+    { id: `${WEATHER_ACTION_PREFIX}refresh`, icon: "refresh", label: "Refresh", style: "secondary" },
+    { id: `${WEATHER_ACTION_PREFIX}dismiss`, icon: "close", label: "Hide", style: "danger" },
   ];
 
   try {
@@ -274,7 +274,7 @@ export async function fetchWeatherCard(
 
     for (let i = 0; i < Math.min(3, times.length); i++) {
       const dayLabel = i === 0 ? "Today" : i === 1 ? "Tomorrow" : times[i];
-      const rain = precip[i] != null ? ` · 💧 ${precip[i]}%` : "";
+      const rain = precip[i] != null ? ` · :icon[droplet] ${precip[i]}%` : "";
       fields.push({
         label: dayLabel,
         value: `**${formatTemp(maxs[i], unit)}** / ${formatTemp(mins[i], unit)} · ${describeWmoCode(codes[i])}${rain}`,
@@ -292,6 +292,7 @@ export async function fetchWeatherCard(
       wxUnit: unit,
       wxUpdatedAt: nowMs,
       subtitle: "WEATHER",
+      icon: "cloud",
       title: `${placeLabel} · ${tempStr}`,
       badge: condStr.toUpperCase(),
       color: "cyan",
@@ -309,6 +310,7 @@ export async function fetchWeatherCard(
       wxUnit: unit,
       wxUpdatedAt: nowMs,
       subtitle: "WEATHER",
+      icon: "alert",
       title: `Weather Unavailable (${cityName})`,
       badge: "OFFLINE",
       color: "coral",
@@ -385,11 +387,12 @@ export function summarizeWikiPill(msg) {
 function wikiNavRow(activeTab) {
   const tabs = [
     { id: "featured", label: "Featured" },
-    { id: "random", label: "🎲 Random" },
+    { id: "random", icon: "dice", label: "Random" },
     { id: "onthisday", label: "On This Day" },
   ];
   return tabs.map((t) => ({
     id: `${WIKI_ACTION_PREFIX}tab:${t.id}`,
+    icon: t.icon,
     label: t.label,
     style: t.id === activeTab ? "primary" : "secondary",
   }));
@@ -409,8 +412,8 @@ export async function fetchWikiCard(
     if (articleUrl && /^https?:\/\//i.test(articleUrl)) {
       row.push({ id: "wiki_open_article", label: "Open Article", url: articleUrl, style: "primary" });
     }
-    row.push({ id: `${WIKI_ACTION_PREFIX}refresh`, label: "↻ Refresh", style: "secondary" });
-    row.push({ id: `${WIKI_ACTION_PREFIX}dismiss`, label: "✕ Hide", style: "danger" });
+    row.push({ id: `${WIKI_ACTION_PREFIX}refresh`, icon: "refresh", label: "Refresh", style: "secondary" });
+    row.push({ id: `${WIKI_ACTION_PREFIX}dismiss`, icon: "close", label: "Hide", style: "danger" });
     return row;
   };
 
@@ -648,8 +651,8 @@ export async function fetchGithubCard(
 
   const controlsRow = (extraUrl = repoWebUrl, extraLabel = "Open Repo") => [
     { id: "gh_open_repo", label: extraLabel, url: extraUrl, style: "secondary" },
-    { id: `${GITHUB_ACTION_PREFIX}refresh`, label: "↻ Refresh", style: "secondary" },
-    { id: `${GITHUB_ACTION_PREFIX}dismiss`, label: "✕ Hide", style: "danger" },
+    { id: `${GITHUB_ACTION_PREFIX}refresh`, icon: "refresh", label: "Refresh", style: "secondary" },
+    { id: `${GITHUB_ACTION_PREFIX}dismiss`, icon: "close", label: "Hide", style: "danger" },
   ];
 
   try {
@@ -679,6 +682,7 @@ export async function fetchGithubCard(
         ghTab: "commits",
         ghUpdatedAt: nowMs,
         subtitle: `GITHUB · ${repo.toUpperCase()}`,
+        icon: "git",
         title: `${repo} — Recent Commits`,
         badge: `${list.length} LATEST`,
         color: "ink",
@@ -709,6 +713,7 @@ export async function fetchGithubCard(
         ghTab: "issues",
         ghUpdatedAt: nowMs,
         subtitle: `GITHUB · ${repo.toUpperCase()}`,
+        icon: "code",
         title: `${repo} — Open Issues & PRs`,
         badge: `${list.length} OPEN`,
         color: "mint",
@@ -733,7 +738,7 @@ export async function fetchGithubCard(
     const fields = [
       {
         label: "Stats",
-        value: `★ **${Number(info.stargazers_count || 0).toLocaleString()}** · Forks **${Number(info.forks_count || 0).toLocaleString()}** · Open Issues **${Number(info.open_issues_count || 0).toLocaleString()}**`,
+        value: `:icon[star-filled] **${Number(info.stargazers_count || 0).toLocaleString()}** · Forks **${Number(info.forks_count || 0).toLocaleString()}** · Open Issues **${Number(info.open_issues_count || 0).toLocaleString()}**`,
         inline: false,
       },
       {

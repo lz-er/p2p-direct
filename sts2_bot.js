@@ -269,8 +269,8 @@ function buildNavButtonRows(activeTab) {
 function buildFooterControls(extraButtons = []) {
   return [
     ...extraButtons,
-    { id: `${STS2_ACTION_PREFIX}refresh`, label: "↻ Refresh", style: "secondary" },
-    { id: `${STS2_ACTION_PREFIX}dismiss`, label: "✕ Hide", style: "danger" },
+    { id: `${STS2_ACTION_PREFIX}refresh`, icon: "refresh", label: "Refresh", style: "secondary" },
+    { id: `${STS2_ACTION_PREFIX}dismiss`, icon: "close", label: "Hide", style: "danger" },
   ];
 }
 
@@ -558,7 +558,7 @@ export function buildSts2CodexCard(entity, state, { kind = "card", metricRow = n
   const imgUrl = resolveSts2ImageUrl(rawImg, apiBase);
 
   const codexRow = [
-    { id: `${STS2_ACTION_PREFIX}codex:random`, label: "🎲 Random Card", style: "warning" },
+    { id: `${STS2_ACTION_PREFIX}codex:random`, icon: "dice", label: "Random Card", style: "warning" },
   ];
   if (isCard && (entity?.image_url_card_upg || entity?.upgrade)) {
     codexRow.push({
@@ -699,8 +699,8 @@ export function buildSts2CoopCard(state) {
 
   const controlsRow = [
     { id: `${STS2_ACTION_PREFIX}coop:leave`, label: "Leave Seat", style: "secondary" },
-    { id: `${STS2_ACTION_PREFIX}coop:clear`, label: "Reset Party", style: "warning" },
-    { id: `${STS2_ACTION_PREFIX}dismiss`, label: "✕ Hide", style: "danger" },
+    { id: `${STS2_ACTION_PREFIX}coop:clear`, icon: "reset", label: "Reset Party", style: "warning" },
+    { id: `${STS2_ACTION_PREFIX}dismiss`, icon: "close", label: "Hide", style: "danger" },
   ];
 
   return basePayload(state, {
@@ -711,6 +711,7 @@ export function buildSts2CoopCard(state) {
     blocks: [
       {
         type: "progress",
+        icon: "users",
         label: "Party Seats",
         value: count,
         max: 4,
@@ -819,7 +820,7 @@ export async function fetchSts2Card(
           text: `No Slay the Spire 2 entry matched **${state.lookupQuery}**. Try another name or click **Random Card**.`,
           buttons: [
             buildNavButtonRows("codex"),
-            [{ id: `${STS2_ACTION_PREFIX}codex:random`, label: "🎲 Random Card", style: "warning" }],
+            [{ id: `${STS2_ACTION_PREFIX}codex:random`, icon: "dice", label: "Random Card", style: "warning" }],
             buildFooterControls(),
           ],
           footer: `Spire Codex Search · ${formatUpdatedClock(nowMs)}`,

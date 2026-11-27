@@ -217,13 +217,13 @@ export function buildPollCard(stateInput, { nowMs = Date.now() } = {}) {
     const count = voters.length;
     const pct = totalVotes > 0 ? Math.round((count / totalVotes) * 100) : 0;
     const isLeading = totalVotes > 0 && count === maxVotes && count > 0;
-    const leadMark = isLeading ? " ★" : "";
     const voterNames =
       voters.length > 0 ? ` · ${voters.slice(0, 5).join(", ")}${voters.length > 5 ? "…" : ""}` : "";
     return {
       type: "progress",
       id: `poll:vote:${idx}`,
-      label: `${idx + 1}. ${opt}${leadMark}`,
+      icon: isLeading ? "trophy" : undefined,
+      label: `${idx + 1}. ${opt}`,
       value: count,
       max: Math.max(1, totalVotes),
       display: `${pct}% (${count})${voterNames}`,
@@ -234,8 +234,8 @@ export function buildPollCard(stateInput, { nowMs = Date.now() } = {}) {
 
   const btnRows = [
     [
-      { id: "poll:reset", label: "↺ Reset Votes", style: "warning" },
-      { id: "poll:dismiss", label: "✕ Hide", style: "danger" },
+      { id: "poll:reset", icon: "reset", label: "Reset Votes", style: "warning" },
+      { id: "poll:dismiss", icon: "close", label: "Hide", style: "danger" },
     ],
   ];
 
@@ -245,6 +245,7 @@ export function buildPollCard(stateInput, { nowMs = Date.now() } = {}) {
     botState: state,
     botUpdatedAt: nowMs,
     subtitle: "POLL",
+    icon: "bar-chart",
     title: state.question || DEFAULT_POLL_SETTINGS.question,
     badge: `${totalVotes} ${totalVotes === 1 ? "VOTE" : "VOTES"}`,
     color: "cobalt",
@@ -384,6 +385,7 @@ export function buildPomodoroCard(stateInput, { nowMs = Date.now() } = {}) {
     botState: s,
     botUpdatedAt: nowMs,
     subtitle: "POMODORO",
+    icon: "timer",
     title: `${modeLabel} — ${clock}`,
     badge: `${statusLabel} · ${clock}`,
     color: barColor,
@@ -398,6 +400,7 @@ export function buildPomodoroCard(stateInput, { nowMs = Date.now() } = {}) {
       },
       {
         type: "progress",
+        icon: "clock",
         label: modeLabel,
         value: Math.round(elapsedMs / 1000),
         max: Math.max(1, Math.round(durMs / 1000)),
@@ -409,16 +412,17 @@ export function buildPomodoroCard(stateInput, { nowMs = Date.now() } = {}) {
       [
         {
           id: "pomo:toggle",
-          label: s.running ? "⏸ Pause" : "▶ Start",
+          icon: s.running ? "pause" : "play",
+          label: s.running ? "Pause" : "Start",
           style: s.running ? "warning" : "success",
         },
-        { id: "pomo:reset", label: "↺ Reset", style: "secondary" },
+        { id: "pomo:reset", icon: "reset", label: "Reset", style: "secondary" },
       ],
       [
         { id: "pomo:mode:focus", label: `${s.focusMin || 25}m Focus`, style: s.mode === "focus" ? "primary" : "secondary" },
         { id: "pomo:mode:break", label: `${s.breakMin || 5}m Break`, style: s.mode === "break" ? "primary" : "secondary" },
         { id: "pomo:mode:long", label: `${s.longBreakMin || 15}m Long`, style: s.mode === "long" ? "primary" : "secondary" },
-        { id: "pomo:dismiss", label: "✕ Hide", style: "danger" },
+        { id: "pomo:dismiss", icon: "close", label: "Hide", style: "danger" },
       ],
     ],
     footer: `Updated ${formatClock(nowMs)}`,
@@ -509,6 +513,7 @@ export function buildChecklistCard(stateInput, { nowMs = Date.now() } = {}) {
   if (items.length > 0) {
     blocks.push({
       type: "progress",
+      icon: "list",
       label: "Progress",
       value: doneCount,
       max: items.length,
@@ -520,7 +525,8 @@ export function buildChecklistCard(stateInput, { nowMs = Date.now() } = {}) {
       blocks.push({
         type: "progress",
         id: `todo:toggle:${idx}`,
-        label: `${it.done ? "✓" : "○"} ${it.text}`,
+        icon: it.done ? "check" : "circle",
+        label: it.text,
         value: it.done ? 1 : 0,
         max: 1,
         display: it.done ? (it.by ? `Done · ${it.by}` : "Done") : "Open",
@@ -544,6 +550,7 @@ export function buildChecklistCard(stateInput, { nowMs = Date.now() } = {}) {
     botState: state,
     botUpdatedAt: nowMs,
     subtitle: "CHECKLIST",
+    icon: "list",
     title: state.title || DEFAULT_CHECKLIST_SETTINGS.title,
     badge: `${doneCount}/${items.length} DONE`,
     color: allDone ? "mint" : "cyan",
@@ -552,9 +559,9 @@ export function buildChecklistCard(stateInput, { nowMs = Date.now() } = {}) {
     fields: [],
     buttons: [
       [
-        { id: "todo:uncheck_all", label: "↺ Uncheck All", style: "secondary" },
-        { id: "todo:clear_done", label: "Clear Done", style: "warning" },
-        { id: "todo:dismiss", label: "✕ Hide", style: "danger" },
+        { id: "todo:uncheck_all", icon: "reset", label: "Uncheck All", style: "secondary" },
+        { id: "todo:clear_done", icon: "trash", label: "Clear Done", style: "warning" },
+        { id: "todo:dismiss", icon: "close", label: "Hide", style: "danger" },
       ],
     ],
     footer: `Updated ${formatClock(nowMs)}`,
@@ -700,6 +707,7 @@ export function buildRandomizerCard(stateInput, { nowMs = Date.now() } = {}) {
     botState: state,
     botUpdatedAt: nowMs,
     subtitle: "RANDOMIZER",
+    icon: "dice",
     title: state.lastResult ? `${state.lastLabel}: ${state.lastResult}` : "Randomizer & Dice",
     badge: state.lastResult ? String(state.lastResult).slice(0, 14).toUpperCase() : "READY",
     color: "ochre",
@@ -707,19 +715,19 @@ export function buildRandomizerCard(stateInput, { nowMs = Date.now() } = {}) {
     fields,
     buttons: [
       [
-        { id: "rng:coin", label: "🪙 Flip Coin", style: "primary" },
-        { id: "rng:peer", label: "👥 Pick Peer", style: "success" },
-        { id: "rng:option", label: "🎯 Pick Option", style: "warning" },
+        { id: "rng:coin", icon: "coin", label: "Flip Coin", style: "primary" },
+        { id: "rng:peer", icon: "users", label: "Pick Peer", style: "success" },
+        { id: "rng:option", icon: "target", label: "Pick Option", style: "warning" },
       ],
       [
-        { id: "rng:dice:d6", label: "🎲 d6", style: "secondary" },
-        { id: "rng:dice:d20", label: "🎲 d20", style: "secondary" },
-        { id: "rng:dice:2d6", label: "🎲 2d6", style: "secondary" },
-        { id: "rng:dice:d100", label: "🎲 d100", style: "secondary" },
+        { id: "rng:dice:d6", icon: "dice", label: "d6", style: "secondary" },
+        { id: "rng:dice:d20", icon: "dice", label: "d20", style: "secondary" },
+        { id: "rng:dice:2d6", icon: "dice", label: "2d6", style: "secondary" },
+        { id: "rng:dice:d100", icon: "dice", label: "d100", style: "secondary" },
       ],
       [
-        { id: "rng:clear", label: "Clear History", style: "secondary" },
-        { id: "rng:dismiss", label: "✕ Hide", style: "danger" },
+        { id: "rng:clear", icon: "reset", label: "Clear History", style: "secondary" },
+        { id: "rng:dismiss", icon: "close", label: "Hide", style: "danger" },
       ],
     ],
     footer: `Updated ${formatClock(nowMs)}`,
@@ -840,20 +848,22 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
     if (list.length > 0) {
       blocks.push({
         type: "progress",
+        icon: "star-filled",
         label: "Average Rating",
         value: Math.round(avgNum * 10),
         max: 50,
-        display: `★ ${avg} / 5 (${list.length})`,
+        display: `${avg} / 5 (${list.length})`,
         color: avgNum >= 4 ? "mint" : avgNum >= 2.5 ? "ochre" : "coral",
       });
       for (const r of list) {
         const st = Math.max(1, Math.min(5, Number(r.stars) || 1));
         blocks.push({
           type: "progress",
+          icon: "star",
           label: r.name || "Peer",
           value: st,
           max: 5,
-          display: `${"★".repeat(st)}${"☆".repeat(5 - st)} (${st}/5)`,
+          display: `${st} / 5`,
           color: st >= 4 ? "mint" : st >= 3 ? "ochre" : "coral",
         });
       }
@@ -865,25 +875,26 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
       botState: state,
       botUpdatedAt: nowMs,
       subtitle: "RATINGS",
+      icon: "star-filled",
       title: `Rate It: ${state.ratingTitle || "Tonight's Watch / Pick"}`,
-      badge: list.length > 0 ? `★ ${avg} / 5 (${list.length})` : "RATE 1–5★",
+      badge: list.length > 0 ? `${avg} / 5 (${list.length})` : "RATE 1–5",
       color: "ochre",
-      text: list.length === 0 ? "Pick 1★–5★ below." : "",
+      text: list.length === 0 ? "Pick 1–5 below." : "",
       blocks,
       fields: [],
       buttons: [
         [
-          { id: "score:rate:1", label: "1★", style: "secondary" },
-          { id: "score:rate:2", label: "2★", style: "secondary" },
-          { id: "score:rate:3", label: "3★", style: "primary" },
-          { id: "score:rate:4", label: "4★", style: "success" },
-          { id: "score:rate:5", label: "5★", style: "warning" },
+          { id: "score:rate:1", icon: "star", label: "1", style: "secondary" },
+          { id: "score:rate:2", icon: "star", label: "2", style: "secondary" },
+          { id: "score:rate:3", icon: "star", label: "3", style: "primary" },
+          { id: "score:rate:4", icon: "star", label: "4", style: "success" },
+          { id: "score:rate:5", icon: "star-filled", label: "5", style: "warning" },
         ],
         [
           { id: "score:use_watch", label: "Use Watch Title", style: "secondary" },
-          { id: "score:mode:scores", label: "Scoreboard", style: "secondary" },
-          { id: "score:reset", label: "↺ Clear", style: "warning" },
-          { id: "score:dismiss", label: "✕ Hide", style: "danger" },
+          { id: "score:mode:scores", icon: "trophy", label: "Scoreboard", style: "secondary" },
+          { id: "score:reset", icon: "reset", label: "Clear", style: "warning" },
+          { id: "score:dismiss", icon: "close", label: "Hide", style: "danger" },
         ],
       ],
       footer: `Updated ${formatClock(nowMs)}`,
@@ -903,7 +914,8 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
     return {
       type: "progress",
       id: `score:inc:${e.origIdx}`,
-      label: `#${rankIdx + 1} ${e.name}${isLead ? " ★" : ""}`,
+      icon: isLead ? "trophy" : undefined,
+      label: `#${rankIdx + 1} ${e.name}`,
       value: Math.max(0, score),
       max: Math.max(1, maxScore),
       display: `${score} pts · +1`,
@@ -924,10 +936,10 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
     }
   }
   btnRows.push([
-    { id: "score:sync_peers", label: "+ Sync Peers", style: "primary" },
-    { id: "score:mode:ratings", label: "★ 1–5 Ratings", style: "warning" },
-    { id: "score:reset", label: "↺ Reset", style: "secondary" },
-    { id: "score:dismiss", label: "✕ Hide", style: "danger" },
+    { id: "score:sync_peers", icon: "users", label: "Sync Peers", style: "primary" },
+    { id: "score:mode:ratings", icon: "star", label: "1–5 Ratings", style: "warning" },
+    { id: "score:reset", icon: "reset", label: "Reset", style: "secondary" },
+    { id: "score:dismiss", icon: "close", label: "Hide", style: "danger" },
   ]);
 
   const leader = ranked[0];
@@ -937,6 +949,7 @@ export function buildScoreboardCard(stateInput, { nowMs = Date.now() } = {}) {
     botState: state,
     botUpdatedAt: nowMs,
     subtitle: "SCOREBOARD",
+    icon: "trophy",
     title: "Room Scoreboard",
     badge: leader ? `LEAD: ${leader.name.slice(0, 10).toUpperCase()} (${leader.score})` : "0 PTS",
     color: "mint",
@@ -954,9 +967,9 @@ export function summarizeScoreboardPill(msg) {
     const list = Object.values(st.ratings || {});
     if (list.length > 0) {
       const avg = (list.reduce((a, r) => a + (Number(r.stars) || 0), 0) / list.length).toFixed(1);
-      return `RATE · ★${avg}`;
+      return `RATE · ${avg}/5`;
     }
-    return "RATE · 1-5★";
+    return "RATE · 1-5";
   }
   return "SCOREBOARD";
 }

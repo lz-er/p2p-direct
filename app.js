@@ -130,13 +130,19 @@ import {
   sanitizeWatchExternalUrl,
 } from "./watch_together.js";
 
+import {
+  renderIconSvg,
+  resolveIconAndText,
+  stripBotEmojis,
+} from "./icons.js";
+
 export { MediaSyncController, WatchTraceRecorder };
 
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v33";
+export const APP_VERSION = "v34";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -1054,34 +1060,39 @@ export function formatBotRichText(raw) {
     tokens.push(html);
     return `\u0000BOTTOK${idx}\u0000`;
   };
-  const src = String(raw || "").replace(
-    /\[([^\[\]\n]{1,120})\]\(([^()\n]{1,320})\)/g,
-    (full, label, target) => {
-      const cleanLabel = label.trim();
-      const cleanTarget = target.trim();
-      if (!cleanLabel || !cleanTarget) return full;
-      if (cleanTarget.startsWith("action:")) {
-        const actId = cleanTarget.slice(7).trim();
-        if (!actId) return full;
-        return stash(
-          `<button type="button" class="bot-inline-action" data-bot-inline-action="${escapeHtml(actId)}">${escapeHtml(cleanLabel)}</button>`
-        );
+  const src = stripBotEmojis(String(raw ?? ""))
+    .replace(/:icon\[([a-z0-9-]{2,24})\]/gi, (full, iconName) => {
+      const svg = renderIconSvg(iconName, { size: 13, className: "bot-inline-icon" });
+      return svg ? stash(svg) : "";
+    })
+    .replace(
+      /\[([^\[\]\n]{1,120})\]\(([^()\n]{1,320})\)/g,
+      (full, label, target) => {
+        const cleanLabel = stripBotEmojis(label);
+        const cleanTarget = target.trim();
+        if (!cleanLabel || !cleanTarget) return full;
+        if (cleanTarget.startsWith("action:")) {
+          const actId = cleanTarget.slice(7).trim();
+          if (!actId) return full;
+          return stash(
+            `<button type="button" class="bot-inline-action" data-bot-inline-action="${escapeHtml(actId)}">${escapeHtml(cleanLabel)}</button>`
+          );
+        }
+        if (cleanTarget.startsWith("edit:")) {
+          const editSpec = cleanTarget.slice(5).trim();
+          if (!editSpec) return full;
+          return stash(
+            `<button type="button" class="bot-inline-action is-edit" data-bot-inline-edit="${escapeHtml(editSpec)}">${escapeHtml(cleanLabel)}</button>`
+          );
+        }
+        if (SAFE_HTTP_URL_RE.test(cleanTarget)) {
+          return stash(
+            `<a class="bot-inline-url" href="${escapeHtml(cleanTarget)}" target="_blank" rel="noopener noreferrer">${escapeHtml(cleanLabel)}</a>`
+          );
+        }
+        return full;
       }
-      if (cleanTarget.startsWith("edit:")) {
-        const editSpec = cleanTarget.slice(5).trim();
-        if (!editSpec) return full;
-        return stash(
-          `<button type="button" class="bot-inline-action is-edit" data-bot-inline-edit="${escapeHtml(editSpec)}">${escapeHtml(cleanLabel)}</button>`
-        );
-      }
-      if (SAFE_HTTP_URL_RE.test(cleanTarget)) {
-        return stash(
-          `<a class="bot-inline-url" href="${escapeHtml(cleanTarget)}" target="_blank" rel="noopener noreferrer">${escapeHtml(cleanLabel)}</a>`
-        );
-      }
-      return full;
-    }
-  );
+    );
   const { html } = extractAndLinkify(src);
   const formatted = html
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
@@ -6217,7 +6228,9 @@ export class P2PDirectApp {
 
     if (this.el["btn-watch-play"]) {
       this.el["btn-watch-play"].classList.toggle("hidden", isTwitchClip);
-      this.el["btn-watch-play"].textContent = state.playing ? "❚❚ Pause" : "▶ Play";
+      this.el["btn-watch-play"].innerHTML = state.playing
+        ? `${renderIconSvg("pause", { size: 13 })} Pause`
+        : `${renderIconSvg("play", { size: 13 })} Play`;
     }
     if (this.el["btn-watch-back10"]) {
       this.el["btn-watch-back10"].classList.toggle("hidden", isTwitchLive || isTwitchClip);
@@ -9617,7 +9630,10 @@ export class P2PDirectApp {
         ? "Saved locally — click to remove from saved rooms"
         : "Save this room locally so you can rejoin it anytime";
       if (this.el["simple-save-room-icon"]) {
-        this.el["simple-save-room-icon"].textContent = activeIsSaved ? "★" : "☆";
+        this.el["simple-save-room-icon"].innerHTML = renderIconSvg(
+          activeIsSaved ? "star-filled" : "star",
+          { size: 13 }
+        );
       }
       if (this.el["simple-save-room-label"]) {
         this.el["simple-save-room-label"].innerHTML = activeIsSaved
@@ -9631,7 +9647,9 @@ export class P2PDirectApp {
     if (advSaveBtn) {
       advSaveBtn.classList.toggle("is-saved", activeIsSaved);
       advSaveBtn.setAttribute("aria-pressed", String(activeIsSaved));
-      advSaveBtn.textContent = activeIsSaved ? "★ Saved" : "☆ Save Room";
+      advSaveBtn.innerHTML = activeIsSaved
+        ? `${renderIconSvg("star-filled", { size: 13 })} Saved`
+        : `${renderIconSvg("star", { size: 13 })} Save Room`;
     }
 
     // Memoize DOM rebuild so inline rename input never loses focus on unrelated status refreshes
@@ -17676,10 +17694,11 @@ export class P2PDirectApp {
             const idx = flatButtons.length;
             flatButtons.push(btn);
             const style = allowedStyles.has(btn.style) ? btn.style : "secondary";
-            const label = escapeHtml(btn.label || btn.id || "Action");
+            const resolved = resolveIconAndText(btn.label || btn.id || "Action", btn.icon);
+            const label = escapeHtml(resolved.text || btn.id || "Action");
             const sublabel =
-              typeof btn.sublabel === "string" && btn.sublabel.trim()
-                ? `<span class="bot-btn-sub">${escapeHtml(btn.sublabel.trim())}</span>`
+              typeof btn.sublabel === "string" && stripBotEmojis(btn.sublabel)
+                ? `<span class="bot-btn-sub">${escapeHtml(stripBotEmojis(btn.sublabel))}</span>`
                 : "";
             const imgSrc =
               typeof btn.image === "string"
@@ -17690,7 +17709,9 @@ export class P2PDirectApp {
             const hasImg = isSafeImageSrc(imgSrc);
             const imgHtml = hasImg
               ? `<img class="bot-btn-img" src="${escapeHtml(imgSrc)}" alt="" loading="lazy" />`
-              : "";
+              : resolved.icon
+                ? renderIconSvg(resolved.icon, { size: 13, className: "bot-btn-svg" })
+                : "";
             const isLink = typeof btn.url === "string" && SAFE_HTTP_URL_RE.test(btn.url.trim());
             const suffix = isLink ? ` ${LINK_ARROW_SVG}` : "";
             const disabledAttr = btn.disabled ? " disabled" : "";
@@ -17720,11 +17741,13 @@ export class P2PDirectApp {
 
       if (type === "heading") {
         const tag = blk.level === 2 ? "h3" : "h4";
+        const resolved = resolveIconAndText(blk.text || "", blk.icon);
+        const iconSvg = resolved.icon ? renderIconSvg(resolved.icon, { size: 14, className: "bot-blk-icon" }) : "";
         const badge = blk.badge
-          ? `<span class="bot-blk-badge">${escapeHtml(blk.badge)}</span>`
+          ? `<span class="bot-blk-badge">${escapeHtml(stripBotEmojis(blk.badge))}</span>`
           : "";
         out.push(
-          `<div class="bot-blk-heading"><${tag}>${escapeHtml(blk.text || "")}</${tag}>${badge}</div>`
+          `<div class="bot-blk-heading"><${tag} class="bot-card-title-row">${iconSvg}<span>${escapeHtml(resolved.text)}</span></${tag}>${badge}</div>`
         );
       } else if (type === "text" && typeof blk.text === "string" && blk.text.trim()) {
         out.push(`<div class="bot-blk-text">${formatBotRichText(blk.text)}</div>`);
@@ -17735,7 +17758,9 @@ export class P2PDirectApp {
         const val = Math.max(0, Math.min(max, Number(blk.value) || 0));
         const pct = Math.round((val / max) * 100);
         const barColor = allowedColors.has(blk.color) ? blk.color : "cobalt";
-        const disp = blk.display !== undefined ? String(blk.display) : `${pct}%`;
+        const disp = stripBotEmojis(blk.display !== undefined ? String(blk.display) : `${pct}%`);
+        const resolved = resolveIconAndText(blk.label || "", blk.icon);
+        const iconSvg = resolved.icon ? renderIconSvg(resolved.icon, { size: 13, className: "bot-blk-icon" }) : "";
         const actId = blk.actionId || blk.id || "";
         const isClickable = Boolean(
           actId || blk.editPatch || blk.editPayload || (typeof blk.url === "string" && blk.url.trim())
@@ -17744,7 +17769,7 @@ export class P2PDirectApp {
           const idx = flatButtons.length;
           flatButtons.push({
             id: actId || `progress_${idx}`,
-            label: blk.label || actId || "Select",
+            label: resolved.text || actId || "Select",
             value: blk.value !== undefined ? blk.value : null,
             url: blk.url || null,
             editPatch: blk.editPatch || null,
@@ -17756,7 +17781,7 @@ export class P2PDirectApp {
           out.push(`
             <button type="button" class="bot-blk-progress is-clickable is-${barColor}${actCls}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(actId)}"${disabledAttr}>
               <span class="bot-blk-progress-head">
-                <span class="bot-blk-progress-label">${escapeHtml(blk.label || "")}</span>
+                <span class="bot-blk-progress-label">${iconSvg}<span>${escapeHtml(resolved.text)}</span></span>
                 <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
               </span>
               <span class="bot-blk-progress-track">
@@ -17768,7 +17793,7 @@ export class P2PDirectApp {
           out.push(`
             <div class="bot-blk-progress">
               <div class="bot-blk-progress-head">
-                <span class="bot-blk-progress-label">${formatBotRichText(blk.label || "")}</span>
+                <span class="bot-blk-progress-label">${iconSvg}<span>${formatBotRichText(resolved.text)}</span></span>
                 <span class="bot-blk-progress-val">${escapeHtml(disp)}</span>
               </div>
               <div class="bot-blk-progress-track">
@@ -17785,7 +17810,7 @@ export class P2PDirectApp {
             const acc = allowedColors.has(it.accent) ? ` is-${it.accent}` : "";
             return `
               <div class="bot-blk-stat${acc}">
-                <span class="bot-blk-stat-label">${escapeHtml(it.label || "")}</span>
+                <span class="bot-blk-stat-label">${escapeHtml(stripBotEmojis(it.label || ""))}</span>
                 <span class="bot-blk-stat-val">${formatBotRichText(it.value ?? "")}</span>
               </div>
             `;
@@ -17794,8 +17819,10 @@ export class P2PDirectApp {
         if (tiles) out.push(`<div class="bot-blk-stats">${tiles}</div>`);
       } else if (type === "callout") {
         const tone = allowedTones.has(blk.tone) ? blk.tone : "info";
-        const titleHtml = blk.title
-          ? `<strong class="bot-blk-callout-title">${escapeHtml(blk.title)}</strong>`
+        const resolved = resolveIconAndText(blk.title || "", blk.icon);
+        const iconSvg = resolved.icon ? renderIconSvg(resolved.icon, { size: 13, className: "bot-blk-icon" }) : "";
+        const titleHtml = resolved.text
+          ? `<strong class="bot-blk-callout-title bot-card-title-row">${iconSvg}<span>${escapeHtml(resolved.text)}</span></strong>`
           : "";
         const textHtml = blk.text
           ? `<div class="bot-blk-callout-body">${formatBotRichText(blk.text)}</div>`
@@ -17805,7 +17832,7 @@ export class P2PDirectApp {
         const cols = Array.isArray(blk.columns) ? blk.columns.slice(0, 6) : [];
         const thead =
           cols.length > 0
-            ? `<thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>`
+            ? `<thead><tr>${cols.map((c) => `<th>${escapeHtml(stripBotEmojis(c))}</th>`).join("")}</tr></thead>`
             : "";
         const tbody = blk.rows
           .slice(0, 12)
@@ -17826,9 +17853,11 @@ export class P2PDirectApp {
           .filter((it) => it && typeof it === "object")
           .map((it) => {
             const idx = flatButtons.length;
+            const cleanTitle = stripBotEmojis(it.title || it.label || "");
+            const cleanSub = stripBotEmojis(it.subtitle || "");
             flatButtons.push({
               id: it.actionId || it.id || `gallery_${idx}`,
-              label: it.title || it.label || "Select",
+              label: cleanTitle || "Select",
               value: it.value !== undefined ? it.value : null,
               url: it.url || null,
               editPatch: it.editPatch || null,
@@ -17842,17 +17871,17 @@ export class P2PDirectApp {
                   ? it.image.url || it.image.dataUrl || ""
                   : "";
             const imgHtml = isSafeImageSrc(imgSrc)
-              ? `<img class="bot-gallery-img" src="${escapeHtml(imgSrc)}" alt="${escapeHtml(it.title || "")}" loading="lazy" />`
+              ? `<img class="bot-gallery-img" src="${escapeHtml(imgSrc)}" alt="${escapeHtml(cleanTitle)}" loading="lazy" />`
               : "";
-            const subHtml = it.subtitle
-              ? `<span class="bot-gallery-sub">${escapeHtml(it.subtitle)}</span>`
+            const subHtml = cleanSub
+              ? `<span class="bot-gallery-sub">${escapeHtml(cleanSub)}</span>`
               : "";
             const actCls = it.active ? " is-active" : "";
             return `
               <button type="button" class="bot-gallery-tile${actCls}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(it.actionId || it.id || "")}">
                 ${imgHtml}
                 <span class="bot-gallery-copy">
-                  <span class="bot-gallery-title">${escapeHtml(it.title || it.label || "")}</span>
+                  <span class="bot-gallery-title">${escapeHtml(cleanTitle)}</span>
                   ${subHtml}
                 </span>
               </button>
@@ -17865,10 +17894,11 @@ export class P2PDirectApp {
       } else if (type === "input") {
         const idx = inputBindings.length;
         inputBindings.push(blk);
-        const labelHtml = blk.label
-          ? `<label class="bot-blk-input-label">${escapeHtml(blk.label)}</label>`
+        const cleanLabel = stripBotEmojis(blk.label || "");
+        const labelHtml = cleanLabel
+          ? `<label class="bot-blk-input-label">${escapeHtml(cleanLabel)}</label>`
           : "";
-        const submitLbl = escapeHtml(blk.submitLabel || "Go");
+        const submitLbl = escapeHtml(stripBotEmojis(blk.submitLabel || "Go") || "Go");
         out.push(`
           <div class="bot-blk-input-wrap" data-bot-input-idx="${idx}">
             ${labelHtml}
@@ -17877,10 +17907,10 @@ export class P2PDirectApp {
                 type="text"
                 class="bot-blk-input"
                 data-bot-input-field="${idx}"
-                placeholder="${escapeHtml(blk.placeholder || "Type here…")}"
+                placeholder="${escapeHtml(stripBotEmojis(blk.placeholder || "Type here…"))}"
                 value="${escapeHtml(blk.value || "")}"
                 autocomplete="off"
-                aria-label="${escapeHtml(blk.label || blk.placeholder || "Bot input")}"
+                aria-label="${escapeHtml(cleanLabel || stripBotEmojis(blk.placeholder || "Bot input"))}"
               />
               <button type="button" class="btn btn-sm btn-primary bot-blk-input-submit" data-bot-input-submit="${idx}">${submitLbl}</button>
             </div>
@@ -17890,14 +17920,15 @@ export class P2PDirectApp {
       } else if (type === "select" && Array.isArray(blk.options) && blk.options.length > 0) {
         const idx = selectBindings.length;
         selectBindings.push(blk);
-        const labelHtml = blk.label
-          ? `<label class="bot-blk-input-label">${escapeHtml(blk.label)}</label>`
+        const cleanLabel = stripBotEmojis(blk.label || "");
+        const labelHtml = cleanLabel
+          ? `<label class="bot-blk-input-label">${escapeHtml(cleanLabel)}</label>`
           : "";
         const optsHtml = blk.options
           .slice(0, 30)
           .map((opt) => {
             const val = typeof opt === "object" ? String(opt.value ?? opt.label ?? "") : String(opt);
-            const lbl = typeof opt === "object" ? String(opt.label ?? opt.value ?? "") : String(opt);
+            const lbl = stripBotEmojis(typeof opt === "object" ? String(opt.label ?? opt.value ?? "") : String(opt));
             const sel = val === String(blk.value ?? "") ? " selected" : "";
             return `<option value="${escapeHtml(val)}"${sel}>${escapeHtml(lbl)}</option>`;
           })
@@ -17929,14 +17960,20 @@ export class P2PDirectApp {
     const selectBindings = [];
 
     if (p.title || p.subtitle || p.badge) {
-      const subHtml = p.subtitle
-        ? `<span class="bot-card-subtitle">${escapeHtml(p.subtitle)}</span>`
+      const subClean = stripBotEmojis(p.subtitle || "");
+      const subHtml = subClean
+        ? `<span class="bot-card-subtitle">${escapeHtml(subClean)}</span>`
         : "";
-      const titleHtml = p.title
-        ? `<h3 class="bot-card-title">${escapeHtml(p.title)}</h3>`
+      const titleResolved = resolveIconAndText(p.title || "", p.icon);
+      const titleIcon = titleResolved.icon
+        ? renderIconSvg(titleResolved.icon, { size: 15, className: "bot-blk-icon" })
         : "";
-      const badgeHtml = p.badge
-        ? `<span class="bot-card-badge">${escapeHtml(p.badge)}</span>`
+      const titleHtml = titleResolved.text
+        ? `<h3 class="bot-card-title bot-card-title-row">${titleIcon}<span>${escapeHtml(titleResolved.text)}</span></h3>`
+        : "";
+      const badgeClean = stripBotEmojis(p.badge || "");
+      const badgeHtml = badgeClean
+        ? `<span class="bot-card-badge">${escapeHtml(badgeClean)}</span>`
         : "";
       parts.push(`
         <div class="bot-card-head">
@@ -17967,7 +18004,7 @@ export class P2PDirectApp {
           const fullCls = f.inline === false ? " is-full" : "";
           return `
             <div class="bot-field${fullCls}">
-              <span class="bot-field-label">${escapeHtml(f.label || "")}</span>
+              <span class="bot-field-label">${escapeHtml(stripBotEmojis(f.label || ""))}</span>
               <span class="bot-field-value">${formatBotRichText(f.value ?? "")}</span>
             </div>
           `;
@@ -17985,7 +18022,7 @@ export class P2PDirectApp {
           ? p.image.dataUrl || p.image.url || ""
           : "";
     if (isSafeImageSrc(imgSrc)) {
-      const alt = escapeHtml((p.image && p.image.alt) || p.title || "Bot attachment");
+      const alt = escapeHtml(stripBotEmojis((p.image && p.image.alt) || p.title || "Bot attachment"));
       parts.push(`
         <button type="button" class="bot-card-image-btn" data-lightbox-src="${escapeHtml(imgSrc)}" data-lightbox-alt="${alt}">
           <img src="${escapeHtml(imgSrc)}" alt="${alt}" loading="lazy" />
@@ -17999,7 +18036,7 @@ export class P2PDirectApp {
     }
 
     if (typeof p.footer === "string" && p.footer.trim()) {
-      parts.push(`<div class="bot-card-footer">${escapeHtml(p.footer)}</div>`);
+      parts.push(`<div class="bot-card-footer">${escapeHtml(stripBotEmojis(p.footer))}</div>`);
     }
 
     return {

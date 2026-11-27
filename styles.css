@@ -9588,6 +9588,27 @@ html[data-watch-stage="true"] .join-listen-strip {
 
 /* ================= Interactive Bot Card UI Kit & Inline Bot Edit ================= */
 
+.metro-icon,
+.bot-btn-svg,
+.bot-blk-icon,
+.bot-inline-icon {
+  display: inline-block;
+  flex-shrink: 0;
+  vertical-align: -2px;
+}
+
+.bot-card-title-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.bot-blk-progress-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .bot-btn.is-active {
   background: var(--ink-primary);
   border-color: var(--rule);

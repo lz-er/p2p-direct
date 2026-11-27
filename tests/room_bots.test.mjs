@@ -160,9 +160,10 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     st = applyScoreboardAction(st, { kind: "rate", stars: 4 }, { peerId: "b", peerName: "Bob" });
     card = buildScoreboardCard(st);
     assert.equal(card.title, "Rate It: Dune Part Two");
-    assert.equal(card.badge, "★ 4.5 / 5 (2)");
+    assert.equal(card.badge, "4.5 / 5 (2)");
     assert.equal(card.blocks[0].type, "progress");
-    assert.match(card.blocks[0].display, /★ 4\.5 \/ 5/);
+    assert.equal(card.blocks[0].icon, "star-filled");
+    assert.match(card.blocks[0].display, /4\.5 \/ 5/);
   });
 
   it("6. Visual inline edit updaters preserve existing votes, checked state, scores, and history", () => {
