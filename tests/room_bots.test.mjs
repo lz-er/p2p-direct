@@ -92,6 +92,8 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     const card = buildPomodoroCard(st, { nowMs: t0 + 70_000 });
     assert.equal(card.builtinBot, POMODORO_BOT_ID);
     assert.match(card.title, /Short Break \(5m\) — 05:00/);
+    assert.equal(card.blocks[0].type, "stats");
+    assert.equal(card.blocks[1].type, "progress");
   });
 
   it("3. Shared Checklist: toggle, in-card add_inline, +todo append, clear done, and uncheck all", () => {
@@ -108,9 +110,11 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     let card = buildChecklistCard(st);
     assert.equal(card.builtinBot, CHECKLIST_BOT_ID);
     assert.equal(card.badge, "1/4 DONE");
-    assert.match(card.fields[0].value, /Alice/);
-    assert.equal(card.blocks[0].type, "input");
-    assert.equal(card.blocks[0].id, "todo:add_inline");
+    assert.equal(card.blocks[0].type, "progress"); // overall completion bar
+    assert.equal(card.blocks[1].id, "todo:toggle:0"); // directly clickable item bar
+    assert.match(card.blocks[1].display, /Alice/);
+    assert.ok(card.blocks.some((b) => b.type === "input" && b.id === "todo:add_inline"));
+    assert.equal(card.buttons.length, 1); // only utility row, no duplicate toggle buttons
 
     st = applyChecklistAction(st, { kind: "clear_done" });
     assert.equal(st.items.length, 3);
@@ -132,6 +136,8 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
 
     const card = buildRandomizerCard(st);
     assert.equal(card.builtinBot, RANDOMIZER_BOT_ID);
+    assert.equal(card.blocks[0].type, "stats");
+    assert.equal(card.blocks[1].type, "progress");
     assert.equal(st.history.length, 4);
   });
 
@@ -146,6 +152,8 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     let card = buildScoreboardCard(st);
     assert.equal(card.builtinBot, SCOREBOARD_BOT_ID);
     assert.match(card.badge, /LEAD: ALICE \(2\)/);
+    assert.equal(card.blocks[0].type, "progress");
+    assert.equal(card.blocks[0].id, "score:inc:0");
 
     st = applyScoreboardAction(st, { kind: "mode", mode: "ratings" }, { watchTitle: "Dune Part Two" });
     st = applyScoreboardAction(st, { kind: "rate", stars: 5 }, { peerId: "a", peerName: "Alice" });
@@ -153,6 +161,8 @@ describe("room_bots (5 Pure-P2P Offline Bots)", () => {
     card = buildScoreboardCard(st);
     assert.equal(card.title, "Rate It: Dune Part Two");
     assert.equal(card.badge, "★ 4.5 / 5 (2)");
+    assert.equal(card.blocks[0].type, "progress");
+    assert.match(card.blocks[0].display, /★ 4\.5 \/ 5/);
   });
 
   it("6. Visual inline edit updaters preserve existing votes, checked state, scores, and history", () => {

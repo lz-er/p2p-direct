@@ -136,7 +136,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v32";
+export const APP_VERSION = "v33";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -9442,15 +9442,23 @@ export class P2PDirectApp {
         `.log-entry[data-msg-id="${CSS.escape(msg.id)}"]`
       );
       if (entryEl) {
+        const dur = Math.max(1, Number(st.durationMs) || 1);
+        const pct = Math.max(0, Math.min(100, Math.round(((dur - remMs) / dur) * 100)));
+        const statusWord = remMs === 0 ? "DONE" : "RUNNING";
         const badgeEl = entryEl.querySelector(".bot-card-badge");
-        if (badgeEl) badgeEl.textContent = `${remMs === 0 ? "DONE" : "RUNNING"} · ${clock}`;
+        if (badgeEl) badgeEl.textContent = `${statusWord} · ${clock}`;
         const titleEl = entryEl.querySelector(".bot-card-title");
         if (titleEl && titleEl.textContent.includes("—")) {
           const prefix = titleEl.textContent.split("—")[0].trim();
           titleEl.textContent = `${prefix} — ${clock}`;
         }
-        const firstCode = entryEl.querySelector(".bot-field-value code");
-        if (firstCode) firstCode.textContent = clock;
+        const statVals = entryEl.querySelectorAll(".bot-blk-stat-val");
+        if (statVals[0]) statVals[0].textContent = clock;
+        if (statVals[1]) statVals[1].textContent = statusWord;
+        const progVal = entryEl.querySelector(".bot-blk-progress-val");
+        if (progVal) progVal.textContent = `${clock} · ${pct}%`;
+        const progFill = entryEl.querySelector(".bot-blk-progress-fill");
+        if (progFill) progFill.style.width = `${pct}%`;
       }
     }, 1000);
   }

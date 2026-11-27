@@ -375,24 +375,30 @@ export function buildSts2MetaCard(metricsData, state) {
     .sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0) || (Number(b.win_rate) || 0) - (Number(a.win_rate) || 0));
   const topRows = (sorted.length > 0 ? sorted : rows).slice(0, 6);
 
-  const fields =
+  const blocks =
     topRows.length > 0
       ? topRows.map((r, idx) => {
           const tier = r.tier ? `[${r.tier}] ` : "";
           const rawId = String(r.id || r.entity_id || "");
           const slug = rawId.toLowerCase();
           const entityPath = /^[a-z0-9_-]+$/.test(slug) ? `/${metricKind}/${slug}` : "";
-          const score = r.score != null ? `Score **${Math.round(Number(r.score))}**` : "";
-          const wr = r.win_rate != null ? `WR **${Number(r.win_rate).toFixed(1)}%**` : "";
+          const wrNum = r.win_rate != null ? Math.max(0, Math.min(100, Number(r.win_rate))) : 0;
+          const score = r.score != null ? `S:${Math.round(Number(r.score))}` : "";
+          const wr = r.win_rate != null ? `WR ${wrNum.toFixed(1)}%` : "";
           const pr = r.pick_rate != null ? `Pick ${Number(r.pick_rate).toFixed(0)}%` : "";
-          const openLink = entityPath ? `[View](action:${STS2_ACTION_PREFIX}open:${entityPath})` : "";
+          const tierColor =
+            r.tier === "S" ? "mint" : r.tier === "A" ? c.accent : r.tier === "B" ? "ochre" : "cobalt";
           return {
+            type: "progress",
+            id: entityPath ? `${STS2_ACTION_PREFIX}open:${entityPath}` : undefined,
             label: `#${idx + 1} ${tier}${humanizeEntityId(rawId)}`,
-            value: [score, wr, pr, openLink].filter(Boolean).join(" · "),
-            inline: true,
+            value: Math.round(wrNum * 10),
+            max: 1000,
+            display: [wr, pr, score].filter(Boolean).join(" · "),
+            color: tierColor,
           };
         })
-      : [{ label: "No Metrics", value: "No data for this filter.", inline: false }];
+      : [];
 
   const totalRuns = Number(metricsData?.character_runs || metricsData?.total_runs || 0);
   const baseWr = metricsData?.baseline_win_rate != null ? `${Number(metricsData.baseline_win_rate).toFixed(1)}%` : "—";
@@ -421,8 +427,9 @@ export function buildSts2MetaCard(metricsData, state) {
     title: `Top ${c.label} ${kindLabel} · ${bracketLabel(state.bracket)}`,
     badge: totalRuns > 0 ? `${totalRuns.toLocaleString()} RUNS` : "META",
     color: c.accent,
-    text: `Baseline WR **${baseWr}**`,
-    fields,
+    text: blocks.length > 0 ? `Baseline WR **${baseWr}**` : "No data for this filter.",
+    blocks,
+    fields: [],
     buttons: [buildNavButtonRows("meta"), charRow, bracketRow, buildFooterControls()],
     footer: `Spire Codex · ${formatUpdatedClock(state.nowMs || Date.now())}`,
   });
@@ -444,28 +451,32 @@ export function buildSts2EncountersCard(encData, state) {
     });
   const top = (sorted.length > 0 ? sorted : list).slice(0, 6);
 
-  const fields =
-    top.length > 0
-      ? top.map((e, idx) => {
-          const total = Math.max(1, Number(e.total || 0));
-          const fatalPct = ((Number(e.fatal || 0) / total) * 100).toFixed(1);
-          const avgDmg = e.avg_damage != null ? `${Number(e.avg_damage).toFixed(1)} dmg` : "—";
-          const avgTurns = e.avg_turns != null ? `${Number(e.avg_turns).toFixed(1)} turns` : "—";
-          const actLabel = e.act ? `Act ${e.act}` : "";
-          const roomLabel = e.room_type ? humanizeEntityId(e.room_type) : "";
-          return {
-            label: `#${idx + 1} ${humanizeEntityId(e.encounter_id || e.name)}`,
-            value: `**${fatalPct}% fatal** · ${avgDmg} · ${avgTurns}${actLabel || roomLabel ? ` · ${[actLabel, roomLabel].filter(Boolean).join(" ")}` : ""}`,
-            inline: true,
-          };
-        })
-      : [{ label: "Encounters", value: "No data.", inline: false }];
+  const blocks = top.map((e, idx) => {
+    const total = Math.max(1, Number(e.total || 0));
+    const fatalNum = Math.max(0, Math.min(100, (Number(e.fatal || 0) / total) * 100));
+    const fatalPct = fatalNum.toFixed(1);
+    const avgDmg = e.avg_damage != null ? `${Number(e.avg_damage).toFixed(1)} dmg` : "—";
+    const avgTurns = e.avg_turns != null ? `${Number(e.avg_turns).toFixed(1)}t` : "—";
+    const metaTag = [e.act ? `Act ${e.act}` : "", e.room_type ? humanizeEntityId(e.room_type) : ""]
+      .filter(Boolean)
+      .join(" ");
+    return {
+      type: "progress",
+      label: `#${idx + 1} ${humanizeEntityId(e.encounter_id || e.name)}${metaTag ? ` · ${metaTag}` : ""}`,
+      value: Math.round(fatalNum * 10),
+      max: 1000,
+      display: `${fatalPct}% fatal · ${avgDmg} · ${avgTurns}`,
+      color: fatalNum >= 35 ? "coral" : fatalNum >= 20 ? "ochre" : "cobalt",
+    };
+  });
 
   return basePayload(state, {
     title: "Deadliest Spire Encounters",
     badge: `${top.length} TRACKED`,
     color: "coral",
-    fields,
+    text: blocks.length === 0 ? "No data." : "",
+    blocks,
+    fields: [],
     buttons: [buildNavButtonRows("encounters"), buildFooterControls()],
     footer: `Spire Codex · ${formatUpdatedClock(state.nowMs || Date.now())}`,
   });
@@ -697,6 +708,16 @@ export function buildSts2CoopCard(state) {
     badge: `${count}/4 READY`,
     color: count >= 2 ? "mint" : "ochre",
     text: summaryText,
+    blocks: [
+      {
+        type: "progress",
+        label: "Party Seats",
+        value: count,
+        max: 4,
+        display: `${count} / 4 ready`,
+        color: count >= 2 ? "mint" : "ochre",
+      },
+    ],
     fields,
     buttons: [buildNavButtonRows("coop"), charRow, controlsRow],
     footer: `Updated ${formatUpdatedClock(state.nowMs || Date.now())}`,

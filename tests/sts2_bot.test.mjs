@@ -167,12 +167,14 @@ describe("sts2_bot Co-op Party Picker & API cards", () => {
 
     const meta = await fetchSts2Card({ tab: "meta", character: "ironclad", bracket: "2p" }, { fetchImpl: mockFetch });
     assert.match(meta.title, /Top Ironclad Cards/);
-    assert.match(meta.fields[0].label, /Offering/);
-    assert.match(meta.fields[0].value, /\[View\]\(action:sts2:open:\/cards\/offering\)/);
     assert.equal(meta.blocks[0].id, "sts2:search");
+    assert.equal(meta.blocks[1].type, "progress");
+    assert.match(meta.blocks[1].label, /Offering/);
+    assert.equal(meta.blocks[1].id, "sts2:open:/cards/offering");
 
     const enc = await fetchSts2Card({ tab: "encounters" }, { fetchImpl: mockFetch });
-    assert.match(enc.fields[0].value, /42\.0% fatal/);
+    assert.equal(enc.blocks[1].type, "progress");
+    assert.match(enc.blocks[1].display, /42\.0% fatal/);
 
     const codexBase = await fetchSts2Card({ tab: "codex", lookupQuery: "Bash", upgraded: false }, { fetchImpl: mockFetch });
     assert.equal(codexBase.title, "Bash");

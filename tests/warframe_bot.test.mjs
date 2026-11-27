@@ -129,7 +129,7 @@ test("buildWarframeCardFromData builds accurate cards for all 5 views including 
   assert.equal(cycles.wfView, "cycles");
   assert.equal(cycles.badge, "EIDOLON NIGHT · 10m 0s");
   assert.equal(cycles.color, "cobalt");
-  assert.ok(cycles.fields.some((f) => f.label === "Orb Vallis" && f.value.includes("6m 30s")));
+  assert.ok(cycles.blocks.some((b) => b.type === "progress" && b.label.includes("Orb Vallis") && b.display === "6m 30s"));
   assert.ok(cycles.fields.some((f) => f.label === "Circuit Warframes" && f.value.includes("Garuda")));
 
   // 2. Fissures filtering (Normal vs Steel Path vs Void Storms, ignoring expired)
@@ -142,13 +142,14 @@ test("buildWarframeCardFromData builds accurate cards for all 5 views including 
   ];
   const fNorm = buildWarframeCardFromData("fissures", { fissures: rawFissures }, { nowMs: now, fissureFilter: "normal" });
   assert.equal(fNorm.badge, "2 ACTIVE");
-  assert.equal(fNorm.fields[0].label, "Lith"); // sorted by tierNum
+  assert.equal(fNorm.blocks[0].type, "progress");
+  assert.ok(fNorm.blocks[0].label.startsWith("Lith")); // sorted by tierNum
   const fSteel = buildWarframeCardFromData("fissures", { fissures: rawFissures }, { nowMs: now, fissureFilter: "steel" });
   assert.equal(fSteel.badge, "1 ACTIVE");
-  assert.ok(fSteel.fields[0].value.includes("Mot"));
+  assert.ok(fSteel.blocks[0].label.includes("Mot"));
   const fStorm = buildWarframeCardFromData("fissures", { fissures: rawFissures }, { nowMs: now, fissureFilter: "storm" });
   assert.equal(fStorm.badge, "1 ACTIVE");
-  assert.ok(fStorm.fields[0].value.includes("Saturn Proxima"));
+  assert.ok(fStorm.blocks[0].label.includes("Saturn Proxima"));
 
   // 3. Sortie & Archon
   const sortie = buildWarframeCardFromData(
@@ -169,6 +170,8 @@ test("buildWarframeCardFromData builds accurate cards for all 5 views including 
     { nowMs: now }
   );
   assert.equal(sortie.badge, "RESETS 4h 0m");
+  assert.equal(sortie.blocks.length, 2);
+  assert.equal(sortie.blocks[0].type, "progress");
   assert.equal(sortie.fields.length, 2);
 
   // 4. Baro (away, derived purely from activation/expiry timestamps!) + Steel Path
@@ -189,8 +192,8 @@ test("buildWarframeCardFromData builds accurate cards for all 5 views including 
     { nowMs: now }
   );
   assert.equal(baroAway.badge, "IN 20h 0m");
-  assert.ok(baroAway.text.includes("Strata Relay"));
-  assert.ok(baroAway.fields.some((f) => f.label.includes("Steel Path") && f.value.includes("75 Steel Essence")));
+  assert.ok(baroAway.blocks[0].label.includes("Strata Relay"));
+  assert.ok(baroAway.blocks.some((b) => b.label.includes("Steel Path") && b.label.includes("75 Steel Essence")));
 
   // 5. Invasions & Alerts
   const inv = buildWarframeCardFromData(
@@ -219,8 +222,10 @@ test("buildWarframeCardFromData builds accurate cards for all 5 views including 
     { nowMs: now }
   );
   assert.equal(inv.badge, "1 ALERTS · 1 INV");
-  assert.ok(inv.fields[0].value.includes("Orokin Catalyst"));
-  assert.ok(inv.fields[1].value.includes("3x Fieldron"));
+  assert.equal(inv.blocks[0].type, "progress");
+  assert.ok(inv.blocks[0].label.includes("Orokin Catalyst"));
+  assert.equal(inv.blocks[1].value, 67);
+  assert.ok(inv.blocks[1].label.includes("3x Fieldron"));
 });
 
 test("fetchWarframeWorldstateCard fetches only tab-relevant endpoints and degrades cleanly on network failure", async () => {

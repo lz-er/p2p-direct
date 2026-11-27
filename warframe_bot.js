@@ -244,6 +244,50 @@ function buildWarframeButtons(activeView, fissureFilter = "normal") {
   return rows;
 }
 
+const WF_CYCLE_FALLBACK_MS = {
+  cetusDay: 100 * 60 * 1000,
+  cetusNight: 50 * 60 * 1000,
+  vallisWarm: (6 * 60 + 40) * 1000,
+  vallisCold: 20 * 60 * 1000,
+  cambionFass: 100 * 60 * 1000,
+  cambionVome: 50 * 60 * 1000,
+  zariman: 150 * 60 * 1000,
+  duviri: 120 * 60 * 1000,
+  fissure: 90 * 60 * 1000,
+  sortie: 24 * 60 * 60 * 1000,
+  archon: 7 * 24 * 60 * 60 * 1000,
+  baroVisit: 48 * 60 * 60 * 1000,
+  baroAway: 14 * 24 * 60 * 60 * 1000,
+  steelPath: 7 * 24 * 60 * 60 * 1000,
+  alert: 24 * 60 * 60 * 1000,
+};
+
+function computeWarframeTimerBar(expiryIso, activationIso, fallbackDurationMs, nowMs) {
+  const expMs = typeof expiryIso === "string" ? Date.parse(expiryIso) : NaN;
+  const actMs = typeof activationIso === "string" ? Date.parse(activationIso) : NaN;
+  const fallbackTotal = Math.max(60_000, Number(fallbackDurationMs) || 3_600_000);
+  if (!Number.isFinite(expMs)) {
+    return { value: 50, max: 100 };
+  }
+  const remMs = Math.max(0, expMs - nowMs);
+  const totalMs =
+    Number.isFinite(actMs) && expMs > actMs ? expMs - actMs : Math.max(fallbackTotal, remMs);
+  const clampedRem = Math.min(totalMs, remMs);
+  return {
+    value: Math.round(clampedRem / 1000),
+    max: Math.max(1, Math.round(totalMs / 1000)),
+  };
+}
+
+function duviriMoodColor(mood) {
+  const m = String(mood || "").toLowerCase();
+  if (m === "joy") return "mint";
+  if (m === "anger") return "coral";
+  if (m === "fear") return "ochre";
+  if (m === "envy") return "cyan";
+  return "cobalt";
+}
+
 /**
  * Pure builder turning fetched Warframe API JSON objects into a Flat Metro persistent bot card payload.
  */
@@ -258,7 +302,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
   const nowMs = typeof opts.nowMs === "number" && Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
   const autoRefreshSec = Number(opts.autoRefreshSec) || 0;
   const autoTag = autoRefreshSec > 0 ? ` · Auto ${Math.round(autoRefreshSec / 60)}m` : "";
-  const footer = `Warframe ${platform.toUpperCase()} · Persistent Dashboard · Updated ${formatUtcClock(nowMs)} UTC${autoTag}`;
+  const footer = `Warframe ${platform.toUpperCase()} · Updated ${formatUtcClock(nowMs)} UTC${autoTag}`;
 
   const baseMeta = {
     builtinBot: WARFRAME_BOT_ID,
@@ -267,7 +311,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
     wfFilter: fissureFilter,
     wfPlatform: platform,
     wfUpdatedAt: nowMs,
-    subtitle: "WARFRAME WORLDSTATE · LIVE",
+    subtitle: "WARFRAME WORLDSTATE",
     buttons: buildWarframeButtons(cleanView, fissureFilter),
     footer,
   };
@@ -284,13 +328,35 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
         ? cetus.isDay
         : String(cetus.state || "").toLowerCase() === "day";
     const cetusLeft = formatWarframeCountdown(cetus.expiry, nowMs, cetus.timeLeft);
+    const cetusBar = computeWarframeTimerBar(
+      cetus.expiry,
+      cetus.activation,
+      cetusIsDay ? WF_CYCLE_FALLBACK_MS.cetusDay : WF_CYCLE_FALLBACK_MS.cetusNight,
+      nowMs
+    );
+
     const vallisIsWarm =
       typeof vallis.isWarm === "boolean"
         ? vallis.isWarm
         : String(vallis.state || "").toLowerCase() === "warm";
     const vallisLeft = formatWarframeCountdown(vallis.expiry, nowMs, vallis.timeLeft);
+    const vallisBar = computeWarframeTimerBar(
+      vallis.expiry,
+      vallis.activation,
+      vallisIsWarm ? WF_CYCLE_FALLBACK_MS.vallisWarm : WF_CYCLE_FALLBACK_MS.vallisCold,
+      nowMs
+    );
+
     const cambionState = String(cambion.state || cambion.active || "—").toUpperCase();
+    const cambionIsFass = cambionState === "FASS";
     const cambionLeft = formatWarframeCountdown(cambion.expiry, nowMs, cambion.timeLeft);
+    const cambionBar = computeWarframeTimerBar(
+      cambion.expiry,
+      cambion.activation,
+      cambionIsFass ? WF_CYCLE_FALLBACK_MS.cambionFass : WF_CYCLE_FALLBACK_MS.cambionVome,
+      nowMs
+    );
+
     const zarimanState =
       typeof zariman.isCorpus === "boolean"
         ? zariman.isCorpus
@@ -298,37 +364,66 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
           : "Grineer"
         : capitalizeWord(zariman.state);
     const zarimanLeft = formatWarframeCountdown(zariman.expiry, nowMs, zariman.timeLeft);
+    const zarimanBar = computeWarframeTimerBar(
+      zariman.expiry,
+      zariman.activation,
+      WF_CYCLE_FALLBACK_MS.zariman,
+      nowMs
+    );
+
     const duviriMood = capitalizeWord(duviri.state);
     const duviriLeft = formatWarframeCountdown(duviri.expiry, nowMs, duviri.timeLeft);
+    const duviriBar = computeWarframeTimerBar(
+      duviri.expiry,
+      duviri.activation,
+      WF_CYCLE_FALLBACK_MS.duviri,
+      nowMs
+    );
 
-    const fields = [
+    const blocks = [
       {
-        label: "Cetus (Plains)",
-        value: `**${cetusIsDay ? "Day" : "Night"}** · ${cetusLeft}`,
-        inline: true,
+        type: "progress",
+        label: `Cetus (Plains) · ${cetusIsDay ? "Day" : "Night"}`,
+        value: cetusBar.value,
+        max: cetusBar.max,
+        display: cetusLeft,
+        color: cetusIsDay ? "ochre" : "cobalt",
       },
       {
-        label: "Orb Vallis",
-        value: `**${vallisIsWarm ? "Warm" : "Cold"}** · ${vallisLeft}`,
-        inline: true,
+        type: "progress",
+        label: `Orb Vallis · ${vallisIsWarm ? "Warm" : "Cold"}`,
+        value: vallisBar.value,
+        max: vallisBar.max,
+        display: vallisLeft,
+        color: vallisIsWarm ? "coral" : "cyan",
       },
       {
-        label: "Cambion Drift",
-        value: `**${cambionState}** · ${cambionLeft}`,
-        inline: true,
+        type: "progress",
+        label: `Cambion Drift · ${cambionState}`,
+        value: cambionBar.value,
+        max: cambionBar.max,
+        display: cambionLeft,
+        color: cambionIsFass ? "ochre" : "cobalt",
       },
       {
-        label: "Zariman",
-        value: `**${zarimanState}** · ${zarimanLeft}`,
-        inline: true,
+        type: "progress",
+        label: `Zariman · ${zarimanState}`,
+        value: zarimanBar.value,
+        max: zarimanBar.max,
+        display: zarimanLeft,
+        color: zarimanState === "Corpus" ? "cyan" : "coral",
       },
       {
-        label: "Duviri Spiral",
-        value: `**${duviriMood}** · ${duviriLeft}`,
-        inline: true,
+        type: "progress",
+        label: `Duviri Spiral · ${duviriMood}`,
+        value: duviriBar.value,
+        max: duviriBar.max,
+        display: duviriLeft,
+        color: duviriMoodColor(duviriMood),
       },
     ];
 
+    const fields = [];
     if (Array.isArray(duviri.choices) && duviri.choices.length > 0) {
       const normalCircuit = duviri.choices.find((c) => c?.category === "normal");
       const hardCircuit = duviri.choices.find((c) => c?.category === "hard");
@@ -353,6 +448,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       title: "Open World Cycles",
       badge: cetusIsDay ? `CETUS DAY · ${cetusLeft}` : `EIDOLON NIGHT · ${cetusLeft}`,
       color: cetusIsDay ? "ochre" : "cobalt",
+      blocks,
       fields,
     };
   }
@@ -382,25 +478,31 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
         : fissureFilter === "storm"
           ? "Void Storms"
           : "Normal";
+    const barColor = fissureFilter === "steel" ? "coral" : fissureFilter === "storm" ? "cyan" : "mint";
+
+    const blocks = shown.map((f) => {
+      const left = formatWarframeCountdown(f.expiry, nowMs, f.eta);
+      const bar = computeWarframeTimerBar(f.expiry, f.activation, WF_CYCLE_FALLBACK_MS.fissure, nowMs);
+      const enemy = f.enemy ? ` · ${f.enemy}` : "";
+      const tag = `${f.tier || "Relic"}${f.isHard ? " SP" : ""}${f.isStorm ? " RJ" : ""}`;
+      return {
+        type: "progress",
+        label: `${tag} · ${f.missionType || "Mission"} — ${f.node || "Unknown"}${enemy}`,
+        value: bar.value,
+        max: bar.max,
+        display: left,
+        color: barColor,
+      };
+    });
 
     return {
       ...baseMeta,
       title: `Void Fissures — ${modeLabel}`,
       badge: `${filtered.length} ACTIVE`,
-      color: fissureFilter === "steel" ? "coral" : fissureFilter === "storm" ? "cyan" : "mint",
-      text:
-        shown.length > 0
-          ? `Showing ${shown.length} of ${filtered.length} active **${modeLabel}** fissures:`
-          : `No active **${modeLabel}** fissures right now.`,
-      fields: shown.map((f) => {
-        const left = formatWarframeCountdown(f.expiry, nowMs, f.eta);
-        const enemy = f.enemy ? ` · ${f.enemy}` : "";
-        return {
-          label: `${f.tier || "Relic"}${f.isHard ? " · SP" : ""}${f.isStorm ? " · Railjack" : ""}`,
-          value: `**${f.missionType || "Mission"}** — ${f.node || "Unknown"}${enemy} (\`${left}\`)`,
-          inline: true,
-        };
-      }),
+      color: barColor,
+      text: shown.length === 0 ? `No active **${modeLabel}** fissures right now.` : "",
+      blocks,
+      fields: [],
     };
   }
 
@@ -411,6 +513,29 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
     const archonMissions = Array.isArray(archon.missions) ? archon.missions : [];
     const sortieLeft = formatWarframeCountdown(sortie.expiry, nowMs, sortie.eta);
     const archonLeft = formatWarframeCountdown(archon.expiry, nowMs, archon.eta);
+    const sortieBar = computeWarframeTimerBar(sortie.expiry, sortie.activation, WF_CYCLE_FALLBACK_MS.sortie, nowMs);
+    const archonBar = computeWarframeTimerBar(archon.expiry, archon.activation, WF_CYCLE_FALLBACK_MS.archon, nowMs);
+
+    const blocks = [
+      {
+        type: "progress",
+        label: `Daily Sortie · ${sortie.boss || "Sortie"}${sortie.faction ? ` (${sortie.faction})` : ""}`,
+        value: sortieBar.value,
+        max: sortieBar.max,
+        display: `Resets ${sortieLeft}`,
+        color: "coral",
+      },
+    ];
+    if (archon.boss || archonMissions.length > 0) {
+      blocks.push({
+        type: "progress",
+        label: `Weekly Archon · ${archon.boss || "Archon"}`,
+        value: archonBar.value,
+        max: archonBar.max,
+        display: `Resets ${archonLeft}`,
+        color: "ochre",
+      });
+    }
 
     const fields = [];
     for (let i = 0; i < variants.length; i++) {
@@ -426,7 +551,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
         .map((m, idx) => `${idx + 1}. **${m.type || "Mission"}** (${m.node || "?"})`)
         .join("  ·  ");
       fields.push({
-        label: `Weekly Archon Hunt — ${archon.boss || "Archon"} (${archonLeft})`,
+        label: `Archon Stages — ${archon.boss || "Archon"}`,
         value: missionLine || "Check navigation for active stages.",
         inline: false,
       });
@@ -437,7 +562,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       title: `Sortie — ${sortie.boss || "Daily Sortie"}`,
       badge: `RESETS ${sortieLeft}`,
       color: "coral",
-      text: `Sortie Faction: **${sortie.faction || "Unknown"}** · Archon: **${archon.boss || "—"}**`,
+      blocks,
       fields,
     };
   }
@@ -458,6 +583,33 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       ? formatWarframeCountdown(trader.expiry, nowMs, trader.endString)
       : formatWarframeCountdown(trader.activation, nowMs, trader.startString);
     const location = trader.location || "Tenno Relay";
+    const baroBar = isActive
+      ? computeWarframeTimerBar(trader.expiry, trader.activation, WF_CYCLE_FALLBACK_MS.baroVisit, nowMs)
+      : computeWarframeTimerBar(trader.activation, null, WF_CYCLE_FALLBACK_MS.baroAway, nowMs);
+
+    const blocks = [
+      {
+        type: "progress",
+        label: `Baro Ki'Teer · ${location}`,
+        value: isActive ? baroBar.value : Math.max(0, baroBar.max - baroBar.value),
+        max: baroBar.max,
+        display: isActive ? `Leaves ${etaStr}` : `Arrives ${etaStr}`,
+        color: isActive ? "mint" : "cyan",
+      },
+    ];
+
+    if (sp && sp.currentReward) {
+      const spLeft = formatWarframeCountdown(sp.expiry, nowMs, sp.remaining);
+      const spBar = computeWarframeTimerBar(sp.expiry, sp.activation, WF_CYCLE_FALLBACK_MS.steelPath, nowMs);
+      blocks.push({
+        type: "progress",
+        label: `Steel Path · ${sp.currentReward.name || "Reward"} (${sp.currentReward.cost ?? "?"} Steel Essence)`,
+        value: spBar.value,
+        max: spBar.max,
+        display: spLeft,
+        color: "ochre",
+      });
+    }
 
     const fields = [];
     if (isActive && Array.isArray(trader.inventory) && trader.inventory.length > 0) {
@@ -468,23 +620,6 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
           inline: true,
         });
       }
-    } else {
-      fields.push({
-        label: "Baro Ki'Teer",
-        value: isActive
-          ? `Visiting **${location}** · Leaves in \`${etaStr}\``
-          : `Next visit: **${location}** · Arrives in \`${etaStr}\``,
-        inline: false,
-      });
-    }
-
-    if (sp && sp.currentReward) {
-      const spLeft = formatWarframeCountdown(sp.expiry, nowMs, sp.remaining);
-      fields.push({
-        label: "Steel Path Weekly Honor",
-        value: `**${sp.currentReward.name || "Reward"}** · ${sp.currentReward.cost ?? "?"} Steel Essence (\`${spLeft}\`)`,
-        inline: false,
-      });
     }
 
     return {
@@ -492,9 +627,7 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
       title: "Baro Ki'Teer & Steel Path",
       badge: isActive ? `HERE · ${etaStr}` : `IN ${etaStr}`,
       color: isActive ? "mint" : "cyan",
-      text: isActive
-        ? `Baro is at **${location}** and leaves in **${etaStr}**.`
-        : `Baro Ki'Teer arrives at **${location}** in **${etaStr}**.`,
+      blocks,
       fields,
     };
   }
@@ -509,29 +642,36 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
     (inv) => inv && !inv.completed
   );
 
-  const fields = [];
+  const blocks = [];
   for (const a of alerts.slice(0, 3)) {
     const m = a.mission || {};
     const left = formatWarframeCountdown(a.expiry, nowMs, a.eta);
     const reward = formatRewardSummary(m.reward);
-    fields.push({
-      label: `Alert · ${m.description || m.type || "Mission"}`,
-      value: `**${reward}** — ${m.node || "Unknown"} (\`${left}\`)`,
-      inline: false,
+    const bar = computeWarframeTimerBar(a.expiry, a.activation, WF_CYCLE_FALLBACK_MS.alert, nowMs);
+    blocks.push({
+      type: "progress",
+      label: `Alert · ${reward} — ${m.node || "Unknown"}`,
+      value: bar.value,
+      max: bar.max,
+      display: left,
+      color: "ochre",
     });
   }
   for (const inv of invasions.slice(0, 5)) {
     const atk = formatRewardSummary(inv.attacker?.reward);
     const def = formatRewardSummary(inv.defender?.reward);
-    const rewardText = inv.vsInfestation || atk === "—" ? def : `${atk}  vs  ${def}`;
+    const rewardText = inv.vsInfestation || atk === "—" ? def : `${atk} vs ${def}`;
     const pct =
       typeof inv.completion === "number" && Number.isFinite(inv.completion)
-        ? `${Math.max(0, Math.min(100, Math.round(inv.completion)))}%`
-        : "";
-    fields.push({
-      label: `Invasion · ${inv.node || "Unknown"}${pct ? ` (${pct})` : ""}`,
-      value: `**${rewardText}**`,
-      inline: true,
+        ? Math.max(0, Math.min(100, Math.round(inv.completion)))
+        : 0;
+    blocks.push({
+      type: "progress",
+      label: `${inv.node || "Invasion"} · ${rewardText}`,
+      value: pct,
+      max: 100,
+      display: `${pct}%`,
+      color: pct >= 75 ? "mint" : "cobalt",
     });
   }
 
@@ -540,11 +680,9 @@ export function buildWarframeCardFromData(view, data, opts = {}) {
     title: "Alerts & Invasions",
     badge: `${alerts.length} ALERTS · ${invasions.length} INV`,
     color: alerts.length > 0 ? "ochre" : "cobalt",
-    text:
-      fields.length > 0
-        ? "Active Gift of the Lotus alerts and ongoing faction invasions:"
-        : "No active alerts or invasions right now.",
-    fields,
+    text: blocks.length === 0 ? "No active alerts or invasions right now." : "",
+    blocks,
+    fields: [],
   };
 }
 
