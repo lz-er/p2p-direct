@@ -5731,7 +5731,7 @@ input[type="checkbox"].metro-switch:checked::after {
 .bot-card-actions {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
   padding-top: 2px;
 }
 
@@ -5739,13 +5739,81 @@ input[type="checkbox"].metro-switch:checked::after {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  width: 100%;
+}
+
+/* Uniform edge-to-edge Flat Metro button grid */
+.bot-btn-row.is-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--btn-cols, 2), minmax(0, 1fr));
+  gap: 6px;
+}
+
+.bot-btn-row.is-grid .bot-btn {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  justify-content: center;
+  padding: 7px 10px;
+}
+
+.bot-btn-row.is-grid .bot-btn.has-img {
+  justify-content: flex-start;
+  padding: 5px 10px 5px 5px;
+}
+
+/* Seamless segmented tab / filter bar */
+.bot-btn-row.is-tabs {
+  display: grid;
+  grid-template-columns: repeat(var(--btn-cols, 3), minmax(0, 1fr));
+  gap: 0;
+  border: 2px solid var(--rule);
+  background: var(--rule);
+}
+
+.bot-btn-row.is-tabs .bot-btn {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  justify-content: center;
+  padding: 6px 8px;
+  border: 0;
+  border-right: 1.5px solid var(--rule);
+  font-size: 10.5px;
+}
+
+.bot-btn-row.is-tabs .bot-btn:last-child {
+  border-right: 0;
+}
+
+/* Separated utility footer row with Hide/Remove pinned cleanly to the right */
+.bot-btn-row.is-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--rule-soft);
+}
+
+.bot-btn-row.is-footer .bot-btn {
+  min-height: 28px;
+  padding: 5px 10px;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+
+.bot-btn-row.is-footer .bot-btn-danger {
+  margin-left: auto;
 }
 
 .bot-btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
-  padding: 7px 13px;
+  padding: 7px 12px;
   border: 2px solid var(--rule);
   border-radius: 0;
   background: var(--bg-surface);
@@ -5753,11 +5821,18 @@ input[type="checkbox"].metro-switch:checked::after {
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   cursor: pointer;
   text-decoration: none;
+  min-width: 0;
   transition: background-color 110ms ease, color 110ms ease, border-color 110ms ease;
+}
+
+.bot-btn-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bot-btn:hover:not(:disabled) {
@@ -10325,5 +10400,61 @@ html[data-watch-stage="true"] .join-listen-strip {
 
   .bot-blk-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .bot-btn-row.is-grid.cols-3[data-btn-density="normal"],
+  .bot-btn-row.is-grid.cols-4[data-btn-density="normal"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .bot-btn-row.is-grid.cols-3[data-btn-density="normal"] .bot-btn:nth-child(3) {
+    grid-column: 1 / -1;
+  }
+
+  .bot-btn-row.is-grid.cols-5[data-btn-density="normal"] {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .bot-btn-row.is-grid.cols-5[data-btn-density="normal"] .bot-btn {
+    grid-column: span 2;
+  }
+
+  .bot-btn-row.is-grid.cols-5[data-btn-density="normal"] .bot-btn:nth-child(4),
+  .bot-btn-row.is-grid.cols-5[data-btn-density="normal"] .bot-btn:nth-child(5) {
+    grid-column: span 3;
+  }
+
+  .bot-btn-row.is-grid.cols-6 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .bot-btn-row.is-tabs.cols-5 {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 1.5px;
+  }
+
+  .bot-btn-row.is-tabs.cols-5 .bot-btn {
+    border-right: 0;
+    grid-column: span 2;
+  }
+
+  .bot-btn-row.is-tabs.cols-5 .bot-btn:nth-child(4),
+  .bot-btn-row.is-tabs.cols-5 .bot-btn:nth-child(5) {
+    grid-column: span 3;
+  }
+
+  .bot-btn-row.is-tabs.cols-6 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1.5px;
+  }
+
+  .bot-btn-row.is-tabs.cols-6 .bot-btn {
+    border-right: 0;
+  }
+
+  .bot-btn-row.is-grid[data-btn-density="compact"] .bot-btn,
+  .bot-btn-row.is-tabs .bot-btn {
+    padding: 6px 4px;
+    font-size: 9.5px;
   }
 }

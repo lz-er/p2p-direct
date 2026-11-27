@@ -620,9 +620,9 @@ export function summarizeGithubPill(msg) {
 
 function ghNavRow(activeTab) {
   const tabs = [
-    { id: "overview", label: "Overview & Release" },
+    { id: "overview", label: "Overview" },
     { id: "commits", label: "Commits" },
-    { id: "issues", label: "Issues & PRs" },
+    { id: "issues", label: "Issues" },
   ];
   return tabs.map((t) => ({
     id: `${GITHUB_ACTION_PREFIX}tab:${t.id}`,

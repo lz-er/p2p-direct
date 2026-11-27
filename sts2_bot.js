@@ -418,7 +418,7 @@ export function buildSts2MetaCard(metricsData, state) {
     })),
     {
       id: `${STS2_ACTION_PREFIX}metric:${nextKind}`,
-      label: nextKind === "relics" ? "Show Relics" : "Show Cards",
+      label: nextKind === "relics" ? "Relics" : "Cards",
       style: "secondary",
     },
   ];

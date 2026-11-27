@@ -210,10 +210,10 @@ function buildWarframeButtons(activeView, fissureFilter = "normal") {
   const tabStyle = (id) => (activeView === id ? "primary" : "secondary");
   const rows = [
     [
-      { id: "wf:tab:cycles", label: "Open Worlds", style: tabStyle("cycles") },
+      { id: "wf:tab:cycles", label: "Worlds", style: tabStyle("cycles") },
       { id: "wf:tab:fissures", label: "Fissures", style: tabStyle("fissures") },
-      { id: "wf:tab:sortie", label: "Sortie & Archon", style: tabStyle("sortie") },
-      { id: "wf:tab:baro", label: "Baro & Steel", style: tabStyle("baro") },
+      { id: "wf:tab:sortie", label: "Sortie", style: tabStyle("sortie") },
+      { id: "wf:tab:baro", label: "Baro", style: tabStyle("baro") },
       { id: "wf:tab:invasions", label: "Invasions", style: tabStyle("invasions") },
     ],
   ];
@@ -221,9 +221,11 @@ function buildWarframeButtons(activeView, fissureFilter = "normal") {
   if (activeView === "fissures") {
     const fStyle = (f) => (fissureFilter === f ? "success" : "secondary");
     rows.push([
-      { id: "wf:fissures:normal", label: "Normal Relics", style: fStyle("normal") },
+      { id: "wf:fissures:normal", label: "Normal", style: fStyle("normal") },
       { id: "wf:fissures:steel", label: "Steel Path", style: fStyle("steel") },
       { id: "wf:fissures:storm", label: "Void Storms", style: fStyle("storm") },
+    ]);
+    rows.push([
       { id: "wf:refresh:fissures", icon: "refresh", label: "Refresh", style: "secondary" },
       { id: "wf:dismiss", icon: "close", label: "Remove", style: "danger" },
     ]);

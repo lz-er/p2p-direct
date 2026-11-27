@@ -422,6 +422,8 @@ export function buildPomodoroCard(stateInput, { nowMs = Date.now() } = {}) {
         { id: "pomo:mode:focus", label: `${s.focusMin || 25}m Focus`, style: s.mode === "focus" ? "primary" : "secondary" },
         { id: "pomo:mode:break", label: `${s.breakMin || 5}m Break`, style: s.mode === "break" ? "primary" : "secondary" },
         { id: "pomo:mode:long", label: `${s.longBreakMin || 15}m Long`, style: s.mode === "long" ? "primary" : "secondary" },
+      ],
+      [
         { id: "pomo:dismiss", icon: "close", label: "Hide", style: "danger" },
       ],
     ],

@@ -142,7 +142,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v34";
+export const APP_VERSION = "v35";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -17672,24 +17672,65 @@ export class P2PDirectApp {
 
   normalizeBotButtonRows(rawButtons) {
     if (!Array.isArray(rawButtons) || rawButtons.length === 0) return [];
-    const rows = Array.isArray(rawButtons[0]) ? rawButtons : [rawButtons];
+    const allowedKinds = new Set(["tabs", "grid", "footer"]);
+    const isRowLike = (item) =>
+      Array.isArray(item) || (item && typeof item === "object" && Array.isArray(item.buttons));
+    const rows = isRowLike(rawButtons[0]) ? rawButtons : [rawButtons];
     const cleanRows = [];
     for (const row of rows) {
-      if (!Array.isArray(row)) continue;
-      const cleanBtns = row.filter((b) => b && typeof b === "object" && (b.label || b.id));
+      const explicitKind =
+        !Array.isArray(row) && row && allowedKinds.has(row.kind) ? row.kind : "auto";
+      const list = Array.isArray(row) ? row : Array.isArray(row?.buttons) ? row.buttons : null;
+      if (!list) continue;
+      const cleanBtns = list.filter((b) => b && typeof b === "object" && (b.label || b.id));
       if (cleanBtns.length > 0) {
-        cleanRows.push(cleanBtns);
+        cleanRows.push({ kind: explicitKind, buttons: cleanBtns });
       }
     }
     return cleanRows;
   }
 
+  _classifyBotButtonRow(rowEntry, rowIdx, totalRows) {
+    if (rowEntry.kind && rowEntry.kind !== "auto") return rowEntry.kind;
+    const btns = rowEntry.buttons;
+    const isLast = rowIdx === totalRows - 1;
+    const hasDismiss = btns.some(
+      (b) => b.style === "danger" || /:dismiss$/i.test(String(b.id || b.actionId || ""))
+    );
+    // Dedicated utility/footer row (e.g. Reset / Refresh / Open / Hide)
+    if (isLast && hasDismiss && btns.length <= 5) {
+      return "footer";
+    }
+    // Segmented tab / mode / city / filter bar
+    if (btns.length >= 2 && btns.length <= 6) {
+      const allSwitchers = btns.every((b) =>
+        /:(tab|mode|city|fissures|bracket|metric):/i.test(String(b.id || b.actionId || ""))
+      );
+      if (allSwitchers) return "tabs";
+    }
+    return "grid";
+  }
+
   _renderBotButtonRowsHtml(buttonRows, flatButtons) {
     if (!Array.isArray(buttonRows) || buttonRows.length === 0) return "";
     const allowedStyles = new Set(["primary", "success", "warning", "danger", "secondary"]);
+    const totalRows = buttonRows.length;
     const rowsHtml = buttonRows
-      .map((row) => {
-        const btnsHtml = row
+      .map((rowEntry, rowIdx) => {
+        const btns = Array.isArray(rowEntry) ? rowEntry : rowEntry.buttons;
+        const kind = this._classifyBotButtonRow(
+          Array.isArray(rowEntry) ? { kind: "auto", buttons: rowEntry } : rowEntry,
+          rowIdx,
+          totalRows
+        );
+        const maxLabelLen = btns.reduce((m, b) => {
+          const r = resolveIconAndText(b.label || b.id || "", b.icon);
+          return Math.max(m, r.text.length);
+        }, 0);
+        const density = maxLabelLen <= 6 ? "compact" : "normal";
+        const cols = Math.min(Math.max(1, btns.length), 6);
+
+        const btnsHtml = btns
           .map((btn) => {
             const idx = flatButtons.length;
             flatButtons.push(btn);
@@ -17710,7 +17751,7 @@ export class P2PDirectApp {
             const imgHtml = hasImg
               ? `<img class="bot-btn-img" src="${escapeHtml(imgSrc)}" alt="" loading="lazy" />`
               : resolved.icon
-                ? renderIconSvg(resolved.icon, { size: 13, className: "bot-btn-svg" })
+                ? renderIconSvg(resolved.icon, { size: kind === "footer" ? 12 : 13, className: "bot-btn-svg" })
                 : "";
             const isLink = typeof btn.url === "string" && SAFE_HTTP_URL_RE.test(btn.url.trim());
             const suffix = isLink ? ` ${LINK_ARROW_SVG}` : "";
@@ -17723,7 +17764,10 @@ export class P2PDirectApp {
             return `<button type="button" class="bot-btn bot-btn-${style}${activeCls}${imgCls}" data-bot-btn-idx="${idx}" data-bot-action-id="${escapeHtml(btn.id || btn.actionId || "")}"${disabledAttr}>${imgHtml}${copyHtml}</button>`;
           })
           .join("");
-        return `<div class="bot-btn-row">${btnsHtml}</div>`;
+
+        const styleAttr =
+          kind === "grid" || kind === "tabs" ? ` style="--btn-cols:${cols}"` : "";
+        return `<div class="bot-btn-row is-${kind} cols-${cols}" data-btn-density="${density}"${styleAttr}>${btnsHtml}</div>`;
       })
       .join("");
     return `<div class="bot-card-actions">${rowsHtml}</div>`;
