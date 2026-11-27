@@ -78,6 +78,14 @@ function buildPlayerCard() {
     fields.push({ label: "Requested By", value: currentTrack.requestedBy, inline: true });
   }
 
+  const voiceStatus = !bot.inVoice
+    ? "Offline"
+    : !currentTrack
+      ? "Idle"
+      : paused
+        ? "Paused"
+        : currentTrack.title;
+
   return {
     subtitle: "VOICE MUSIC BOT",
     title: "Signal Jukebox",
@@ -85,6 +93,28 @@ function buildPlayerCard() {
     color,
     text: "Control playback directly with the buttons below or type `!play <file/url>` / `!demo`.",
     fields,
+    voiceControls: {
+      status: voiceStatus,
+      statusIcon: "music",
+      statusTone: color,
+      buttons: [
+        {
+          id: paused ? "music:resume" : "music:pause",
+          label: paused ? "Resume" : "Pause",
+          icon: paused ? "play" : "pause",
+          style: paused ? "success" : "warning",
+          disabled: !currentTrack,
+        },
+        { id: "music:skip", label: "Skip", icon: "next", style: "secondary", disabled: !currentTrack },
+        {
+          id: "music:stop",
+          label: "Stop",
+          icon: "close",
+          style: "danger",
+          disabled: !currentTrack && queue.length === 0,
+        },
+      ],
+    },
     buttons: [
       [
         {

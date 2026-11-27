@@ -13,7 +13,15 @@ import {
   WyomingSatelliteServer,
   encodeWyomingEvent,
 } from "../bot/wyoming.mjs";
-import { HomeAssistantVoiceAssistant } from "../bot/ha-assistant.mjs";
+import {
+  HomeAssistantVoiceAssistant,
+  HomeAssistantWsClient,
+  TIMER_LIST_FEATURES,
+  formatTimerDurationLabel,
+  formatTimerListSourceLabel,
+  formatWakeWordLabel,
+  parseHaCliArgs,
+} from "../bot/ha-assistant.mjs";
 
 function makeSinePcm(sampleRate, durationMs, channels = 1, amplitude = 12000) {
   const frames = Math.round((sampleRate * durationMs) / 1000);
@@ -85,6 +93,83 @@ describe("Bot SDK Voice Assistant DSP — resamplePcm16 & VoiceRoomMixer", () =>
     mixer.pushPeerAudio("peer-b", b, 2000);
     const afterAllow = mixer.produceFrame(Date.now() + 1000);
     assert.equal(afterAllow.isSilence, true);
+  });
+
+  it("absorbs WebRTC jitter with jitterBufferFrames=3, applies decay on underrun, and flushes short trailing bursts", () => {
+    const mixer = new VoiceRoomMixer({
+      echoSuppression: false,
+      jitterBufferFrames: 3,
+      maxBufferedFramesPerPeer: 16,
+    });
+
+    const f1 = new Int16Array(VOICE_FRAME_SAMPLES).fill(1000);
+    const f2 = new Int16Array(VOICE_FRAME_SAMPLES).fill(1200);
+    const f3 = new Int16Array(VOICE_FRAME_SAMPLES).fill(1400);
+    const f4 = new Int16Array(VOICE_FRAME_SAMPLES).fill(1600);
+
+    // Push 2 frames (< 3): buffer holds until primed
+    mixer.pushPeerAudio("peer-a", f1, 1000, 1000);
+    assert.equal(mixer.produceFrame(1000).isSilence, true);
+    assert.equal(mixer.getBufferedFrames(), 1);
+
+    mixer.pushPeerAudio("peer-a", f2, 1200, 1020);
+    assert.equal(mixer.produceFrame(1020).isSilence, true);
+    assert.equal(mixer.getBufferedFrames(), 2);
+
+    // 3rd frame primes the jitter buffer and immediately begins smooth playback
+    mixer.pushPeerAudio("peer-a", f3, 1400, 1040);
+    const out1 = mixer.produceFrame(1040);
+    assert.equal(out1.isSilence, false);
+    assert.equal(out1.pcm[0], 1000);
+    assert.equal(out1.underrunCount, 0);
+    assert.equal(out1.bufferedFrames, 2);
+
+    // 40ms jitter gap (two ticks with no incoming packets) -> zero dropouts, zero underruns
+    const out2 = mixer.produceFrame(1060);
+    assert.equal(out2.isSilence, false);
+    assert.equal(out2.pcm[0], 1200);
+    assert.equal(out2.underrunCount, 0);
+
+    const out3 = mixer.produceFrame(1080);
+    assert.equal(out3.isSilence, false);
+    assert.equal(out3.pcm[0], 1400);
+    assert.equal(out3.underrunCount, 0);
+
+    // Late packet arrives right on time -> continues cleanly with zero underruns
+    mixer.pushPeerAudio("peer-a", f4, 1600, 1100);
+    const out4 = mixer.produceFrame(1100);
+    assert.equal(out4.isSilence, false);
+    assert.equal(out4.pcm[0], 1600);
+    assert.equal(out4.underrunCount, 0);
+
+    // Genuine underrun after draining: 1st tick emits gentle 0.35x decay instead of hard zero
+    const u1 = mixer.produceFrame(1120);
+    assert.equal(u1.isSilence, false);
+    assert.equal(u1.pcm[0], Math.round(1600 * 0.35));
+    assert.equal(u1.underrunCount, 1);
+
+    // 2nd & 3rd empty ticks emit silence and unprime peer after 3 underrun ticks (60ms)
+    const u2 = mixer.produceFrame(1140);
+    assert.equal(u2.isSilence, true);
+    assert.equal(u2.underrunCount, 2);
+
+    const u3 = mixer.produceFrame(1160);
+    assert.equal(u3.isSilence, true);
+    assert.equal(u3.underrunCount, 3);
+
+    // Further idle ticks do NOT increment underrunCount once unprimed
+    const idle = mixer.produceFrame(1180);
+    assert.equal(idle.isSilence, true);
+    assert.equal(idle.underrunCount, 3);
+
+    // Short trailing 1-frame burst while unprimed flushes once jitterBufferFrames * 20ms (60ms) elapses
+    const trailing = new Int16Array(VOICE_FRAME_SAMPLES).fill(2000);
+    mixer.pushPeerAudio("peer-a", trailing, 2000, 2000);
+    assert.equal(mixer.produceFrame(2020).isSilence, true);
+    assert.equal(mixer.produceFrame(2040).isSilence, true);
+    const flushed = mixer.produceFrame(2060);
+    assert.equal(flushed.isSilence, false);
+    assert.equal(flushed.pcm[0], 2000);
   });
 });
 
@@ -162,10 +247,11 @@ describe("Wyoming Voice Satellite Protocol & Server", () => {
       assert.equal(wakeRun.data.end_stage, "tts");
       await waitEvent("audio-start");
 
-      // 3. Button activation skips wake word -> start_stage = "asr"
+      // 3. Button activation skips wake word -> start_stage = "asr", restart_on_end = false
       assert.equal(sat.triggerListenNow({ wakeWordName: "button" }), true);
       const asrRun = await waitEvent("run-pipeline");
       assert.equal(asrRun.data.start_stage, "asr");
+      assert.equal(asrRun.data.restart_on_end, false);
 
       // 4. Native HA Timer events + TTS playback + played ack
       const eventsSeen = [];
@@ -192,6 +278,151 @@ describe("Wyoming Voice Satellite Protocol & Server", () => {
       client.write(encodeWyomingEvent("error", { code: "stt-no-text-recognized", text: "" }));
       const rearmed = await waitEvent("run-pipeline");
       assert.equal(rearmed.data.start_stage, "wake");
+    } finally {
+      client.destroy();
+      await sat.stop();
+    }
+  });
+
+  it("delays audio-start after run-pipeline, sends restart_on_end=false on wake/asr, accelerates triggerListenNow on stale error + transcribe, recovers from silent processing timeout, and survives unhandled ECONNRESET", async () => {
+    const sat = new WyomingSatelliteServer({
+      host: "127.0.0.1",
+      port: 0,
+      name: "delay-test-sat",
+      area: "Lab",
+      wakeWordEnabled: true,
+      rearmDelayMs: 100,
+      audioStartDelayMs: 120,
+      interruptDelayMs: 300,
+      processingTimeoutMs: 70,
+    });
+    const { port } = await sat.start();
+
+    const received = [];
+    const dec = new WyomingFrameDecoder();
+    const client = net.createConnection({ host: "127.0.0.1", port });
+    const waitEvent = (type, timeoutMs = 2000) =>
+      new Promise((resolve, reject) => {
+        const onData = () => check();
+        const timer = setTimeout(() => {
+          client.off("data", onData);
+          reject(new Error(`Timeout waiting for ${type}`));
+        }, timeoutMs);
+        const check = () => {
+          const idx = received.findIndex((e) => e.type === type);
+          if (idx !== -1) {
+            clearTimeout(timer);
+            client.off("data", onData);
+            const [ev] = received.splice(idx, 1);
+            resolve(ev);
+          }
+        };
+        client.on("data", onData);
+        check();
+      });
+
+    client.on("data", (chunk) => {
+      const ts = Date.now();
+      for (const ev of dec.push(chunk)) {
+        received.push({ ...ev, ts });
+      }
+    });
+
+    try {
+      // 1. run-satellite -> run-pipeline(wake, restart_on_end=false) followed by delayed audio-start
+      client.write(encodeWyomingEvent("run-satellite"));
+      const wakeEv = await waitEvent("run-pipeline");
+      assert.equal(wakeEv.data.start_stage, "wake");
+      assert.equal(wakeEv.data.restart_on_end, false);
+      const wakeAudioStart = await waitEvent("audio-start");
+      assert.ok(
+        wakeAudioStart.ts - wakeEv.ts >= 70,
+        `expected delayed audio-start after run-pipeline, delta was ${wakeAudioStart.ts - wakeEv.ts}ms`
+      );
+
+      // 2. triggerListenNow while streaming -> audio-stop first, stale wake-word-timeout error
+      //    accelerates run-pipeline(asr, restart_on_end=false) past the 300ms fallback,
+      //    and incoming transcribe immediately triggers audio-start ahead of the 120ms audioStartDelayMs!
+      const pipelineErrors = [];
+      const stageEvents = [];
+      sat.on("pipelineError", (e) => pipelineErrors.push(e));
+      sat.on("sttStart", () => stageEvents.push("sttStart"));
+      sat.on("voiceStarted", () => stageEvents.push("voiceStarted"));
+      sat.on("voiceStopped", () => stageEvents.push("voiceStopped"));
+      sat.on("synthesize", () => stageEvents.push("synthesize"));
+      sat.on("wakeListening", () => stageEvents.push("wakeListening"));
+
+      received.length = 0;
+      assert.equal(sat.triggerListenNow({ wakeWordName: "button" }), true);
+      const stopEv = await waitEvent("audio-stop");
+      // Simulate HA Core aborting the prior wake pipeline right after receiving audio-stop
+      const errSentAt = Date.now();
+      client.write(encodeWyomingEvent("error", { code: "wake-word-timeout", text: "wake stream stopped" }));
+      const asrEv = await waitEvent("run-pipeline");
+      assert.equal(asrEv.data.start_stage, "asr");
+      assert.equal(asrEv.data.restart_on_end, false);
+      assert.ok(asrEv.ts >= stopEv.ts, "expected audio-stop before new run-pipeline");
+      assert.ok(
+        asrEv.ts - errSentAt < 180,
+        `expected stale error to accelerate run-pipeline below 300ms fallback, delta was ${asrEv.ts - errSentAt}ms`
+      );
+
+      // Send transcribe immediately -> audio-start should fire right away (well below 120ms audioStartDelayMs)
+      const transcribeSentAt = Date.now();
+      client.write(encodeWyomingEvent("transcribe"));
+      const asrAudioStart = await waitEvent("audio-start");
+      assert.ok(
+        asrAudioStart.ts - transcribeSentAt < 75,
+        `expected transcribe to trigger immediate audio-start, delta was ${asrAudioStart.ts - transcribeSentAt}ms`
+      );
+      assert.equal(pipelineErrors.length, 0, "expected aborted wake stream error to be ignored during Listen Now");
+      assert.equal(sat.pipelineMode, "asr");
+      assert.ok(stageEvents.includes("sttStart"), "expected sttStart event on transcribe");
+
+      client.write(encodeWyomingEvent("voice-started"));
+      client.write(encodeWyomingEvent("voice-stopped"));
+      client.write(encodeWyomingEvent("synthesize", { text: "Done." }));
+      await new Promise((r) => setTimeout(r, 25));
+      assert.ok(stageEvents.includes("voiceStarted"));
+      assert.ok(stageEvents.includes("voiceStopped"));
+      assert.ok(stageEvents.includes("synthesize"));
+
+      // 3. TTS completes -> notifyAudioPlayed sends played and re-arms start_stage="wake" (restart_on_end=false)
+      received.length = 0;
+      client.write(encodeWyomingEvent("audio-start", { rate: 16000, width: 2, channels: 1 }));
+      client.write(encodeWyomingEvent("audio-stop"));
+      await new Promise((r) => setTimeout(r, 30));
+      sat.notifyAudioPlayed();
+      await waitEvent("played");
+      const rearmEv = await waitEvent("run-pipeline");
+      assert.equal(rearmEv.data.start_stage, "wake");
+      assert.equal(rearmEv.data.restart_on_end, false);
+      // Incoming detect immediately triggers audio-start ahead of audioStartDelayMs
+      const detectSentAt = Date.now();
+      client.write(encodeWyomingEvent("detect"));
+      const rearmAudioStart = await waitEvent("audio-start");
+      assert.ok(
+        rearmAudioStart.ts - detectSentAt < 75,
+        `expected detect to trigger immediate audio-start, delta was ${rearmAudioStart.ts - detectSentAt}ms`
+      );
+      assert.ok(stageEvents.includes("wakeListening"));
+
+      // 4. Silent intent recovery: transcript with no TTS/error recovers back to wake after processingTimeoutMs
+      received.length = 0;
+      client.write(encodeWyomingEvent("transcript", { text: "turn off office light" }));
+      await waitEvent("audio-stop");
+      assert.equal(sat.pipelineMode, "processing");
+      const silentRearmEv = await waitEvent("run-pipeline", 1500);
+      assert.equal(silentRearmEv.data.start_stage, "wake");
+      assert.equal(silentRearmEv.data.restart_on_end, false);
+      await waitEvent("audio-start");
+
+      // 5. Unhandled ECONNRESET on standalone WyomingSatelliteServer (no 'error' listener) must NOT throw
+      assert.equal(sat.listenerCount("error"), 0);
+      sat.activeSocket.emit("error", Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }));
+      client.resetAndDestroy();
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(sat.isConnected(), false);
     } finally {
       client.destroy();
       await sat.stop();
@@ -307,6 +538,32 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       const statusRes = await fetch(`http://127.0.0.1:${ui.port}/api/status`).then((r) => r.json());
       assert.equal(statusRes.ok, true);
       assert.equal(statusRes.state.homeAssistant.authenticated, true);
+      assert.deepEqual(statusRes.state.audio, {
+        lastRms: 0,
+        peakRms: 0,
+        activeFrames: 0,
+        silenceFrames: 0,
+        underrunCount: 0,
+        bufferedFrames: 0,
+      });
+
+      // Audio diagnostics update as frames flow through the mixer
+      const testMixer = new VoiceRoomMixer({ echoSuppression: false, jitterBufferFrames: 3 });
+      assistant.mixer = testMixer;
+      assistant._recordAudioFrame(testMixer.produceFrame(1000)); // silence
+      const loudFrame = new Int16Array(VOICE_FRAME_SAMPLES).fill(2500);
+      testMixer.pushPeerAudio("peer-1", loudFrame, 2500, 1020);
+      testMixer.pushPeerAudio("peer-1", loudFrame, 2500, 1040);
+      testMixer.pushPeerAudio("peer-1", loudFrame, 2500, 1060);
+      assistant._recordAudioFrame(testMixer.produceFrame(1060)); // active, 2 buffered
+      const audioStatus = await fetch(`http://127.0.0.1:${ui.port}/api/status`).then((r) => r.json());
+      assert.equal(audioStatus.state.audio.lastRms, 2500);
+      assert.equal(audioStatus.state.audio.peakRms, 2500);
+      assert.equal(audioStatus.state.audio.activeFrames, 1);
+      assert.equal(audioStatus.state.audio.silenceFrames, 1);
+      assert.equal(audioStatus.state.audio.underrunCount, 0);
+      assert.equal(audioStatus.state.audio.bufferedFrames, 2);
+      assistant.mixer = null;
 
       // Text Q&A via HA conversation/process
       const askRes = await fetch(`http://127.0.0.1:${ui.port}/api/ask`, {
@@ -331,6 +588,871 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       assert.equal(timerBlock.label, "Tea Timer");
       assert.equal(timerBlock.totalSec, 180);
       assert.ok(timerBlock.endsAtMs > Date.now());
+    } finally {
+      await assistant.stop();
+      await new Promise((r) => mockHaWss.close(r));
+    }
+  });
+
+  it("handles Wyoming socket ECONNRESET gracefully without crashing and accepts reconnections", async () => {
+    const assistant = new HomeAssistantVoiceAssistant({
+      wyomingHost: "127.0.0.1",
+      wyomingPort: 0,
+      uiHost: "127.0.0.1",
+      uiPort: 0,
+    });
+    const { wyoming } = await assistant.start();
+
+    const c1 = net.createConnection({ host: "127.0.0.1", port: wyoming.port });
+    let c2 = null;
+    try {
+      await new Promise((r) => c1.once("connect", r));
+      c1.write(encodeWyomingEvent("run-satellite"));
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(assistant.wyoming.isReady(), true);
+
+      // Emit explicit ECONNRESET on active server socket + hard TCP RST from client
+      assistant.wyoming.activeSocket.emit(
+        "error",
+        Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })
+      );
+      c1.resetAndDestroy();
+      await new Promise((r) => setTimeout(r, 80));
+
+      assert.equal(assistant.wyoming.isConnected(), false);
+      const stateAfterReset = assistant.getApiState();
+      assert.ok(
+        stateAfterReset.recentLog.some((e) => e.speaker === "Wyoming" && /ECONNRESET/i.test(e.text)),
+        "expected ECONNRESET to be logged gracefully"
+      );
+
+      // Verify satellite server is still healthy and accepts a fresh HA reconnection
+      c2 = net.createConnection({ host: "127.0.0.1", port: wyoming.port });
+      const dec = new WyomingFrameDecoder();
+      const infoPromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timeout waiting for info after reconnect")), 2000);
+        c2.on("data", (chunk) => {
+          for (const ev of dec.push(chunk)) {
+            if (ev.type === "info") {
+              clearTimeout(timer);
+              resolve(ev);
+            }
+          }
+        });
+      });
+      await new Promise((r) => c2.once("connect", r));
+      c2.write(encodeWyomingEvent("describe"));
+      const info = await infoPromise;
+      assert.equal(info.type, "info");
+      assert.equal(info.data.satellite.supports_trigger, true);
+    } finally {
+      c1.destroy();
+      if (c2) c2.destroy();
+      await assistant.stop();
+    }
+  });
+
+  it("formats wake-word IDs, discovers live wake word via assist_pipeline/pipeline/list + state_changed, emits voiceControls, and restarts wake listening on change", async () => {
+    // 1. formatWakeWordLabel
+    assert.equal(formatWakeWordLabel("hey_jarvis"), "Hey Jarvis");
+    assert.equal(formatWakeWordLabel("okay_nabu"), "Okay Nabu");
+    assert.equal(formatWakeWordLabel("hey_mycroft_v0.1"), "Hey Mycroft");
+    assert.equal(formatWakeWordLabel("alexa_v0.1"), "Alexa");
+    assert.equal(formatWakeWordLabel(""), "");
+    assert.equal(formatWakeWordLabel(null), "");
+    assert.equal(formatWakeWordLabel(undefined), "");
+
+    // Fallback WAKE_WORD_LABEL via CLI/env args
+    const cliArgs = parseHaCliArgs(["--wake-word-label", "Hey Jarvis"]);
+    assert.equal(cliArgs.wakeWordLabel, "Hey Jarvis");
+
+    // 2. Mock HA WebSocket with select.voice_room_p2p_direct_voice_assistant + assist_pipeline/pipeline/list
+    const mockHaWss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise((r) => mockHaWss.once("listening", r));
+    const haPort = mockHaWss.address().port;
+
+    let serverWs = null;
+    mockHaWss.on("connection", (ws) => {
+      serverWs = ws;
+      ws.send(JSON.stringify({ type: "auth_required" }));
+      ws.on("message", (raw) => {
+        const m = JSON.parse(raw.toString("utf8"));
+        if (m.type === "auth") {
+          ws.send(JSON.stringify({ type: "auth_ok" }));
+        } else if (m.type === "subscribe_events") {
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        } else if (m.type === "get_states") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: [
+              { entity_id: "input_text.p2p_voice_room_link", state: "" },
+              { entity_id: "select.voice_room_p2p_direct_voice_assistant", state: "preferred" },
+            ],
+          }));
+        } else if (m.type === "assist_pipeline/pipeline/list") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: {
+              preferred_pipeline: "p-default",
+              pipelines: [
+                {
+                  id: "p-default",
+                  name: "Home Assistant",
+                  wake_word_entity: "wake_word.openwakeword",
+                  wake_word_id: "okay_nabu",
+                },
+                {
+                  id: "p-office",
+                  name: "Office Assist",
+                  wake_word_entity: "wake_word.openwakeword",
+                  wake_word_id: "hey_jarvis_v0.1",
+                },
+              ],
+            },
+          }));
+        }
+      });
+    });
+
+    const assistant = new HomeAssistantVoiceAssistant({
+      wyomingHost: "127.0.0.1",
+      wyomingPort: 0,
+      wyomingName: "p2p-direct-voice",
+      uiHost: "127.0.0.1",
+      uiPort: 0,
+      haUrl: `http://127.0.0.1:${haPort}`,
+      haToken: "tok",
+    });
+
+    const { wyoming, ui } = await assistant.start();
+    const wyClient = net.createConnection({ host: "127.0.0.1", port: wyoming.port });
+    const dec = new WyomingFrameDecoder();
+    const wyEvents = [];
+    wyClient.on("data", (chunk) => {
+      wyEvents.push(...dec.push(chunk));
+    });
+
+    try {
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Resolved preferred pipeline -> Okay Nabu
+      const st1 = await fetch(`http://127.0.0.1:${ui.port}/api/status`).then((r) => r.json());
+      assert.deepEqual(st1.state.wakeWord, {
+        id: "okay_nabu",
+        label: "Okay Nabu",
+        pipelineName: "Home Assistant",
+      });
+
+      // Before Wyoming connects -> voiceControls shows Waiting HA with Listen Now disabled
+      const waitingCard = assistant.buildChatCard();
+      assert.equal(waitingCard.voiceControls.status, "Waiting HA");
+      assert.equal(waitingCard.voiceControls.statusIcon, "mic");
+      assert.equal(waitingCard.voiceControls.statusTone, "ochre");
+      assert.equal(waitingCard.voiceControls.buttons.length, 3);
+      assert.equal(waitingCard.voiceControls.buttons[0].id, "ha:listen");
+      assert.equal(waitingCard.voiceControls.buttons[0].disabled, true);
+
+      // Connect Wyoming satellite -> enters wake mode
+      wyClient.write(encodeWyomingEvent("run-satellite"));
+      await new Promise((r) => setTimeout(r, 120));
+      assert.equal(assistant.wyoming.pipelineMode, "wake");
+
+      const wakeCard = assistant.buildChatCard();
+      assert.equal(wakeCard.voiceControls.status, "Okay Nabu");
+      assert.equal(wakeCard.voiceControls.statusIcon, "bolt");
+      assert.equal(wakeCard.voiceControls.statusTone, "cobalt");
+      assert.equal(wakeCard.voiceControls.buttons[0].disabled, false);
+      assert.equal(wakeCard.voiceControls.buttons[1].id, "ha:toggle_wake");
+      assert.equal(wakeCard.voiceControls.buttons[2].id, "ha:stop_audio");
+      const wakeStat = wakeCard.blocks[0].items.find((i) => i.label === "Wake Word");
+      assert.equal(wakeStat.value, "Okay Nabu");
+      assert.match(wakeCard.footer, /Say "Okay Nabu" or click Listen Now/);
+
+      // Live state_changed on select.voice_room_p2p_direct_voice_assistant -> "Office Assist" (hey_jarvis_v0.1)
+      wyEvents.length = 0;
+      serverWs.send(JSON.stringify({
+        type: "event",
+        event: {
+          event_type: "state_changed",
+          data: {
+            entity_id: "select.voice_room_p2p_direct_voice_assistant",
+            new_state: { state: "Office Assist" },
+          },
+        },
+      }));
+      // Wait for clean audio-stop -> interruptDelayMs (150ms) -> run-pipeline(wake) reload
+      await new Promise((r) => setTimeout(r, 260));
+
+      const st2 = await fetch(`http://127.0.0.1:${ui.port}/api/status`).then((r) => r.json());
+      assert.deepEqual(st2.state.wakeWord, {
+        id: "hey_jarvis_v0.1",
+        label: "Hey Jarvis",
+        pipelineName: "Office Assist",
+      });
+
+      // Verified wake listening restarted (audio-stop + run-pipeline wake with restart_on_end=false)
+      assert.ok(wyEvents.some((e) => e.type === "audio-stop"), "expected audio-stop when wake word changed");
+      assert.ok(
+        wyEvents.some(
+          (e) => e.type === "run-pipeline" && e.data?.start_stage === "wake" && e.data?.restart_on_end === false
+        ),
+        "expected run-pipeline(wake, restart_on_end=false) reload when wake word changed"
+      );
+
+      // Verify updated voiceControls & card states (Hey Jarvis, Listening..., Speaking, Muted, Button Only)
+      const jarvisCard = assistant.buildChatCard();
+      assert.equal(jarvisCard.voiceControls.status, "Hey Jarvis");
+      assert.equal(jarvisCard.voiceControls.statusIcon, "bolt");
+      assert.equal(jarvisCard.voiceControls.statusTone, "cobalt");
+      assert.match(jarvisCard.footer, /Say "Hey Jarvis" or click Listen Now/);
+
+      assistant.setMuted(true);
+      const mutedCard = assistant.buildChatCard();
+      assert.equal(mutedCard.voiceControls.status, "Muted");
+      assert.equal(mutedCard.voiceControls.statusIcon, "mic-off");
+      assert.equal(mutedCard.voiceControls.statusTone, "coral");
+      assistant.setMuted(false);
+
+      assistant.wyoming.pipelineMode = "asr";
+      assert.equal(assistant.buildChatCard().voiceControls.status, "Listening...");
+      assistant.wyoming.pipelineMode = "speaking";
+      const speakingVc = assistant.buildChatCard().voiceControls;
+      assert.equal(speakingVc.status, "Speaking");
+      assert.equal(speakingVc.statusIcon, "volume");
+
+      assistant.wyoming.pipelineMode = "idle";
+      assistant.setWakeWordEnabled(false);
+      const btnOnlyCard = assistant.buildChatCard();
+      assert.equal(btnOnlyCard.voiceControls.status, "Button Only");
+      assert.equal(btnOnlyCard.voiceControls.buttons[1].label, "Wake: Off");
+
+      // Verify HomeAssistantWsClient standalone export + named selector matching
+      assert.equal(assistant.haClient instanceof HomeAssistantWsClient, true);
+      assert.equal(assistant.haClient.assistantSelectEntity, "select.voice_room_p2p_direct_voice_assistant");
+    } finally {
+      wyClient.destroy();
+      await assistant.stop();
+      await new Promise((r) => mockHaWss.close(r));
+    }
+  });
+
+  it("integrates HA timer_list entities: subscribe snapshots, live deltas, unavailable->available resubscribe, Wyoming dedupe, card.timers contract, room actions, and /api/timer/* endpoints", async () => {
+    // 1. Pure helpers & CLI allowlist
+    assert.equal(
+      formatTimerListSourceLabel("timer_list.kitchen_kitchen_assist_timers", "kitchen_assist Timers"),
+      "Kitchen Assist"
+    );
+    assert.equal(
+      formatTimerListSourceLabel("timer_list.living_living_assist_timers", "Living Room Timers"),
+      "Living Room"
+    );
+    assert.equal(formatTimerListSourceLabel("timer_list.office_timers", ""), "Office");
+    assert.equal(formatTimerDurationLabel(300), "5m Timer");
+    assert.equal(formatTimerDurationLabel(90), "1m 30s Timer");
+    assert.equal(formatTimerDurationLabel(3600), "1h Timer");
+    assert.equal(formatTimerDurationLabel(45), "45s Timer");
+    assert.equal(formatTimerDurationLabel(0), "Timer");
+
+    const cli = parseHaCliArgs(["--timer-list-entities", "timer_list.a, timer_list.b"]);
+    assert.deepEqual(cli.timerListEntities, ["timer_list.a", "timer_list.b"]);
+
+    // 2. Mock HA WebSocket server implementing timer_list/item/subscribe + timer_list.* services
+    const mockHaWss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise((r) => mockHaWss.once("listening", r));
+    const haPort = mockHaWss.address().port;
+
+    let serverWs = null;
+    const subIdsByEntity = new Map();
+    const subscribeCounts = new Map();
+    const serviceCalls = [];
+    const nowIsoPlus = (sec) => new Date(Date.now() + sec * 1000).toISOString();
+
+    mockHaWss.on("connection", (ws) => {
+      serverWs = ws;
+      ws.send(JSON.stringify({ type: "auth_required" }));
+      ws.on("message", (raw) => {
+        const m = JSON.parse(raw.toString("utf8"));
+        if (m.type === "auth") {
+          ws.send(JSON.stringify({ type: "auth_ok" }));
+        } else if (m.type === "subscribe_events") {
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        } else if (m.type === "unsubscribe_events") {
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        } else if (m.type === "get_states") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: [
+              { entity_id: "input_text.p2p_voice_room_link", state: "" },
+              {
+                entity_id: "timer_list.kitchen_kitchen_assist_timers",
+                state: "2",
+                attributes: {
+                  friendly_name: "kitchen_assist Timers",
+                  supported_features:
+                    TIMER_LIST_FEATURES.CREATE_TIMER |
+                    TIMER_LIST_FEATURES.PAUSE_TIMER |
+                    TIMER_LIST_FEATURES.CANCEL_TIMER |
+                    TIMER_LIST_FEATURES.ADD_TIME,
+                },
+              },
+              {
+                entity_id: "timer_list.living_living_assist_timers",
+                state: "0",
+                attributes: {
+                  friendly_name: "Living Room Timers",
+                  supported_features: TIMER_LIST_FEATURES.CANCEL_TIMER,
+                },
+              },
+            ],
+          }));
+        } else if (m.type === "assist_pipeline/pipeline/list") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: { preferred_pipeline: "", pipelines: [] },
+          }));
+        } else if (m.type === "timer_list/item/subscribe") {
+          const eid = m.entity_id;
+          subIdsByEntity.set(eid, m.id);
+          subscribeCounts.set(eid, (subscribeCounts.get(eid) || 0) + 1);
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+          if (eid === "timer_list.kitchen_kitchen_assist_timers") {
+            ws.send(JSON.stringify({
+              id: m.id,
+              type: "event",
+              event: {
+                type: "timers",
+                timers: [
+                  {
+                    timer_id: "tl-1:alpha",
+                    name: "Pasta",
+                    status: "active",
+                    created_duration: 300,
+                    total_duration: 300,
+                    finishes_at: nowIsoPlus(240),
+                    remaining: 240,
+                  },
+                  {
+                    timer_id: "tl-paused",
+                    name: "",
+                    status: "paused",
+                    created_duration: 180,
+                    total_duration: 180,
+                    paused_remaining: 95,
+                    remaining: 95,
+                  },
+                  {
+                    timer_id: "tl-archived-done",
+                    name: "Old Timer",
+                    status: "finished",
+                    created_duration: 60,
+                    total_duration: 60,
+                    remaining: 0,
+                  },
+                  {
+                    timer_id: "tl-archived-cancel",
+                    name: "Cancelled",
+                    status: "cancelled",
+                    created_duration: 60,
+                    total_duration: 60,
+                    remaining: 0,
+                  },
+                ],
+              },
+            }));
+          } else {
+            ws.send(JSON.stringify({
+              id: m.id,
+              type: "event",
+              event: { type: "timers", timers: [] },
+            }));
+          }
+        } else if (m.type === "call_service") {
+          serviceCalls.push(m);
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        }
+      });
+    });
+
+    const assistant = new HomeAssistantVoiceAssistant({
+      wyomingHost: "127.0.0.1",
+      wyomingPort: 0,
+      uiHost: "127.0.0.1",
+      uiPort: 0,
+      haUrl: `http://127.0.0.1:${haPort}`,
+      haToken: "tok",
+    });
+
+    const { ui } = await assistant.start();
+    try {
+      await new Promise((r) => setTimeout(r, 140));
+
+      // Both timer_list entities discovered & subscribed; archived items filtered out
+      const st1 = await fetch(`http://127.0.0.1:${ui.port}/api/status`).then((r) => r.json());
+      assert.equal(st1.state.timerLists.length, 2);
+      assert.equal(st1.state.timers.length, 2);
+      // Sorted: active soonest-finishing first, then paused
+      assert.equal(st1.state.timers[0].id, "tl-1:alpha");
+      assert.equal(st1.state.timers[0].name, "Pasta");
+      assert.equal(st1.state.timers[0].sourceLabel, "Kitchen Assist");
+      assert.equal(st1.state.timers[0].paused, false);
+      assert.equal(st1.state.timers[1].id, "tl-paused");
+      assert.equal(st1.state.timers[1].name, "3m Timer");
+      assert.equal(st1.state.timers[1].paused, true);
+      assert.equal(st1.state.timers[1].remainingSec, 95);
+      assert.equal(st1.state.timers[1].endsAtMs, 0);
+
+      // Merge + deduplicate with Wyoming native timers (same ID prefers timer_list; distinct Wyoming timer coexists)
+      assistant.wyoming.emit("timerStarted", {
+        id: "tl-1:alpha",
+        name: "Duplicate Pasta",
+        totalSeconds: 300,
+        commandText: "",
+      });
+      assistant.wyoming.emit("timerStarted", {
+        id: "wy-only-1",
+        name: "Eggs",
+        totalSeconds: 120,
+        commandText: "",
+      });
+
+      const merged = assistant.getAllActiveTimers();
+      assert.equal(merged.length, 3);
+      assert.equal(merged[0].id, "wy-only-1"); // finishes in ~120s (< 240s)
+      assert.equal(merged[0].source, "wyoming");
+      assert.equal(merged[1].id, "tl-1:alpha");
+      assert.equal(merged[1].source, "timer_list"); // deduped in favor of timer_list!
+      assert.equal(merged[2].id, "tl-paused"); // paused last
+
+      // Verify buildChatCard().timers exact shared contract & feature-gated actions
+      const card = assistant.buildChatCard();
+      assert.equal(Array.isArray(card.timers), true);
+      assert.equal(card.timers.length, 3);
+      const timerStat = card.blocks[0].items.find((i) => i.label === "Timers");
+      assert.equal(timerStat.value, "3");
+
+      const wyCardTimer = card.timers[0];
+      assert.equal(wyCardTimer.id, "wy-only-1");
+      assert.equal(wyCardTimer.actions.length, 1);
+      assert.equal(wyCardTimer.actions[0].id, "ha:timer:dismiss:wy-only-1");
+
+      const pastaCardTimer = card.timers[1];
+      assert.equal(pastaCardTimer.id, "timer_list.kitchen_kitchen_assist_timers:tl-1:alpha");
+      assert.equal(pastaCardTimer.label, "Pasta");
+      assert.equal(pastaCardTimer.source, "Kitchen Assist");
+      assert.equal(pastaCardTimer.color, "cobalt");
+      assert.deepEqual(
+        pastaCardTimer.actions.map((a) => a.id),
+        [
+          "ha:tl:pause:timer_list.kitchen_kitchen_assist_timers:tl-1:alpha",
+          "ha:tl:add60:timer_list.kitchen_kitchen_assist_timers:tl-1:alpha",
+          "ha:tl:cancel:timer_list.kitchen_kitchen_assist_timers:tl-1:alpha",
+        ]
+      );
+      const pastaBlock = card.blocks.find((b) => b.type === "timer" && b.label === "Pasta · Kitchen Assist");
+      assert.ok(pastaBlock, "expected timer block with source suffix in card.blocks");
+
+      const pausedCardTimer = card.timers[2];
+      assert.equal(pausedCardTimer.paused, true);
+      assert.equal(pausedCardTimer.color, "ochre");
+      assert.equal(pausedCardTimer.actions[0].label, "Resume");
+      assert.equal(pausedCardTimer.actions[0].icon, "play");
+
+      // Test _onRoomInteraction for ha:tl:pause / unpause / add60 / cancel (even with ":" inside timerId!)
+      serviceCalls.length = 0;
+      assistant._onRoomInteraction({
+        mode: "action",
+        actionId: "ha:tl:pause:timer_list.kitchen_kitchen_assist_timers:tl-1:alpha",
+      });
+      assistant._onRoomInteraction({
+        mode: "action",
+        actionId: "ha:tl:unpause:timer_list.kitchen_kitchen_assist_timers:tl-paused",
+      });
+      assistant._onRoomInteraction({
+        mode: "action",
+        actionId: "ha:tl:add60:timer_list.kitchen_kitchen_assist_timers:tl-1:alpha",
+      });
+      assistant._onRoomInteraction({
+        mode: "action",
+        actionId: "ha:tl:cancel:timer_list.kitchen_kitchen_assist_timers:tl-1:alpha",
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(serviceCalls.length, 4);
+      assert.deepEqual(
+        serviceCalls.map((c) => [c.domain, c.service, c.target.entity_id, c.service_data]),
+        [
+          ["timer_list", "pause_timer", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-1:alpha" }],
+          ["timer_list", "unpause_timer", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-paused" }],
+          ["timer_list", "add_time", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-1:alpha", duration: 60 }],
+          ["timer_list", "cancel_timer", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-1:alpha" }],
+        ]
+      );
+
+      // Test HTTP endpoints: /api/timer/create, pause, unpause, add-time, cancel + Ingress HTML check
+      serviceCalls.length = 0;
+      const createRes = await fetch(`http://127.0.0.1:${ui.port}/api/timer/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Coffee", duration: "4m" }),
+      }).then((r) => r.json());
+      assert.equal(createRes.ok, true);
+
+      const pauseRes = await fetch(`http://127.0.0.1:${ui.port}/api/timer/pause`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entityId: "timer_list.kitchen_kitchen_assist_timers", timerId: "tl-1:alpha" }),
+      }).then((r) => r.json());
+      assert.equal(pauseRes.ok, true);
+
+      const unpauseRes = await fetch(`http://127.0.0.1:${ui.port}/api/timer/unpause`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entityId: "timer_list.kitchen_kitchen_assist_timers", timerId: "tl-paused" }),
+      }).then((r) => r.json());
+      assert.equal(unpauseRes.ok, true);
+
+      const addRes = await fetch(`http://127.0.0.1:${ui.port}/api/timer/add-time`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entityId: "timer_list.kitchen_kitchen_assist_timers", timerId: "tl-1:alpha", duration: 60 }),
+      }).then((r) => r.json());
+      assert.equal(addRes.ok, true);
+
+      const cancelRes = await fetch(`http://127.0.0.1:${ui.port}/api/timer/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entityId: "timer_list.kitchen_kitchen_assist_timers", timerId: "tl-1:alpha" }),
+      }).then((r) => r.json());
+      assert.equal(cancelRes.ok, true);
+
+      assert.deepEqual(
+        serviceCalls.map((c) => [c.service, c.target.entity_id, c.service_data]),
+        [
+          ["create_timer", "timer_list.kitchen_kitchen_assist_timers", { duration: 240, name: "Coffee" }],
+          ["pause_timer", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-1:alpha" }],
+          ["unpause_timer", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-paused" }],
+          ["add_time", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-1:alpha", duration: 60 }],
+          ["cancel_timer", "timer_list.kitchen_kitchen_assist_timers", { timer_id: "tl-1:alpha" }],
+        ]
+      );
+
+      // Control Panel HTML remains strictly Ingress-safe (relative ./api/ only, no absolute /api/)
+      const html = await fetch(`http://127.0.0.1:${ui.port}/`).then((r) => r.text());
+      assert.match(html, /fetch\("\.\/api\/"/);
+      assert.equal(html.includes('"/api/'), false, "Control Panel HTML must not contain absolute /api/ paths");
+      assert.match(html, /id="timer-create-bar"/);
+
+      // Live delta events: created, paused, unpaused, time_changed, finished (triggers chime + lastReply), cancelled, removed
+      const kitchenSubId = subIdsByEntity.get("timer_list.kitchen_kitchen_assist_timers");
+      const livingSubId = subIdsByEntity.get("timer_list.living_living_assist_timers");
+      let chimeCount = 0;
+      assistant.bot = {
+        inVoice: true,
+        getPeers: () => [],
+        playChime: (kind) => {
+          if (kind === "timer") chimeCount += 1;
+        },
+        updateBotMessage: () => {},
+        sendBotMessage: () => ({ id: "msg-1" }),
+      };
+      assistant.roomState = "connected";
+
+      // Created on Living Room (CANCEL_TIMER only -> only 1 action button!)
+      serverWs.send(JSON.stringify({
+        id: livingSubId,
+        type: "event",
+        event: {
+          type: "change",
+          event_type: "created",
+          timer: {
+            timer_id: "lr-1",
+            name: "Laundry",
+            status: "active",
+            created_duration: 600,
+            total_duration: 600,
+            finishes_at: nowIsoPlus(600),
+            remaining: 600,
+          },
+        },
+      }));
+      await new Promise((r) => setTimeout(r, 40));
+      const lrCardTimer = assistant.buildChatCard().timers.find((t) => t.label === "Laundry");
+      assert.ok(lrCardTimer);
+      assert.equal(lrCardTimer.source, "Living Room");
+      assert.deepEqual(lrCardTimer.actions.map((a) => a.label), ["Cancel"]);
+
+      // Paused -> Unpaused -> Time changed on Kitchen
+      serverWs.send(JSON.stringify({
+        id: kitchenSubId,
+        type: "event",
+        event: {
+          type: "change",
+          event_type: "paused",
+          timer: {
+            timer_id: "tl-1:alpha",
+            name: "Pasta",
+            status: "paused",
+            created_duration: 300,
+            total_duration: 300,
+            paused_remaining: 200,
+            remaining: 200,
+          },
+        },
+      }));
+      serverWs.send(JSON.stringify({
+        id: kitchenSubId,
+        type: "event",
+        event: {
+          type: "change",
+          event_type: "unpaused",
+          timer: {
+            timer_id: "tl-1:alpha",
+            name: "Pasta",
+            status: "active",
+            created_duration: 300,
+            total_duration: 300,
+            finishes_at: nowIsoPlus(200),
+            remaining: 200,
+          },
+        },
+      }));
+      serverWs.send(JSON.stringify({
+        id: kitchenSubId,
+        type: "event",
+        event: {
+          type: "change",
+          event_type: "time_changed",
+          delta: 60,
+          timer: {
+            timer_id: "tl-1:alpha",
+            name: "Pasta",
+            status: "active",
+            created_duration: 300,
+            total_duration: 360,
+            finishes_at: nowIsoPlus(260),
+            remaining: 260,
+          },
+        },
+      }));
+      await new Promise((r) => setTimeout(r, 40));
+      const updatedPasta = assistant.haClient.getTimerListTimers().find((t) => t.id === "tl-1:alpha");
+      assert.equal(updatedPasta.totalSeconds, 360);
+      assert.equal(updatedPasta.paused, false);
+
+      // Finished -> removes timer, plays chime, updates lastReply
+      serverWs.send(JSON.stringify({
+        id: kitchenSubId,
+        type: "event",
+        event: {
+          type: "change",
+          event_type: "finished",
+          timer: {
+            timer_id: "tl-1:alpha",
+            name: "Pasta",
+            status: "finished",
+            created_duration: 300,
+            total_duration: 360,
+            remaining: 0,
+          },
+        },
+      }));
+      // Cancelled & removed
+      serverWs.send(JSON.stringify({
+        id: kitchenSubId,
+        type: "event",
+        event: {
+          type: "change",
+          event_type: "cancelled",
+          timer: { timer_id: "tl-paused", name: "", status: "cancelled" },
+        },
+      }));
+      serverWs.send(JSON.stringify({
+        id: livingSubId,
+        type: "event",
+        event: {
+          type: "change",
+          event_type: "removed",
+          timer: { timer_id: "lr-1", name: "Laundry", status: "cancelled" },
+        },
+      }));
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(chimeCount, 1);
+      assert.match(assistant.lastReply, /Timer finished: Pasta \(Kitchen Assist\)/);
+      assert.equal(assistant.haClient.getTimerListTimers().length, 0);
+
+      // Clear Wyoming timers too -> buildChatCard().timers must be []
+      assistant.activeTimers.clear();
+      assert.deepEqual(assistant.buildChatCard().timers, []);
+
+      // state_changed: unavailable -> clears & unsubscribes; unavailable -> available -> resubscribes!
+      const prevSubCount = subscribeCounts.get("timer_list.kitchen_kitchen_assist_timers") || 0;
+      serverWs.send(JSON.stringify({
+        type: "event",
+        event: {
+          event_type: "state_changed",
+          data: {
+            entity_id: "timer_list.kitchen_kitchen_assist_timers",
+            old_state: { state: "1", attributes: { friendly_name: "kitchen_assist Timers", supported_features: 15 } },
+            new_state: { state: "unavailable", attributes: { friendly_name: "kitchen_assist Timers", supported_features: 15 } },
+          },
+        },
+      }));
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(
+        assistant.haClient.getTimerLists().find((t) => t.entityId === "timer_list.kitchen_kitchen_assist_timers").available,
+        false
+      );
+
+      serverWs.send(JSON.stringify({
+        type: "event",
+        event: {
+          event_type: "state_changed",
+          data: {
+            entity_id: "timer_list.kitchen_kitchen_assist_timers",
+            old_state: { state: "unavailable", attributes: { friendly_name: "kitchen_assist Timers", supported_features: 15 } },
+            new_state: { state: "2", attributes: { friendly_name: "kitchen_assist Timers", supported_features: 15 } },
+          },
+        },
+      }));
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(
+        subscribeCounts.get("timer_list.kitchen_kitchen_assist_timers"),
+        prevSubCount + 1,
+        "expected timer_list entity to resubscribe after transitioning unavailable -> available"
+      );
+      assert.equal(assistant.haClient.getTimerListTimers().length, 2);
+
+      // Detach mock bot cleanly before stop()
+      assistant.bot = null;
+      assistant.roomState = "disconnected";
+    } finally {
+      await assistant.stop();
+      await new Promise((r) => mockHaWss.close(r));
+    }
+  });
+
+  it("relays HA p2p_voice_send_chat events to room chat with chunking and exposes POST /api/chat", async () => {
+    const mockHaWss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise((r) => mockHaWss.once("listening", r));
+    const haPort = mockHaWss.address().port;
+
+    let serverWs = null;
+    const subscribedEventTypes = [];
+    mockHaWss.on("connection", (ws) => {
+      serverWs = ws;
+      ws.send(JSON.stringify({ type: "auth_required" }));
+      ws.on("message", (raw) => {
+        const m = JSON.parse(raw.toString("utf8"));
+        if (m.type === "auth") {
+          ws.send(JSON.stringify({ type: "auth_ok" }));
+        } else if (m.type === "subscribe_events") {
+          subscribedEventTypes.push(m.event_type);
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        } else if (m.type === "get_states") {
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: [] }));
+        } else if (m.type === "assist_pipeline/pipeline/list") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: { preferred_pipeline: "", pipelines: [] },
+          }));
+        }
+      });
+    });
+
+    const assistant = new HomeAssistantVoiceAssistant({
+      wyomingHost: "127.0.0.1",
+      wyomingPort: 0,
+      uiHost: "127.0.0.1",
+      uiPort: 0,
+      haUrl: `http://127.0.0.1:${haPort}`,
+      haToken: "tok",
+    });
+
+    const { ui } = await assistant.start();
+    try {
+      await new Promise((r) => setTimeout(r, 120));
+      assert.ok(subscribedEventTypes.includes("p2p_voice_send_chat"), "expected subscription to p2p_voice_send_chat");
+
+      // POST /api/chat when empty -> 400
+      const emptyRes = await fetch(`http://127.0.0.1:${ui.port}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "   " }),
+      });
+      assert.equal(emptyRes.status, 400);
+      assert.equal((await emptyRes.json()).ok, false);
+
+      // POST /api/chat when disconnected -> 409
+      const disconnRes = await fetch(`http://127.0.0.1:${ui.port}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "Hello room" }),
+      });
+      assert.equal(disconnRes.status, 409);
+      assert.equal((await disconnRes.json()).ok, false);
+
+      // Connect mock bot
+      const sentTexts = [];
+      let nextMsgSeq = 1;
+      assistant.bot = {
+        inVoice: true,
+        getPeers: () => [],
+        sendText: (t) => {
+          sentTexts.push(t);
+          return { id: `chat-${nextMsgSeq++}` };
+        },
+      };
+      assistant.roomState = "connected";
+
+      // HA custom event p2p_voice_send_chat -> calls bot.sendText with title + markdown code block
+      const mdCode = "```python\nprint('hello from HA')\n```";
+      serverWs.send(JSON.stringify({
+        type: "event",
+        event: {
+          event_type: "p2p_voice_send_chat",
+          data: { title: "Python Example", message: mdCode },
+        },
+      }));
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(sentTexts.length, 1);
+      assert.equal(sentTexts[0], `Python Example\n${mdCode}`);
+
+      // POST /api/chat when connected -> 200
+      const okRes = await fetch(`http://127.0.0.1:${ui.port}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Shopping List", text: "- Milk\n- Eggs" }),
+      });
+      assert.equal(okRes.status, 200);
+      const okBody = await okRes.json();
+      assert.equal(okBody.ok, true);
+      assert.equal(okBody.chunks, 1);
+      assert.deepEqual(okBody.ids, ["chat-2"]);
+      assert.equal(sentTexts[1], "Shopping List\n- Milk\n- Eggs");
+
+      // Long message (>12,000 chars) splits cleanly on newline boundaries
+      sentTexts.length = 0;
+      const longMsg = Array.from({ length: 300 }, (_, i) => `Line ${i + 1}: ${"x".repeat(50)}`).join("\n");
+      assert.ok(longMsg.length > 12000);
+      const chunkRes = assistant.sendRoomChat(longMsg, { title: "Long Report" });
+      assert.equal(chunkRes.ok, true);
+      assert.equal(chunkRes.chunks, 2);
+      assert.equal(sentTexts.length, 2);
+      assert.ok(sentTexts.every((c) => c.length <= 12000));
+      assert.ok(sentTexts[0].startsWith("Long Report\nLine 1:"));
+      assert.ok(sentTexts[1].endsWith(longMsg.split("\n").at(-1)));
+
+      assistant.bot = null;
+      assistant.roomState = "disconnected";
     } finally {
       await assistant.stop();
       await new Promise((r) => mockHaWss.close(r));

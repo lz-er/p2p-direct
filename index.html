@@ -87,6 +87,21 @@
             <span class="status-dot online"></span>
             Voice <strong id="voice-header-count">0</strong>
           </div>
+          <button
+            type="button"
+            class="stat-chip room-only hidden timers-header-chip"
+            id="timers-header-chip"
+            title="Active room timers (click to view)"
+            aria-label="Active room timers"
+          >
+            <svg class="metro-icon timers-header-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <line x1="9" y1="2" x2="15" y2="2" />
+              <circle cx="12" cy="13" r="8" />
+              <line x1="12" y1="9" x2="12" y2="13" />
+            </svg>
+            <strong id="timers-header-value">00:00</strong>
+            <span id="timers-header-count" class="timers-header-count hidden"></span>
+          </button>
           <div class="stat-chip chip-secondary advanced-only" title="Local Peer ID">
             ID <strong id="peer-id-display">loading…</strong>
           </div>
@@ -100,7 +115,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v36</strong>
+            <strong id="app-version-display">v37</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -673,6 +688,23 @@
 
               <div id="voice-notice" class="inline-notice voice-inline-notice hidden"></div>
             </div>
+          </section>
+
+          <!-- Always-Visible Room Timers Bar (Generic across all bots; hidden when 0 timers active) -->
+          <section class="panel room-timers-bar hidden" id="room-timers-bar" aria-label="Active room timers">
+            <div class="room-timers-header">
+              <div class="room-timers-title-group">
+                <svg class="metro-icon room-timers-header-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+                  <line x1="9" y1="2" x2="15" y2="2" />
+                  <circle cx="12" cy="13" r="8" />
+                  <line x1="12" y1="9" x2="12" y2="13" />
+                </svg>
+                <h2 class="room-timers-title">Timers</h2>
+                <span class="badge auto" id="room-timers-count">0</span>
+              </div>
+              <span class="room-timers-hint">Live room countdowns · Click a timer to locate in chat</span>
+            </div>
+            <div class="room-timers-grid" id="room-timers-grid" role="list"></div>
           </section>
 
           <div class="watch-chat-split" id="watch-chat-split">
@@ -1616,7 +1648,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v36</span>
+                <span id="adv-version-number">v37</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>

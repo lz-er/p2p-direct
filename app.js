@@ -131,18 +131,23 @@ import {
 } from "./watch_together.js";
 
 import {
+  hasIcon,
   renderIconSvg,
   resolveIconAndText,
   stripBotEmojis,
 } from "./icons.js";
+import {
+  highlightCodeToHtml,
+  normalizeCodeBlockInfo,
+} from "./code_highlight.js";
 
-export { MediaSyncController, WatchTraceRecorder };
+export { MediaSyncController, WatchTraceRecorder, highlightCodeToHtml, normalizeCodeBlockInfo };
 
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v36";
+export const APP_VERSION = "v37";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -1063,13 +1068,38 @@ export function formatBotTimerClock(remainingSec) {
 }
 
 export function formatBotRichText(raw) {
+  const rawStr = String(raw ?? "");
   const tokens = [];
   const stash = (html) => {
     const idx = tokens.length;
     tokens.push(html);
     return `\u0000BOTTOK${idx}\u0000`;
   };
-  const src = stripBotEmojis(String(raw ?? ""))
+  let working = rawStr;
+  if (working.includes("```") || working.includes("~~~")) {
+    const segs = parseFencedCodeSegments(working);
+    if (segs.some((s) => s.type === "code")) {
+      const rebuilt = [];
+      let hadCode = false;
+      for (const seg of segs) {
+        if (seg.type === "code") {
+          if (rebuilt.length > 0 && rebuilt[rebuilt.length - 1].endsWith("\n")) {
+            rebuilt[rebuilt.length - 1] = rebuilt[rebuilt.length - 1].slice(0, -1);
+          }
+          rebuilt.push(stash(renderCodeBlockHtml(seg.code, seg.info)));
+          hadCode = true;
+        } else {
+          let txt = seg.value;
+          if (hadCode && txt.startsWith("\n")) {
+            txt = txt.slice(1);
+          }
+          if (txt) rebuilt.push(txt);
+        }
+      }
+      working = rebuilt.join("");
+    }
+  }
+  const src = stripBotEmojis(working)
     .replace(/:icon\[([a-z0-9-]{2,24})\]/gi, (full, iconName) => {
       const svg = renderIconSvg(iconName, { size: 13, className: "bot-inline-icon" });
       return svg ? stash(svg) : "";
@@ -1107,6 +1137,697 @@ export function formatBotRichText(raw) {
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   return formatted.replace(/\u0000BOTTOK(\d+)\u0000/g, (_, idx) => tokens[Number(idx)] || "");
+}
+
+const VOICE_BOT_CONTROL_MAX_BUTTONS = 4;
+const VOICE_BOT_CONTROL_ALLOWED_TONES = new Set(["cobalt", "mint", "ochre", "coral", "cyan", "ink"]);
+const VOICE_BOT_CONTROL_ALLOWED_STYLES = new Set(["primary", "success", "warning", "danger", "secondary"]);
+
+/**
+ * Sanitizes an optional `voiceControls` object from a bot card payload into a safe, bounded
+ * representation for rendering inside a voice-channel participant card.
+ */
+export function sanitizeBotVoiceControls(rawVc) {
+  if (!rawVc || typeof rawVc !== "object" || Array.isArray(rawVc)) return null;
+
+  const rawStatus = typeof rawVc.status === "string" ? rawVc.status : "";
+  const explicitStatusIcon =
+    typeof rawVc.statusIcon === "string" ? rawVc.statusIcon.trim().toLowerCase() : "";
+  const resolvedStatus = resolveIconAndText(rawStatus, explicitStatusIcon);
+  const status = resolvedStatus.text.slice(0, 48).trim();
+  const statusIcon =
+    status && resolvedStatus.icon && hasIcon(resolvedStatus.icon) ? resolvedStatus.icon : "";
+
+  const rawTone = typeof rawVc.statusTone === "string" ? rawVc.statusTone.trim().toLowerCase() : "";
+  const statusTone = VOICE_BOT_CONTROL_ALLOWED_TONES.has(rawTone) ? rawTone : "cobalt";
+
+  const buttons = [];
+  if (Array.isArray(rawVc.buttons)) {
+    for (const rawBtn of rawVc.buttons) {
+      if (buttons.length >= VOICE_BOT_CONTROL_MAX_BUTTONS) break;
+      if (!rawBtn || typeof rawBtn !== "object" || Array.isArray(rawBtn)) continue;
+
+      const rawId =
+        typeof rawBtn.id === "string"
+          ? rawBtn.id
+          : typeof rawBtn.actionId === "string"
+            ? rawBtn.actionId
+            : "";
+      const id = rawId.trim().slice(0, 120);
+      const rawLabel = typeof rawBtn.label === "string" ? rawBtn.label : "";
+      if (!id && !rawLabel.trim()) continue;
+
+      const explicitBtnIcon =
+        typeof rawBtn.icon === "string" ? rawBtn.icon.trim().toLowerCase() : "";
+      const resolvedBtn = resolveIconAndText(rawLabel || id, explicitBtnIcon);
+      const label = (resolvedBtn.text || id).slice(0, 32).trim();
+      if (!label) continue;
+
+      const icon = resolvedBtn.icon && hasIcon(resolvedBtn.icon) ? resolvedBtn.icon : "";
+      const rawStyle =
+        typeof rawBtn.style === "string" ? rawBtn.style.trim().toLowerCase() : "";
+      const style = VOICE_BOT_CONTROL_ALLOWED_STYLES.has(rawStyle) ? rawStyle : "secondary";
+      const mode = rawBtn.mode === "reply" ? "reply" : "action";
+      const replyText =
+        mode === "reply" && typeof rawBtn.replyText === "string" && rawBtn.replyText.trim()
+          ? rawBtn.replyText.trim().slice(0, 200)
+          : null;
+      const url =
+        typeof rawBtn.url === "string" && SAFE_HTTP_URL_RE.test(rawBtn.url.trim())
+          ? rawBtn.url.trim()
+          : null;
+      const editPayload =
+        rawBtn.editPayload &&
+        typeof rawBtn.editPayload === "object" &&
+        !Array.isArray(rawBtn.editPayload)
+          ? rawBtn.editPayload
+          : null;
+      const editPatch =
+        rawBtn.editPatch &&
+        typeof rawBtn.editPatch === "object" &&
+        !Array.isArray(rawBtn.editPatch)
+          ? rawBtn.editPatch
+          : null;
+
+      const cleanBtn = {
+        id: id || label,
+        label,
+        icon,
+        style,
+        disabled: Boolean(rawBtn.disabled),
+        active: Boolean(rawBtn.active),
+        mode,
+      };
+      if (replyText !== null) cleanBtn.replyText = replyText;
+      if (rawBtn.value !== undefined) cleanBtn.value = rawBtn.value;
+      if (url) cleanBtn.url = url;
+      if (editPayload) cleanBtn.editPayload = editPayload;
+      if (editPatch) cleanBtn.editPatch = editPatch;
+
+      buttons.push(cleanBtn);
+    }
+  }
+
+  if (!status && buttons.length === 0) return null;
+  return { status, statusIcon, statusTone, buttons };
+}
+
+function getRawVoiceControlsFromMessage(msg) {
+  if (!msg || typeof msg !== "object") return null;
+  if (msg.type !== "bot" && msg.type !== "bot_message") return null;
+  const payload = msg.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if (payload.voiceControls && typeof payload.voiceControls === "object" && !Array.isArray(payload.voiceControls)) {
+    return payload.voiceControls;
+  }
+  if (
+    payload.card &&
+    typeof payload.card === "object" &&
+    !Array.isArray(payload.card) &&
+    payload.card.voiceControls &&
+    typeof payload.card.voiceControls === "object" &&
+    !Array.isArray(payload.card.voiceControls)
+  ) {
+    return payload.card.voiceControls;
+  }
+  return null;
+}
+
+/**
+ * Scans messages newest-to-oldest for the latest non-deleted bot card authored by `peerId`
+ * containing a valid `voiceControls` descriptor.
+ */
+export function extractPeerVoiceControls(messages, peerId) {
+  if (!peerId || !Array.isArray(messages) || messages.length === 0) return null;
+
+  let deletedIds = null;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m && m.type === "msg-delete" && typeof m.payload?.targetId === "string") {
+      if (!deletedIds) deletedIds = new Set();
+      deletedIds.add(m.payload.targetId);
+    }
+  }
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || typeof m !== "object" || m.deleted) continue;
+    if (deletedIds && m.id && deletedIds.has(m.id)) continue;
+    if (m.author !== peerId) continue;
+    const rawVc = getRawVoiceControlsFromMessage(m);
+    if (!rawVc) continue;
+    const clean = sanitizeBotVoiceControls(rawVc);
+    if (clean) {
+      return {
+        messageId: m.id,
+        status: clean.status,
+        statusIcon: clean.statusIcon,
+        statusTone: clean.statusTone,
+        buttons: clean.buttons,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Deterministic compact signature for DOM diffing inside `renderVoicePanel()` so bot card
+ * updates refresh the voice card smoothly without rebuilding during audio meter ticks.
+ */
+export function buildVoiceControlsSignature(vc) {
+  if (!vc || typeof vc !== "object") return "";
+  return JSON.stringify([
+    vc.messageId || "",
+    vc.status || "",
+    vc.statusIcon || "",
+    vc.statusTone || "cobalt",
+    Array.isArray(vc.buttons)
+      ? vc.buttons.map((b) => [
+          b.id || "",
+          b.label || "",
+          b.icon || "",
+          b.style || "secondary",
+          b.disabled ? 1 : 0,
+          b.active ? 1 : 0,
+          b.mode || "action",
+          b.replyText || "",
+          b.value !== undefined ? b.value : null,
+          b.url || "",
+        ])
+      : [],
+  ]);
+}
+
+/**
+ * Renders the Flat Metro voice-channel bot status chip and interactive button strip HTML.
+ */
+export function renderVoiceBotControlsHtml(peerId, vc) {
+  if (!vc || typeof vc !== "object") return "";
+  const safePeerId = escapeHtml(peerId || "");
+  const safeMsgId = escapeHtml(vc.messageId || "");
+  const parts = [];
+
+  if (vc.status) {
+    const statusSvg = vc.statusIcon
+      ? renderIconSvg(vc.statusIcon, { size: 11, className: "voice-bot-svg" })
+      : "";
+    const safeStatus = escapeHtml(vc.status);
+    const tone = VOICE_BOT_CONTROL_ALLOWED_TONES.has(vc.statusTone) ? vc.statusTone : "cobalt";
+    parts.push(`
+      <div class="voice-bot-status-row">
+        <span class="voice-bot-status is-tone-${tone}" title="${safeStatus}">
+          ${statusSvg}
+          <span class="voice-bot-status-label">${safeStatus}</span>
+        </span>
+      </div>
+    `);
+  }
+
+  if (Array.isArray(vc.buttons) && vc.buttons.length > 0) {
+    const btnsHtml = vc.buttons
+      .slice(0, VOICE_BOT_CONTROL_MAX_BUTTONS)
+      .map((btn, idx) => {
+        const style = VOICE_BOT_CONTROL_ALLOWED_STYLES.has(btn.style) ? btn.style : "secondary";
+        const iconSvg = btn.icon
+          ? renderIconSvg(btn.icon, { size: 11, className: "voice-bot-svg" })
+          : "";
+        const safeLabel = escapeHtml(btn.label || btn.id || "Action");
+        const safeActionId = escapeHtml(btn.id || "");
+        const isLink = typeof btn.url === "string" && SAFE_HTTP_URL_RE.test(btn.url.trim());
+        const suffix = isLink ? ` ${LINK_ARROW_SVG}` : "";
+        const disabledAttr = btn.disabled ? " disabled" : "";
+        const activeCls = btn.active ? " is-active" : "";
+        return `<button type="button" class="voice-bot-btn voice-bot-btn-${style}${activeCls}" data-voice-bot-msg-id="${safeMsgId}" data-voice-bot-action-id="${safeActionId}" data-voice-bot-peer-id="${safePeerId}" data-voice-bot-btn-idx="${idx}" title="${safeLabel}"${disabledAttr}>${iconSvg}<span class="voice-bot-btn-label">${safeLabel}${suffix}</span></button>`;
+      })
+      .join("");
+    parts.push(`<div class="voice-bot-actions cols-${Math.min(vc.buttons.length, VOICE_BOT_CONTROL_MAX_BUTTONS)}">${btnsHtml}</div>`);
+  }
+
+  if (parts.length === 0) return "";
+  return `<div class="voice-bot-controls" data-voice-bot-controls="${safePeerId}" data-voice-bot-msg-id="${safeMsgId}">${parts.join("")}</div>`;
+}
+
+const ROOM_TIMER_MAX_ITEMS = 12;
+const ROOM_TIMER_MAX_ACTIONS = 3;
+const ROOM_TIMER_ALLOWED_COLORS = new Set(["cobalt", "mint", "ochre", "coral", "cyan", "ink"]);
+const ROOM_TIMER_ALLOWED_STYLES = new Set(["primary", "success", "warning", "danger", "secondary"]);
+
+/**
+ * Sanitizes a single bot-supplied timer item into a bounded, XSS-safe, emoji-free descriptor
+ * for the always-visible Room Timers Bar and topbar countdown chip.
+ */
+export function sanitizeRoomTimerItem(rawTimer, meta = {}) {
+  if (!rawTimer || typeof rawTimer !== "object" || Array.isArray(rawTimer)) return null;
+
+  const nowMs = Number.isFinite(Number(meta.nowMs)) ? Number(meta.nowMs) : Date.now();
+  const msgId = typeof meta.msgId === "string" ? meta.msgId : "";
+  const peerId = typeof meta.peerId === "string" ? meta.peerId : "";
+  const authorName = stripBotEmojis(typeof meta.authorName === "string" ? meta.authorName : "")
+    .slice(0, 40)
+    .trim();
+  const sourceKey = typeof meta.sourceKey === "string" ? meta.sourceKey : "";
+
+  const fallbackId =
+    typeof meta.fallbackId === "string" && meta.fallbackId.trim()
+      ? meta.fallbackId.trim()
+      : `${msgId || "timer"}:${Number.isFinite(Number(meta.index)) ? Number(meta.index) : 0}`;
+  const rawId = typeof rawTimer.id === "string" ? rawTimer.id.trim() : "";
+  const id = (rawId || fallbackId).slice(0, 140);
+
+  const rawLabel = typeof rawTimer.label === "string" ? rawTimer.label : "";
+  const explicitIcon = typeof rawTimer.icon === "string" ? rawTimer.icon.trim().toLowerCase() : "";
+  const resolved = resolveIconAndText(rawLabel, explicitIcon);
+  const label = (resolved.text || "Timer").slice(0, 64).trim() || "Timer";
+  const icon = resolved.icon && hasIcon(resolved.icon) ? resolved.icon : "timer";
+
+  const rawSource =
+    typeof rawTimer.source === "string"
+      ? rawTimer.source
+      : typeof meta.defaultSource === "string"
+        ? meta.defaultSource
+        : "";
+  const source = stripBotEmojis(rawSource).slice(0, 40).trim();
+
+  const rawColor = typeof rawTimer.color === "string" ? rawTimer.color.trim().toLowerCase() : "";
+  const color = ROOM_TIMER_ALLOWED_COLORS.has(rawColor) ? rawColor : "cobalt";
+
+  const doneLabel =
+    (stripBotEmojis(typeof rawTimer.doneLabel === "string" ? rawTimer.doneLabel : "") || "DONE")
+      .slice(0, 20)
+      .trim() || "DONE";
+  const pausedLabel =
+    (stripBotEmojis(typeof rawTimer.pausedLabel === "string" ? rawTimer.pausedLabel : "") || "PAUSED")
+      .slice(0, 20)
+      .trim() || "PAUSED";
+
+  const paused = Boolean(rawTimer.paused);
+  const rawTotal = Number(rawTimer.totalSec ?? rawTimer.durationSec ?? rawTimer.totalSeconds);
+  const rawRem = Number(rawTimer.remainingSec ?? rawTimer.remainingSeconds);
+  const rawEndsAt = Number(rawTimer.endsAtMs);
+
+  let endsAtMs = 0;
+  let remainingSec = 0;
+  if (paused) {
+    endsAtMs = 0;
+    remainingSec = Math.max(
+      0,
+      Math.round(Number.isFinite(rawRem) ? rawRem : Number.isFinite(rawTotal) ? rawTotal : 0)
+    );
+  } else {
+    if (Number.isFinite(rawEndsAt) && rawEndsAt > 0) {
+      endsAtMs = Math.round(rawEndsAt);
+      remainingSec = Math.max(0, Math.ceil((endsAtMs - nowMs) / 1000));
+    } else if (Number.isFinite(rawRem) && rawRem > 0) {
+      remainingSec = Math.max(0, Math.round(rawRem));
+      endsAtMs = Math.round(nowMs + remainingSec * 1000);
+    } else {
+      endsAtMs = 0;
+      remainingSec = 0;
+    }
+  }
+  const totalSec = Math.max(
+    1,
+    Math.round(Number.isFinite(rawTotal) && rawTotal > 0 ? rawTotal : Math.max(1, remainingSec))
+  );
+
+  const actions = [];
+  if (Array.isArray(rawTimer.actions)) {
+    for (const rawAct of rawTimer.actions) {
+      if (actions.length >= ROOM_TIMER_MAX_ACTIONS) break;
+      if (!rawAct || typeof rawAct !== "object" || Array.isArray(rawAct)) continue;
+
+      const rawActId =
+        typeof rawAct.id === "string"
+          ? rawAct.id
+          : typeof rawAct.actionId === "string"
+            ? rawAct.actionId
+            : "";
+      const actId = rawActId.trim().slice(0, 140);
+      const rawActLabel = typeof rawAct.label === "string" ? rawAct.label : "";
+      if (!actId && !rawActLabel.trim()) continue;
+
+      const explicitActIcon =
+        typeof rawAct.icon === "string" ? rawAct.icon.trim().toLowerCase() : "";
+      const resolvedAct = resolveIconAndText(rawActLabel || actId, explicitActIcon);
+      const actLabel = (resolvedAct.text || actId).slice(0, 28).trim();
+      if (!actLabel) continue;
+
+      const actIcon = resolvedAct.icon && hasIcon(resolvedAct.icon) ? resolvedAct.icon : "";
+      const rawStyle = typeof rawAct.style === "string" ? rawAct.style.trim().toLowerCase() : "";
+      const style = ROOM_TIMER_ALLOWED_STYLES.has(rawStyle) ? rawStyle : "secondary";
+      const mode = rawAct.mode === "reply" ? "reply" : "action";
+      const replyText =
+        mode === "reply" && typeof rawAct.replyText === "string" && rawAct.replyText.trim()
+          ? rawAct.replyText.trim().slice(0, 200)
+          : null;
+      const url =
+        typeof rawAct.url === "string" && SAFE_HTTP_URL_RE.test(rawAct.url.trim())
+          ? rawAct.url.trim()
+          : null;
+      const editPayload =
+        rawAct.editPayload &&
+        typeof rawAct.editPayload === "object" &&
+        !Array.isArray(rawAct.editPayload)
+          ? rawAct.editPayload
+          : null;
+      const editPatch =
+        rawAct.editPatch &&
+        typeof rawAct.editPatch === "object" &&
+        !Array.isArray(rawAct.editPatch)
+          ? rawAct.editPatch
+          : null;
+
+      const cleanAct = {
+        id: actId || actLabel,
+        label: actLabel,
+        icon: actIcon,
+        style,
+        disabled: Boolean(rawAct.disabled),
+        mode,
+      };
+      if (replyText !== null) cleanAct.replyText = replyText;
+      if (rawAct.value !== undefined) cleanAct.value = rawAct.value;
+      if (url) cleanAct.url = url;
+      if (editPayload) cleanAct.editPayload = editPayload;
+      if (editPatch) cleanAct.editPatch = editPatch;
+      actions.push(cleanAct);
+    }
+  }
+
+  return {
+    id,
+    msgId,
+    peerId,
+    authorName,
+    sourceKey,
+    label,
+    source,
+    icon,
+    totalSec,
+    remainingSec,
+    endsAtMs,
+    paused,
+    color,
+    doneLabel,
+    pausedLabel,
+    actions,
+  };
+}
+
+function getTimerCardFromMessage(msg) {
+  if (!msg || typeof msg !== "object") return null;
+  if (msg.type !== "bot" && msg.type !== "bot_message") return null;
+  const payload = msg.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if (Array.isArray(payload.timers) || Array.isArray(payload.blocks)) {
+    return payload;
+  }
+  if (
+    payload.card &&
+    typeof payload.card === "object" &&
+    !Array.isArray(payload.card) &&
+    (Array.isArray(payload.card.timers) || Array.isArray(payload.card.blocks))
+  ) {
+    return payload.card;
+  }
+  return null;
+}
+
+/**
+ * Extracts all active room timers across bots using latest-timer-bearing-card-wins per source
+ * (`builtin:<botId>` for built-in bots, `peer:<author>` for external bots). Respects `msg-delete`
+ * tombstones, `m.deleted`, authoritative `card.timers` (including `[]` to clear), and falls back
+ * to `{ type: "timer" }` blocks in `card.blocks`.
+ */
+export function extractActiveRoomTimers(messages, nowMs = Date.now()) {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+
+  let deletedIds = null;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m && m.type === "msg-delete" && typeof m.payload?.targetId === "string") {
+      if (!deletedIds) deletedIds = new Set();
+      deletedIds.add(m.payload.targetId);
+    }
+  }
+
+  const seenSourceKeys = new Set();
+  const collected = [];
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || typeof m !== "object" || m.deleted) continue;
+    if (deletedIds && m.id && deletedIds.has(m.id)) continue;
+
+    const card = getTimerCardFromMessage(m);
+    if (!card) continue;
+
+    const rawBotId = card.botId || card.builtinBot || m.payload?.botId || m.payload?.builtinBot;
+    const sourceKey = rawBotId
+      ? `builtin:${String(rawBotId).trim()}`
+      : `peer:${String(m.author || m.id || "unknown")}`;
+
+    if (Array.isArray(card.timers)) {
+      if (seenSourceKeys.has(sourceKey)) continue;
+      seenSourceKeys.add(sourceKey);
+      // Authoritative timers list — empty `[]` clears all timers for this source cleanly.
+      for (let idx = 0; idx < card.timers.length; idx++) {
+        const clean = sanitizeRoomTimerItem(card.timers[idx], {
+          msgId: m.id || "",
+          peerId: m.author || "",
+          authorName: m.authorName || "",
+          sourceKey,
+          index: idx,
+          nowMs,
+        });
+        if (clean) collected.push(clean);
+      }
+      continue;
+    }
+
+    if (Array.isArray(card.blocks)) {
+      const timerBlocks = card.blocks.filter(
+        (b) => b && typeof b === "object" && String(b.type || "").toLowerCase() === "timer"
+      );
+      if (timerBlocks.length === 0) continue;
+      if (seenSourceKeys.has(sourceKey)) continue;
+      seenSourceKeys.add(sourceKey);
+
+      const defaultSource =
+        typeof card.title === "string" && card.title.trim()
+          ? card.title
+          : typeof m.authorName === "string"
+            ? m.authorName
+            : "";
+      for (let idx = 0; idx < timerBlocks.length; idx++) {
+        const blk = timerBlocks[idx];
+        const actId =
+          typeof blk.actionId === "string" && blk.actionId.trim()
+            ? blk.actionId.trim()
+            : typeof blk.id === "string" && blk.id.trim()
+              ? blk.id.trim()
+              : "";
+        const actions = [];
+        if (actId) {
+          const isDismissLike = /dismiss|cancel|stop|delete|remove/i.test(actId);
+          const customLabel =
+            typeof blk.actionLabel === "string" && blk.actionLabel.trim()
+              ? blk.actionLabel.trim()
+              : isDismissLike
+                ? "Dismiss"
+                : "Action";
+          actions.push({
+            id: actId,
+            label: customLabel,
+            icon: isDismissLike ? "close" : "check",
+            style: isDismissLike ? "secondary" : "primary",
+            disabled: Boolean(blk.disabled),
+            ...(blk.value !== undefined ? { value: blk.value } : {}),
+            ...(blk.url ? { url: blk.url } : {}),
+            ...(blk.editPatch ? { editPatch: blk.editPatch } : {}),
+            ...(blk.editPayload ? { editPayload: blk.editPayload } : {}),
+          });
+        }
+        const clean = sanitizeRoomTimerItem(
+          {
+            id: blk.id || actId || `${m.id || "msg"}:blk:${idx}`,
+            label: blk.label || "Timer",
+            source: blk.source !== undefined ? blk.source : defaultSource,
+            icon: blk.icon || "timer",
+            totalSec: blk.totalSec ?? blk.durationSec,
+            remainingSec: blk.remainingSec,
+            endsAtMs: blk.endsAtMs,
+            paused: blk.paused,
+            color: blk.color,
+            doneLabel: blk.doneLabel,
+            pausedLabel: blk.pausedLabel,
+            actions,
+          },
+          {
+            msgId: m.id || "",
+            peerId: m.author || "",
+            authorName: m.authorName || "",
+            sourceKey,
+            index: idx,
+            nowMs,
+          }
+        );
+        if (clean) collected.push(clean);
+      }
+    }
+  }
+
+  collected.sort((a, b) => {
+    if (a.paused !== b.paused) return a.paused ? 1 : -1;
+    if (!a.paused) {
+      const aRem = a.endsAtMs > 0 ? a.endsAtMs - nowMs : a.remainingSec * 1000;
+      const bRem = b.endsAtMs > 0 ? b.endsAtMs - nowMs : b.remainingSec * 1000;
+      if (aRem !== bRem) return aRem - bRem;
+    } else if (a.remainingSec !== b.remainingSec) {
+      return a.remainingSec - b.remainingSec;
+    }
+    return a.label.localeCompare(b.label) || a.id.localeCompare(b.id);
+  });
+
+  return collected.slice(0, ROOM_TIMER_MAX_ITEMS);
+}
+
+/**
+ * Deterministic signature for `#room-timers-grid` DOM diffing. Uses `endsAtMs` for running
+ * timers (not `remainingSec`) so 1-second ticks never trigger full DOM rebuilds.
+ */
+export function buildRoomTimersSignature(timers) {
+  if (!Array.isArray(timers) || timers.length === 0) return "";
+  return JSON.stringify(
+    timers.map((t) => [
+      t.id || "",
+      t.msgId || "",
+      t.label || "",
+      t.source || "",
+      t.icon || "timer",
+      t.totalSec || 1,
+      t.paused ? 1 : 0,
+      t.paused || !t.endsAtMs ? t.remainingSec || 0 : 0,
+      t.paused ? 0 : t.endsAtMs || 0,
+      t.color || "cobalt",
+      t.doneLabel || "DONE",
+      t.pausedLabel || "PAUSED",
+      Array.isArray(t.actions)
+        ? t.actions.map((a) => [
+            a.id || "",
+            a.label || "",
+            a.icon || "",
+            a.style || "secondary",
+            a.disabled ? 1 : 0,
+            a.mode || "action",
+            a.replyText || "",
+            a.value !== undefined ? a.value : null,
+            a.url || "",
+          ])
+        : [],
+    ])
+  );
+}
+
+/**
+ * Renders Flat Metro `.room-timer-tile` cards HTML for `#room-timers-grid`.
+ */
+export function renderRoomTimersHtml(timers, nowMs = Date.now()) {
+  if (!Array.isArray(timers) || timers.length === 0) return "";
+
+  return timers
+    .slice(0, ROOM_TIMER_MAX_ITEMS)
+    .map((t, tIdx) => {
+      const tone = ROOM_TIMER_ALLOWED_COLORS.has(t.color) ? t.color : "cobalt";
+      const totalSec = Math.max(1, Number(t.totalSec) || 1);
+      const paused = Boolean(t.paused);
+      const endsAtMs = paused ? 0 : Number(t.endsAtMs) || 0;
+      const remSec = paused
+        ? Math.max(0, Number(t.remainingSec) || 0)
+        : endsAtMs > 0
+          ? Math.max(0, (endsAtMs - nowMs) / 1000)
+          : Math.max(0, Number(t.remainingSec) || 0);
+      const elapsed = Math.max(0, totalSec - remSec);
+      const pct = Math.max(0, Math.min(100, Math.round((elapsed / totalSec) * 100)));
+      const doneLabel = t.doneLabel || "DONE";
+      const pausedLabel = t.pausedLabel || "PAUSED";
+      const isDone = !paused && remSec <= 0;
+      const running = !paused && remSec > 0 && endsAtMs > 0;
+      const clockText = isDone ? doneLabel : formatBotTimerClock(remSec);
+
+      const safeId = escapeHtml(t.id || "");
+      const safeMsgId = escapeHtml(t.msgId || "");
+      const safeLabel = escapeHtml(t.label || "Timer");
+      const safeSource = t.source ? escapeHtml(t.source) : "";
+      const safeDoneLabel = escapeHtml(doneLabel);
+      const iconName = t.icon && hasIcon(t.icon) ? t.icon : "timer";
+      const iconSvg = renderIconSvg(iconName, { size: 13, className: "room-timer-icon" });
+
+      const subTags = [];
+      if (safeSource) {
+        subTags.push(`<span class="room-timer-source">${safeSource}</span>`);
+      }
+      if (paused) {
+        subTags.push(`<span class="room-timer-state-tag is-paused">${escapeHtml(pausedLabel)}</span>`);
+      } else if (isDone) {
+        subTags.push(`<span class="room-timer-state-tag is-done">${safeDoneLabel}</span>`);
+      }
+      const subRowHtml =
+        subTags.length > 0 ? `<span class="room-timer-sub-row">${subTags.join("")}</span>` : "";
+
+      let actionsHtml = "";
+      if (Array.isArray(t.actions) && t.actions.length > 0) {
+        const btns = t.actions
+          .slice(0, ROOM_TIMER_MAX_ACTIONS)
+          .map((act, aIdx) => {
+            const style = ROOM_TIMER_ALLOWED_STYLES.has(act.style) ? act.style : "secondary";
+            const actIconSvg =
+              act.icon && hasIcon(act.icon)
+                ? renderIconSvg(act.icon, { size: 11, className: "room-timer-btn-svg" })
+                : "";
+            const safeActId = escapeHtml(act.id || "");
+            const safeActLabel = escapeHtml(act.label || act.id || "Action");
+            const disabledAttr = act.disabled ? " disabled" : "";
+            return `<button type="button" class="room-timer-btn room-timer-btn-${style}" data-room-timer-msg-id="${safeMsgId}" data-room-timer-action-id="${safeActId}" data-room-timer-label="${safeActLabel}" data-room-timer-btn-idx="${aIdx}" data-room-timer-idx="${tIdx}" title="${safeActLabel}"${disabledAttr}>${actIconSvg}<span class="room-timer-btn-label">${safeActLabel}</span></button>`;
+          })
+          .join("");
+        actionsHtml = `<div class="room-timer-actions cols-${Math.min(t.actions.length, ROOM_TIMER_MAX_ACTIONS)}">${btns}</div>`;
+      }
+
+      const stateCls = `${paused ? " is-paused" : ""}${isDone ? " is-done" : ""}`;
+      return `
+        <article
+          class="room-timer-tile is-${tone}${stateCls}"
+          role="listitem"
+          data-room-timer-idx="${tIdx}"
+          data-room-timer-id="${safeId}"
+          data-room-timer-msg-id="${safeMsgId}"
+          data-room-timer-running="${running ? "1" : "0"}"
+          data-room-timer-paused="${paused ? "1" : "0"}"
+          data-room-timer-ends-at="${Math.round(endsAtMs)}"
+          data-room-timer-total-sec="${Math.round(totalSec)}"
+          data-room-timer-done-label="${safeDoneLabel}"
+        >
+          <button
+            type="button"
+            class="room-timer-head"
+            data-room-timer-jump="${safeMsgId}"
+            title="Jump to source card in chat"
+          >
+            <span class="room-timer-meta">
+              <span class="room-timer-title-row">${iconSvg}<span class="room-timer-label">${safeLabel}</span></span>
+              ${subRowHtml}
+            </span>
+            <span class="room-timer-clock">${escapeHtml(clockText)}</span>
+          </button>
+          <div class="room-timer-progress-track" aria-hidden="true">
+            <div class="room-timer-progress-fill is-${tone}" style="width:${pct}%"></div>
+          </div>
+          ${actionsHtml}
+        </article>
+      `;
+    })
+    .join("");
 }
 
 function computeFloat32RmsI16Scale(float32Pcm) {
@@ -1366,6 +2087,237 @@ function extractAndLinkify(text) {
 
   html += escapeHtml(raw.slice(lastIndex));
   return { html, links };
+}
+
+/**
+ * Renders a single-line, XSS-safe Flat Metro code block with syntax highlighting, optional
+ * filename/title, line counter, Wrap toggle, Copy button, and sibling line-number gutter.
+ */
+export function renderCodeBlockHtml(rawCode, rawInfo = "") {
+  const code = String(rawCode ?? "");
+  const { lang, displayLang, title } = normalizeCodeBlockInfo(rawInfo);
+  const highlighted = highlightCodeToHtml(code, lang);
+  const lineCount = code.length === 0 ? 1 : code.split("\n").length;
+  const linesLabel = lineCount === 1 ? "1 line" : `${lineCount} lines`;
+  const titleHtml = title
+    ? `<span class="chat-code-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>`
+    : "";
+  let gutterHtml = "";
+  if (lineCount >= 2) {
+    const nums = [];
+    for (let n = 1; n <= lineCount; n++) {
+      nums.push(`<span>${n}</span>`);
+    }
+    gutterHtml = `<div class="chat-code-gutter" aria-hidden="true">${nums.join("")}</div>`;
+  }
+  return (
+    `<div class="chat-code-block" data-code-lang="${escapeHtml(lang)}">` +
+    `<div class="chat-code-head">` +
+    `<div class="chat-code-meta"><span class="chat-code-lang">${escapeHtml(displayLang)}</span>${titleHtml}<span class="chat-code-lines">${linesLabel}</span></div>` +
+    `<div class="chat-code-actions"><button type="button" class="chat-code-action-btn" data-chat-wrap-code aria-pressed="false" title="Toggle line wrapping">Wrap</button><button type="button" class="chat-code-copy-btn" data-chat-copy-code aria-label="Copy code">Copy</button></div>` +
+    `</div>` +
+    `<div class="chat-code-body">${gutterHtml}<pre class="chat-code-pre"><code>${highlighted}</code></pre></div>` +
+    `</div>`
+  );
+}
+
+/**
+ * Splits normalized text into `{ type: "text", value }` and `{ type: "code", info, code }`
+ * segments supporting both backtick (```) and tilde (~~~) fences (3+ chars), up to 3 leading
+ * spaces on opening/closing fence lines, single-line backtick fences, and graceful unclosed fences.
+ */
+function parseFencedCodeSegments(text) {
+  const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
+  const segments = [];
+  const n = normalized.length;
+  let plainBuf = [];
+  let pos = 0;
+
+  const flushPlain = () => {
+    if (plainBuf.length > 0) {
+      segments.push({ type: "text", value: plainBuf.join("") });
+      plainBuf = [];
+    }
+  };
+
+  while (pos < n) {
+    const nlIdx = normalized.indexOf("\n", pos);
+    const lineEnd = nlIdx === -1 ? n : nlIdx;
+    const line = normalized.slice(pos, lineEnd);
+
+    // 1. Standard line-start backtick or tilde fence (with up to 3 leading spaces)
+    const openMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (openMatch) {
+      const fenceStr = openMatch[1];
+      const fenceChar = fenceStr[0];
+      const fenceLen = fenceStr.length;
+      const openInfo = openMatch[2];
+
+      // Single-line backtick fence e.g. ```const x = 1;```
+      const inlineCloseIdx = fenceChar === "`" ? openInfo.indexOf(fenceStr) : -1;
+      if (inlineCloseIdx !== -1) {
+        flushPlain();
+        segments.push({ type: "code", info: "", code: openInfo.slice(0, inlineCloseIdx) });
+        const afterInline = openInfo.slice(inlineCloseIdx + fenceLen);
+        if (afterInline) plainBuf.push(afterInline);
+        if (nlIdx !== -1) plainBuf.push("\n");
+        pos = nlIdx === -1 ? n : nlIdx + 1;
+        continue;
+      }
+
+      flushPlain();
+      const bodyStart = nlIdx === -1 ? n : nlIdx + 1;
+      let searchPos = bodyStart;
+      let closeStart = -1;
+      let nextPos = n;
+
+      while (searchPos <= n) {
+        const cNl = normalized.indexOf("\n", searchPos);
+        const cLineEnd = cNl === -1 ? n : cNl;
+        const cLine = normalized.slice(searchPos, cLineEnd);
+        const closeMatch = cLine.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+        if (closeMatch && closeMatch[1][0] === fenceChar && closeMatch[1].length >= fenceLen) {
+          closeStart = searchPos;
+          nextPos = cNl === -1 ? n : cNl + 1;
+          break;
+        }
+        if (cNl === -1) break;
+        searchPos = cNl + 1;
+      }
+
+      let rawCode =
+        closeStart !== -1
+          ? normalized.slice(bodyStart, closeStart)
+          : normalized.slice(bodyStart);
+      if (rawCode.endsWith("\n")) {
+        rawCode = rawCode.slice(0, -1);
+      }
+      segments.push({ type: "code", info: openInfo, code: rawCode });
+      pos = nextPos;
+      continue;
+    }
+
+    // 2. Mid-line backtick fence fallback (e.g. "Code: ```python\n...")
+    const midTick = line.indexOf("```");
+    if (midTick > 0) {
+      const prefix = line.slice(0, midTick);
+      let tickEnd = midTick;
+      while (tickEnd < line.length && line[tickEnd] === "`") tickEnd++;
+      const fenceLen = tickEnd - midTick;
+      const fenceStr = "`".repeat(fenceLen);
+      const openInfo = line.slice(tickEnd);
+      const inlineCloseIdx = openInfo.indexOf(fenceStr);
+
+      if (inlineCloseIdx !== -1) {
+        plainBuf.push(prefix);
+        flushPlain();
+        segments.push({ type: "code", info: "", code: openInfo.slice(0, inlineCloseIdx) });
+        const afterInline = openInfo.slice(inlineCloseIdx + fenceLen);
+        if (afterInline) plainBuf.push(afterInline);
+        if (nlIdx !== -1) plainBuf.push("\n");
+        pos = nlIdx === -1 ? n : nlIdx + 1;
+        continue;
+      }
+
+      if (nlIdx !== -1) {
+        plainBuf.push(prefix);
+        flushPlain();
+        const bodyStart = nlIdx + 1;
+        let searchPos = bodyStart;
+        let closeStart = -1;
+        let nextPos = n;
+        while (searchPos <= n) {
+          const cNl = normalized.indexOf("\n", searchPos);
+          const cLineEnd = cNl === -1 ? n : cNl;
+          const cLine = normalized.slice(searchPos, cLineEnd);
+          const closeMatch = cLine.match(/^ {0,3}(`{3,})[ \t]*$/);
+          if (closeMatch && closeMatch[1].length >= fenceLen) {
+            closeStart = searchPos;
+            nextPos = cNl === -1 ? n : cNl + 1;
+            break;
+          }
+          if (cNl === -1) break;
+          searchPos = cNl + 1;
+        }
+        let rawCode =
+          closeStart !== -1
+            ? normalized.slice(bodyStart, closeStart)
+            : normalized.slice(bodyStart);
+        if (rawCode.endsWith("\n")) {
+          rawCode = rawCode.slice(0, -1);
+        }
+        segments.push({ type: "code", info: openInfo, code: rawCode });
+        pos = nextPos;
+        continue;
+      }
+    }
+
+    plainBuf.push(line);
+    if (nlIdx !== -1) plainBuf.push("\n");
+    pos = nlIdx === -1 ? n : nlIdx + 1;
+  }
+
+  flushPlain();
+  return segments;
+}
+
+function formatChatPlainSegment(segment, allLinks, seenHref) {
+  if (!segment) return "";
+  const tokens = [];
+  const withStashedInlineCode = segment.replace(/`([^`\n]+)`/g, (full, inner) => {
+    const idx = tokens.length;
+    tokens.push(`<code class="chat-inline-code">${escapeHtml(inner)}</code>`);
+    return `\u0000CHCODE${idx}\u0000`;
+  });
+  const { html, links } = extractAndLinkify(withStashedInlineCode);
+  for (const lnk of links) {
+    if (lnk && lnk.href && !seenHref.has(lnk.href)) {
+      seenHref.add(lnk.href);
+      allLinks.push(lnk);
+    }
+  }
+  if (tokens.length === 0) return html;
+  return html.replace(/\u0000CHCODE(\d+)\u0000/g, (_, idx) => tokens[Number(idx)] || "");
+}
+
+/**
+ * Formats a regular chat message payload with XSS-safe syntax-highlighted Markdown fenced
+ * code blocks (``` or ~~~) and inline `code`, while preserving URL linkification and Watch
+ * Together / link card extraction strictly outside code blocks.
+ */
+export function formatChatTextPayload(text) {
+  const raw = String(text ?? "");
+  if (!raw.includes("`") && !raw.includes("~~~")) {
+    return extractAndLinkify(raw);
+  }
+
+  const segs = parseFencedCodeSegments(raw);
+  const allLinks = [];
+  const seenHref = new Set();
+  const out = [];
+  let hadBlockBefore = false;
+
+  for (let idx = 0; idx < segs.length; idx++) {
+    const seg = segs[idx];
+    if (seg.type === "code") {
+      out.push(renderCodeBlockHtml(seg.code, seg.info));
+      hadBlockBefore = true;
+    } else {
+      let val = seg.value;
+      if (hadBlockBefore && val.startsWith("\n")) {
+        val = val.slice(1);
+      }
+      const nextIsCode = idx + 1 < segs.length && segs[idx + 1].type === "code";
+      if (nextIsCode && val.endsWith("\n")) {
+        val = val.slice(0, -1);
+      }
+      if (val) {
+        out.push(formatChatPlainSegment(val, allLinks, seenHref));
+      }
+    }
+  }
+
+  return { html: out.join(""), links: allLinks };
 }
 
 function loadImageFromFile(file) {
@@ -2072,6 +3024,8 @@ export class P2PDirectApp {
     };
     this._pomoTickTimer = null;
     this._botBlockTickTimer = null;
+    this._roomTimersCache = [];
+    this._lastRoomTimersSig = "";
     this._seenTriggerMsgIds = new Set();
     this.el = {};
   }
@@ -2133,6 +3087,12 @@ export class P2PDirectApp {
       "peer-count-display",
       "voice-header-chip",
       "voice-header-count",
+      "timers-header-chip",
+      "timers-header-value",
+      "timers-header-count",
+      "room-timers-bar",
+      "room-timers-count",
+      "room-timers-grid",
       "log-count-display",
       "app-version-chip",
       "app-version-dot",
@@ -2598,11 +3558,49 @@ export class P2PDirectApp {
     }
     if (this.el["voice-participant-list"]) {
       this.el["voice-participant-list"].addEventListener("click", (ev) => {
+        const botBtn = ev.target?.closest?.("[data-voice-bot-action-id]");
+        if (botBtn) {
+          this.handleVoiceBotButtonClick(botBtn);
+          return;
+        }
         const head = ev.target?.closest?.(".vas-head");
         if (!head) return;
         const plate = head.closest("[data-voice-adv-stats]");
         const key = plate?.getAttribute("data-voice-adv-stats");
         if (key) this.toggleVoiceCardStatsCollapsed(key);
+      });
+    }
+    if (this.el["room-timers-grid"]) {
+      this.el["room-timers-grid"].addEventListener("click", (ev) => {
+        const actBtn = ev.target?.closest?.("[data-room-timer-action-id]");
+        if (actBtn) {
+          this.handleRoomTimerActionClick(actBtn);
+          return;
+        }
+        const jumpBtn = ev.target?.closest?.("[data-room-timer-jump]");
+        if (jumpBtn) {
+          const msgId =
+            jumpBtn.dataset?.roomTimerJump || jumpBtn.getAttribute?.("data-room-timer-jump") || "";
+          if (msgId) this.jumpToLogMessage(msgId);
+        }
+      });
+    }
+    if (this.el["timers-header-chip"]) {
+      this.el["timers-header-chip"].addEventListener("click", () => {
+        this.jumpToRoomTimersBar();
+      });
+    }
+    if (this.el["log-feed"]) {
+      this.el["log-feed"].addEventListener("click", (ev) => {
+        const copyBtn = ev.target?.closest?.("[data-chat-copy-code]");
+        if (copyBtn) {
+          this.handleChatCodeCopyClick(copyBtn);
+          return;
+        }
+        const wrapBtn = ev.target?.closest?.("[data-chat-wrap-code]");
+        if (wrapBtn) {
+          this.handleChatCodeWrapClick(wrapBtn);
+        }
       });
     }
     if (this.el["btn-simple-save-room"]) {
@@ -7402,6 +8400,64 @@ export class P2PDirectApp {
     }
   }
 
+  async handleChatCodeCopyClick(btnEl) {
+    if (!btnEl) return;
+    const block = btnEl.closest?.(".chat-code-block");
+    const codeEl = block?.querySelector?.("pre > code");
+    if (!codeEl) return;
+    const codeText = String(codeEl.textContent ?? "");
+    let copied = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(codeText);
+        copied = true;
+      }
+    } catch {
+      copied = false;
+    }
+    if (!copied && typeof document !== "undefined") {
+      try {
+        const tmp = document.createElement("textarea");
+        tmp.value = codeText;
+        document.body.appendChild(tmp);
+        tmp.select();
+        document.execCommand("copy");
+        tmp.remove();
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+    if (copied && typeof this.showToast === "function") {
+      this.showToast("Copied code snippet");
+    }
+    btnEl.textContent = copied ? "Copied" : "Copy Failed";
+    btnEl.classList.toggle("is-copied", copied);
+    if (btnEl._copyResetTimer) {
+      clearTimeout(btnEl._copyResetTimer);
+    }
+    btnEl._copyResetTimer = setTimeout(() => {
+      btnEl._copyResetTimer = null;
+      if (btnEl.isConnected) {
+        btnEl.textContent = "Copy";
+        btnEl.classList.remove("is-copied");
+      }
+    }, 1600);
+  }
+
+  handleChatCodeWrapClick(btnEl) {
+    if (!btnEl) return false;
+    const block = btnEl.closest?.(".chat-code-block");
+    if (!block) return false;
+    const isWrapped = block.classList.toggle("is-wrapped");
+    if (typeof btnEl.setAttribute === "function") {
+      btnEl.setAttribute("aria-pressed", isWrapped ? "true" : "false");
+    }
+    btnEl.textContent = isWrapped ? "Wrapped" : "Wrap";
+    btnEl.classList?.toggle?.("is-active", isWrapped);
+    return isWrapped;
+  }
+
   addTelemetry(event, detail) {
     this.telemetry.unshift({ ts: formatTime(Date.now()), event, detail });
     if (this.telemetry.length > 80) {
@@ -7987,6 +9043,8 @@ export class P2PDirectApp {
   leaveLongLivedRoom({ silent = false } = {}) {
     this.stopWarframeBotTimers();
     this.stopBuiltinBotsTimers();
+    this._roomTimersCache = [];
+    this._lastRoomTimersSig = "";
     this.warframeBot.dismissedInRoomTopic = null;
     this.builtinBots.dismissedByRoom = {};
     this._seenTriggerMsgIds.clear();
@@ -9490,36 +10548,129 @@ export class P2PDirectApp {
     }, 1000);
   }
 
+  _updateTimersHeaderChip(nowMs = Date.now()) {
+    const chip = this.el?.["timers-header-chip"];
+    const valEl = this.el?.["timers-header-value"];
+    const countEl = this.el?.["timers-header-count"];
+    const timers = Array.isArray(this._roomTimersCache) ? this._roomTimersCache : [];
+
+    if (!chip) return false;
+    if (timers.length === 0) {
+      chip.classList.add("hidden");
+      chip.classList.remove("live", "is-done", "is-paused");
+      if (countEl) {
+        countEl.classList.add("hidden");
+        countEl.textContent = "";
+      }
+      return false;
+    }
+
+    let anyDone = false;
+    let anyRunning = false;
+    for (const t of timers) {
+      if (t.paused) continue;
+      const remSec =
+        t.endsAtMs > 0 ? Math.max(0, (t.endsAtMs - nowMs) / 1000) : Math.max(0, Number(t.remainingSec) || 0);
+      if (remSec <= 0) {
+        anyDone = true;
+      } else if (t.endsAtMs > 0) {
+        anyRunning = true;
+      }
+    }
+
+    const lead = timers[0];
+    const leadRemSec = lead.paused
+      ? Math.max(0, Number(lead.remainingSec) || 0)
+      : lead.endsAtMs > 0
+        ? Math.max(0, (lead.endsAtMs - nowMs) / 1000)
+        : Math.max(0, Number(lead.remainingSec) || 0);
+    const leadDone = !lead.paused && leadRemSec <= 0;
+    const valText = leadDone ? lead.doneLabel || "DONE" : formatBotTimerClock(leadRemSec);
+
+    chip.classList.remove("hidden");
+    chip.classList.toggle("is-done", anyDone);
+    chip.classList.toggle("is-paused", Boolean(lead.paused && !anyDone));
+    chip.classList.toggle("live", !lead.paused && !anyDone);
+    chip.title = `${lead.label}${lead.source ? ` (${lead.source})` : ""} — ${valText}${timers.length > 1 ? ` · ${timers.length} active timers` : ""} (click to view)`;
+
+    if (valEl && valEl.textContent !== valText) {
+      valEl.textContent = valText;
+    }
+    if (countEl) {
+      if (timers.length > 1) {
+        countEl.classList.remove("hidden");
+        countEl.textContent = `+${timers.length - 1}`;
+      } else {
+        countEl.classList.add("hidden");
+        countEl.textContent = "";
+      }
+    }
+    return anyRunning;
+  }
+
   _syncBotBlockTimersTicker() {
     const feed = this.el?.["log-feed"];
+    const timersGrid = this.el?.["room-timers-grid"];
     const tick = () => {
-      if (!feed) return false;
-      const nodes = feed.querySelectorAll('.bot-blk-timer[data-bot-timer-running="1"]');
-      if (nodes.length === 0) return false;
       const nowMs = Date.now();
       let anyStillRunning = false;
-      for (const el of nodes) {
-        const endsAtMs = Number(el.dataset.botTimerEndsAt) || 0;
-        const totalSec = Math.max(1, Number(el.dataset.botTimerTotalSec) || 1);
-        const doneLabel = el.dataset.botTimerDoneLabel || "DONE";
-        const remSec = Math.max(0, (endsAtMs - nowMs) / 1000);
-        const elapsed = Math.max(0, totalSec - remSec);
-        const pct = Math.max(0, Math.min(100, Math.round((elapsed / totalSec) * 100)));
-        const valEl = el.querySelector(".bot-blk-progress-val");
-        if (valEl) {
-          valEl.textContent = remSec <= 0 ? doneLabel : `${formatBotTimerClock(remSec)} · ${pct}%`;
-        }
-        const fillEl = el.querySelector(".bot-blk-progress-fill");
-        if (fillEl) {
-          fillEl.style.width = `${pct}%`;
-        }
-        if (remSec <= 0) {
-          el.dataset.botTimerRunning = "0";
-          el.classList.add("is-done");
-        } else {
-          anyStillRunning = true;
+
+      if (feed) {
+        const nodes = feed.querySelectorAll('.bot-blk-timer[data-bot-timer-running="1"]');
+        for (const el of nodes) {
+          const endsAtMs = Number(el.dataset.botTimerEndsAt) || 0;
+          const totalSec = Math.max(1, Number(el.dataset.botTimerTotalSec) || 1);
+          const doneLabel = el.dataset.botTimerDoneLabel || "DONE";
+          const remSec = Math.max(0, (endsAtMs - nowMs) / 1000);
+          const elapsed = Math.max(0, totalSec - remSec);
+          const pct = Math.max(0, Math.min(100, Math.round((elapsed / totalSec) * 100)));
+          const valEl = el.querySelector(".bot-blk-progress-val");
+          if (valEl) {
+            valEl.textContent = remSec <= 0 ? doneLabel : `${formatBotTimerClock(remSec)} · ${pct}%`;
+          }
+          const fillEl = el.querySelector(".bot-blk-progress-fill");
+          if (fillEl) {
+            fillEl.style.width = `${pct}%`;
+          }
+          if (remSec <= 0) {
+            el.dataset.botTimerRunning = "0";
+            el.classList.add("is-done");
+          } else {
+            anyStillRunning = true;
+          }
         }
       }
+
+      if (timersGrid) {
+        const tileNodes = timersGrid.querySelectorAll('.room-timer-tile[data-room-timer-running="1"]');
+        for (const tile of tileNodes) {
+          const endsAtMs = Number(tile.dataset.roomTimerEndsAt) || 0;
+          const totalSec = Math.max(1, Number(tile.dataset.roomTimerTotalSec) || 1);
+          const doneLabel = tile.dataset.roomTimerDoneLabel || "DONE";
+          const remSec = Math.max(0, (endsAtMs - nowMs) / 1000);
+          const elapsed = Math.max(0, totalSec - remSec);
+          const pct = Math.max(0, Math.min(100, Math.round((elapsed / totalSec) * 100)));
+          const clockEl = tile.querySelector(".room-timer-clock");
+          if (clockEl) {
+            clockEl.textContent = remSec <= 0 ? doneLabel : formatBotTimerClock(remSec);
+          }
+          const fillEl = tile.querySelector(".room-timer-progress-fill");
+          if (fillEl) {
+            fillEl.style.width = `${pct}%`;
+          }
+          if (remSec <= 0) {
+            tile.dataset.roomTimerRunning = "0";
+            tile.classList.add("is-done");
+          } else {
+            anyStillRunning = true;
+          }
+        }
+      }
+
+      if (this._updateTimersHeaderChip(nowMs)) {
+        anyStillRunning = true;
+      }
+
       return anyStillRunning;
     };
 
@@ -9538,6 +10689,147 @@ export class P2PDirectApp {
         this._botBlockTickTimer = null;
       }
     }, 1000);
+  }
+
+  jumpToLogMessage(msgId) {
+    if (!msgId) return false;
+    if (this.settingsOpen) {
+      this.toggleSettingsModal(false);
+    }
+    if (typeof this.setMobileAdvTab === "function") {
+      this.setMobileAdvTab("chat", { autoOpen: false, scrollTop: false });
+    }
+    if (this.rawJsonMode) {
+      this.rawJsonMode = false;
+      if (this.el?.["btn-toggle-raw"]) {
+        this.el["btn-toggle-raw"].textContent = "Raw JSON";
+      }
+      this.renderLog();
+    }
+    const feed = this.el?.["log-feed"];
+    if (!feed) return false;
+    const escapedId = typeof CSS !== "undefined" && typeof CSS.escape === "function" ? CSS.escape(msgId) : msgId;
+    const targetEl = feed.querySelector(`.log-entry[data-msg-id="${escapedId}"]`);
+    if (!targetEl) return false;
+    targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    targetEl.classList.remove("is-wf-highlight");
+    void targetEl.offsetWidth;
+    targetEl.classList.add("is-wf-highlight");
+    setTimeout(() => {
+      if (targetEl.isConnected) targetEl.classList.remove("is-wf-highlight");
+    }, 1500);
+    return true;
+  }
+
+  jumpToRoomTimersBar() {
+    if (this.settingsOpen) {
+      this.toggleSettingsModal(false);
+    }
+    if (typeof this.setMobileAdvTab === "function") {
+      this.setMobileAdvTab("chat", { autoOpen: false, scrollTop: false });
+    }
+    const bar = this.el?.["room-timers-bar"];
+    if (!bar || bar.classList.contains("hidden")) return false;
+    bar.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    bar.classList.remove("is-focused");
+    void bar.offsetWidth;
+    bar.classList.add("is-focused");
+    setTimeout(() => {
+      if (bar.isConnected) bar.classList.remove("is-focused");
+    }, 1200);
+    return true;
+  }
+
+  handleRoomTimerActionClick(btnEl) {
+    if (!btnEl || btnEl.disabled) return;
+    const msgId =
+      btnEl.dataset?.roomTimerMsgId || btnEl.getAttribute?.("data-room-timer-msg-id") || "";
+    const actionId =
+      btnEl.dataset?.roomTimerActionId || btnEl.getAttribute?.("data-room-timer-action-id") || "";
+    const timerIdxRaw =
+      btnEl.dataset?.roomTimerIdx ?? btnEl.getAttribute?.("data-room-timer-idx");
+    const btnIdxRaw =
+      btnEl.dataset?.roomTimerBtnIdx ?? btnEl.getAttribute?.("data-room-timer-btn-idx");
+    const timerIdx =
+      timerIdxRaw !== undefined && timerIdxRaw !== null && timerIdxRaw !== ""
+        ? Number(timerIdxRaw)
+        : -1;
+    const btnIdx =
+      btnIdxRaw !== undefined && btnIdxRaw !== null && btnIdxRaw !== "" ? Number(btnIdxRaw) : -1;
+    if (!msgId || !actionId) return;
+
+    const messages = this._getMessagesForVoiceControls();
+    let isDeleted = false;
+    let targetMsg = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (!m || typeof m !== "object") continue;
+      if (m.type === "msg-delete" && m.payload?.targetId === msgId) {
+        isDeleted = true;
+        break;
+      }
+      if (!targetMsg && m.id === msgId) {
+        targetMsg = m;
+      }
+    }
+    if (isDeleted || !targetMsg || targetMsg.deleted) return;
+
+    const timers = Array.isArray(this._roomTimersCache) ? this._roomTimersCache : [];
+    let actionObj = null;
+    if (timerIdx >= 0 && timers[timerIdx] && timers[timerIdx].msgId === msgId) {
+      const acts = timers[timerIdx].actions || [];
+      actionObj =
+        (btnIdx >= 0 && acts[btnIdx] && acts[btnIdx].id === actionId
+          ? acts[btnIdx]
+          : acts.find((a) => a.id === actionId)) || null;
+    }
+    if (!actionObj) {
+      for (const t of timers) {
+        if (t.msgId !== msgId) continue;
+        const found = (t.actions || []).find((a) => a.id === actionId);
+        if (found) {
+          actionObj = found;
+          break;
+        }
+      }
+    }
+    if (!actionObj || actionObj.disabled) return;
+
+    this.handleBotButtonClick(targetMsg, actionObj, btnEl);
+  }
+
+  renderRoomTimers(forceRebuild = false) {
+    const nowMs = Date.now();
+    const timers = extractActiveRoomTimers(this._getMessagesForVoiceControls(), nowMs);
+    this._roomTimersCache = timers;
+
+    const bar = this.el?.["room-timers-bar"];
+    const countEl = this.el?.["room-timers-count"];
+    const grid = this.el?.["room-timers-grid"];
+    const sig = buildRoomTimersSignature(timers);
+
+    if (timers.length === 0) {
+      this._lastRoomTimersSig = "";
+      if (bar) bar.classList.add("hidden");
+      if (countEl) countEl.textContent = "0";
+      if (grid && grid.innerHTML !== "") {
+        grid.innerHTML = "";
+      }
+      this._updateTimersHeaderChip(nowMs);
+      this._syncBotBlockTimersTicker();
+      return;
+    }
+
+    if (bar) bar.classList.remove("hidden");
+    if (countEl) countEl.textContent = String(timers.length);
+
+    if (grid && (forceRebuild || sig !== this._lastRoomTimersSig)) {
+      this._lastRoomTimersSig = sig;
+      grid.innerHTML = renderRoomTimersHtml(timers, nowMs);
+    }
+
+    this._updateTimersHeaderChip(nowMs);
+    this._syncBotBlockTimersTicker();
   }
 
   /* ================= Locally Saved Rooms & Last Joined Room ================= */
@@ -15246,6 +16538,7 @@ export class P2PDirectApp {
     this.renderWizard();
     this.renderConnectBanners();
     this.renderVoicePanel();
+    this.renderRoomTimers();
     this.renderPeers();
     this.renderTopology();
     this.renderStats();
@@ -15265,6 +16558,10 @@ export class P2PDirectApp {
     this.renderStats();
     this.renderTypeFilterOptions();
     this.renderLog();
+    this.renderRoomTimers();
+    if (this.status?.peers?.some((p) => p.inVoice)) {
+      this.renderVoicePanel();
+    }
     if (colorsChanged) {
       this._refreshPeerColorDom();
     }
@@ -15408,6 +16705,64 @@ export class P2PDirectApp {
     }
   }
 
+  _getMessagesForVoiceControls() {
+    if (Array.isArray(this.logMessages) && this.logMessages.length > 0) {
+      return this.logMessages;
+    }
+    if (Array.isArray(this.status?.messages) && this.status.messages.length > 0) {
+      return this.status.messages;
+    }
+    return [];
+  }
+
+  getPeerVoiceControls(peerId) {
+    return extractPeerVoiceControls(this._getMessagesForVoiceControls(), peerId);
+  }
+
+  handleVoiceBotButtonClick(btnEl) {
+    if (!btnEl || btnEl.disabled) return;
+    const msgId =
+      btnEl.dataset?.voiceBotMsgId || btnEl.getAttribute?.("data-voice-bot-msg-id") || "";
+    const actionId =
+      btnEl.dataset?.voiceBotActionId || btnEl.getAttribute?.("data-voice-bot-action-id") || "";
+    const peerId =
+      btnEl.dataset?.voiceBotPeerId || btnEl.getAttribute?.("data-voice-bot-peer-id") || "";
+    const idxAttr =
+      btnEl.dataset?.voiceBotBtnIdx ?? btnEl.getAttribute?.("data-voice-bot-btn-idx");
+    const btnIdx =
+      idxAttr !== undefined && idxAttr !== null && idxAttr !== "" ? Number(idxAttr) : -1;
+    if (!msgId || !actionId) return;
+
+    const messages = this._getMessagesForVoiceControls();
+    let isDeleted = false;
+    let targetMsg = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (!m || typeof m !== "object") continue;
+      if (m.type === "msg-delete" && m.payload?.targetId === msgId) {
+        isDeleted = true;
+        break;
+      }
+      if (!targetMsg && m.id === msgId) {
+        targetMsg = m;
+      }
+    }
+    if (isDeleted || !targetMsg || targetMsg.deleted) return;
+    if (peerId && targetMsg.author && targetMsg.author !== peerId) return;
+
+    const rawVc = getRawVoiceControlsFromMessage(targetMsg);
+    const vc = sanitizeBotVoiceControls(rawVc);
+    if (!vc || vc.buttons.length === 0) return;
+
+    const btnObj =
+      (btnIdx >= 0 && vc.buttons[btnIdx] && vc.buttons[btnIdx].id === actionId
+        ? vc.buttons[btnIdx]
+        : vc.buttons.find((b) => b.id === actionId)) || null;
+    if (!btnObj || btnObj.disabled) return;
+
+    this.handleBotButtonClick(targetMsg, btnObj, btnEl);
+  }
+
   renderVoicePanel(forceRebuild = false) {
     if (!this.status) return;
     const peersInVoice = (this.status.peers || []).filter((p) => p.inVoice);
@@ -15478,6 +16833,14 @@ export class P2PDirectApp {
     }
 
     const selfColorSpec = this.getPeerColorSpec(this.status.peerId);
+    const voiceControlsByPeer = new Map();
+    for (const id of ordered) {
+      if (id === "self") continue;
+      const vc = this.getPeerVoiceControls(id);
+      if (vc) {
+        voiceControlsByPeer.set(id, vc);
+      }
+    }
     const rosterKey = JSON.stringify({
       inVoice: this.voice.inVoice,
       order: ordered,
@@ -15492,6 +16855,7 @@ export class P2PDirectApp {
         .map((id) => {
           const p = peerMap.get(id);
           const mx = this.voice.peerMixers.get(id);
+          const vc = voiceControlsByPeer.get(id) || null;
           return [
             id,
             p ? p.authorName : "",
@@ -15499,6 +16863,7 @@ export class P2PDirectApp {
             mx ? mx.muted : false,
             Boolean(p && p.isBot),
             this.getPeerColorIndex(id),
+            buildVoiceControlsSignature(vc),
           ];
         }),
     });
@@ -15592,6 +16957,11 @@ export class P2PDirectApp {
       const peerStyle = peerColorSpec.styleAttr ? ` style="${peerColorSpec.styleAttr}"` : "";
       const initials = escapeHtml(avatarInitials(p.authorName));
       const botPill = p.isBot ? '<span class="voice-bot-pill">BOT</span>' : "";
+      const voiceControls = voiceControlsByPeer.get(p.peerId) || null;
+      const botControlsHtml = voiceControls
+        ? renderVoiceBotControlsHtml(p.peerId, voiceControls)
+        : "";
+      const botControlsCls = botControlsHtml ? " has-bot-controls" : "";
 
       if (this.voice.inVoice) {
         const mixer = this.voice.peerMixers.get(p.peerId);
@@ -15605,7 +16975,7 @@ export class P2PDirectApp {
             : "Live";
 
         items.push(`
-          <li class="voice-card ${peerTheme}${peerColorMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
+          <li class="voice-card ${peerTheme}${peerColorMuted ? " is-color-muted" : ""}${botControlsCls}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
             <div class="voice-tile-top">
               <span class="tile-mono">${initials}</span>
               <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${peerStateText}</span></span>
@@ -15615,6 +16985,7 @@ export class P2PDirectApp {
                 <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
                 ${botPill}
               </div>
+              ${botControlsHtml}
               <div class="tile-control-slot">
                 <div class="voice-peer-mixer">
                   <button
@@ -15641,7 +17012,7 @@ export class P2PDirectApp {
       } else {
         const previewStateText = p.voiceMuted ? "Muted" : "In Voice";
         items.push(`
-          <li class="voice-card is-channel-preview ${peerTheme}${p.voiceMuted ? " is-color-muted" : ""}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
+          <li class="voice-card is-channel-preview ${peerTheme}${p.voiceMuted ? " is-color-muted" : ""}${botControlsCls}${enteringClass}" data-voice-row="${escapeHtml(p.peerId)}"${peerStyle}>
             <div class="voice-tile-top">
               <span class="tile-mono">${initials}</span>
               <span class="tile-status-tag">${SPEAK_STAR_SVG}<span data-voice-state="${escapeHtml(p.peerId)}">${previewStateText}</span></span>
@@ -15651,6 +17022,7 @@ export class P2PDirectApp {
                 <span class="voice-card-name">${escapeHtml(p.authorName)}</span>
                 ${botPill}
               </div>
+              ${botControlsHtml}
               <div class="tile-control-slot">
                 <span class="tile-prejoin-hint">Active in voice channel</span>
               </div>
@@ -17545,7 +18917,7 @@ export class P2PDirectApp {
 
     const text = typeof payload.text === "string" ? payload.text : "";
     if (text) {
-      const { html, links } = extractAndLinkify(text);
+      const { html, links } = formatChatTextPayload(text);
       parts.push(`<div class="log-text-body">${html}</div>`);
       if (links.length > 0) {
         const cards = links

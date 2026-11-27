@@ -2,7 +2,7 @@
 // Caches ONLY immutable public static shell assets (HTML, CSS, JS, WASM, fonts, icons).
 // Never caches chat messages, room secrets, URL fragments, or cross-origin traffic.
 
-const CACHE_NAME = "p2p-direct-shell-v36";
+const CACHE_NAME = "p2p-direct-shell-v37";
 const SW_VERSION = CACHE_NAME.replace(/^p2p-direct-shell-/, "");
 
 const SHELL_ASSETS = [
@@ -11,6 +11,7 @@ const SHELL_ASSETS = [
   "./styles.css",
   "./app.js",
   "./icons.js",
+  "./code_highlight.js",
   "./media_sync_controller.js",
   "./watch_together.js",
   "./warframe_bot.js",

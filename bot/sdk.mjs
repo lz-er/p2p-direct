@@ -331,6 +331,7 @@ export class VoiceRoomMixer extends EventEmitter {
     echoSuppression = true,
     echoTailMs = 350,
     maxBufferedFramesPerPeer = 12,
+    jitterBufferFrames = 0,
     allowedSpeakers = null,
     speechRmsThreshold = 140,
   } = {}) {
@@ -338,10 +339,14 @@ export class VoiceRoomMixer extends EventEmitter {
     this.bot = bot;
     this.echoSuppression = Boolean(echoSuppression);
     this.echoTailMs = Math.max(0, Number(echoTailMs) || 0);
-    this.maxBufferedFramesPerPeer = Math.max(2, Number(maxBufferedFramesPerPeer) || 12);
+    this.jitterBufferFrames = Math.max(0, Math.floor(Number(jitterBufferFrames) || 0));
+    this.maxBufferedFramesPerPeer = Math.max(
+      Math.max(2, this.jitterBufferFrames + 2),
+      Number(maxBufferedFramesPerPeer) || 12
+    );
     this.speechRmsThreshold = Math.max(0, Number(speechRmsThreshold) || 140);
 
-    this.peerBuffers = new Map(); // peerId -> { queue: Int16Array[], lastRms, lastVoiceAtMs }
+    this.peerBuffers = new Map(); // peerId -> { queue: Int16Array[], lastRms, lastVoiceAtMs, primed, underrunFrames, lastFrame }
     this.lockedPeerId = null;
     this.allowedSpeakers = null; // Set<string> lowercase peerId or authorName, or null = allow all
     if (Array.isArray(allowedSpeakers) && allowedSpeakers.length > 0) {
@@ -353,6 +358,7 @@ export class VoiceRoomMixer extends EventEmitter {
     this.lastActiveAtMs = 0;
     this.botSpeaking = false;
     this.botSpokeUntilMs = 0;
+    this.underrunCount = 0;
     this.running = false;
     this.timer = null;
     this.nextTickAt = 0;
@@ -426,13 +432,28 @@ export class VoiceRoomMixer extends EventEmitter {
     }
   }
 
-  pushPeerAudio(peerId, pcm, rms = 0) {
+  getBufferedFrames() {
+    let total = 0;
+    for (const st of this.peerBuffers.values()) {
+      total += st.queue.length;
+    }
+    return total;
+  }
+
+  pushPeerAudio(peerId, pcm, rms = 0, nowMs = Date.now()) {
     if (!peerId || !pcm || pcm.length === 0) return;
     if (!this.isPeerAllowed(peerId)) return;
     const samples = pcm instanceof Int16Array ? pcm : new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
     let st = this.peerBuffers.get(peerId);
     if (!st) {
-      st = { queue: [], lastRms: 0, lastVoiceAtMs: 0 };
+      st = {
+        queue: [],
+        lastRms: 0,
+        lastVoiceAtMs: -1,
+        primed: false,
+        underrunFrames: 0,
+        lastFrame: null,
+      };
       this.peerBuffers.set(peerId, st);
     }
 
@@ -452,7 +473,7 @@ export class VoiceRoomMixer extends EventEmitter {
       }
     }
 
-    const now = Date.now();
+    const now = Number.isFinite(nowMs) ? nowMs : Date.now();
     st.lastRms = Number(rms) || 0;
     st.lastVoiceAtMs = now;
     if (st.lastRms >= this.speechRmsThreshold) {
@@ -479,23 +500,85 @@ export class VoiceRoomMixer extends EventEmitter {
       // Drain buffered frames while suppressed so stale echo audio isn't played back after TTS ends
       for (const st of this.peerBuffers.values()) {
         if (st.queue.length > 0) st.queue.shift();
+        st.primed = false;
+        st.underrunFrames = 0;
+        st.lastFrame = null;
       }
     } else {
       const accum = new Int32Array(VOICE_FRAME_SAMPLES);
       for (const [peerId, st] of this.peerBuffers.entries()) {
-        if (st.queue.length === 0) continue;
         if (this.lockedPeerId && peerId !== this.lockedPeerId) {
-          st.queue.shift(); // keep non-locked peer buffers fresh without mixing
+          if (st.queue.length > 0) st.queue.shift(); // keep non-locked peer buffers fresh without mixing
+          st.primed = false;
+          st.underrunFrames = 0;
+          st.lastFrame = null;
           continue;
         }
-        const frame = st.queue.shift();
-        activePeerIds.push(peerId);
-        if (st.lastRms > dominantRms) {
-          dominantRms = st.lastRms;
-          dominantPeerId = peerId;
-        }
-        for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
-          accum[i] += frame[i];
+
+        if (this.jitterBufferFrames > 0) {
+          if (!st.primed) {
+            if (st.queue.length === 0) continue;
+            const flushDue =
+              st.lastVoiceAtMs >= 0 && nowMs - st.lastVoiceAtMs >= this.jitterBufferFrames * 20;
+            if (st.queue.length < this.jitterBufferFrames && !flushDue) {
+              continue;
+            }
+            st.primed = true;
+            st.underrunFrames = 0;
+          }
+
+          if (st.queue.length === 0) {
+            st.underrunFrames += 1;
+            this.underrunCount += 1;
+            if (st.underrunFrames === 1 && st.lastFrame) {
+              let hasEnergy = false;
+              for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
+                if (st.lastFrame[i] !== 0) {
+                  hasEnergy = true;
+                  break;
+                }
+              }
+              if (hasEnergy) {
+                activePeerIds.push(peerId);
+                if (st.lastRms > dominantRms) {
+                  dominantRms = st.lastRms;
+                  dominantPeerId = peerId;
+                }
+                for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
+                  accum[i] += Math.round(st.lastFrame[i] * 0.35);
+                }
+              }
+            }
+            if (st.underrunFrames >= 3) {
+              st.primed = false;
+              st.underrunFrames = 0;
+              st.lastFrame = null;
+            }
+            continue;
+          }
+
+          const frame = st.queue.shift();
+          st.underrunFrames = 0;
+          st.lastFrame = frame;
+          activePeerIds.push(peerId);
+          if (st.lastRms > dominantRms) {
+            dominantRms = st.lastRms;
+            dominantPeerId = peerId;
+          }
+          for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
+            accum[i] += frame[i];
+          }
+        } else {
+          if (st.queue.length === 0) continue;
+          const frame = st.queue.shift();
+          activePeerIds.push(peerId);
+          if (st.lastRms > dominantRms) {
+            dominantRms = st.lastRms;
+            dominantPeerId = peerId;
+          }
+          for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
+            accum[i] += frame[i];
+          }
         }
       }
       if (activePeerIds.length > 0) {
@@ -524,6 +607,8 @@ export class VoiceRoomMixer extends EventEmitter {
       rms,
       isSilence: activePeerIds.length === 0 || suppressed,
       suppressed,
+      underrunCount: this.underrunCount,
+      bufferedFrames: this.getBufferedFrames(),
       ts: nowMs,
     };
   }

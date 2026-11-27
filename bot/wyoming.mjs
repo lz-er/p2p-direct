@@ -16,6 +16,8 @@ import { EventEmitter } from "node:events";
 
 export const WYOMING_PROTOCOL_VERSION = "1.5.2";
 
+const BENIGN_SOCKET_ERROR_CODES = new Set(["ECONNRESET", "EPIPE", "ECONNABORTED"]);
+
 /**
  * Encodes a single Wyoming protocol event into a Buffer:
  *   `<JSON header line>\n[<additional data JSON>][<binary payload>]`
@@ -146,6 +148,9 @@ export class WyomingSatelliteServer extends EventEmitter {
     wakeWordEnabled = true,
     sampleRate = 16000,
     rearmDelayMs = 450,
+    audioStartDelayMs = 60,
+    interruptDelayMs = 150,
+    processingTimeoutMs = 45000,
   } = {}) {
     super();
     this.host = host;
@@ -156,6 +161,12 @@ export class WyomingSatelliteServer extends EventEmitter {
     this.wakeWordEnabled = Boolean(wakeWordEnabled);
     this.sampleRate = Number(sampleRate) || 16000;
     this.rearmDelayMs = Math.max(100, Number(rearmDelayMs) || 450);
+    const parsedAudioDelay = Number(audioStartDelayMs);
+    this.audioStartDelayMs = Number.isFinite(parsedAudioDelay) ? Math.max(0, parsedAudioDelay) : 60;
+    const parsedInterruptDelay = Number(interruptDelayMs);
+    this.interruptDelayMs = Number.isFinite(parsedInterruptDelay) ? Math.max(0, parsedInterruptDelay) : 150;
+    const parsedProcessingTimeout = Number(processingTimeoutMs);
+    this.processingTimeoutMs = Number.isFinite(parsedProcessingTimeout) ? Math.max(0, parsedProcessingTimeout) : 45000;
 
     this.server = null;
     this.activeSocket = null;
@@ -165,6 +176,10 @@ export class WyomingSatelliteServer extends EventEmitter {
     this.receivingTts = false;
     this.ttsFormat = { rate: 16000, width: 2, channels: 1 };
     this._rearmTimer = null;
+    this._audioStartTimer = null;
+    this._pipelineStartTimer = null;
+    this._pendingPipelineStart = null;
+    this._processingTimer = null;
     this._audioTimestamp = 0;
   }
 
@@ -203,8 +218,14 @@ export class WyomingSatelliteServer extends EventEmitter {
     await new Promise((resolve, reject) => {
       const server = net.createServer((socket) => this._handleSocket(socket));
       this.server = server;
-      server.once("error", reject);
+      const onStartupError = (err) => {
+        if (this.server === server) this.server = null;
+        reject(err);
+      };
+      server.once("error", onStartupError);
       server.listen(this.port, this.host, () => {
+        server.off("error", onStartupError);
+        server.on("error", (err) => this._emitSafeError(err));
         const addr = server.address();
         if (addr && typeof addr === "object") {
           this.port = addr.port;
@@ -216,7 +237,7 @@ export class WyomingSatelliteServer extends EventEmitter {
   }
 
   async stop() {
-    this._clearRearmTimer();
+    this._clearAllTimers();
     if (this.activeSocket) {
       try {
         this.activeSocket.destroy();
@@ -251,25 +272,61 @@ export class WyomingSatelliteServer extends EventEmitter {
         this.startWakeListening();
       }
     } else if (this.pipelineMode === "wake") {
+      this._clearPipelineStartTimer();
       this.stopAudioStream();
       this._setPipelineMode("idle");
     }
+  }
+
+  _startPipeline({ startStage, wakeWordName = undefined, mode }) {
+    if (!this.isReady()) return false;
+    const wasStreaming = this.streamingToHa;
+    this._clearAllTimers();
+    if (wasStreaming) {
+      this.stopAudioStream();
+    }
+
+    const targetSocket = this.activeSocket;
+    const payload = {
+      start_stage: startStage,
+      end_stage: "tts",
+      restart_on_end: false,
+    };
+    if (wakeWordName) {
+      payload.wake_word_name = wakeWordName;
+    }
+
+    const pending = {
+      targetSocket,
+      sendFn: () => {
+        if (this._pendingPipelineStart && this._pendingPipelineStart !== pending) return;
+        this._pendingPipelineStart = null;
+        this._pipelineStartTimer = null;
+        if (!this.isReady() || this.activeSocket !== targetSocket) return;
+        this._sendEvent("run-pipeline", payload);
+        this._scheduleAudioStart(targetSocket);
+      },
+    };
+
+    this._setPipelineMode(mode);
+
+    if (wasStreaming && this.interruptDelayMs > 0) {
+      this._pendingPipelineStart = pending;
+      this._pipelineStartTimer = setTimeout(() => {
+        this._pipelineStartTimer = null;
+        pending.sendFn();
+      }, this.interruptDelayMs);
+    } else {
+      pending.sendFn();
+    }
+    return true;
   }
 
   /**
    * Arms HA's Assist Pipeline in wake-word detection mode (`start_stage: "wake"`).
    */
   startWakeListening() {
-    if (!this.isReady()) return false;
-    this._clearRearmTimer();
-    this._sendEvent("run-pipeline", {
-      start_stage: "wake",
-      end_stage: "tts",
-      restart_on_end: true,
-    });
-    this._startAudioStream();
-    this._setPipelineMode("wake");
-    return true;
+    return this._startPipeline({ startStage: "wake", mode: "wake" });
   }
 
   /**
@@ -278,18 +335,11 @@ export class WyomingSatelliteServer extends EventEmitter {
    */
   triggerListenNow({ wakeWordName = "button" } = {}) {
     if (!this.isReady()) return false;
-    this._clearRearmTimer();
-    if (this.streamingToHa) {
-      this.stopAudioStream();
-    }
-    this._sendEvent("run-pipeline", {
-      start_stage: "asr",
-      end_stage: "tts",
-      restart_on_end: this.wakeWordEnabled,
-      wake_word_name: wakeWordName || undefined,
+    this._startPipeline({
+      startStage: "asr",
+      wakeWordName: wakeWordName || undefined,
+      mode: "asr",
     });
-    this._startAudioStream();
-    this._setPipelineMode("asr");
     this.emit("listenTriggered", { source: wakeWordName || "button" });
     return true;
   }
@@ -317,6 +367,7 @@ export class WyomingSatelliteServer extends EventEmitter {
   }
 
   stopAudioStream() {
+    this._clearAudioStartTimer();
     if (!this.streamingToHa) return;
     this.streamingToHa = false;
     if (this.isConnected()) {
@@ -350,6 +401,20 @@ export class WyomingSatelliteServer extends EventEmitter {
     });
   }
 
+  _scheduleAudioStart(expectedSocket = this.activeSocket) {
+    this._clearAudioStartTimer();
+    if (this.audioStartDelayMs <= 0) {
+      this._startAudioStream();
+      return;
+    }
+    this._audioStartTimer = setTimeout(() => {
+      this._audioStartTimer = null;
+      if (!this.isReady() || this.activeSocket !== expectedSocket) return;
+      if (this.pipelineMode !== "wake" && this.pipelineMode !== "asr") return;
+      this._startAudioStream();
+    }, this.audioStartDelayMs);
+  }
+
   _setPipelineMode(mode) {
     if (this.pipelineMode === mode) return;
     this.pipelineMode = mode;
@@ -365,6 +430,65 @@ export class WyomingSatelliteServer extends EventEmitter {
     if (this._rearmTimer) {
       clearTimeout(this._rearmTimer);
       this._rearmTimer = null;
+    }
+  }
+
+  _clearAudioStartTimer() {
+    if (this._audioStartTimer) {
+      clearTimeout(this._audioStartTimer);
+      this._audioStartTimer = null;
+    }
+  }
+
+  _clearPipelineStartTimer() {
+    if (this._pipelineStartTimer) {
+      clearTimeout(this._pipelineStartTimer);
+      this._pipelineStartTimer = null;
+    }
+    this._pendingPipelineStart = null;
+  }
+
+  _clearProcessingTimer() {
+    if (this._processingTimer) {
+      clearTimeout(this._processingTimer);
+      this._processingTimer = null;
+    }
+  }
+
+  _scheduleProcessingTimeout() {
+    this._clearProcessingTimer();
+    if (this.processingTimeoutMs <= 0) return;
+    this._processingTimer = setTimeout(() => {
+      this._processingTimer = null;
+      if (this.pipelineMode === "processing") {
+        this._setPipelineMode("idle");
+        if (this.satelliteRunning && this.wakeWordEnabled) {
+          this._scheduleWakeRearm();
+        }
+      }
+    }, this.processingTimeoutMs);
+    this._processingTimer.unref?.();
+  }
+
+  _clearAllTimers() {
+    this._clearRearmTimer();
+    this._clearPipelineStartTimer();
+    this._clearAudioStartTimer();
+    this._clearProcessingTimer();
+  }
+
+  _emitSafeError(err) {
+    const code = err?.code || "";
+    if (BENIGN_SOCKET_ERROR_CODES.has(code)) {
+      if (this.listenerCount("error") > 0) {
+        this.emit("error", err);
+      }
+      return;
+    }
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", err);
+    } else {
+      console.warn("[wyoming] Socket error:", err?.message || String(err));
     }
   }
 
@@ -398,7 +522,7 @@ export class WyomingSatelliteServer extends EventEmitter {
       try {
         events = decoder.push(chunk);
       } catch (err) {
-        this.emit("error", err);
+        this._emitSafeError(err);
         socket.destroy();
         return;
       }
@@ -412,14 +536,14 @@ export class WyomingSatelliteServer extends EventEmitter {
         this.activeSocket = null;
         this.satelliteRunning = false;
         this.streamingToHa = false;
-        this._clearRearmTimer();
+        this._clearAllTimers();
         this._setPipelineMode("idle");
         this.emit("haDisconnected");
       }
     });
 
     socket.on("error", (err) => {
-      this.emit("error", err);
+      this._emitSafeError(err);
     });
   }
 
@@ -438,6 +562,8 @@ export class WyomingSatelliteServer extends EventEmitter {
       }
 
       case "run-satellite": {
+        this._clearAllTimers();
+        this.streamingToHa = false;
         if (this.activeSocket && this.activeSocket !== socket) {
           try {
             this.activeSocket.destroy();
@@ -458,8 +584,8 @@ export class WyomingSatelliteServer extends EventEmitter {
       case "pause-satellite": {
         if (this.activeSocket === socket) {
           this.satelliteRunning = false;
+          this._clearAllTimers();
           this.stopAudioStream();
-          this._clearRearmTimer();
           this._setPipelineMode("idle");
           this.emit("satellitePaused");
         }
@@ -475,19 +601,32 @@ export class WyomingSatelliteServer extends EventEmitter {
         }
         const startStage = String(data?.start_stage || "").toLowerCase();
         if (startStage === "asr") {
-          this._startAudioStream();
+          this._clearPipelineStartTimer();
           this._setPipelineMode("asr");
+          this._scheduleAudioStart(socket);
           this.emit("continueConversation", data);
         } else if (startStage === "wake") {
           if (this.wakeWordEnabled) {
-            this._startAudioStream();
+            this._clearPipelineStartTimer();
             this._setPipelineMode("wake");
+            this._scheduleAudioStart(socket);
           }
         }
         break;
       }
 
+      case "detect": {
+        this._clearProcessingTimer();
+        if (this.pipelineMode === "wake" && this._audioStartTimer) {
+          this._clearAudioStartTimer();
+          this._startAudioStream();
+        }
+        this.emit("wakeListening", data || {});
+        break;
+      }
+
       case "detection": {
+        this._clearProcessingTimer();
         this._setPipelineMode("asr");
         this.emit("wakeDetected", {
           name: data?.name || "wake_word",
@@ -496,9 +635,31 @@ export class WyomingSatelliteServer extends EventEmitter {
         break;
       }
 
+      case "transcribe": {
+        this._clearProcessingTimer();
+        this._setPipelineMode("asr");
+        if (this._audioStartTimer) {
+          this._clearAudioStartTimer();
+          this._startAudioStream();
+        }
+        this.emit("sttStart", data || {});
+        break;
+      }
+
+      case "voice-started": {
+        this.emit("voiceStarted", data || {});
+        break;
+      }
+
+      case "voice-stopped": {
+        this.emit("voiceStopped", data || {});
+        break;
+      }
+
       case "transcript": {
         this.stopAudioStream();
         this._setPipelineMode("processing");
+        this._scheduleProcessingTimeout();
         this.emit("transcript", { text: String(data?.text || "").trim() });
         break;
       }
@@ -516,7 +677,15 @@ export class WyomingSatelliteServer extends EventEmitter {
         break;
       }
 
+      case "synthesize": {
+        this._clearProcessingTimer();
+        this.emit("synthesize", data || {});
+        break;
+      }
+
       case "audio-start": {
+        this._clearProcessingTimer();
+        this._clearPipelineStartTimer();
         this.stopAudioStream();
         this.receivingTts = true;
         this.ttsFormat = {
@@ -580,6 +749,28 @@ export class WyomingSatelliteServer extends EventEmitter {
       }
 
       case "error": {
+        if (this._pendingPipelineStart || this._pipelineStartTimer) {
+          // Stale error (e.g. wake-word-timeout) from stopping the prior stream with audio-stop.
+          // Cancel the long fallback timer and fire our pending run-pipeline right after HA's RUN_END tick.
+          const pending = this._pendingPipelineStart;
+          if (this._pipelineStartTimer) {
+            clearTimeout(this._pipelineStartTimer);
+            this._pipelineStartTimer = null;
+          }
+          if (pending) {
+            const accelDelayMs = Math.min(30, this.interruptDelayMs);
+            if (accelDelayMs <= 0) {
+              pending.sendFn();
+            } else {
+              this._pipelineStartTimer = setTimeout(() => {
+                this._pipelineStartTimer = null;
+                pending.sendFn();
+              }, accelDelayMs);
+            }
+          }
+          break;
+        }
+        this._clearProcessingTimer();
         const code = String(data?.code || "error");
         const text = String(data?.text || "");
         this.stopAudioStream();

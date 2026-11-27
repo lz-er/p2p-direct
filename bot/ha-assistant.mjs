@@ -23,6 +23,173 @@ import WebSocket from "ws";
 import { P2PBot, VOICE_SAMPLE_RATE } from "./sdk.mjs";
 import { WyomingSatelliteServer } from "./wyoming.mjs";
 
+export const TIMER_LIST_FEATURES = Object.freeze({
+  CREATE_TIMER: 1,
+  PAUSE_TIMER: 2,
+  CANCEL_TIMER: 4,
+  ADD_TIME: 8,
+  REMOVE_TIMER: 16,
+  FINISH_TIMER: 32,
+});
+
+export function formatTimerListSourceLabel(entityId, friendlyName = "") {
+  const base = String(friendlyName || "").trim() || String(entityId || "").replace(/^timer_list\./i, "");
+  const stripped = base
+    .replace(/(?:[\s_-]+)timers?$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!stripped) return "";
+  return stripped
+    .split(" ")
+    .map((word) => {
+      if (!word) return "";
+      return word.toLowerCase() === word ? word[0].toUpperCase() + word.slice(1) : word;
+    })
+    .join(" ");
+}
+
+export function formatTimerDurationLabel(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total <= 0) return "Timer";
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const parts = [];
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  if (s > 0 && h === 0) parts.push(`${s}s`);
+  return parts.length > 0 ? `${parts.join(" ")} Timer` : "Timer";
+}
+
+function normalizeServiceDuration(duration) {
+  if (typeof duration === "number") {
+    const secs = Math.round(duration);
+    if (!Number.isFinite(secs) || secs <= 0) throw new Error("Duration must be a positive number of seconds");
+    return secs;
+  }
+  const raw = String(duration ?? "").trim();
+  if (!raw) throw new Error("Duration is required");
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const secs = Math.round(Number(raw));
+    if (secs <= 0) throw new Error("Duration must be greater than 0");
+    return secs;
+  }
+  if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(raw)) {
+    return raw.split(":").length === 2 ? `00:${raw}` : raw;
+  }
+  const unitMatches = Array.from(raw.matchAll(/(\d+)\s*([hms])/gi));
+  if (unitMatches.length > 0 && raw.replace(/(\d+)\s*[hms]\s*/gi, "").trim() === "") {
+    let total = 0;
+    for (const [, numStr, unit] of unitMatches) {
+      const n = Number(numStr);
+      const u = unit.toLowerCase();
+      if (u === "h") total += n * 3600;
+      else if (u === "m") total += n * 60;
+      else total += n;
+    }
+    if (total > 0) return total;
+  }
+  throw new Error(`Invalid timer duration "${raw}"`);
+}
+
+function normalizeTimerListItem(rawTimer, meta = {}, nowMs = Date.now()) {
+  if (!rawTimer || typeof rawTimer !== "object") return null;
+  const id = String(rawTimer.timer_id || rawTimer.id || "").trim();
+  if (!id) return null;
+  const status = String(rawTimer.status || "").trim().toLowerCase();
+  const paused = status === "paused";
+  const totalSeconds = Math.max(
+    1,
+    Math.round(
+      Number(rawTimer.total_duration) ||
+        Number(rawTimer.created_duration) ||
+        Number(rawTimer.remaining) ||
+        1
+    )
+  );
+
+  let endsAtMs = 0;
+  let remainingSec = 0;
+  if (paused) {
+    endsAtMs = 0;
+    remainingSec = Math.max(0, Math.round(Number(rawTimer.paused_remaining ?? rawTimer.remaining) || 0));
+  } else {
+    const parsedFinishes = rawTimer.finishes_at ? Date.parse(rawTimer.finishes_at) : NaN;
+    if (Number.isFinite(parsedFinishes) && parsedFinishes > 0) {
+      endsAtMs = parsedFinishes;
+    } else {
+      const rem = Math.max(0, Number(rawTimer.remaining) || 0);
+      endsAtMs = nowMs + rem * 1000;
+    }
+    remainingSec = Math.max(0, Math.ceil((endsAtMs - nowMs) / 1000));
+  }
+
+  const name =
+    String(rawTimer.name || "").trim() ||
+    formatTimerDurationLabel(rawTimer.created_duration ?? rawTimer.total_duration ?? remainingSec);
+
+  return {
+    id,
+    name,
+    status: status || (paused ? "paused" : "active"),
+    paused,
+    totalSeconds,
+    endsAtMs,
+    remainingSec,
+    source: "timer_list",
+    entityId: meta.entityId || "",
+    sourceLabel: meta.sourceLabel || "",
+    supportedFeatures: Number(meta.supportedFeatures) || 0,
+  };
+}
+
+function splitChatChunks(text, maxLen = 12000) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    const slice = remaining.slice(0, maxLen);
+    let splitAt = slice.lastIndexOf("\n");
+    if (splitAt < Math.floor(maxLen * 0.5)) {
+      splitAt = maxLen;
+    }
+    const part = remaining.slice(0, splitAt).trimEnd();
+    if (part) chunks.push(part);
+    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+  }
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
+export function formatWakeWordLabel(wakeWordId) {
+  const raw = String(wakeWordId || "").trim();
+  if (!raw) return "";
+  const cleaned = raw
+    .replace(/\.(tflite|onnx|json)$/i, "")
+    .replace(/[_-]?v\d+(?:\.\d+)*$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return "";
+  return cleaned
+    .split(" ")
+    .map((word) => (word ? word[0].toUpperCase() + word.slice(1).toLowerCase() : ""))
+    .join(" ");
+}
+
+function buildAssistantSelectPattern(wyomingName) {
+  const slug = String(wyomingName || "p2p-direct-voice")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const escaped = (slug || "p2p_direct_voice").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^select\\..*${escaped}_assistant$`, "i");
+}
+
 export function parseHaCliArgs(argv) {
   const env = process.env;
   const isSupervisor = Boolean(env.SUPERVISOR_TOKEN && !env.HA_URL);
@@ -42,6 +209,10 @@ export function parseHaCliArgs(argv) {
     roomHelper: env.HA_ROOM_HELPER || "input_text.p2p_voice_room_link",
     passphraseHelper: env.HA_PASSPHRASE_HELPER || "input_text.p2p_voice_room_passphrase",
     wakeWordEnabled: env.WAKE_WORD_ENABLED !== "0",
+    wakeWordLabel: env.WAKE_WORD_LABEL || "",
+    timerListEntities: env.HA_TIMER_LIST_ENTITIES
+      ? env.HA_TIMER_LIST_ENTITIES.split(",").map((s) => s.trim()).filter(Boolean)
+      : [],
     allowedSpeakers: env.ALLOWED_SPEAKERS
       ? env.ALLOWED_SPEAKERS.split(",").map((s) => s.trim()).filter(Boolean)
       : [],
@@ -66,7 +237,11 @@ export function parseHaCliArgs(argv) {
     else if (f === "--room-helper" && next) { args.roomHelper = next; i++; }
     else if (f === "--passphrase-helper" && next) { args.passphraseHelper = next; i++; }
     else if (f === "--no-wake-word") { args.wakeWordEnabled = false; }
-    else if (f === "--allowed-speakers" && next) {
+    else if (f === "--wake-word-label" && next) { args.wakeWordLabel = next; i++; }
+    else if (f === "--timer-list-entities" && next) {
+      args.timerListEntities = next.split(",").map((s) => s.trim()).filter(Boolean);
+      i++;
+    } else if (f === "--allowed-speakers" && next) {
       args.allowedSpeakers = next.split(",").map((s) => s.trim()).filter(Boolean);
       i++;
     } else if (f === "--help" || f === "-h") {
@@ -77,16 +252,29 @@ export function parseHaCliArgs(argv) {
 }
 
 /**
- * Lightweight Home Assistant WebSocket API client for watching room-link helpers
- * and running text conversation queries (`conversation/process`).
+ * Lightweight Home Assistant WebSocket API client for watching room-link helpers,
+ * subscribing to `timer_list.*` entities, and running text conversation queries (`conversation/process`).
  */
 export class HomeAssistantWsClient extends EventEmitter {
-  constructor({ haUrl = "", haToken = "", roomHelper = "", passphraseHelper = "" } = {}) {
+  constructor({
+    haUrl = "",
+    haToken = "",
+    roomHelper = "",
+    passphraseHelper = "",
+    wyomingName = "p2p-direct-voice",
+    timerListEntities = [],
+  } = {}) {
     super();
     this.haUrl = String(haUrl || "").replace(/\/+$/, "");
     this.haToken = String(haToken || "").trim();
     this.roomHelper = String(roomHelper || "").trim();
     this.passphraseHelper = String(passphraseHelper || "").trim();
+    this.wyomingName = String(wyomingName || "p2p-direct-voice").trim() || "p2p-direct-voice";
+    this._assistantSelectPattern = buildAssistantSelectPattern(this.wyomingName);
+    const cleanedTimerEntities = Array.isArray(timerListEntities)
+      ? timerListEntities.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean)
+      : [];
+    this.timerListAllowlist = cleanedTimerEntities.length > 0 ? new Set(cleanedTimerEntities) : null;
 
     this.ws = null;
     this.connected = false;
@@ -97,6 +285,17 @@ export class HomeAssistantWsClient extends EventEmitter {
     this.stopped = false;
     this.helperRoomLink = "";
     this.helperPassphrase = "";
+    this.assistantSelectEntity = "";
+    this.assistantSelectState = "";
+    this.pipelineName = "";
+    this.wakeWordId = "";
+    this.wakeWordLabel = "";
+    this.wakeWordEntity = "";
+    this.timerLists = new Map(); // entityId -> { entityId, friendlyName, sourceLabel, available, supportedFeatures, state }
+    this.timerListItems = new Map(); // entityId -> Map<timerId, normalizedTimer>
+    this._timerListSubToEntity = new Map(); // subId -> entityId
+    this._timerListEntityToSub = new Map(); // entityId -> subId
+    this._timerListSubscribing = new Set();
     this.lastError = "";
   }
 
@@ -141,10 +340,32 @@ export class HomeAssistantWsClient extends EventEmitter {
     }
     this.connected = false;
     this.authenticated = false;
-    for (const { reject } of this.pending.values()) {
+    this._clearTimerListState(false);
+    for (const { reject, timer } of this.pending.values()) {
+      if (timer) clearTimeout(timer);
       reject(new Error("Home Assistant client stopped"));
     }
     this.pending.clear();
+  }
+
+  _clearTimerListState(emitUpdate = false) {
+    let hadTimers = false;
+    if (emitUpdate) {
+      for (const map of this.timerListItems.values()) {
+        if (map.size > 0) {
+          hadTimers = true;
+          break;
+        }
+      }
+    }
+    this._timerListSubToEntity.clear();
+    this._timerListEntityToSub.clear();
+    this._timerListSubscribing.clear();
+    this.timerListItems.clear();
+    this.timerLists.clear();
+    if (emitUpdate && hadTimers) {
+      this.emit("timerListUpdated", { entityId: "", type: "reset", timers: [] });
+    }
   }
 
   _connect() {
@@ -177,6 +398,7 @@ export class HomeAssistantWsClient extends EventEmitter {
       this.connected = false;
       this.authenticated = false;
       this.ws = null;
+      this._clearTimerListState(!this.stopped);
       this.emit("status", this.getStatus());
       if (!this.stopped) {
         this.reconnectTimer = setTimeout(() => {
@@ -212,8 +434,23 @@ export class HomeAssistantWsClient extends EventEmitter {
       const waiter = this.pending.get(msg.id);
       if (waiter) {
         this.pending.delete(msg.id);
+        if (waiter.timer) clearTimeout(waiter.timer);
         if (msg.success) waiter.resolve(msg.result);
         else waiter.reject(new Error(msg.error?.message || "HA WS call failed"));
+      }
+      return;
+    }
+    if (msg.type === "event" && msg.id != null && this._timerListSubToEntity.has(msg.id)) {
+      const entityId = this._timerListSubToEntity.get(msg.id);
+      this._handleTimerListEvent(entityId, msg.event);
+      return;
+    }
+    if (msg.type === "event" && msg.event?.event_type === "p2p_voice_send_chat") {
+      const d = msg.event.data || {};
+      const message = String(d.message ?? d.text ?? "").trim();
+      const title = String(d.title ?? "").trim();
+      if (message) {
+        this.emit("chatMessageRequested", { message, title });
       }
       return;
     }
@@ -240,34 +477,243 @@ export class HomeAssistantWsClient extends EventEmitter {
             });
           }
         }
+      } else if (
+        (this.assistantSelectEntity && entityId === this.assistantSelectEntity) ||
+        this._assistantSelectPattern.test(String(entityId || ""))
+      ) {
+        this.assistantSelectEntity = entityId;
+        this.assistantSelectState = cleaned;
+        this.refreshWakeWordInfo({ skipGetStates: true }).catch(() => {});
+      } else if (this._isTimerListAllowed(entityId)) {
+        const oldRaw = String(d.old_state?.state ?? "").trim();
+        const wasAvailable = Boolean(d.old_state) && !/^(unavailable|unknown)$/i.test(oldRaw);
+        if (!d.new_state) {
+          this._unsubscribeTimerList(entityId, { clearItems: true });
+          this.timerLists.delete(entityId);
+        } else {
+          const meta = this._upsertTimerListMeta(entityId, d.new_state);
+          if (!meta.available) {
+            this._unsubscribeTimerList(entityId, { clearItems: true });
+          } else if (!wasAvailable || !this._timerListEntityToSub.has(entityId)) {
+            this._unsubscribeTimerList(entityId, { clearItems: false });
+            this._subscribeTimerList(entityId).catch(() => {});
+          } else {
+            this.emit("timerListUpdated", { entityId, type: "meta", timers: this.getTimerListTimers() });
+          }
+        }
       }
     }
   }
 
-  call(type, extra = {}) {
+  call(type, extra = {}, { timeoutMs = 0, onId = null } = {}) {
     return new Promise((resolve, reject) => {
       if (!this.ws || !this.authenticated || this.ws.readyState !== 1) {
         reject(new Error("Home Assistant WebSocket not connected"));
         return;
       }
       const id = this.nextId++;
-      this.pending.set(id, { resolve, reject });
+      if (typeof onId === "function") {
+        onId(id);
+      }
+      let timer = null;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (this.pending.delete(id)) {
+            reject(new Error(`HA WS call "${type}" timed out`));
+          }
+        }, timeoutMs);
+        timer.unref?.();
+      }
+      this.pending.set(id, { resolve, reject, timer });
       this.ws.send(JSON.stringify({ id, type, ...extra }));
     });
   }
 
+  _isTimerListAllowed(entityId) {
+    const eid = String(entityId || "").trim();
+    if (!eid.startsWith("timer_list.")) return false;
+    if (!this.timerListAllowlist) return true;
+    return this.timerListAllowlist.has(eid.toLowerCase());
+  }
+
+  _upsertTimerListMeta(entityId, stateObj) {
+    const rawState = String(stateObj?.state ?? "").trim();
+    const available = Boolean(stateObj) && !/^(unavailable|unknown)$/i.test(rawState);
+    const attrs = stateObj?.attributes || {};
+    const friendlyName = String(attrs.friendly_name || "").trim();
+    const sourceLabel = formatTimerListSourceLabel(entityId, friendlyName);
+    const supportedFeatures = Number(attrs.supported_features) || 0;
+    const meta = {
+      entityId,
+      friendlyName,
+      sourceLabel,
+      available,
+      supportedFeatures,
+      state: rawState,
+    };
+    this.timerLists.set(entityId, meta);
+    const existing = this.timerListItems.get(entityId);
+    if (existing) {
+      for (const item of existing.values()) {
+        item.sourceLabel = sourceLabel;
+        item.supportedFeatures = supportedFeatures;
+      }
+    }
+    return meta;
+  }
+
+  async _subscribeTimerList(entityId) {
+    if (!this.authenticated || !this._isTimerListAllowed(entityId)) return false;
+    if (this._timerListEntityToSub.has(entityId) || this._timerListSubscribing.has(entityId)) {
+      return true;
+    }
+    this._timerListSubscribing.add(entityId);
+    let subId = null;
+    try {
+      await this.call(
+        "timer_list/item/subscribe",
+        { entity_id: entityId },
+        {
+          timeoutMs: 4000,
+          onId: (id) => {
+            subId = id;
+            this._timerListSubToEntity.set(id, entityId);
+            this._timerListEntityToSub.set(entityId, id);
+          },
+        }
+      );
+      return true;
+    } catch {
+      if (subId != null) {
+        this._timerListSubToEntity.delete(subId);
+        if (this._timerListEntityToSub.get(entityId) === subId) {
+          this._timerListEntityToSub.delete(entityId);
+        }
+      }
+      return false;
+    } finally {
+      this._timerListSubscribing.delete(entityId);
+    }
+  }
+
+  _unsubscribeTimerList(entityId, { clearItems = true } = {}) {
+    const subId = this._timerListEntityToSub.get(entityId);
+    if (subId != null) {
+      this._timerListEntityToSub.delete(entityId);
+      this._timerListSubToEntity.delete(subId);
+      if (this.authenticated && this.ws && this.ws.readyState === 1) {
+        this.call("unsubscribe_events", { subscription: subId }, { timeoutMs: 2000 }).catch(() => {});
+      }
+    }
+    if (clearItems) {
+      const hadItems = (this.timerListItems.get(entityId)?.size || 0) > 0;
+      this.timerListItems.delete(entityId);
+      if (hadItems) {
+        this.emit("timerListUpdated", { entityId, type: "cleared", timers: this.getTimerListTimers() });
+      }
+    }
+  }
+
+  _handleTimerListEvent(entityId, ev) {
+    if (!ev || typeof ev !== "object") return;
+    const meta = this.timerLists.get(entityId) || {
+      entityId,
+      friendlyName: "",
+      sourceLabel: formatTimerListSourceLabel(entityId),
+      available: true,
+      supportedFeatures: 0,
+    };
+
+    if (ev.type === "timers" && Array.isArray(ev.timers)) {
+      const map = new Map();
+      for (const raw of ev.timers) {
+        const status = String(raw?.status || "").trim().toLowerCase();
+        if (status !== "active" && status !== "paused") continue;
+        const norm = normalizeTimerListItem(raw, meta);
+        if (norm) map.set(norm.id, norm);
+      }
+      this.timerListItems.set(entityId, map);
+      this.emit("timerListUpdated", { entityId, type: "timers", timers: this.getTimerListTimers() });
+      return;
+    }
+
+    if (ev.type === "change" && ev.timer) {
+      let map = this.timerListItems.get(entityId);
+      if (!map) {
+        map = new Map();
+        this.timerListItems.set(entityId, map);
+      }
+      const eventType = String(ev.event_type || "").trim().toLowerCase();
+      const raw = ev.timer;
+      const tid = String(raw?.timer_id || raw?.id || "").trim();
+      const status = String(raw?.status || "").trim().toLowerCase();
+      const isInactive =
+        eventType === "finished" ||
+        eventType === "cancelled" ||
+        eventType === "removed" ||
+        (Boolean(status) && status !== "active" && status !== "paused");
+
+      if (isInactive) {
+        const prev = tid ? map.get(tid) : null;
+        if (tid) map.delete(tid);
+        const item = prev ||
+          normalizeTimerListItem({ ...raw, status: "active" }, meta) || {
+            id: tid,
+            name: String(raw?.name || "").trim() || formatTimerDurationLabel(raw?.created_duration),
+            source: "timer_list",
+            entityId,
+            sourceLabel: meta.sourceLabel,
+            supportedFeatures: meta.supportedFeatures,
+          };
+        this.emit("timerListUpdated", {
+          entityId,
+          type: "change",
+          eventType,
+          timer: item,
+          timers: this.getTimerListTimers(),
+        });
+        if (eventType === "finished") {
+          this.emit("timerListFinished", { entityId, timer: item });
+        }
+        return;
+      }
+
+      const norm = normalizeTimerListItem(raw, meta);
+      if (norm) {
+        map.set(norm.id, norm);
+      }
+      this.emit("timerListUpdated", {
+        entityId,
+        type: "change",
+        eventType,
+        timer: norm,
+        delta: ev.delta,
+        timers: this.getTimerListTimers(),
+      });
+    }
+  }
+
   async _bootstrapHelpers() {
-    if (!this.roomHelper && !this.passphraseHelper) return;
     await this.call("subscribe_events", { event_type: "state_changed" });
+    await this.call("subscribe_events", { event_type: "p2p_voice_send_chat" }, { timeoutMs: 4000 }).catch(() => {});
     const states = await this.call("get_states");
+    const availableTimerLists = [];
     if (Array.isArray(states)) {
       for (const st of states) {
         const val = String(st.state ?? "").trim();
         const cleaned = /^(unknown|unavailable|none|off)$/i.test(val) ? "" : val;
-        if (st.entity_id === this.roomHelper) {
+        if (this.roomHelper && st.entity_id === this.roomHelper) {
           this.helperRoomLink = cleaned;
         } else if (this.passphraseHelper && st.entity_id === this.passphraseHelper) {
           this.helperPassphrase = cleaned;
+        } else if (this._assistantSelectPattern.test(String(st.entity_id || ""))) {
+          this.assistantSelectEntity = st.entity_id;
+          this.assistantSelectState = cleaned;
+        } else if (this._isTimerListAllowed(st.entity_id)) {
+          const meta = this._upsertTimerListMeta(st.entity_id, st);
+          if (meta.available) {
+            availableTimerLists.push(st.entity_id);
+          }
         }
       }
       if (this.helperRoomLink) {
@@ -276,6 +722,82 @@ export class HomeAssistantWsClient extends EventEmitter {
           passphrase: this.helperPassphrase,
         });
       }
+    }
+    await this.refreshWakeWordInfo({ skipGetStates: true });
+    if (availableTimerLists.length > 0) {
+      await Promise.allSettled(availableTimerLists.map((eid) => this._subscribeTimerList(eid)));
+    }
+  }
+
+  async refreshWakeWordInfo({ skipGetStates = false } = {}) {
+    if (!this.authenticated) return null;
+    try {
+      if (!skipGetStates) {
+        const states = await this.call("get_states", {}, { timeoutMs: 4000 });
+        if (Array.isArray(states)) {
+          for (const st of states) {
+            if (this._assistantSelectPattern.test(String(st?.entity_id || ""))) {
+              const val = String(st.state ?? "").trim();
+              this.assistantSelectEntity = st.entity_id;
+              this.assistantSelectState = /^(unknown|unavailable|none|off)$/i.test(val) ? "" : val;
+              break;
+            }
+          }
+        }
+      }
+
+      const res = await this.call("assist_pipeline/pipeline/list", {}, { timeoutMs: 4000 });
+      const pipelines = Array.isArray(res?.pipelines) ? res.pipelines : [];
+      const preferredId = String(res?.preferred_pipeline || "").trim();
+      if (pipelines.length === 0) return null;
+
+      const selector = String(this.assistantSelectState || "").trim();
+      let active = null;
+      if (selector && selector.toLowerCase() !== "preferred") {
+        const lowerSel = selector.toLowerCase();
+        active =
+          pipelines.find((p) => String(p?.name || "").trim().toLowerCase() === lowerSel) ||
+          pipelines.find((p) => String(p?.id || "").trim().toLowerCase() === lowerSel) ||
+          null;
+      }
+      if (!active && preferredId) {
+        active = pipelines.find((p) => p?.id === preferredId) || null;
+      }
+      if (!active) {
+        active = pipelines[0] || null;
+      }
+      if (!active) return null;
+
+      const pipelineName = String(active.name || "").trim();
+      const wakeWordId = String(active.wake_word_id || "").trim();
+      const wakeWordEntity = String(active.wake_word_entity || "").trim();
+      const wakeWordLabel = formatWakeWordLabel(wakeWordId);
+
+      const changed =
+        pipelineName !== this.pipelineName ||
+        wakeWordId !== this.wakeWordId ||
+        wakeWordLabel !== this.wakeWordLabel ||
+        wakeWordEntity !== this.wakeWordEntity;
+
+      this.pipelineName = pipelineName;
+      this.wakeWordId = wakeWordId;
+      this.wakeWordEntity = wakeWordEntity;
+      this.wakeWordLabel = wakeWordLabel;
+
+      const info = {
+        pipelineName: this.pipelineName,
+        wakeWordId: this.wakeWordId,
+        wakeWordLabel: this.wakeWordLabel,
+        wakeWordEntity: this.wakeWordEntity,
+        assistantSelectEntity: this.assistantSelectEntity,
+      };
+      if (changed) {
+        this.emit("wakeWordInfoChanged", info);
+      }
+      return info;
+    } catch {
+      // Best-effort: older/mock HA instances without assist_pipeline/pipeline/list stay unaffected
+      return null;
     }
   }
 
@@ -305,6 +827,91 @@ export class HomeAssistantWsClient extends EventEmitter {
       },
     });
     return true;
+  }
+
+  async _callTimerListService(service, entityId, serviceData = {}) {
+    const eid = String(entityId || "").trim();
+    if (!eid) throw new Error("timer_list entityId is required");
+    await this.call("call_service", {
+      domain: "timer_list",
+      service,
+      target: { entity_id: eid },
+      service_data: serviceData,
+    });
+    return true;
+  }
+
+  async createTimerListTimer(entityId, { name = "", duration } = {}) {
+    const normalizedDuration = normalizeServiceDuration(duration);
+    const serviceData = { duration: normalizedDuration };
+    const cleanName = String(name || "").trim();
+    if (cleanName) serviceData.name = cleanName;
+    return this._callTimerListService("create_timer", entityId, serviceData);
+  }
+
+  async pauseTimerListTimer(entityId, timerId) {
+    const tid = String(timerId || "").trim();
+    if (!tid) throw new Error("timerId is required");
+    return this._callTimerListService("pause_timer", entityId, { timer_id: tid });
+  }
+
+  async unpauseTimerListTimer(entityId, timerId) {
+    const tid = String(timerId || "").trim();
+    if (!tid) throw new Error("timerId is required");
+    return this._callTimerListService("unpause_timer", entityId, { timer_id: tid });
+  }
+
+  async addTimerListTime(entityId, timerId, duration = 60) {
+    const tid = String(timerId || "").trim();
+    if (!tid) throw new Error("timerId is required");
+    const normalizedDuration = normalizeServiceDuration(duration);
+    return this._callTimerListService("add_time", entityId, {
+      timer_id: tid,
+      duration: normalizedDuration,
+    });
+  }
+
+  async subtractTimerListTime(entityId, timerId, duration = 60) {
+    const tid = String(timerId || "").trim();
+    if (!tid) throw new Error("timerId is required");
+    const normalizedDuration = normalizeServiceDuration(duration);
+    return this._callTimerListService("subtract_time", entityId, {
+      timer_id: tid,
+      duration: normalizedDuration,
+    });
+  }
+
+  async cancelTimerListTimer(entityId, timerId) {
+    const tid = String(timerId || "").trim();
+    if (!tid) throw new Error("timerId is required");
+    return this._callTimerListService("cancel_timer", entityId, { timer_id: tid });
+  }
+
+  getTimerLists() {
+    return Array.from(this.timerLists.values())
+      .map((m) => ({
+        entityId: m.entityId,
+        friendlyName: m.friendlyName,
+        sourceLabel: m.sourceLabel,
+        available: m.available,
+        supportedFeatures: m.supportedFeatures,
+      }))
+      .sort((a, b) => (a.sourceLabel || a.entityId).localeCompare(b.sourceLabel || b.entityId));
+  }
+
+  getTimerListTimers(nowMs = Date.now()) {
+    const out = [];
+    for (const map of this.timerListItems.values()) {
+      for (const t of map.values()) {
+        out.push({
+          ...t,
+          remainingSec: t.paused
+            ? t.remainingSec
+            : Math.max(0, Math.ceil((t.endsAtMs - nowMs) / 1000)),
+        });
+      }
+    }
+    return out;
   }
 
   getStatus() {
@@ -341,6 +948,8 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       roomHelper: options.roomHelper || "input_text.p2p_voice_room_link",
       passphraseHelper: options.passphraseHelper || "input_text.p2p_voice_room_passphrase",
       wakeWordEnabled: options.wakeWordEnabled !== false,
+      wakeWordLabel: options.wakeWordLabel || "",
+      timerListEntities: Array.isArray(options.timerListEntities) ? options.timerListEntities : [],
       allowedSpeakers: Array.isArray(options.allowedSpeakers) ? options.allowedSpeakers : [],
       wasmPath: options.wasmPath,
     };
@@ -354,6 +963,9 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     this.controlMsgId = null;
 
     this.wakeWordEnabled = this.options.wakeWordEnabled;
+    this.pipelineName = "";
+    this.wakeWordId = "";
+    this.wakeWordLabel = String(this.options.wakeWordLabel || "").trim();
     this.muted = false;
     this.activeTimers = new Map(); // id -> { id, name, totalSeconds, endsAtMs, paused, remainingSec, commandText }
     this.recentLog = []; // [{ ts, kind, speaker, text }]
@@ -362,6 +974,14 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     this.lastSpeaker = "";
     this.conversationId = null;
     this._awaitingAudioDoneForWyoming = false;
+    this.audioStats = {
+      lastRms: 0,
+      peakRms: 0,
+      activeFrames: 0,
+      silenceFrames: 0,
+      underrunCount: 0,
+      bufferedFrames: 0,
+    };
 
     this.wyoming = new WyomingSatelliteServer({
       host: this.options.wyomingHost,
@@ -377,6 +997,8 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       haToken: this.options.haToken,
       roomHelper: this.options.roomHelper,
       passphraseHelper: this.options.passphraseHelper,
+      wyomingName: this.options.wyomingName,
+      timerListEntities: this.options.timerListEntities,
     });
     this.haClient.on("roomHelperChanged", ({ roomLink, passphrase }) => {
       if (roomLink) {
@@ -388,6 +1010,39 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       } else if (this.currentRoomLink) {
         this.disconnectRoom().catch(() => {});
       }
+    });
+    this.haClient.on("wakeWordInfoChanged", ({ pipelineName, wakeWordId, wakeWordLabel }) => {
+      const prevWakeWordId = this.wakeWordId;
+      this.pipelineName = pipelineName || "";
+      this.wakeWordId = wakeWordId || "";
+      this.wakeWordLabel = wakeWordLabel || String(this.options.wakeWordLabel || "").trim();
+      this.syncChatCard(false);
+      if (
+        this.wakeWordEnabled &&
+        this.wyoming.isReady() &&
+        this.wyoming.pipelineMode === "wake" &&
+        prevWakeWordId &&
+        this.wakeWordId !== prevWakeWordId
+      ) {
+        this.wyoming.startWakeListening();
+      }
+    });
+    this.haClient.on("timerListUpdated", () => {
+      const hasActiveTimers = this.getAllActiveTimers().length > 0;
+      this.syncChatCard(hasActiveTimers);
+    });
+    this.haClient.on("timerListFinished", ({ timer }) => {
+      const label = timer?.name || "Timer";
+      const src = timer?.sourceLabel ? ` (${timer.sourceLabel})` : "";
+      this._pushLog("timer", "Timer", `Finished "${label}"${src}`);
+      if (this.bot && this.bot.inVoice && !this.muted) {
+        this.bot.playChime("timer", { amplitude: 0.3 });
+      }
+      this.lastReply = `Timer finished: ${label}${src}`;
+      this.syncChatCard(true);
+    });
+    this.haClient.on("chatMessageRequested", ({ message, title }) => {
+      this.sendRoomChat(message, { title, speaker: "Assist" });
     });
 
     this.uiServer = null;
@@ -453,12 +1108,16 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       this.roomState = "connected";
       bot.joinVoice({ muted: this.muted });
 
+      this._resetAudioStats();
       this.mixer = bot.createVoiceMixer({
         echoSuppression: true,
         echoTailMs: 350,
+        jitterBufferFrames: 3,
+        maxBufferedFramesPerPeer: 16,
         allowedSpeakers: this.options.allowedSpeakers,
       });
       this.mixer.on("frame", (frame) => {
+        this._recordAudioFrame(frame);
         if (!this.muted && this.wyoming.streamingToHa) {
           this.wyoming.sendAudioChunk(frame.buffer);
         }
@@ -502,6 +1161,41 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     this.currentPassphrase = "";
     this.roomState = "disconnected";
     this.roomError = "";
+    this._resetAudioStats();
+  }
+
+  _resetAudioStats() {
+    this.audioStats = {
+      lastRms: 0,
+      peakRms: 0,
+      activeFrames: 0,
+      silenceFrames: 0,
+      underrunCount: 0,
+      bufferedFrames: 0,
+    };
+  }
+
+  _recordAudioFrame(frame) {
+    const rms = Number(frame?.rms) || 0;
+    this.audioStats.lastRms = rms;
+    if (rms > this.audioStats.peakRms) {
+      this.audioStats.peakRms = rms;
+    }
+    if (frame?.isSilence) {
+      this.audioStats.silenceFrames += 1;
+    } else {
+      this.audioStats.activeFrames += 1;
+    }
+    if (typeof frame?.underrunCount === "number") {
+      this.audioStats.underrunCount = frame.underrunCount;
+    } else if (this.mixer) {
+      this.audioStats.underrunCount = this.mixer.underrunCount || 0;
+    }
+    if (typeof frame?.bufferedFrames === "number") {
+      this.audioStats.bufferedFrames = frame.bufferedFrames;
+    } else if (this.mixer) {
+      this.audioStats.bufferedFrames = this.mixer.getBufferedFrames();
+    }
   }
 
   triggerListenNow({ speakerPeerId = null, speakerName = "" } = {}) {
@@ -550,6 +1244,28 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     this.syncChatCard(false);
   }
 
+  sendRoomChat(text, { title = "", speaker = "Home Assistant" } = {}) {
+    const body = String(text ?? "").trim();
+    if (!body) {
+      return { ok: false, error: "Message is empty" };
+    }
+    if (!this.bot || this.roomState !== "connected") {
+      this._pushLog("error", speaker, "Cannot post chat message — not connected to a room");
+      return { ok: false, error: "Not connected to a room" };
+    }
+    const heading = String(title || "").trim();
+    const fullText = heading ? `${heading}\n${body}` : body;
+    const chunks = splitChatChunks(fullText, 12000);
+    const ids = [];
+    for (const chunk of chunks) {
+      const sent = this.bot.sendText(chunk);
+      if (sent?.id) ids.push(sent.id);
+    }
+    const summary = heading || body.split("\n")[0].slice(0, 90);
+    this._pushLog("chat", speaker, summary);
+    return { ok: true, chunks: ids.length, ids };
+  }
+
   async askText(question, { speakerName = "User" } = {}) {
     const clean = String(question || "").trim();
     if (!clean) throw new Error("Question is empty");
@@ -574,8 +1290,19 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
   }
 
   _wireWyomingEvents() {
+    this.wyoming.on("error", (err) => {
+      const code = err?.code || "";
+      if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED") {
+        this._pushLog("system", "Wyoming", `Connection reset (${code})`);
+        return;
+      }
+      this._pushLog("error", "Wyoming", err?.message || String(err));
+    });
     this.wyoming.on("haConnected", () => {
       this._pushLog("system", "Wyoming", "Home Assistant connected");
+      if (this.haClient.authenticated) {
+        this.haClient.refreshWakeWordInfo().catch(() => {});
+      }
       this.syncChatCard(false);
     });
     this.wyoming.on("haDisconnected", () => {
@@ -729,6 +1456,31 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
           this._pushLog("error", "Assist", err.message);
         });
       }
+    } else if (id.startsWith("ha:tl:")) {
+      const rest = id.slice("ha:tl:".length);
+      const firstColon = rest.indexOf(":");
+      if (firstColon > 0) {
+        const action = rest.slice(0, firstColon);
+        const afterAction = rest.slice(firstColon + 1);
+        const secondColon = afterAction.indexOf(":");
+        if (secondColon > 0) {
+          const entityId = afterAction.slice(0, secondColon);
+          const timerId = afterAction.slice(secondColon + 1);
+          if (entityId && timerId) {
+            let op = null;
+            if (action === "pause") op = this.haClient.pauseTimerListTimer(entityId, timerId);
+            else if (action === "unpause") op = this.haClient.unpauseTimerListTimer(entityId, timerId);
+            else if (action === "add60") op = this.haClient.addTimerListTime(entityId, timerId, 60);
+            else if (action === "cancel") op = this.haClient.cancelTimerListTimer(entityId, timerId);
+            if (op) {
+              op.catch((err) => {
+                this._pushLog("error", "Timer", err?.message || String(err));
+                this.syncChatCard(false);
+              });
+            }
+          }
+        }
+      }
     } else if (id.startsWith("ha:timer:dismiss:")) {
       const tid = id.slice("ha:timer:dismiss:".length);
       this.activeTimers.delete(tid);
@@ -738,6 +1490,39 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     } else if (id === "ha:disconnect") {
       this.disconnectRoom().catch(() => {});
     }
+  }
+
+  getAllActiveTimers(nowMs = Date.now()) {
+    const tlTimers = this.haClient.getTimerListTimers(nowMs);
+    const seenIds = new Set(tlTimers.map((t) => t.id));
+    const merged = tlTimers.slice();
+    for (const t of this.activeTimers.values()) {
+      if (seenIds.has(t.id)) continue;
+      merged.push({
+        id: t.id,
+        name: t.name,
+        totalSeconds: t.totalSeconds,
+        endsAtMs: t.paused ? 0 : t.endsAtMs,
+        paused: Boolean(t.paused),
+        remainingSec: t.paused ? t.remainingSec : Math.max(0, Math.ceil((t.endsAtMs - nowMs) / 1000)),
+        commandText: t.commandText || "",
+        source: "wyoming",
+        entityId: "",
+        sourceLabel: "",
+        supportedFeatures: 0,
+      });
+    }
+    merged.sort((a, b) => {
+      if (a.paused !== b.paused) return a.paused ? 1 : -1;
+      if (!a.paused) {
+        const endDiff = (a.endsAtMs || 0) - (b.endsAtMs || 0);
+        if (endDiff !== 0) return endDiff;
+      }
+      const remDiff = (a.remainingSec || 0) - (b.remainingSec || 0);
+      if (remDiff !== 0) return remDiff;
+      return String(a.id).localeCompare(String(b.id));
+    });
+    return merged;
   }
 
   buildChatCard() {
@@ -772,29 +1557,88 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       ? this.bot.getPeers().filter((p) => p.inVoice).length
       : 0;
 
+    const allTimers = this.getAllActiveTimers();
+
     const blocks = [
       {
         type: "stats",
         items: [
           { label: "Satellite", value: wyConnected ? "Online" : "Offline", accent: wyConnected ? "mint" : "coral" },
-          { label: "Wake Word", value: this.wakeWordEnabled ? "Active" : "Off", accent: this.wakeWordEnabled ? "cobalt" : "ink" },
-          { label: "Timers", value: String(this.activeTimers.size), accent: this.activeTimers.size > 0 ? "ochre" : "ink" },
+          {
+            label: "Wake Word",
+            value: this.wakeWordEnabled ? (this.wakeWordLabel || "Active") : "Off",
+            accent: this.wakeWordEnabled ? "cobalt" : "ink",
+          },
+          { label: "Timers", value: String(allTimers.length), accent: allTimers.length > 0 ? "ochre" : "ink" },
           { label: "In Voice", value: String(voicePeers), accent: "cyan" },
         ],
       },
     ];
 
-    for (const timer of this.activeTimers.values()) {
+    const cardTimers = [];
+    for (const timer of allTimers) {
+      const actions = [];
+      let blockActionId = "";
+      if (timer.source === "timer_list") {
+        const feats = Number(timer.supportedFeatures) || 0;
+        if (feats & TIMER_LIST_FEATURES.PAUSE_TIMER) {
+          actions.push({
+            id: `ha:tl:${timer.paused ? "unpause" : "pause"}:${timer.entityId}:${timer.id}`,
+            label: timer.paused ? "Resume" : "Pause",
+            icon: timer.paused ? "play" : "pause",
+            style: timer.paused ? "success" : "secondary",
+          });
+        }
+        if (feats & TIMER_LIST_FEATURES.ADD_TIME) {
+          actions.push({
+            id: `ha:tl:add60:${timer.entityId}:${timer.id}`,
+            label: "+1m",
+            icon: "plus",
+            style: "secondary",
+          });
+        }
+        if (feats & TIMER_LIST_FEATURES.CANCEL_TIMER) {
+          blockActionId = `ha:tl:cancel:${timer.entityId}:${timer.id}`;
+          actions.push({
+            id: blockActionId,
+            label: "Cancel",
+            icon: "close",
+            style: "danger",
+          });
+        }
+      } else {
+        blockActionId = `ha:timer:dismiss:${timer.id}`;
+        actions.push({
+          id: blockActionId,
+          label: "Dismiss",
+          icon: "close",
+          style: "secondary",
+        });
+      }
+
       blocks.push({
         type: "timer",
-        label: timer.name,
+        label: timer.sourceLabel ? `${timer.name} · ${timer.sourceLabel}` : timer.name,
         icon: "timer",
         totalSec: timer.totalSeconds,
-        endsAtMs: timer.endsAtMs,
-        paused: timer.paused,
+        endsAtMs: timer.paused ? 0 : timer.endsAtMs,
+        paused: Boolean(timer.paused),
         remainingSec: timer.remainingSec,
         color: timer.paused ? "ochre" : "cobalt",
-        actionId: `ha:timer:dismiss:${timer.id}`,
+        actionId: blockActionId || undefined,
+      });
+
+      cardTimers.push({
+        id: timer.source === "timer_list" ? `${timer.entityId}:${timer.id}` : timer.id,
+        label: timer.name,
+        source: timer.sourceLabel || "",
+        icon: "timer",
+        totalSec: timer.totalSeconds,
+        remainingSec: timer.remainingSec,
+        endsAtMs: timer.paused ? 0 : timer.endsAtMs,
+        paused: Boolean(timer.paused),
+        color: timer.paused ? "ochre" : "cobalt",
+        actions: actions.slice(0, 3),
       });
     }
 
@@ -825,6 +1669,39 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       });
     }
 
+    let voiceStatus = "Button Only";
+    let voiceStatusIcon = "mic";
+    if (!wyConnected) {
+      voiceStatus = "Waiting HA";
+      voiceStatusIcon = this.muted ? "mic-off" : "mic";
+    } else if (this.muted) {
+      voiceStatus = "Muted";
+      voiceStatusIcon = "mic-off";
+    } else if (mode === "asr") {
+      voiceStatus = "Listening...";
+      voiceStatusIcon = "mic";
+    } else if (mode === "processing") {
+      voiceStatus = "Thinking...";
+      voiceStatusIcon = "mic";
+    } else if (mode === "speaking") {
+      voiceStatus = "Speaking";
+      voiceStatusIcon = "volume";
+    } else if (this.wakeWordEnabled && this.wakeWordLabel) {
+      voiceStatus = this.wakeWordLabel;
+      voiceStatusIcon = "bolt";
+    } else if (this.wakeWordEnabled) {
+      voiceStatus = "Wake Ready";
+      voiceStatusIcon = "mic";
+    } else {
+      voiceStatus = "Button Only";
+      voiceStatusIcon = "mic";
+    }
+
+    const footerHint =
+      this.wakeWordEnabled && this.wakeWordLabel
+        ? `Say "${this.wakeWordLabel}" or click Listen Now`
+        : "Say wake word or click Listen Now";
+
     return {
       subtitle: "HOME ASSISTANT VOICE",
       title: this.options.name,
@@ -832,6 +1709,22 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       badge,
       color,
       blocks,
+      timers: cardTimers,
+      voiceControls: {
+        status: voiceStatus,
+        statusIcon: voiceStatusIcon,
+        statusTone: color,
+        buttons: [
+          { id: "ha:listen", label: "Listen Now", icon: "mic", style: "primary", disabled: !wyConnected },
+          {
+            id: "ha:toggle_wake",
+            label: this.wakeWordEnabled ? "Wake: On" : "Wake: Off",
+            icon: "bolt",
+            style: this.wakeWordEnabled ? "success" : "secondary",
+          },
+          { id: "ha:stop_audio", label: "Stop", icon: "close", style: "secondary" },
+        ],
+      },
       buttons: [
         {
           kind: "grid",
@@ -860,7 +1753,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
           ],
         },
       ],
-      footer: `Wyoming :${this.wyoming.port} · Say wake word or click Listen Now`,
+      footer: `Wyoming :${this.wyoming.port} · ${footerHint}`,
     };
   }
 
@@ -880,11 +1773,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
   }
 
   getApiState() {
-    const now = Date.now();
-    const timers = Array.from(this.activeTimers.values()).map((t) => ({
-      ...t,
-      remainingSec: t.paused ? t.remainingSec : Math.max(0, Math.ceil((t.endsAtMs - now) / 1000)),
-    }));
+    const timers = this.getAllActiveTimers();
     return {
       roomState: this.roomState,
       roomError: this.roomError,
@@ -892,6 +1781,11 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       inVoice: Boolean(this.bot?.inVoice),
       muted: this.muted,
       wakeWordEnabled: this.wakeWordEnabled,
+      wakeWord: {
+        id: this.wakeWordId,
+        label: this.wakeWordLabel,
+        pipelineName: this.pipelineName,
+      },
       peers: this.bot ? this.bot.getPeers() : [],
       wyoming: {
         host: this.wyoming.host,
@@ -903,6 +1797,15 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
         mode: this.wyoming.pipelineMode,
       },
       homeAssistant: this.haClient.getStatus(),
+      timerLists: this.haClient.getTimerLists(),
+      audio: {
+        lastRms: this.audioStats.lastRms,
+        peakRms: this.audioStats.peakRms,
+        activeFrames: this.audioStats.activeFrames,
+        silenceFrames: this.audioStats.silenceFrames,
+        underrunCount: this.mixer ? this.mixer.underrunCount : this.audioStats.underrunCount,
+        bufferedFrames: this.mixer ? this.mixer.getBufferedFrames() : this.audioStats.bufferedFrames,
+      },
       timers,
       lastTranscript: this.lastTranscript,
       lastReply: this.lastReply,
@@ -1005,6 +1908,89 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       sendJson(200, { ok: true, reply, state: this.getApiState() });
       return;
     }
+    if (req.method === "POST" && urlPath.endsWith("/api/chat")) {
+      const body = await this._readJsonBody(req);
+      const out = this.sendRoomChat(body.message ?? body.text, {
+        title: body.title || "",
+        speaker: "Control Panel",
+      });
+      const statusCode = out.ok ? 200 : out.error === "Message is empty" ? 400 : 409;
+      sendJson(statusCode, { ...out, state: this.getApiState() });
+      return;
+    }
+    if (req.method === "POST" && urlPath.endsWith("/api/timer/create")) {
+      const body = await this._readJsonBody(req);
+      let entityId = String(body.entityId || "").trim();
+      if (!entityId) {
+        const creatable = this.haClient
+          .getTimerLists()
+          .find((tl) => tl.available && (tl.supportedFeatures & TIMER_LIST_FEATURES.CREATE_TIMER));
+        entityId = creatable?.entityId || "";
+      }
+      if (!entityId) {
+        sendJson(400, { ok: false, error: "No available timer_list entity supports create_timer" });
+        return;
+      }
+      try {
+        await this.haClient.createTimerListTimer(entityId, {
+          name: body.name || "",
+          duration: body.duration,
+        });
+        sendJson(200, { ok: true, state: this.getApiState() });
+      } catch (err) {
+        sendJson(400, { ok: false, error: err?.message || String(err) });
+      }
+      return;
+    }
+    if (req.method === "POST" && urlPath.endsWith("/api/timer/pause")) {
+      const body = await this._readJsonBody(req);
+      try {
+        await this.haClient.pauseTimerListTimer(body.entityId, body.timerId);
+        sendJson(200, { ok: true, state: this.getApiState() });
+      } catch (err) {
+        sendJson(400, { ok: false, error: err?.message || String(err) });
+      }
+      return;
+    }
+    if (req.method === "POST" && urlPath.endsWith("/api/timer/unpause")) {
+      const body = await this._readJsonBody(req);
+      try {
+        await this.haClient.unpauseTimerListTimer(body.entityId, body.timerId);
+        sendJson(200, { ok: true, state: this.getApiState() });
+      } catch (err) {
+        sendJson(400, { ok: false, error: err?.message || String(err) });
+      }
+      return;
+    }
+    if (req.method === "POST" && urlPath.endsWith("/api/timer/add-time")) {
+      const body = await this._readJsonBody(req);
+      try {
+        await this.haClient.addTimerListTime(body.entityId, body.timerId, body.duration ?? 60);
+        sendJson(200, { ok: true, state: this.getApiState() });
+      } catch (err) {
+        sendJson(400, { ok: false, error: err?.message || String(err) });
+      }
+      return;
+    }
+    if (req.method === "POST" && urlPath.endsWith("/api/timer/cancel")) {
+      const body = await this._readJsonBody(req);
+      try {
+        const entityId = String(body.entityId || "").trim();
+        const timerId = String(body.timerId || "").trim();
+        if (entityId) {
+          await this.haClient.cancelTimerListTimer(entityId, timerId);
+        } else if (timerId && this.activeTimers.has(timerId)) {
+          this.activeTimers.delete(timerId);
+          this.syncChatCard(false);
+        } else {
+          throw new Error("entityId and timerId are required");
+        }
+        sendJson(200, { ok: true, state: this.getApiState() });
+      } catch (err) {
+        sendJson(400, { ok: false, error: err?.message || String(err) });
+      }
+      return;
+    }
 
     sendJson(404, { ok: false, error: "Not found" });
   }
@@ -1044,15 +2030,25 @@ function renderControlPanelHtml() {
   .stat span { font: 700 13px/1.2 monospace; }
   .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
   .btns { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-  input { width: 100%; padding: 9px 10px; border: 2px solid var(--rule); background: var(--bg); color: var(--ink); font: 13px monospace; }
+  input, select { width: 100%; padding: 9px 10px; border: 2px solid var(--rule); background: var(--bg); color: var(--ink); font: 13px monospace; }
   button { padding: 9px 12px; border: 2px solid var(--rule); background: var(--panel); color: var(--ink); font: 700 12px/1 monospace; text-transform: uppercase; cursor: pointer; }
   button.primary { background: var(--cobalt); color: #fff; }
   button.success { background: var(--mint); color: #fff; }
   button.danger { background: var(--coral); color: #fff; }
+  button.sm { padding: 5px 8px; font-size: 11px; }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   .log { border: 1.5px solid var(--rule); padding: 8px; max-height: 200px; overflow: auto; font: 12px/1.5 monospace; background: var(--bg); }
-  .timer { border: 1.5px solid var(--rule); padding: 8px; display: flex; justify-content: space-between; font: 700 12px monospace; }
-  @media (max-width: 600px) { .grid4, .btns { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .timers-wrap { display: grid; gap: 8px; }
+  .timer { border: 1.5px solid var(--rule); border-left: 5px solid var(--cobalt); padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font: 700 12px monospace; }
+  .timer.paused { border-left-color: var(--ochre); }
+  .timer-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .timer-src { font: 700 10px/1 monospace; padding: 3px 6px; border: 1px solid var(--rule); color: var(--muted); text-transform: uppercase; }
+  .timer-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .timer-clock { font: 700 14px/1 monospace; font-variant-numeric: tabular-nums; margin-right: 4px; }
+  .timer-create { display: grid; grid-template-columns: 1fr 110px auto; gap: 8px; }
+  .timer-create.has-select { grid-template-columns: minmax(120px, 160px) 1fr 100px auto; }
+  .hidden { display: none !important; }
+  @media (max-width: 600px) { .grid4, .btns { grid-template-columns: repeat(2, minmax(0, 1fr)); } .timer-create, .timer-create.has-select { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
@@ -1089,19 +2085,101 @@ function renderControlPanelHtml() {
       <input id="ask-input" placeholder="Ask Home Assistant (text fallback)..." />
       <button id="btn-ask" class="primary">Ask</button>
     </div>
-    <div id="timers"></div>
+    <div id="timer-create-bar" class="timer-create hidden">
+      <select id="timer-entity" class="hidden" aria-label="Timer list"></select>
+      <input id="timer-name" placeholder="Timer label (optional)..." />
+      <input id="timer-duration" value="5m" placeholder="5m / 90s" />
+      <button id="btn-timer-create" class="primary">Start Timer</button>
+    </div>
+    <div id="timers" class="timers-wrap"></div>
     <div id="log" class="log">Waiting for status...</div>
   </div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
 let curState = null;
+let lastTimersSig = "";
+
+function esc(v) {
+  return String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function fmtClock(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const mm = String(m).padStart(2, "0");
+  const ss = String(r).padStart(2, "0");
+  return h > 0 ? h + ":" + mm + ":" + ss : mm + ":" + ss;
+}
 
 async function api(path, body) {
   const res = await fetch("./api/" + path, body !== undefined
     ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
     : { method: "GET" });
   return res.json();
+}
+
+function renderTimers(s) {
+  const lists = (s.timerLists || []).filter((tl) => tl.available && (tl.supportedFeatures & 1));
+  const bar = $("timer-create-bar");
+  const sel = $("timer-entity");
+  if (lists.length > 0) {
+    bar.classList.remove("hidden");
+    const prevSel = sel.value;
+    const optsHtml = lists.map((tl) => '<option value="' + esc(tl.entityId) + '">' + esc(tl.sourceLabel || tl.friendlyName || tl.entityId) + '</option>').join("");
+    if (sel.innerHTML !== optsHtml) sel.innerHTML = optsHtml;
+    if (prevSel && lists.some((tl) => tl.entityId === prevSel)) sel.value = prevSel;
+    if (lists.length > 1) {
+      sel.classList.remove("hidden");
+      bar.classList.add("has-select");
+    } else {
+      sel.classList.add("hidden");
+      bar.classList.remove("has-select");
+    }
+  } else {
+    bar.classList.add("hidden");
+  }
+
+  const timers = s.timers || [];
+  const sig = JSON.stringify(timers.map((t) => [t.entityId, t.id, t.name, t.sourceLabel, t.paused, t.endsAtMs, t.paused ? t.remainingSec : 0, t.supportedFeatures]));
+  if (sig === lastTimersSig) {
+    tickTimerClocks();
+    return;
+  }
+  lastTimersSig = sig;
+  const now = Date.now();
+  $("timers").innerHTML = timers.map((t) => {
+    const rem = t.paused ? t.remainingSec : Math.max(0, Math.ceil(((t.endsAtMs || 0) - now) / 1000));
+    const f = Number(t.supportedFeatures) || 0;
+    const isTl = t.source === "timer_list" && t.entityId;
+    const btns = [];
+    if (isTl && (f & 2)) {
+      btns.push('<button type="button" class="sm ' + (t.paused ? 'success' : '') + '" data-t-act="' + (t.paused ? 'unpause' : 'pause') + '" data-t-ent="' + esc(t.entityId) + '" data-t-id="' + esc(t.id) + '">' + (t.paused ? 'Resume' : 'Pause') + '</button>');
+    }
+    if (isTl && (f & 8)) {
+      btns.push('<button type="button" class="sm" data-t-act="add-time" data-t-ent="' + esc(t.entityId) + '" data-t-id="' + esc(t.id) + '">+1m</button>');
+    }
+    if ((isTl && (f & 4)) || !isTl) {
+      btns.push('<button type="button" class="sm danger" data-t-act="cancel" data-t-ent="' + esc(t.entityId || '') + '" data-t-id="' + esc(t.id) + '">' + (isTl ? 'Cancel' : 'Dismiss') + '</button>');
+    }
+    return '<div class="timer' + (t.paused ? ' paused' : '') + '">' +
+      '<div class="timer-meta"><span>' + esc(t.name) + '</span>' +
+      (t.sourceLabel ? '<span class="timer-src">' + esc(t.sourceLabel) + '</span>' : '') +
+      (t.paused ? '<span class="timer-src">PAUSED</span>' : '') +
+      '</div><div class="timer-right"><span class="timer-clock" data-ends-at="' + (t.paused ? 0 : (t.endsAtMs || 0)) + '">' + fmtClock(rem) + '</span>' + btns.join('') + '</div></div>';
+  }).join("");
+}
+
+function tickTimerClocks() {
+  const now = Date.now();
+  for (const el of $("timers").querySelectorAll(".timer-clock[data-ends-at]")) {
+    const endsAt = Number(el.getAttribute("data-ends-at") || 0);
+    if (endsAt > 0) {
+      el.textContent = fmtClock(Math.max(0, Math.ceil((endsAt - now) / 1000)));
+    }
+  }
 }
 
 function render(s) {
@@ -1111,16 +2189,14 @@ function render(s) {
   badge.className = "badge " + (s.roomState === "connected" ? "ok" : s.roomState === "error" ? "err" : "warn");
   $("st-room").textContent = s.roomName || "Standby";
   $("st-wy").textContent = s.wyoming.ready ? "Online :" + s.wyoming.port : "Waiting :" + s.wyoming.port;
-  $("st-mode").textContent = s.wyoming.mode || "idle";
+  $("st-mode").textContent = (s.wyoming.mode || "idle") + (s.wakeWord && s.wakeWord.label ? " · " + s.wakeWord.label : "");
   $("st-ha").textContent = s.homeAssistant.authenticated ? "Synced" : s.homeAssistant.configured ? "Connecting" : "Manual";
   $("btn-listen").disabled = !s.wyoming.ready;
-  $("btn-wake").textContent = s.wakeWordEnabled ? "Wake: On" : "Wake: Off";
+  $("btn-wake").textContent = s.wakeWordEnabled ? (s.wakeWord && s.wakeWord.label ? "Wake: " + s.wakeWord.label : "Wake: On") : "Wake: Off";
   $("btn-mute").textContent = s.muted ? "Unmute" : "Mute";
-  $("timers").innerHTML = (s.timers || []).map((t) =>
-    '<div class="timer"><span>' + t.name + '</span><span>' + t.remainingSec + 's' + (t.paused ? ' PAUSED' : '') + '</span></div>'
-  ).join("");
+  renderTimers(s);
   $("log").innerHTML = (s.recentLog || []).slice().reverse().map((e) =>
-    '<div>[' + e.ts.slice(11, 19) + '] <b>' + e.speaker + '</b>: ' + e.text.replace(/</g, "&lt;") + '</div>'
+    '<div>[' + esc(e.ts.slice(11, 19)) + '] <b>' + esc(e.speaker) + '</b>: ' + esc(e.text) + '</div>'
   ).join("") || "No events yet.";
 }
 
@@ -1130,6 +2206,28 @@ async function poll() {
     if (out.ok) render(out.state);
   } catch {}
 }
+
+$("timers").onclick = async (ev) => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest("button[data-t-act]") : null;
+  if (!btn) return;
+  const act = btn.getAttribute("data-t-act");
+  const entityId = btn.getAttribute("data-t-ent") || "";
+  const timerId = btn.getAttribute("data-t-id") || "";
+  const payload = { entityId, timerId };
+  if (act === "add-time") payload.duration = 60;
+  const out = await api("timer/" + act, payload);
+  if (out.state) render(out.state);
+};
+
+$("btn-timer-create").onclick = async () => {
+  const duration = $("timer-duration").value.trim();
+  if (!duration) return;
+  const name = $("timer-name").value.trim();
+  const entityId = $("timer-entity").value || "";
+  const out = await api("timer/create", { entityId, name, duration });
+  if (out.ok) $("timer-name").value = "";
+  if (out.state) render(out.state);
+};
 
 $("btn-connect").onclick = async () => {
   const roomLink = $("room-link").value.trim();
@@ -1166,6 +2264,7 @@ $("btn-ask").onclick = async () => {
 };
 poll();
 setInterval(poll, 1500);
+setInterval(tickTimerClocks, 1000);
 </script>
 </body>
 </html>`;
@@ -1193,8 +2292,9 @@ if (isMain) {
         "  --ha-token           Long-Lived Access Token (HA_TOKEN or auto SUPERVISOR_TOKEN)",
         "  --room-helper        HA input_text entity to watch (HA_ROOM_HELPER, default: input_text.p2p_voice_room_link)",
         "  --passphrase-helper  Optional HA input_text for room passphrase (HA_PASSPHRASE_HELPER)",
-        "  --no-wake-word       Disable always-on wake-word streaming (button activation only)",
-        "  --allowed-speakers   Comma-separated allowlist of speaker names/peerIds (ALLOWED_SPEAKERS)",
+        "  --no-wake-word          Disable always-on wake-word streaming (button activation only)",
+        "  --timer-list-entities   Comma-separated allowlist of HA timer_list.* entities (HA_TIMER_LIST_ENTITIES)",
+        "  --allowed-speakers      Comma-separated allowlist of speaker names/peerIds (ALLOWED_SPEAKERS)",
       ].join("\n")
     );
     process.exit(0);
