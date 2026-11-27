@@ -115,7 +115,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v37</strong>
+            <strong id="app-version-display">v38</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -953,6 +953,9 @@
                 <span class="panel-meta" id="next-lamport-preview">URLs, images, GIFs &amp; videos</span>
               </div>
 
+              <!-- Slash Command Popover (appears on `/` inside chat input) -->
+              <div id="chat-slash-menu" class="chat-slash-menu hidden" role="listbox" aria-label="Chat commands"></div>
+
               <!-- Staged Pasted / Dropped / Attached Media Preview Tray -->
               <div id="chat-image-tray" class="chat-image-tray hidden"></div>
 
@@ -966,6 +969,12 @@
                   class="hidden"
                 />
                 <div class="composer-input-wrap">
+                  <button
+                    type="button"
+                    id="composer-agent-pill"
+                    class="composer-agent-pill hidden"
+                    title="Direct Assistant mode active — click or press Esc to return to normal chat"
+                  ><span>/ha</span><span class="composer-agent-pill-x" aria-hidden="true">×</span></button>
                   <input
                     id="chat-text-input"
                     class="composer-text-input"
@@ -974,6 +983,13 @@
                     autocomplete="off"
                   />
                   <div class="comp-inline-badges">
+                    <button
+                      type="button"
+                      id="btn-composer-ha"
+                      class="inline-chip inline-chip-btn inline-chip-ha hidden"
+                      aria-pressed="false"
+                      title="Toggle /ha mode — ask Home Assistant in voice + chat"
+                    >/ha</button>
                     <span class="inline-chip" title="Links become clickable cards automatically">URL ↗</span>
                     <button
                       type="button"
@@ -1648,7 +1664,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v37</span>
+                <span id="adv-version-number">v38</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>

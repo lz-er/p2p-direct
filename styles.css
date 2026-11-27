@@ -2304,6 +2304,18 @@ html[data-advanced="true"] .voice-mosaic {
   background: var(--self-msg-bg);
 }
 
+.log-entry.is-assistant-reply {
+  background: var(--accent-action-bg);
+}
+
+.log-entry.is-assistant-reply .msg-stripe {
+  background: var(--cobalt);
+}
+
+[data-theme="dark"] .log-entry.is-assistant-reply {
+  background: rgba(30, 107, 255, 0.09);
+}
+
 .msg-stripe {
   background: var(--cobalt);
   transition: background-color 180ms ease;
@@ -3112,6 +3124,171 @@ html[data-advanced="true"] .voice-mosaic {
   padding: 10px 22px;
   background: var(--bg-subtle);
   border-bottom: 2px solid var(--rule);
+}
+
+/* Slash Command Popover & Direct /ha Assistant Composer Mode (Flat Metro, 0px corners, zero shadow) */
+#chat-composer-dropzone {
+  position: relative;
+}
+
+.chat-slash-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border-top: 2px solid var(--rule);
+  border-bottom: 2px solid var(--rule);
+  border-radius: 0;
+}
+
+.chat-slash-item {
+  appearance: none;
+  border: 0;
+  border-bottom: 1px solid var(--rule-soft);
+  border-left: 4px solid transparent;
+  border-radius: 0;
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  padding: 9px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+  transition: background-color 90ms ease, color 90ms ease, border-color 90ms ease;
+}
+
+.chat-slash-item:last-child {
+  border-bottom: 0;
+}
+
+.chat-slash-item:hover,
+.chat-slash-item.is-active {
+  background: var(--accent-action-bg);
+  border-left-color: var(--cobalt);
+}
+
+[data-theme="dark"] .chat-slash-item:hover,
+[data-theme="dark"] .chat-slash-item.is-active {
+  background: var(--accent-action-bg);
+  border-left-color: var(--acid);
+}
+
+.chat-slash-icon {
+  color: var(--cobalt);
+  flex-shrink: 0;
+}
+
+[data-theme="dark"] .chat-slash-icon {
+  color: var(--acid);
+}
+
+.chat-slash-cmd {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--ink-primary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.chat-slash-desc {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  color: var(--ink-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.composer-agent-pill {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 14px;
+  padding: 4px 8px;
+  border: 2px solid var(--rule);
+  border-radius: 0;
+  background: var(--cobalt);
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: lowercase;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 110ms ease, color 110ms ease;
+}
+
+.composer-agent-pill:hover {
+  background: var(--coral);
+  color: #ffffff;
+}
+
+.composer-agent-pill-x {
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
+.composer-row.is-agent-mode .composer-input-wrap {
+  background: var(--accent-action-bg);
+  outline: 2px solid var(--cobalt);
+  outline-offset: -2px;
+}
+
+[data-theme="dark"] .composer-row.is-agent-mode .composer-input-wrap {
+  outline-color: var(--acid);
+}
+
+.composer-row.is-agent-mode .composer-text-input {
+  padding-left: 12px;
+}
+
+.inline-chip-btn.inline-chip-ha {
+  background: var(--bg-subtle);
+  color: var(--cobalt);
+  border-color: var(--cobalt);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}
+
+[data-theme="dark"] .inline-chip-btn.inline-chip-ha {
+  color: var(--acid);
+  border-color: var(--acid);
+}
+
+.inline-chip-btn.inline-chip-ha:hover {
+  background: var(--cobalt);
+  color: #ffffff;
+  border-color: var(--rule);
+}
+
+[data-theme="dark"] .inline-chip-btn.inline-chip-ha:hover {
+  background: var(--acid);
+  color: #0e0f12;
+  border-color: var(--acid);
+}
+
+.inline-chip-btn.inline-chip-ha.is-active {
+  background: var(--cobalt);
+  color: #ffffff;
+  border-color: var(--rule);
+}
+
+[data-theme="dark"] .inline-chip-btn.inline-chip-ha.is-active {
+  background: var(--acid);
+  color: #0e0f12;
+  border-color: var(--acid);
 }
 
 .staged-image-chip {
@@ -6515,6 +6692,7 @@ html[data-watch-stage="true"] .voice-bot-btn {
 .chat-reply-banner {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 2px 8px;
   margin-bottom: 4px;
@@ -6523,6 +6701,71 @@ html[data-watch-stage="true"] .voice-bot-btn {
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--ink-secondary);
+}
+
+.chat-reply-banner.is-assistant-meta {
+  border-left-color: var(--cobalt);
+  background: var(--bg-surface);
+  border-top: 1px solid var(--rule-soft);
+  border-right: 1px solid var(--rule-soft);
+  border-bottom: 1px solid var(--rule-soft);
+  padding: 3px 8px;
+}
+
+.chat-reply-pipeline {
+  color: var(--cobalt);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+[data-theme="dark"] .chat-reply-pipeline {
+  color: var(--cyan);
+}
+
+.chat-cmd-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  margin-right: 3px;
+  border: 1.5px solid var(--rule);
+  border-radius: 0;
+  background: var(--cobalt);
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.3;
+  vertical-align: 1px;
+}
+
+[data-theme="dark"] .chat-cmd-pill {
+  background: var(--cobalt);
+  color: #ffffff;
+}
+
+.chat-voice-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1.5px solid var(--rule);
+  border-radius: 0;
+  background: var(--mint);
+  color: #0e0f12;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1.25;
+}
+
+[data-theme="dark"] .chat-voice-badge {
+  background: var(--mint);
+  border-color: #0b0c0f;
+  color: #0e0f12;
 }
 
 .bot-setup-body .step-hint {
@@ -7407,6 +7650,25 @@ html[data-watch-stage="true"] .voice-bot-btn {
   .inline-chip-btn {
     padding: 5px 8px;
     font-size: 9.5px;
+  }
+
+  .composer-agent-pill {
+    margin-left: 8px;
+    padding: 3px 6px;
+    font-size: 10px;
+  }
+
+  .chat-slash-item {
+    padding: 8px 10px;
+    gap: 8px;
+  }
+
+  .chat-slash-cmd {
+    font-size: 11px;
+  }
+
+  .chat-slash-desc {
+    font-size: 11px;
   }
 
   .composer-send-btn {

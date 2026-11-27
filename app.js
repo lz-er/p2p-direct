@@ -147,7 +147,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v37";
+export const APP_VERSION = "v38";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -2320,6 +2320,226 @@ export function formatChatTextPayload(text) {
   return { html: out.join(""), links: allLinks };
 }
 
+const TRANSIENT_WAKE_STATUSES = new Set([
+  "waiting ha",
+  "listening...",
+  "thinking...",
+  "speaking",
+  "muted",
+  "button only",
+  "wake ready",
+]);
+
+/**
+ * Inspects connected peers and latest non-deleted bot cards to detect an active room
+ * assistant bot (via `card.assistantMeta` or `ha:listen` in `card.voiceControls`).
+ */
+export function detectRoomAssistant(messages, peers) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+
+  const hasPeersFilter = Array.isArray(peers);
+  const peerById = new Map();
+  if (hasPeersFilter) {
+    for (const p of peers) {
+      if (p && typeof p === "object" && p.peerId) {
+        peerById.set(p.peerId, p);
+      }
+    }
+    if (peerById.size === 0) return null;
+  }
+
+  let deletedIds = null;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m && m.type === "msg-delete" && typeof m.payload?.targetId === "string") {
+      if (!deletedIds) deletedIds = new Set();
+      deletedIds.add(m.payload.targetId);
+    }
+  }
+
+  const seenAuthors = new Set();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || typeof m !== "object" || m.deleted) continue;
+    if (deletedIds && m.id && deletedIds.has(m.id)) continue;
+    if (m.type !== "bot" && m.type !== "bot_message") continue;
+    if (!m.payload || typeof m.payload !== "object" || Array.isArray(m.payload)) continue;
+
+    const peerId = typeof m.author === "string" ? m.author : "";
+    if (!peerId) continue;
+    if (hasPeersFilter && !peerById.has(peerId)) continue;
+
+    const card =
+      m.payload.card && typeof m.payload.card === "object" && !Array.isArray(m.payload.card)
+        ? m.payload.card
+        : m.payload;
+
+    const meta =
+      card.assistantMeta &&
+      typeof card.assistantMeta === "object" &&
+      !Array.isArray(card.assistantMeta)
+        ? card.assistantMeta
+        : null;
+    const rawVc =
+      card.voiceControls &&
+      typeof card.voiceControls === "object" &&
+      !Array.isArray(card.voiceControls)
+        ? card.voiceControls
+        : null;
+    const hasHaListenBtn = Boolean(
+      rawVc &&
+        Array.isArray(rawVc.buttons) &&
+        rawVc.buttons.some((b) => {
+          const bid = String(b?.id || b?.actionId || "").trim().toLowerCase();
+          return bid === "ha:listen";
+        })
+    );
+
+    if (!meta && !hasHaListenBtn) continue;
+    if (seenAuthors.has(peerId)) continue;
+    seenAuthors.add(peerId);
+
+    const peerInfo = peerById.get(peerId) || null;
+    const name =
+      stripBotEmojis(
+        (peerInfo && peerInfo.authorName) ||
+          (typeof card.title === "string" && card.title) ||
+          m.authorName ||
+          "Home Assistant"
+      )
+        .slice(0, 40)
+        .trim() || "Home Assistant";
+
+    const pipelineName = meta && typeof meta.pipelineName === "string"
+      ? stripBotEmojis(meta.pipelineName).slice(0, 40).trim()
+      : "";
+
+    let wakeWordLabel =
+      meta && typeof meta.wakeWordLabel === "string"
+        ? stripBotEmojis(meta.wakeWordLabel).slice(0, 40).trim()
+        : "";
+    if (!wakeWordLabel && rawVc && typeof rawVc.status === "string") {
+      const candidate = stripBotEmojis(rawVc.status).slice(0, 40).trim();
+      if (candidate && !TRANSIENT_WAKE_STATUSES.has(candidate.toLowerCase())) {
+        wakeWordLabel = candidate;
+      }
+    }
+
+    const rawCmds =
+      meta && Array.isArray(meta.commands) && meta.commands.length > 0
+        ? meta.commands
+        : ["/ha", "/listen"];
+    const commands = rawCmds
+      .map((c) => String(c || "").trim())
+      .filter((c) => /^[/!][a-z0-9_-]{1,20}$/i.test(c))
+      .slice(0, 6);
+
+    return {
+      peerId,
+      name,
+      pipelineName,
+      wakeWordLabel,
+      commands: commands.length > 0 ? commands : ["/ha", "/listen"],
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Recognizes leading assistant/voice slash & bang commands (`/ha`, `/assist`, `!ha`, `!assist`,
+ * `/listen`, `!listen`) in normal chat messages.
+ */
+export function parseChatCommandPrefix(text) {
+  const raw = String(text ?? "");
+  const m = raw.match(/^\s*([/!])(ha|assist|listen)(?:\s+([\s\S]*))?$/i);
+  if (!m) return null;
+  const prefix = m[1];
+  const word = m[2].toLowerCase();
+  const cmd = `${prefix}${word}`;
+  const rest = (m[3] || "").trim();
+  const isAssistantPrompt = (word === "ha" || word === "assist") && rest.length > 0;
+  return {
+    cmd,
+    displayCmd: cmd,
+    rest,
+    isAssistantPrompt,
+  };
+}
+
+/**
+ * Computes filtered slash-command suggestions for the chat composer popover.
+ */
+export function getSlashCommandSuggestions(
+  inputText,
+  { assistant = null, warframeEnabled = false } = {}
+) {
+  const raw = String(inputText ?? "");
+  if (!/^\/[a-z0-9_-]*$/i.test(raw)) return [];
+
+  const q = raw.toLowerCase();
+  const candidates = [];
+
+  if (assistant && typeof assistant === "object") {
+    const name = stripBotEmojis(assistant.name || "Home Assistant").trim() || "Home Assistant";
+    const pipe = stripBotEmojis(assistant.pipelineName || "").trim();
+    const pipeSuffix = pipe ? ` (${pipe})` : "";
+    candidates.push(
+      {
+        command: "/ha ",
+        label: "/ha <message>",
+        desc: `Ask ${name}${pipeSuffix} — answers in voice + chat`,
+        submit: false,
+        icon: "home",
+        keywords: ["/ha", "/assist"],
+      },
+      {
+        command: "/listen",
+        label: "/listen",
+        desc: "Start listening in voice channel right now",
+        submit: true,
+        icon: "mic",
+        keywords: ["/listen"],
+      },
+      {
+        command: "/ha",
+        label: "/ha",
+        desc: "Show or refresh Home Assistant status card",
+        submit: true,
+        icon: "refresh",
+        keywords: ["/ha", "/assist"],
+      }
+    );
+  }
+
+  if (warframeEnabled) {
+    candidates.push({
+      command: "!wf",
+      label: "!wf",
+      desc: "Show or refresh Warframe Worldstate card",
+      submit: true,
+      icon: "bolt",
+      keywords: ["/wf", "/warframe"],
+    });
+  }
+
+  return candidates
+    .filter((item) => {
+      if (q === "/") return true;
+      return (
+        item.command.trim().toLowerCase().startsWith(q) ||
+        item.keywords.some((kw) => kw.startsWith(q))
+      );
+    })
+    .map(({ command, label, desc, submit, icon }) => ({
+      command,
+      label,
+      desc,
+      submit,
+      icon,
+    }));
+}
+
 function loadImageFromFile(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -3026,6 +3246,10 @@ export class P2PDirectApp {
     this._botBlockTickTimer = null;
     this._roomTimersCache = [];
     this._lastRoomTimersSig = "";
+    this.composerAgentMode = false;
+    this.slashMenuIndex = 0;
+    this._slashMenuItems = [];
+    this._detectedAssistant = null;
     this._seenTriggerMsgIds = new Set();
     this.el = {};
   }
@@ -3378,6 +3602,9 @@ export class P2PDirectApp {
       "chat-panel",
       "chat-drop-overlay",
       "chat-composer-dropzone",
+      "chat-slash-menu",
+      "composer-agent-pill",
+      "btn-composer-ha",
       "chat-image-tray",
       "chat-image-input",
       "btn-attach-image",
@@ -4442,9 +4669,83 @@ export class P2PDirectApp {
       }
     });
 
+    if (this.el["btn-composer-ha"]) {
+      this.el["btn-composer-ha"].addEventListener("click", () => {
+        this.setComposerAgentMode(!this.composerAgentMode, { focus: true });
+      });
+    }
+    if (this.el["composer-agent-pill"]) {
+      this.el["composer-agent-pill"].addEventListener("click", () => {
+        this.setComposerAgentMode(false, { focus: true });
+      });
+    }
+    if (this.el["chat-slash-menu"]) {
+      this.el["chat-slash-menu"].addEventListener("mousedown", (ev) => {
+        const itemBtn = ev.target?.closest?.("[data-slash-idx]");
+        if (!itemBtn) return;
+        ev.preventDefault();
+        const idx = Number(itemBtn.dataset.slashIdx);
+        const item = this._slashMenuItems[idx];
+        if (item) this.applySlashCommand(item);
+      });
+    }
+    if (this.el["chat-text-input"]) {
+      this.el["chat-text-input"].addEventListener("input", () => {
+        this.renderSlashMenu();
+      });
+      this.el["chat-text-input"].addEventListener("blur", () => {
+        setTimeout(() => this.closeSlashMenu(), 120);
+      });
+      this.el["chat-text-input"].addEventListener("keydown", (ev) => {
+        if (this._slashMenuItems.length > 0) {
+          if (ev.key === "ArrowDown") {
+            ev.preventDefault();
+            this.slashMenuIndex = (this.slashMenuIndex + 1) % this._slashMenuItems.length;
+            this._highlightSlashMenuSelection();
+            return;
+          }
+          if (ev.key === "ArrowUp") {
+            ev.preventDefault();
+            this.slashMenuIndex =
+              (this.slashMenuIndex - 1 + this._slashMenuItems.length) % this._slashMenuItems.length;
+            this._highlightSlashMenuSelection();
+            return;
+          }
+          if (ev.key === "Tab" || ev.key === "Enter") {
+            const chosen = this._slashMenuItems[this.slashMenuIndex] || this._slashMenuItems[0];
+            if (chosen) {
+              ev.preventDefault();
+              this.applySlashCommand(chosen);
+              return;
+            }
+          }
+          if (ev.key === "Escape") {
+            ev.preventDefault();
+            this.closeSlashMenu();
+            return;
+          }
+        } else if (this.composerAgentMode) {
+          if (ev.key === "Escape") {
+            ev.preventDefault();
+            this.setComposerAgentMode(false);
+            return;
+          }
+          if (ev.key === "Backspace" && this.el["chat-text-input"].value === "") {
+            ev.preventDefault();
+            this.setComposerAgentMode(false);
+            return;
+          }
+        }
+      });
+    }
+
     this.el["chat-composer-form"].addEventListener("submit", (ev) => {
       ev.preventDefault();
-      const text = this.el["chat-text-input"].value.trim();
+      this.closeSlashMenu();
+      let text = this.el["chat-text-input"].value.trim();
+      if (this.composerAgentMode && text && !/^[/!]/.test(text)) {
+        text = `/ha ${text}`;
+      }
       const images = [];
       const videos = [];
       for (const item of this.pendingImages) {
@@ -9045,6 +9346,9 @@ export class P2PDirectApp {
     this.stopBuiltinBotsTimers();
     this._roomTimersCache = [];
     this._lastRoomTimersSig = "";
+    this.composerAgentMode = false;
+    this._detectedAssistant = null;
+    this.closeSlashMenu();
     this.warframeBot.dismissedInRoomTopic = null;
     this.builtinBots.dismissedByRoom = {};
     this._seenTriggerMsgIds.clear();
@@ -16530,6 +16834,157 @@ export class P2PDirectApp {
 
   /* ================= Rendering ================= */
 
+  syncAssistantComposerUi() {
+    const assistant = detectRoomAssistant(
+      this._getMessagesForVoiceControls(),
+      this.status?.peers || []
+    );
+    this._detectedAssistant = assistant;
+    if (!assistant && this.composerAgentMode) {
+      this.composerAgentMode = false;
+    }
+
+    const active = Boolean(assistant && this.composerAgentMode);
+    const haBtn = this.el?.["btn-composer-ha"];
+    const pill = this.el?.["composer-agent-pill"];
+    const form = this.el?.["chat-composer-form"];
+    const input = this.el?.["chat-text-input"];
+
+    if (haBtn) {
+      haBtn.classList.toggle("hidden", !assistant);
+      haBtn.classList.toggle("is-active", active);
+      if (typeof haBtn.setAttribute === "function") {
+        haBtn.setAttribute("aria-pressed", active ? "true" : "false");
+      }
+      if (assistant) {
+        const pipe = assistant.pipelineName ? ` (${assistant.pipelineName})` : "";
+        haBtn.title = active
+          ? `Direct Assistant mode active (${assistant.name}${pipe}) — click or press Esc to return to normal chat`
+          : `Toggle /ha mode — ask ${assistant.name}${pipe} in voice + chat`;
+      }
+    }
+    if (pill) {
+      pill.classList.toggle("hidden", !active);
+    }
+    if (form) {
+      form.classList.toggle("is-agent-mode", active);
+    }
+    if (input) {
+      if (active && assistant) {
+        const pipePart = assistant.pipelineName
+          ? `${assistant.pipelineName} · voice + chat`
+          : "voice + chat";
+        input.placeholder = `Ask ${assistant.name} (${pipePart})…`;
+      } else {
+        input.placeholder = "Write a message…";
+      }
+    }
+  }
+
+  setComposerAgentMode(active, { focus = false } = {}) {
+    const hasAssistant = Boolean(
+      this._detectedAssistant ||
+        detectRoomAssistant(this._getMessagesForVoiceControls(), this.status?.peers || [])
+    );
+    this.composerAgentMode = Boolean(active && hasAssistant);
+    this.closeSlashMenu();
+    this.syncAssistantComposerUi();
+    if (focus && this.el?.["chat-text-input"] && typeof this.el["chat-text-input"].focus === "function") {
+      this.el["chat-text-input"].focus();
+    }
+  }
+
+  closeSlashMenu() {
+    this._slashMenuItems = [];
+    this.slashMenuIndex = 0;
+    const menu = this.el?.["chat-slash-menu"];
+    if (menu) {
+      menu.classList.add("hidden");
+      menu.innerHTML = "";
+    }
+  }
+
+  _highlightSlashMenuSelection() {
+    const menu = this.el?.["chat-slash-menu"];
+    if (!menu) return;
+    for (const el of menu.querySelectorAll("[data-slash-idx]")) {
+      const idx = Number(el.dataset.slashIdx);
+      const isAct = idx === this.slashMenuIndex;
+      el.classList.toggle("is-active", isAct);
+      el.setAttribute("aria-selected", isAct ? "true" : "false");
+    }
+  }
+
+  renderSlashMenu() {
+    const menu = this.el?.["chat-slash-menu"];
+    const input = this.el?.["chat-text-input"];
+    if (!menu || !input) return;
+
+    const assistant =
+      this._detectedAssistant ||
+      detectRoomAssistant(this._getMessagesForVoiceControls(), this.status?.peers || []);
+    const items = getSlashCommandSuggestions(input.value || "", {
+      assistant,
+      warframeEnabled: Boolean(this.warframeBot?.settings?.enabled),
+    });
+
+    if (items.length === 0) {
+      this.closeSlashMenu();
+      return;
+    }
+
+    this._slashMenuItems = items;
+    if (this.slashMenuIndex >= items.length || this.slashMenuIndex < 0) {
+      this.slashMenuIndex = 0;
+    }
+
+    menu.innerHTML = items
+      .map((item, idx) => {
+        const isAct = idx === this.slashMenuIndex;
+        const iconSvg =
+          item.icon && hasIcon(item.icon)
+            ? renderIconSvg(item.icon, { size: 13, className: "chat-slash-icon" })
+            : "";
+        return (
+          `<button type="button" class="chat-slash-item${isAct ? " is-active" : ""}" role="option" aria-selected="${isAct ? "true" : "false"}" data-slash-idx="${idx}">` +
+          `${iconSvg}` +
+          `<span class="chat-slash-cmd">${escapeHtml(item.label)}</span>` +
+          `<span class="chat-slash-desc">${escapeHtml(item.desc)}</span>` +
+          `</button>`
+        );
+      })
+      .join("");
+    menu.classList.remove("hidden");
+  }
+
+  applySlashCommand(item) {
+    if (!item) return;
+    const input = this.el?.["chat-text-input"];
+    const form = this.el?.["chat-composer-form"];
+    this.closeSlashMenu();
+    if (!input) return;
+
+    input.value = item.command;
+    if (item.submit && form) {
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+      } else if (typeof form.dispatchEvent === "function") {
+        form.dispatchEvent(new Event("submit", { cancelable: true }));
+      }
+      return;
+    }
+    if (typeof input.focus === "function") {
+      input.focus();
+    }
+    if (typeof input.setSelectionRange === "function") {
+      try {
+        input.setSelectionRange(input.value.length, input.value.length);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   renderAll() {
     const colorsChanged = this._syncPeerColorsFromStatus();
     this.syncLayoutAttributes();
@@ -16539,6 +16994,7 @@ export class P2PDirectApp {
     this.renderConnectBanners();
     this.renderVoicePanel();
     this.renderRoomTimers();
+    this.syncAssistantComposerUi();
     this.renderPeers();
     this.renderTopology();
     this.renderStats();
@@ -16559,6 +17015,7 @@ export class P2PDirectApp {
     this.renderTypeFilterOptions();
     this.renderLog();
     this.renderRoomTimers();
+    this.syncAssistantComposerUi();
     if (this.status?.peers?.some((p) => p.inVoice)) {
       this.renderVoicePanel();
     }
@@ -18908,17 +19365,49 @@ export class P2PDirectApp {
     const gifBindings = [];
     const videoBindings = [];
     if (payload.replyTo && typeof payload.replyTo === "object") {
-      const targetName = escapeHtml(payload.replyTo.botName || "Bot");
-      const viaLabel = escapeHtml(payload.replyTo.label || payload.replyTo.actionId || "Button");
-      parts.push(
-        `<div class="chat-reply-banner"><span>↳ Answer to <strong>${targetName}</strong> · ${viaLabel}</span></div>`
-      );
+      const r = payload.replyTo;
+      if (r.toName || r.pipeline || payload.assistant) {
+        const targetName = escapeHtml(stripBotEmojis(r.toName || r.botName || "Chat") || "Chat");
+        const detail = stripBotEmojis(r.pipeline || r.label || "");
+        const detailHtml = detail
+          ? ` · <span class="chat-reply-pipeline">${escapeHtml(detail)}</span>`
+          : "";
+        const voiceBadgeHtml =
+          r.spoken === true
+            ? `<span class="chat-voice-badge">${renderIconSvg("volume", { size: 11, className: "metro-icon" })}<span>VOICE</span></span>`
+            : "";
+        parts.push(
+          `<div class="chat-reply-banner is-assistant-meta"><span>↳ <strong>${targetName}</strong>${detailHtml}</span>${voiceBadgeHtml}</div>`
+        );
+      } else {
+        const targetName = escapeHtml(r.botName || "Bot");
+        const viaLabel = escapeHtml(r.label || r.actionId || "Button");
+        parts.push(
+          `<div class="chat-reply-banner"><span>↳ Answer to <strong>${targetName}</strong> · ${viaLabel}</span></div>`
+        );
+      }
     }
 
     const text = typeof payload.text === "string" ? payload.text : "";
     if (text) {
-      const { html, links } = formatChatTextPayload(text);
-      parts.push(`<div class="log-text-body">${html}</div>`);
+      const cmdParsed = parseChatCommandPrefix(text);
+      let bodyHtml = "";
+      let links = [];
+      if (cmdParsed) {
+        const pillHtml = `<span class="chat-cmd-pill">${escapeHtml(cmdParsed.displayCmd)}</span>`;
+        if (cmdParsed.rest) {
+          const formatted = formatChatTextPayload(cmdParsed.rest);
+          bodyHtml = `${pillHtml} ${formatted.html}`;
+          links = formatted.links;
+        } else {
+          bodyHtml = pillHtml;
+        }
+      } else {
+        const formatted = formatChatTextPayload(text);
+        bodyHtml = formatted.html;
+        links = formatted.links;
+      }
+      parts.push(`<div class="log-text-body">${bodyHtml}</div>`);
       if (links.length > 0) {
         const cards = links
           .map((lnk) => {
@@ -20509,8 +20998,11 @@ export class P2PDirectApp {
     const historyHtml = isHistOpen ? this._renderEditHistoryHtml(m) : "";
     const effectiveRev = `${messageEditRev(m)}:${isEditing ? "edit" : "view"}:${isHistOpen ? "h1" : "h0"}`;
 
+    const isAssistantReply = Boolean(
+      isChat && (m.payload?.assistant || (m.payload?.replyTo && m.payload.replyTo.pipeline))
+    );
     const article = document.createElement("article");
-    article.className = `log-entry${isSelf ? " is-self" : ""}${isBotMsg ? " is-bot-entry" : ""}${isPersistentWf ? " is-persistent-wf" : ""}${isEditing ? " is-editing" : ""}${isNew ? " is-new" : ""}`;
+    article.className = `log-entry${isSelf ? " is-self" : ""}${isBotMsg ? " is-bot-entry" : ""}${isAssistantReply ? " is-assistant-reply" : ""}${isPersistentWf ? " is-persistent-wf" : ""}${isEditing ? " is-editing" : ""}${isNew ? " is-new" : ""}`;
     article.dataset.msgId = m.id;
     article.dataset.rev = effectiveRev;
     article.innerHTML = `

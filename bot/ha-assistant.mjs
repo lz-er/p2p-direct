@@ -180,6 +180,59 @@ export function formatWakeWordLabel(wakeWordId) {
     .join(" ");
 }
 
+export function parseWavPcm16(buffer) {
+  if (!buffer) return null;
+  const buf = Buffer.isBuffer(buffer)
+    ? buffer
+    : buffer instanceof Uint8Array
+      ? Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+      : buffer instanceof ArrayBuffer
+        ? Buffer.from(buffer)
+        : null;
+  if (!buf || buf.length < 12) return null;
+  if (buf.toString("ascii", 0, 4) !== "RIFF" || buf.toString("ascii", 8, 12) !== "WAVE") {
+    return null;
+  }
+
+  let audioFormat = 0;
+  let channels = 0;
+  let sampleRate = 0;
+  let bitsPerSample = 0;
+  let pcm = null;
+
+  let offset = 12;
+  while (offset + 8 <= buf.length) {
+    const chunkId = buf.toString("ascii", offset, offset + 4);
+    const chunkSize = buf.readUInt32LE(offset + 4);
+    const dataStart = offset + 8;
+    const isUnknownLen = chunkSize === 0xffffffff;
+    const dataEnd = isUnknownLen ? buf.length : Math.min(buf.length, dataStart + chunkSize);
+
+    if (chunkId === "fmt " && dataEnd - dataStart >= 16) {
+      audioFormat = buf.readUInt16LE(dataStart);
+      channels = buf.readUInt16LE(dataStart + 2);
+      sampleRate = buf.readUInt32LE(dataStart + 4);
+      bitsPerSample = buf.readUInt16LE(dataStart + 14);
+    } else if (chunkId === "data") {
+      pcm = buf.subarray(dataStart, dataEnd);
+    }
+
+    if (isUnknownLen) break;
+    const nextOffset = dataStart + chunkSize + (chunkSize & 1);
+    if (nextOffset <= offset) break;
+    offset = nextOffset;
+  }
+
+  if (audioFormat !== 1 || bitsPerSample !== 16 || channels < 1 || sampleRate < 4000 || !pcm || pcm.length === 0) {
+    return null;
+  }
+  return {
+    sampleRate,
+    channels,
+    pcm: Buffer.from(pcm),
+  };
+}
+
 function buildAssistantSelectPattern(wyomingName) {
   const slug = String(wyomingName || "p2p-direct-voice")
     .trim()
@@ -188,6 +241,16 @@ function buildAssistantSelectPattern(wyomingName) {
     .replace(/^_+|_+$/g, "");
   const escaped = (slug || "p2p_direct_voice").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`^select\\..*${escaped}_assistant$`, "i");
+}
+
+function buildSatelliteEntityPattern(wyomingName) {
+  const slug = String(wyomingName || "p2p-direct-voice")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const escaped = (slug || "p2p_direct_voice").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^assist_satellite\\..*${escaped}$`, "i");
 }
 
 export function parseHaCliArgs(argv) {
@@ -271,6 +334,7 @@ export class HomeAssistantWsClient extends EventEmitter {
     this.passphraseHelper = String(passphraseHelper || "").trim();
     this.wyomingName = String(wyomingName || "p2p-direct-voice").trim() || "p2p-direct-voice";
     this._assistantSelectPattern = buildAssistantSelectPattern(this.wyomingName);
+    this._satelliteEntityPattern = buildSatelliteEntityPattern(this.wyomingName);
     const cleanedTimerEntities = Array.isArray(timerListEntities)
       ? timerListEntities.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean)
       : [];
@@ -281,13 +345,18 @@ export class HomeAssistantWsClient extends EventEmitter {
     this.authenticated = false;
     this.nextId = 1;
     this.pending = new Map();
+    this._pipelineRuns = new Map(); // id -> { resolve, reject, timer, result }
     this.reconnectTimer = null;
     this.stopped = false;
     this.helperRoomLink = "";
     this.helperPassphrase = "";
     this.assistantSelectEntity = "";
     this.assistantSelectState = "";
+    this.pipelineId = "";
     this.pipelineName = "";
+    this.pipelineTtsEngine = "";
+    this.satelliteEntityId = "";
+    this.satelliteDeviceId = "";
     this.wakeWordId = "";
     this.wakeWordLabel = "";
     this.wakeWordEntity = "";
@@ -341,11 +410,20 @@ export class HomeAssistantWsClient extends EventEmitter {
     this.connected = false;
     this.authenticated = false;
     this._clearTimerListState(false);
+    this._abortPipelineRuns("Home Assistant client stopped");
     for (const { reject, timer } of this.pending.values()) {
       if (timer) clearTimeout(timer);
       reject(new Error("Home Assistant client stopped"));
     }
     this.pending.clear();
+  }
+
+  _abortPipelineRuns(reason) {
+    for (const run of this._pipelineRuns.values()) {
+      if (run.timer) clearTimeout(run.timer);
+      run.reject(new Error(reason));
+    }
+    this._pipelineRuns.clear();
   }
 
   _clearTimerListState(emitUpdate = false) {
@@ -399,6 +477,7 @@ export class HomeAssistantWsClient extends EventEmitter {
       this.authenticated = false;
       this.ws = null;
       this._clearTimerListState(!this.stopped);
+      this._abortPipelineRuns("Home Assistant WebSocket disconnected");
       this.emit("status", this.getStatus());
       if (!this.stopped) {
         this.reconnectTimer = setTimeout(() => {
@@ -436,8 +515,16 @@ export class HomeAssistantWsClient extends EventEmitter {
         this.pending.delete(msg.id);
         if (waiter.timer) clearTimeout(waiter.timer);
         if (msg.success) waiter.resolve(msg.result);
-        else waiter.reject(new Error(msg.error?.message || "HA WS call failed"));
+        else {
+          const err = new Error(msg.error?.message || "HA WS call failed");
+          if (msg.error?.code) err.code = String(msg.error.code);
+          waiter.reject(err);
+        }
       }
+      return;
+    }
+    if (msg.type === "event" && msg.id != null && this._pipelineRuns.has(msg.id)) {
+      this._handlePipelineRunEvent(msg.id, msg.event);
       return;
     }
     if (msg.type === "event" && msg.id != null && this._timerListSubToEntity.has(msg.id)) {
@@ -484,6 +571,12 @@ export class HomeAssistantWsClient extends EventEmitter {
         this.assistantSelectEntity = entityId;
         this.assistantSelectState = cleaned;
         this.refreshWakeWordInfo({ skipGetStates: true }).catch(() => {});
+      } else if (this._satelliteEntityPattern.test(String(entityId || ""))) {
+        if (entityId !== this.satelliteEntityId) {
+          this.satelliteEntityId = entityId;
+          this.satelliteDeviceId = "";
+          this._resolveSatelliteDeviceId().catch(() => {});
+        }
       } else if (this._isTimerListAllowed(entityId)) {
         const oldRaw = String(d.old_state?.state ?? "").trim();
         const wasAvailable = Boolean(d.old_state) && !/^(unavailable|unknown)$/i.test(oldRaw);
@@ -709,6 +802,8 @@ export class HomeAssistantWsClient extends EventEmitter {
         } else if (this._assistantSelectPattern.test(String(st.entity_id || ""))) {
           this.assistantSelectEntity = st.entity_id;
           this.assistantSelectState = cleaned;
+        } else if (this._satelliteEntityPattern.test(String(st.entity_id || ""))) {
+          this.satelliteEntityId = st.entity_id;
         } else if (this._isTimerListAllowed(st.entity_id)) {
           const meta = this._upsertTimerListMeta(st.entity_id, st);
           if (meta.available) {
@@ -736,14 +831,23 @@ export class HomeAssistantWsClient extends EventEmitter {
         const states = await this.call("get_states", {}, { timeoutMs: 4000 });
         if (Array.isArray(states)) {
           for (const st of states) {
-            if (this._assistantSelectPattern.test(String(st?.entity_id || ""))) {
+            const eid = String(st?.entity_id || "");
+            if (this._assistantSelectPattern.test(eid)) {
               const val = String(st.state ?? "").trim();
               this.assistantSelectEntity = st.entity_id;
               this.assistantSelectState = /^(unknown|unavailable|none|off)$/i.test(val) ? "" : val;
-              break;
+            } else if (this._satelliteEntityPattern.test(eid)) {
+              if (this.satelliteEntityId !== st.entity_id) {
+                this.satelliteEntityId = st.entity_id;
+                this.satelliteDeviceId = "";
+              }
             }
           }
         }
+      }
+
+      if (this.satelliteEntityId && !this.satelliteDeviceId) {
+        await this._resolveSatelliteDeviceId();
       }
 
       const res = await this.call("assist_pipeline/pipeline/list", {}, { timeoutMs: 4000 });
@@ -768,28 +872,38 @@ export class HomeAssistantWsClient extends EventEmitter {
       }
       if (!active) return null;
 
+      const pipelineId = String(active.id || "").trim();
       const pipelineName = String(active.name || "").trim();
+      const pipelineTtsEngine = String(active.tts_engine || "").trim();
       const wakeWordId = String(active.wake_word_id || "").trim();
       const wakeWordEntity = String(active.wake_word_entity || "").trim();
       const wakeWordLabel = formatWakeWordLabel(wakeWordId);
 
       const changed =
+        pipelineId !== this.pipelineId ||
         pipelineName !== this.pipelineName ||
+        pipelineTtsEngine !== this.pipelineTtsEngine ||
         wakeWordId !== this.wakeWordId ||
         wakeWordLabel !== this.wakeWordLabel ||
         wakeWordEntity !== this.wakeWordEntity;
 
+      this.pipelineId = pipelineId;
       this.pipelineName = pipelineName;
+      this.pipelineTtsEngine = pipelineTtsEngine;
       this.wakeWordId = wakeWordId;
       this.wakeWordEntity = wakeWordEntity;
       this.wakeWordLabel = wakeWordLabel;
 
       const info = {
+        pipelineId: this.pipelineId,
         pipelineName: this.pipelineName,
+        pipelineTtsEngine: this.pipelineTtsEngine,
         wakeWordId: this.wakeWordId,
         wakeWordLabel: this.wakeWordLabel,
         wakeWordEntity: this.wakeWordEntity,
         assistantSelectEntity: this.assistantSelectEntity,
+        satelliteEntityId: this.satelliteEntityId,
+        satelliteDeviceId: this.satelliteDeviceId,
       };
       if (changed) {
         this.emit("wakeWordInfoChanged", info);
@@ -799,6 +913,217 @@ export class HomeAssistantWsClient extends EventEmitter {
       // Best-effort: older/mock HA instances without assist_pipeline/pipeline/list stay unaffected
       return null;
     }
+  }
+
+  async _resolveSatelliteDeviceId() {
+    if (!this.authenticated || !this.satelliteEntityId) return "";
+    try {
+      const reg = await this.call(
+        "config/entity_registry/get",
+        { entity_id: this.satelliteEntityId },
+        { timeoutMs: 3000 }
+      );
+      if (reg && typeof reg.device_id === "string" && reg.device_id.trim()) {
+        this.satelliteDeviceId = reg.device_id.trim();
+      }
+      return this.satelliteDeviceId;
+    } catch {
+      return this.satelliteDeviceId;
+    }
+  }
+
+  _handlePipelineRunEvent(id, ev) {
+    const run = this._pipelineRuns.get(id);
+    if (!run || !ev || typeof ev !== "object") return;
+    const type = String(ev.type || "").trim();
+    const data = ev.data || {};
+    if (type === "intent-end") {
+      const out = data.intent_output || {};
+      const speech =
+        out?.response?.speech?.plain?.speech ||
+        out?.response?.speech?.ssml?.speech ||
+        "";
+      run.result.text = String(speech || "").trim();
+      run.result.conversationId = out?.conversation_id || run.result.conversationId || null;
+      run.result.responseType = String(out?.response?.response_type || "");
+    } else if (type === "tts-end") {
+      const ttsOut = data.tts_output || {};
+      run.result.ttsUrl = String(ttsOut.url || "").trim();
+      run.result.ttsMediaId = String(ttsOut.media_id || "").trim();
+      run.result.ttsMimeType = String(ttsOut.mime_type || "").trim();
+      run.result.ttsToken = String(ttsOut.token || "").trim();
+    } else if (type === "error") {
+      const code = String(data.code || "pipeline_error");
+      const message = String(data.message || code);
+      const err = new Error(message);
+      err.code = code;
+      if (run.timer) clearTimeout(run.timer);
+      this._pipelineRuns.delete(id);
+      run.reject(err);
+    } else if (type === "run-end") {
+      if (run.timer) clearTimeout(run.timer);
+      this._pipelineRuns.delete(id);
+      run.resolve(run.result);
+    }
+  }
+
+  async _executePipelineOnce(cleanText, { endStage, conversationId, timeoutMs }) {
+    const payload = {
+      start_stage: "intent",
+      end_stage: endStage,
+      input: { text: cleanText },
+    };
+    if (this.pipelineId) payload.pipeline = this.pipelineId;
+    if (conversationId) payload.conversation_id = conversationId;
+    if (this.satelliteDeviceId) payload.device_id = this.satelliteDeviceId;
+
+    let runId = null;
+    let streamResolve;
+    let streamReject;
+    const streamPromise = new Promise((resolve, reject) => {
+      streamResolve = resolve;
+      streamReject = reject;
+    });
+
+    try {
+      await this.call("assist_pipeline/run", payload, {
+        timeoutMs: Math.min(timeoutMs || 45000, 2500),
+        onId: (id) => {
+          runId = id;
+          this._pipelineRuns.set(id, {
+            resolve: streamResolve,
+            reject: streamReject,
+            timer: null,
+            result: {
+              text: "",
+              conversationId: conversationId || null,
+              responseType: "",
+              ttsUrl: "",
+              ttsMediaId: "",
+              ttsMimeType: "",
+              ttsToken: "",
+            },
+          });
+        },
+      });
+    } catch (err) {
+      if (runId != null) {
+        const run = this._pipelineRuns.get(runId);
+        if (run?.timer) clearTimeout(run.timer);
+        this._pipelineRuns.delete(runId);
+      }
+      err._pipelineAckFailed = true;
+      throw err;
+    }
+
+    if (runId != null && this._pipelineRuns.has(runId) && timeoutMs > 0) {
+      const run = this._pipelineRuns.get(runId);
+      run.timer = setTimeout(() => {
+        if (this._pipelineRuns.delete(runId)) {
+          streamReject(new Error("HA assist_pipeline/run timed out"));
+        }
+      }, timeoutMs);
+      run.timer.unref?.();
+    }
+    return streamPromise;
+  }
+
+  async runTextPipeline(text, { conversationId = null, speak = true, timeoutMs = 45000 } = {}) {
+    const clean = String(text || "").trim();
+    if (!clean) throw new Error("Question is empty");
+    let endStage = Boolean(speak && this.pipelineTtsEngine) ? "tts" : "intent";
+    let activeConvId = conversationId || null;
+
+    const isUnknownCmd = (err) =>
+      err?.code === "unknown_command" ||
+      (err?._pipelineAckFailed && /unknown command|timed out/i.test(String(err?.message || "")));
+    const isTtsError = (err) => {
+      const code = String(err?.code || "").toLowerCase();
+      const msg = String(err?.message || "").toLowerCase();
+      return (
+        code === "tts-not-configured" ||
+        code === "tts-failed" ||
+        code.startsWith("tts-") ||
+        /tts[-_\s]*(not[-_\s]*configured|failed)/i.test(msg)
+      );
+    };
+    const isThinkingSessionError = (err) =>
+      /thinking|signature|block_binding/i.test(`${err?.code || ""} ${err?.message || ""}`);
+
+    let retriedWithoutTts = false;
+    let retriedFreshConv = false;
+
+    while (true) {
+      try {
+        return await this._executePipelineOnce(clean, {
+          endStage,
+          conversationId: activeConvId,
+          timeoutMs,
+        });
+      } catch (err) {
+        if (isUnknownCmd(err)) {
+          return this.askConversation(clean, { conversationId: activeConvId });
+        }
+        if (endStage === "tts" && !retriedWithoutTts && isTtsError(err)) {
+          retriedWithoutTts = true;
+          endStage = "intent";
+          continue;
+        }
+        if (activeConvId && !retriedFreshConv && isThinkingSessionError(err)) {
+          retriedFreshConv = true;
+          activeConvId = null;
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  _buildHttpBaseUrl() {
+    if (!this.haUrl) return "";
+    return this.haUrl
+      .replace(/^wss:\/\//i, "https://")
+      .replace(/^ws:\/\//i, "http://")
+      .replace(/\/api\/websocket$/i, "")
+      .replace(/\/websocket$/i, "")
+      .replace(/\/+$/, "");
+  }
+
+  async fetchHttpBytes(relativeOrFullUrl, { timeoutMs = 15000 } = {}) {
+    const raw = String(relativeOrFullUrl || "").trim();
+    if (!raw) throw new Error("URL is required");
+    let targetUrl = raw;
+    if (!/^https?:\/\//i.test(raw)) {
+      const base = this._buildHttpBaseUrl();
+      if (!base) throw new Error("Home Assistant HTTP base URL is not configured");
+      targetUrl = raw.startsWith("/") ? `${base}${raw}` : `${base}/${raw}`;
+    }
+    const res = await fetch(targetUrl, {
+      method: "GET",
+      headers: this.haToken ? { Authorization: `Bearer ${this.haToken}` } : {},
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      throw new Error(`HA HTTP GET failed (HTTP ${res.status})`);
+    }
+    const arr = await res.arrayBuffer();
+    return Buffer.from(arr);
+  }
+
+  async announceSatelliteMedia(mediaId, { preannounce = false } = {}) {
+    const mid = String(mediaId || "").trim();
+    if (!mid) throw new Error("mediaId is required");
+    if (!this.satelliteEntityId) throw new Error("Satellite entity ID not discovered");
+    await this.call("call_service", {
+      domain: "assist_satellite",
+      service: "announce",
+      target: { entity_id: this.satelliteEntityId },
+      service_data: {
+        media_id: mid,
+        preannounce: Boolean(preannounce),
+      },
+    });
+    return true;
   }
 
   async askConversation(text, { conversationId = null } = {}) {
@@ -1266,27 +1591,81 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     return { ok: true, chunks: ids.length, ids };
   }
 
-  async askText(question, { speakerName = "User" } = {}) {
+  async askText(question, { speakerName = "User", replyInChat = true, speak = true } = {}) {
     const clean = String(question || "").trim();
     if (!clean) throw new Error("Question is empty");
     this.lastSpeaker = speakerName;
     this.lastTranscript = clean;
     this._pushLog("user", speakerName, clean);
-    this.syncChatCard(true);
+    this.syncChatCard(false);
 
     if (!this.haClient.authenticated) {
       this.lastReply = "Home Assistant WebSocket API is not configured — use voice or set HA_URL/HA_TOKEN.";
-      this.syncChatCard(true);
-      return { text: this.lastReply };
+      this.syncChatCard(false);
+      return { text: this.lastReply, spoken: false, postedToChat: false };
     }
-    const res = await this.haClient.askConversation(clean, {
+
+    const canSpeak = Boolean(speak && this.bot && this.bot.inVoice && !this.muted);
+    const res = await this.haClient.runTextPipeline(clean, {
       conversationId: this.conversationId,
+      speak: canSpeak,
     });
-    this.conversationId = res.conversationId;
-    this.lastReply = res.text || "Done.";
-    this._pushLog("assistant", "Home Assistant", this.lastReply);
-    this.syncChatCard(true);
-    return res;
+    this.conversationId = res.conversationId || this.conversationId;
+    const replyText = String(res.text || "").trim();
+    this.lastReply = replyText || "Done.";
+    this._pushLog("assistant", this.options.name || "Home Assistant", this.lastReply);
+
+    let spoken = false;
+    if (canSpeak) {
+      if (res.ttsUrl) {
+        try {
+          const audioBuf = await this.haClient.fetchHttpBytes(res.ttsUrl);
+          const wav = parseWavPcm16(audioBuf);
+          if (wav && wav.pcm.length > 0) {
+            this.bot.stopAudio();
+            this.bot.pushPcmBytes(wav.pcm, {
+              sampleRate: wav.sampleRate,
+              channels: wav.channels,
+            });
+            this.bot.markAudioStreamEnd();
+            spoken = true;
+          }
+        } catch (err) {
+          this._pushLog("error", "TTS", err?.message || String(err));
+        }
+      }
+      if (!spoken && res.ttsMediaId && this.haClient.satelliteEntityId) {
+        try {
+          await this.haClient.announceSatelliteMedia(res.ttsMediaId, { preannounce: false });
+          spoken = true;
+        } catch (err) {
+          this._pushLog("error", "TTS", err?.message || String(err));
+        }
+      }
+    }
+
+    let postedToChat = false;
+    if (replyInChat && this.bot && this.roomState === "connected" && replyText) {
+      const chunks = splitChatChunks(replyText, 12000);
+      const replyMeta = {
+        toName: speakerName,
+        botName: this.options.name,
+        label: this.pipelineName || "Assist",
+        pipeline: this.pipelineName || "",
+        spoken,
+      };
+      for (let i = 0; i < chunks.length; i++) {
+        const payload =
+          i === 0
+            ? { text: chunks[i], replyTo: replyMeta, assistant: true }
+            : { text: chunks[i], assistant: true };
+        this.bot.sendRaw("chat", payload);
+      }
+      postedToChat = true;
+    }
+
+    this.syncChatCard(false);
+    return { ...res, spoken, postedToChat };
   }
 
   _wireWyomingEvents() {
@@ -1421,17 +1800,18 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
 
   _onRoomMessage(msg) {
     if (msg.type !== "chat" || typeof msg.payload?.text !== "string") return;
+    if (msg.author && this.bot && msg.author === this.bot.peerId) return;
     const raw = msg.payload.text.trim();
     const lower = raw.toLowerCase();
-    if (lower === "!ha" || lower === "!assist") {
+    if (lower === "/ha" || lower === "/assist" || lower === "!ha" || lower === "!assist") {
       this.controlMsgId = null;
       this.syncChatCard(true);
-    } else if (lower === "!listen" || lower === "!ask") {
+    } else if (lower === "/listen" || lower === "!listen" || lower === "/ask" || lower === "!ask") {
       this.triggerListenNow({ speakerPeerId: msg.author, speakerName: msg.authorName });
-    } else if (lower.startsWith("!ha ") || lower.startsWith("!assist ")) {
-      const q = raw.replace(/^!(ha|assist)\s+/i, "").trim();
+    } else if (/^[/!](ha|assist)\s+/i.test(raw)) {
+      const q = raw.replace(/^[/!](ha|assist)\s+/i, "").trim();
       if (q) {
-        this.askText(q, { speakerName: msg.authorName }).catch((err) => {
+        this.askText(q, { speakerName: msg.authorName, replyInChat: true, speak: true }).catch((err) => {
           this._pushLog("error", "Assist", err.message);
         });
       }
@@ -1452,7 +1832,7 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
     } else if (id === "ha:ask_input") {
       const q = String(ev.value || "").trim();
       if (q) {
-        this.askText(q, { speakerName: ev.fromName }).catch((err) => {
+        this.askText(q, { speakerName: ev.fromName, replyInChat: true, speak: true }).catch((err) => {
           this._pushLog("error", "Assist", err.message);
         });
       }
@@ -1699,8 +2079,8 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
 
     const footerHint =
       this.wakeWordEnabled && this.wakeWordLabel
-        ? `Say "${this.wakeWordLabel}" or click Listen Now`
-        : "Say wake word or click Listen Now";
+        ? `Say "${this.wakeWordLabel}", click Listen Now, or type /ha <msg>`
+        : "Say wake word, click Listen Now, or type /ha <msg>";
 
     return {
       subtitle: "HOME ASSISTANT VOICE",
@@ -1710,6 +2090,11 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
       color,
       blocks,
       timers: cardTimers,
+      assistantMeta: {
+        pipelineName: this.pipelineName || "",
+        wakeWordLabel: this.wakeWordLabel || "",
+        commands: ["/ha", "/listen"],
+      },
       voiceControls: {
         status: voiceStatus,
         statusIcon: voiceStatusIcon,
@@ -1785,6 +2170,11 @@ export class HomeAssistantVoiceAssistant extends EventEmitter {
         id: this.wakeWordId,
         label: this.wakeWordLabel,
         pipelineName: this.pipelineName,
+      },
+      pipeline: {
+        id: this.haClient.pipelineId || "",
+        name: this.pipelineName || "",
+        ttsEngine: this.haClient.pipelineTtsEngine || "",
       },
       peers: this.bot ? this.bot.getPeers() : [],
       wyoming: {

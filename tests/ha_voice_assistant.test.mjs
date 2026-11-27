@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import net from "node:net";
 import { WebSocketServer, WebSocket } from "../bot/node_modules/ws/wrapper.mjs";
 import {
@@ -21,6 +22,7 @@ import {
   formatTimerListSourceLabel,
   formatWakeWordLabel,
   parseHaCliArgs,
+  parseWavPcm16,
 } from "../bot/ha-assistant.mjs";
 
 function makeSinePcm(sampleRate, durationMs, channels = 1, amplitude = 12000) {
@@ -770,7 +772,7 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       assert.equal(wakeCard.voiceControls.buttons[2].id, "ha:stop_audio");
       const wakeStat = wakeCard.blocks[0].items.find((i) => i.label === "Wake Word");
       assert.equal(wakeStat.value, "Okay Nabu");
-      assert.match(wakeCard.footer, /Say "Okay Nabu" or click Listen Now/);
+      assert.match(wakeCard.footer, /Say "Okay Nabu", click Listen Now, or type \/ha <msg>/);
 
       // Live state_changed on select.voice_room_p2p_direct_voice_assistant -> "Office Assist" (hey_jarvis_v0.1)
       wyEvents.length = 0;
@@ -808,7 +810,7 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
       assert.equal(jarvisCard.voiceControls.status, "Hey Jarvis");
       assert.equal(jarvisCard.voiceControls.statusIcon, "bolt");
       assert.equal(jarvisCard.voiceControls.statusTone, "cobalt");
-      assert.match(jarvisCard.footer, /Say "Hey Jarvis" or click Listen Now/);
+      assert.match(jarvisCard.footer, /Say "Hey Jarvis", click Listen Now, or type \/ha <msg>/);
 
       assistant.setMuted(true);
       const mutedCard = assistant.buildChatCard();
@@ -1456,6 +1458,385 @@ describe("P2PBotBridge Standby Mode & HomeAssistantVoiceAssistant Integration", 
     } finally {
       await assistant.stop();
       await new Promise((r) => mockHaWss.close(r));
+    }
+  });
+
+  it("parses WAV PCM16 headers cleanly, runs /ha through assist_pipeline/run (WAV TTS + MP3 announce fallback + normal chat reply), and handles /listen + resilience retries", async () => {
+    const buildWav = ({ sampleRate = 22050, channels = 1, bitsPerSample = 16, audioFormat = 1, pcmBytes, extraChunks = [] }) => {
+      const fmt = Buffer.alloc(16);
+      fmt.writeUInt16LE(audioFormat, 0);
+      fmt.writeUInt16LE(channels, 2);
+      fmt.writeUInt32LE(sampleRate, 4);
+      fmt.writeUInt32LE((sampleRate * channels * bitsPerSample) / 8, 8);
+      fmt.writeUInt16LE((channels * bitsPerSample) / 8, 12);
+      fmt.writeUInt16LE(bitsPerSample, 14);
+
+      const parts = [];
+      const addChunk = (id, data) => {
+        const hdr = Buffer.alloc(8);
+        hdr.write(id, 0, 4, "ascii");
+        hdr.writeUInt32LE(data.length, 4);
+        parts.push(hdr, data);
+        if (data.length & 1) parts.push(Buffer.alloc(1));
+      };
+      for (const ch of extraChunks) addChunk(ch.id, ch.data);
+      addChunk("fmt ", fmt);
+      addChunk("data", pcmBytes);
+      const body = Buffer.concat(parts);
+      const riff = Buffer.alloc(12);
+      riff.write("RIFF", 0, 4, "ascii");
+      riff.writeUInt32LE(4 + body.length, 4);
+      riff.write("WAVE", 8, 4, "ascii");
+      return Buffer.concat([riff, body]);
+    };
+
+    // 1. Unit-test parseWavPcm16
+    const rawPcm = makeSinePcm(22050, 40, 1);
+    const stdWav = buildWav({ sampleRate: 22050, channels: 1, pcmBytes: rawPcm });
+    const parsedStd = parseWavPcm16(stdWav);
+    assert.ok(parsedStd);
+    assert.equal(parsedStd.sampleRate, 22050);
+    assert.equal(parsedStd.channels, 1);
+    assert.deepEqual(parsedStd.pcm, rawPcm);
+
+    const extraWav = buildWav({
+      sampleRate: 16000,
+      channels: 2,
+      pcmBytes: Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]),
+      extraChunks: [
+        { id: "JUNK", data: Buffer.from("odd") }, // odd length tests RIFF word alignment
+        { id: "LIST", data: Buffer.from("INFOmeta") },
+      ],
+    });
+    const parsedExtra = parseWavPcm16(extraWav);
+    assert.ok(parsedExtra);
+    assert.equal(parsedExtra.sampleRate, 16000);
+    assert.equal(parsedExtra.channels, 2);
+    assert.deepEqual(parsedExtra.pcm, Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+
+    assert.equal(parseWavPcm16(Buffer.from("ID3\x03\x00mp3data")), null);
+    assert.equal(parseWavPcm16(buildWav({ audioFormat: 3, bitsPerSample: 32, pcmBytes: Buffer.alloc(16) })), null);
+    assert.equal(parseWavPcm16(buildWav({ bitsPerSample: 8, pcmBytes: Buffer.alloc(16) })), null);
+
+    // 2. Combined Mock HA HTTP + WebSocket server
+    let fetchedAuth = "";
+    const httpServer = http.createServer((req, res) => {
+      fetchedAuth = req.headers.authorization || "";
+      if (req.url === "/api/tts_proxy/reply.wav") {
+        res.writeHead(200, { "Content-Type": "audio/wav" });
+        res.end(stdWav);
+        return;
+      }
+      if (req.url === "/api/tts_proxy/reply.mp3") {
+        res.writeHead(200, { "Content-Type": "audio/mpeg" });
+        res.end(Buffer.from("ID3\x03\x00fake-mp3-audio"));
+        return;
+      }
+      res.writeHead(404);
+      res.end("not found");
+    });
+    const wss = new WebSocketServer({ server: httpServer, path: "/api/websocket" });
+    await new Promise((r) => httpServer.listen(0, "127.0.0.1", r));
+    const haPort = httpServer.address().port;
+
+    const pipelineRequests = [];
+    const serviceCalls = [];
+    let mode = "wav"; // wav | mp3 | tts_fail_once | thinking_fail_once | unknown_cmd
+
+    wss.on("connection", (ws) => {
+      ws.send(JSON.stringify({ type: "auth_required" }));
+      ws.on("message", (raw) => {
+        const m = JSON.parse(raw.toString("utf8"));
+        if (m.type === "auth") {
+          ws.send(JSON.stringify({ type: "auth_ok" }));
+        } else if (m.type === "subscribe_events") {
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        } else if (m.type === "get_states") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: [
+              { entity_id: "select.voice_room_p2p_direct_voice_assistant", state: "Assist LLM" },
+              { entity_id: "assist_satellite.voice_room_p2p_direct_voice", state: "idle" },
+            ],
+          }));
+        } else if (m.type === "config/entity_registry/get") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: { entity_id: m.entity_id, device_id: "dev-sat-42" },
+          }));
+        } else if (m.type === "assist_pipeline/pipeline/list") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: {
+              preferred_pipeline: "p-assist",
+              pipelines: [
+                {
+                  id: "p-assist",
+                  name: "Assist LLM",
+                  tts_engine: "tts.piper",
+                  wake_word_entity: "wake_word.openwakeword",
+                  wake_word_id: "hey_jarvis",
+                },
+              ],
+            },
+          }));
+        } else if (m.type === "assist_pipeline/run") {
+          pipelineRequests.push(m);
+          if (mode === "unknown_cmd") {
+            ws.send(JSON.stringify({
+              id: m.id,
+              type: "result",
+              success: false,
+              error: { code: "unknown_command", message: "Unknown command." },
+            }));
+            return;
+          }
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+
+          if (mode === "tts_fail_once" && m.end_stage === "tts") {
+            ws.send(JSON.stringify({
+              id: m.id,
+              type: "event",
+              event: { type: "error", data: { code: "tts-failed", message: "TTS engine offline" } },
+            }));
+            return;
+          }
+          if (mode === "thinking_fail_once" && m.conversation_id) {
+            ws.send(JSON.stringify({
+              id: m.id,
+              type: "event",
+              event: { type: "error", data: { code: "intent-failed", message: "Invalid thinking signature block_binding" } },
+            }));
+            return;
+          }
+
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "event",
+            event: {
+              type: "intent-end",
+              data: {
+                intent_output: {
+                  conversation_id: m.conversation_id || "conv-fresh-1",
+                  response: {
+                    response_type: "action_done",
+                    speech: { plain: { speech: `Handled: ${m.input.text}` } },
+                  },
+                },
+              },
+            },
+          }));
+          if (m.end_stage === "tts") {
+            ws.send(JSON.stringify({
+              id: m.id,
+              type: "event",
+              event: {
+                type: "tts-end",
+                data: {
+                  tts_output:
+                    mode === "mp3"
+                      ? {
+                          media_id: "media-source://tts/google_mp3_1",
+                          url: "/api/tts_proxy/reply.mp3",
+                          mime_type: "audio/mpeg",
+                        }
+                      : {
+                          media_id: "media-source://tts/piper_wav_1",
+                          url: "/api/tts_proxy/reply.wav",
+                          mime_type: "audio/wav",
+                        },
+                },
+              },
+            }));
+          }
+          ws.send(JSON.stringify({ id: m.id, type: "event", event: { type: "run-end", data: {} } }));
+        } else if (m.type === "conversation/process") {
+          ws.send(JSON.stringify({
+            id: m.id,
+            type: "result",
+            success: true,
+            result: {
+              conversation_id: "conv-fallback",
+              response: {
+                response_type: "action_done",
+                speech: { plain: { speech: `Fallback: ${m.text}` } },
+              },
+            },
+          }));
+        } else if (m.type === "call_service") {
+          serviceCalls.push(m);
+          ws.send(JSON.stringify({ id: m.id, type: "result", success: true, result: null }));
+        }
+      });
+    });
+
+    const assistant = new HomeAssistantVoiceAssistant({
+      name: "ha",
+      wyomingHost: "127.0.0.1",
+      wyomingPort: 0,
+      wyomingName: "p2p-direct-voice",
+      uiHost: "127.0.0.1",
+      uiPort: 0,
+      haUrl: `http://127.0.0.1:${haPort}`,
+      haToken: "tok-pipeline",
+    });
+
+    const { ui } = await assistant.start();
+    try {
+      await new Promise((r) => setTimeout(r, 140));
+
+      // Pipeline & satellite entity/device discovered
+      const st = await fetch(`http://127.0.0.1:${ui.port}/api/status`).then((r) => r.json());
+      assert.deepEqual(st.state.pipeline, {
+        id: "p-assist",
+        name: "Assist LLM",
+        ttsEngine: "tts.piper",
+      });
+      assert.equal(assistant.haClient.satelliteEntityId, "assist_satellite.voice_room_p2p_direct_voice");
+      assert.equal(assistant.haClient.satelliteDeviceId, "dev-sat-42");
+
+      const card = assistant.buildChatCard();
+      assert.deepEqual(card.assistantMeta, {
+        pipelineName: "Assist LLM",
+        wakeWordLabel: "Hey Jarvis",
+        commands: ["/ha", "/listen"],
+      });
+
+      // Attach mock room bot capturing PCM playback, chat sends, and card syncs
+      const pushedPcm = [];
+      let audioEndMarked = 0;
+      const rawChatSends = [];
+      let cardSent = 0;
+      let listenTriggers = 0;
+      assistant.wyoming.triggerListenNow = () => {
+        listenTriggers += 1;
+        return true;
+      };
+      assistant.wyoming.isReady = () => true;
+      assistant.bot = {
+        peerId: "bot-self",
+        inVoice: true,
+        getPeers: () => [],
+        stopAudio: () => {},
+        pushPcmBytes: (buf, opts) => pushedPcm.push({ buf, opts }),
+        markAudioStreamEnd: () => { audioEndMarked += 1; },
+        playChime: () => {},
+        sendRaw: (type, payload) => {
+          rawChatSends.push({ type, payload });
+          return { id: `m-${rawChatSends.length}` };
+        },
+        sendBotMessage: () => {
+          cardSent += 1;
+          return { id: `card-${cardSent}` };
+        },
+        updateBotMessage: () => {},
+      };
+      assistant.roomState = "connected";
+
+      // 3. `/ha <message>` triggers assist_pipeline/run -> WAV PCM16 playback + normal chat reply with replyTo
+      mode = "wav";
+      assistant._onRoomMessage({
+        type: "chat",
+        author: "peer-alice",
+        authorName: "Alice",
+        payload: { text: "/ha Turn on the desk lamp" },
+      });
+      await new Promise((r) => setTimeout(r, 120));
+
+      assert.equal(pipelineRequests.length, 1);
+      assert.equal(pipelineRequests[0].start_stage, "intent");
+      assert.equal(pipelineRequests[0].end_stage, "tts");
+      assert.equal(pipelineRequests[0].pipeline, "p-assist");
+      assert.equal(pipelineRequests[0].device_id, "dev-sat-42");
+      assert.deepEqual(pipelineRequests[0].input, { text: "Turn on the desk lamp" });
+      assert.equal(fetchedAuth, "Bearer tok-pipeline");
+      assert.equal(pushedPcm.length, 1);
+      assert.equal(pushedPcm[0].opts.sampleRate, 22050);
+      assert.equal(pushedPcm[0].opts.channels, 1);
+      assert.equal(audioEndMarked, 1);
+      assert.equal(rawChatSends.length, 1);
+      assert.equal(rawChatSends[0].type, "chat");
+      assert.equal(rawChatSends[0].payload.text, "Handled: Turn on the desk lamp");
+      assert.equal(rawChatSends[0].payload.assistant, true);
+      assert.deepEqual(rawChatSends[0].payload.replyTo, {
+        toName: "Alice",
+        botName: "ha",
+        label: "Assist LLM",
+        pipeline: "Assist LLM",
+        spoken: true,
+      });
+
+      // 4. Non-WAV MP3 fallback -> calls assist_satellite.announce(preannounce: false, media_id)
+      mode = "mp3";
+      serviceCalls.length = 0;
+      const mp3Res = await assistant.askText("What time is it?", { speakerName: "Alice" });
+      assert.equal(mp3Res.spoken, true);
+      assert.equal(mp3Res.postedToChat, true);
+      assert.equal(serviceCalls.length, 1);
+      assert.equal(serviceCalls[0].domain, "assist_satellite");
+      assert.equal(serviceCalls[0].service, "announce");
+      assert.deepEqual(serviceCalls[0].target, { entity_id: "assist_satellite.voice_room_p2p_direct_voice" });
+      assert.deepEqual(serviceCalls[0].service_data, {
+        media_id: "media-source://tts/google_mp3_1",
+        preannounce: false,
+      });
+
+      // 5. TTS error resilience: retries once with end_stage="intent" so written reply still succeeds
+      mode = "tts_fail_once";
+      pipelineRequests.length = 0;
+      const ttsRetryRes = await assistant.askText("Check weather", { speakerName: "Alice" });
+      assert.equal(pipelineRequests.length, 2);
+      assert.equal(pipelineRequests[0].end_stage, "tts");
+      assert.equal(pipelineRequests[1].end_stage, "intent");
+      assert.equal(ttsRetryRes.text, "Handled: Check weather");
+      assert.equal(ttsRetryRes.spoken, false);
+      assert.equal(ttsRetryRes.postedToChat, true);
+
+      // 6. Stale Anthropic thinking/signature error resilience: retries once without conversation_id
+      mode = "thinking_fail_once";
+      pipelineRequests.length = 0;
+      assistant.conversationId = "stale-conv-id";
+      const thinkRetryRes = await assistant.askText("Summarize notes", { speakerName: "Alice" });
+      assert.equal(pipelineRequests.length, 2);
+      assert.equal(pipelineRequests[0].conversation_id, "stale-conv-id");
+      assert.equal(pipelineRequests[1].conversation_id, undefined);
+      assert.equal(thinkRetryRes.text, "Handled: Summarize notes");
+
+      // 7. unknown_command fallback -> conversation/process
+      mode = "unknown_cmd";
+      const fbRes = await assistant.askText("Legacy ping", { speakerName: "Alice" });
+      assert.equal(fbRes.text, "Fallback: Legacy ping");
+
+      // 8. `/listen` and `/ha` (no args) slash commands
+      assistant._onRoomMessage({
+        type: "chat",
+        author: "peer-alice",
+        authorName: "Alice",
+        payload: { text: "/listen" },
+      });
+      assert.equal(listenTriggers, 1);
+
+      const cardsBeforeHa = cardSent;
+      assistant._onRoomMessage({
+        type: "chat",
+        author: "peer-alice",
+        authorName: "Alice",
+        payload: { text: "/ha" },
+      });
+      assert.equal(cardSent, cardsBeforeHa + 1);
+
+      assistant.bot = null;
+      assistant.roomState = "disconnected";
+    } finally {
+      await assistant.stop();
+      await new Promise((r) => wss.close(r));
+      await new Promise((r) => httpServer.close(r));
     }
   });
 });
