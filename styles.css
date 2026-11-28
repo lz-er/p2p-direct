@@ -4618,6 +4618,10 @@ input[type="checkbox"]:checked::after {
   background: var(--mint);
 }
 
+.legend-dot.hop-dot {
+  background: var(--cobalt);
+}
+
 .legend-dot.relay-dot {
   background: var(--cyan);
 }
@@ -4755,8 +4759,19 @@ input[type="checkbox"]:checked::after {
   border-left-color: var(--mint);
 }
 
+.peer-item.transport-peer-hop {
+  border-left-color: var(--cobalt);
+}
+
 .peer-item.transport-relay {
   border-left-color: var(--cyan);
+}
+
+.peer-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .peer-item.is-pending {
@@ -4841,6 +4856,12 @@ input[type="checkbox"]:checked::after {
   background: var(--mint);
   border-color: #0e0f12;
   color: #0e0f12;
+}
+
+.badge.peer-hop {
+  background: var(--cobalt);
+  border-color: #0e0f12;
+  color: #ffffff;
 }
 
 .badge.relay {

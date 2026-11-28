@@ -17,6 +17,21 @@ import {
   hasUserOwnedRelay,
   resolveRelayUrls,
 } from "../mqtt_relay.js";
+import {
+  PEER_HOP_DATA_CHUNK_SIZE,
+  canReplaceTransport,
+  computeDirectUpgradeDelayMs,
+  decodePeerHopVoicePacket,
+  decrementPeerHopVoiceTtl,
+  encodeHopCtrl,
+  encodeHopData,
+  encodePeerHopVoicePacket,
+  isPeerHopVoicePacket,
+  isTransportUpgrade,
+  normalizeTransportKind,
+  selectPeerHopMediators,
+  tryParseHopFrame,
+} from "../peer_hop.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1054,7 +1069,7 @@ export class P2PBot extends EventEmitter {
     this.seenRoomSignalIds = new Map();
     this.lastHelloReplyPerPeer = new Map();
 
-    // Zero-TURN E2EE Relay Fallback state
+    // Zero-TURN E2EE Relay Fallback & Zero-Server Peer-Hop state
     this.roomMyTag = null;
     this.roomKnownPeers = new Map();
     this.roomTagToPeerId = new Map();
@@ -1065,6 +1080,11 @@ export class P2PBot extends EventEmitter {
     this.seenVoiceBundleSeq = new Map();
     this.relayDataMsgSeq = 1;
     this.relayVoiceBundleSeq = 1;
+    this.dcChunkSeq = 1;
+    this.peerDirectNeighbors = new Map(); // peerId -> Set<directPeerId>
+    this.peerHopPending = new Map(); // targetPeerId -> { mediatorPeerId, triedMediators, timer, ... }
+    this.peerHopMediated = new Map(); // "a|b" -> { a, b, startedAt }
+    this.directUpgradeState = new Map(); // peerId -> { connectedAt, lastAttemptAt, attempts }
 
     // Tracking diffs for clean events
     this.knownMessages = new Map(); // msgId -> { msg, rev }
@@ -1193,12 +1213,18 @@ export class P2PBot extends EventEmitter {
       clearInterval(this.keepaliveTimer);
       this.keepaliveTimer = null;
     }
-    if (this.roomRendezvous) {
-      for (const [pid, peer] of this.directPeers.entries()) {
-        if (peer.transport === "relay") {
-          this._sendRoomSignal({ t: "relay-close", from: this.peerId, to: pid });
-        }
+    for (const [pid, peer] of this.directPeers.entries()) {
+      if (peer.transport === "relay" && this.roomRendezvous) {
+        this._sendRoomSignal({ t: "relay-close", from: this.peerId, to: pid });
+      } else if (peer.transport === "peer-hop" && peer.hopViaPeerId) {
+        this._sendHopCtrlToDirectPeer(peer.hopViaPeerId, {
+          op: "close",
+          from: this.peerId,
+          to: pid,
+        });
       }
+    }
+    if (this.roomRendezvous) {
       this.roomRendezvous.stop();
       this.roomRendezvous = null;
     }
@@ -1206,10 +1232,18 @@ export class P2PBot extends EventEmitter {
       if (pending.retryTimer) clearTimeout(pending.retryTimer);
     }
     this.relayPendingOpens.clear();
+    for (const pending of this.peerHopPending.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+    }
+    this.peerHopPending.clear();
+    this.peerHopMediated.clear();
+    this.peerDirectNeighbors.clear();
+    this.directUpgradeState.clear();
     for (const [, entry] of this.directPeers) {
       entry.superseded = true;
       try {
         entry.voiceDc?.close();
+        entry.bulkDc?.close();
         entry.dc?.close(true);
         entry.pc?.close();
       } catch {
@@ -1218,6 +1252,7 @@ export class P2PBot extends EventEmitter {
     }
     this.directPeers.clear();
     this.voiceChannels.clear();
+    this.bulkChannels.clear();
     this.peerVoiceCaps.clear();
     for (const [, entry] of this.roomDialing) {
       if (entry.fallbackTimer) clearTimeout(entry.fallbackTimer);
@@ -1761,7 +1796,18 @@ export class P2PBot extends EventEmitter {
   }
 
   _sendRoomSignal(msgObj) {
-    if (!this.activeRoom || !this.roomRendezvous || !this.wasm) return;
+    if (!this.wasm || !this.status) return;
+    const hasBroker = Boolean(
+      this.activeRoom &&
+        this.roomRendezvous &&
+        (this.roomRendezvous.getStatus?.().connectedCount || 0) > 0
+    );
+    const hopPeer = msgObj?.to ? this.directPeers.get(msgObj.to) : null;
+    const hopMed =
+      hopPeer && hopPeer.transport === "peer-hop" && !hopPeer.superseded && hopPeer.hopViaPeerId
+        ? hopPeer.hopViaPeerId
+        : null;
+    if (!hasBroker && !hopMed) return;
     try {
       const enriched = msgObj.sid ? msgObj : { ...msgObj, sid: randomId("rs") };
       const sealedRes = this.wasm.call({
@@ -1769,9 +1815,614 @@ export class P2PBot extends EventEmitter {
         payload: JSON.stringify(enriched),
         entropy: randomBase64Url(16),
       });
-      this.roomRendezvous.publish(sealedRes.sealed);
+      if (hasBroker) {
+        this.roomRendezvous.publish(sealedRes.sealed);
+      } else if (hopMed) {
+        this._sendHopCtrlToDirectPeer(hopMed, {
+          op: "sig",
+          from: this.status.peerId,
+          to: msgObj.to,
+          sealed: sealedRes.sealed,
+        });
+      }
     } catch {
       // ignore during teardown
+    }
+  }
+
+  /* ================= Zero-Server Intra-Room E2EE Peer-Hopping ================= */
+
+  _getOpenDirectPeerIds() {
+    const ids = [];
+    for (const [pid, entry] of this.directPeers.entries()) {
+      if (entry && !entry.superseded && entry.transport === "direct" && entry.dc?.readyState === "open") {
+        ids.push(pid);
+      }
+    }
+    return ids;
+  }
+
+  _sendHopCtrlToDirectPeer(directPeerId, ctrlFields) {
+    const entry = this.directPeers.get(directPeerId);
+    if (!entry || entry.superseded || entry.transport !== "direct" || entry.dc?.readyState !== "open") {
+      return false;
+    }
+    try {
+      entry.dc.send(encodeHopCtrl(ctrlFields));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _broadcastDirectNeighborsToDirectPeers() {
+    if (!this.status) return;
+    const peers = this._getOpenDirectPeerIds();
+    const payload = encodeHopCtrl({ op: "neighbors", peers });
+    for (const pid of peers) {
+      const entry = this.directPeers.get(pid);
+      if (entry && entry.dc?.readyState === "open") {
+        try {
+          entry.dc.send(payload);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  _pickPeerHopMediators(targetPeerId, excludeMediators = null) {
+    if (!this.status) return [];
+    const botPeerIds = new Set();
+    for (const p of this.status?.peers || []) {
+      if (p?.isBot && p.peerId) botPeerIds.add(p.peerId);
+    }
+    return selectPeerHopMediators({
+      selfPeerId: this.status.peerId,
+      targetPeerId,
+      directPeers: this.directPeers,
+      peerNeighbors: this.peerDirectNeighbors,
+      indirectPeers: this.status.indirectPeers || [],
+      botPeerIds,
+      excludeMediators,
+    });
+  }
+
+  _clearPeerHopPending(targetPeerId) {
+    const p = this.peerHopPending.get(targetPeerId);
+    if (p) {
+      if (p.timer) clearTimeout(p.timer);
+      this.peerHopPending.delete(targetPeerId);
+    }
+  }
+
+  _tryPeerHopFallback(targetPeerId, targetName, targetPubKey, excludeMediators = null) {
+    if (!this.status || !targetPeerId || targetPeerId === this.status.peerId) return false;
+    const existing = this.directPeers.get(targetPeerId);
+    if (existing && existing.dc?.readyState === "open" && !canReplaceTransport(existing.transport, "peer-hop")) {
+      return false;
+    }
+    if (existing && existing.transport === "peer-hop" && existing.dc?.readyState === "open") {
+      return true;
+    }
+
+    const tried = excludeMediators ? new Set(excludeMediators) : new Set();
+    const prevPending = this.peerHopPending.get(targetPeerId);
+    if (prevPending) {
+      if (prevPending.timer) clearTimeout(prevPending.timer);
+      for (const m of prevPending.triedMediators) tried.add(m);
+    }
+
+    const mediators = this._pickPeerHopMediators(targetPeerId, tried);
+    if (mediators.length === 0) {
+      this.peerHopPending.delete(targetPeerId);
+      return false;
+    }
+
+    const mediatorPeerId = mediators[0];
+    tried.add(mediatorPeerId);
+    const sent = this._sendHopCtrlToDirectPeer(mediatorPeerId, {
+      op: "open",
+      from: this.status.peerId,
+      to: targetPeerId,
+      name: this.status.authorName,
+      pk: this.status.e2ee.publicKey,
+      vcodec: "adpcm16",
+      v2pcm: true,
+    });
+    if (!sent) {
+      return this._tryPeerHopFallback(targetPeerId, targetName, targetPubKey, tried);
+    }
+
+    const pending = {
+      mediatorPeerId,
+      triedMediators: tried,
+      targetName: targetName || "Peer",
+      targetPubKey: targetPubKey || "",
+      timer: setTimeout(() => {
+        if (this.peerHopPending.get(targetPeerId) !== pending) return;
+        this.peerHopPending.delete(targetPeerId);
+        const cur = this.directPeers.get(targetPeerId);
+        if (cur && cur.dc?.readyState === "open") return;
+        const retried = this._tryPeerHopFallback(
+          targetPeerId,
+          pending.targetName,
+          pending.targetPubKey,
+          pending.triedMediators
+        );
+        if (!retried) {
+          this._finishFallbackAfterPeerHopExhausted(
+            targetPeerId,
+            pending.targetName,
+            pending.targetPubKey
+          );
+        }
+      }, 2600),
+    };
+    this.peerHopPending.set(targetPeerId, pending);
+    return true;
+  }
+
+  _handleMediatorDisconnected(deadPeerId) {
+    if (!deadPeerId) return;
+    // Remove `deadPeerId` as a mediator candidate for us, but preserve OTHER peers'
+    // advertised neighbor sets (they may still have a live direct link to `deadPeerId`!).
+    this.peerDirectNeighbors.delete(deadPeerId);
+    for (const [pairKey, pair] of Array.from(this.peerHopMediated.entries())) {
+      if (pair.a === deadPeerId || pair.b === deadPeerId) {
+        const other = pair.a === deadPeerId ? pair.b : pair.a;
+        this.peerHopMediated.delete(pairKey);
+        this._sendHopCtrlToDirectPeer(other, {
+          op: "close",
+          from: deadPeerId,
+          to: other,
+        });
+      }
+    }
+    for (const [pid, peer] of Array.from(this.directPeers.entries())) {
+      if (peer.transport === "peer-hop" && peer.hopViaPeerId === deadPeerId && !peer.superseded) {
+        const savedName = peer.authorName;
+        const savedPk = peer.peerPubKey || this.roomKnownPeers.get(pid)?.pk || "";
+        try {
+          peer.dc.close(true);
+        } catch {
+          // ignore
+        }
+        if (savedPk) {
+          setTimeout(() => {
+            const cur = this.directPeers.get(pid);
+            if (cur && cur.dc?.readyState === "open") return;
+            const hasSignaling = Boolean(
+              this.activeRoom &&
+                this.roomRendezvous &&
+                (this.roomRendezvous.getStatus?.().connectedCount || 0) > 0
+            );
+            if (hasSignaling) {
+              if (!this.roomDialing.has(pid)) {
+                this._startRoomOffer(pid, savedName, savedPk, false);
+              }
+            } else {
+              this._tryPeerHopFallback(pid, savedName, savedPk, new Set([deadPeerId]));
+            }
+          }, 250);
+        }
+      }
+    }
+  }
+
+  _handleIncomingHopFrame(fromDirectEntry, hop) {
+    if (!this.status || !fromDirectEntry || fromDirectEntry.transport !== "direct") return;
+    const selfId = this.status.peerId;
+    const fromDirectId = fromDirectEntry.peerId;
+
+    if (hop.kind === "hop_ctrl") {
+      const op = String(hop.op || "");
+      if (op === "neighbors") {
+        const list = Array.isArray(hop.peers) ? hop.peers.filter((p) => typeof p === "string" && p) : [];
+        this.peerDirectNeighbors.set(fromDirectId, new Set(list));
+        return;
+      }
+
+      const srcId = String(hop.from || "");
+      const dstId = String(hop.to || "");
+      if (!srcId || !dstId) return;
+
+      if (op === "open") {
+        if (dstId === selfId) {
+          if (!hop.pk || srcId === selfId) return;
+          const neighbors = this.peerDirectNeighbors.get(fromDirectId) || new Set();
+          neighbors.add(srcId);
+          this.peerDirectNeighbors.set(fromDirectId, neighbors);
+          this._recordPeerVoiceCapsFromSignal({
+            from: srcId,
+            vcodec: hop.vcodec,
+            v2pcm: hop.v2pcm,
+          });
+          const existing = this.directPeers.get(srcId);
+          if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
+            this._sendHopCtrlToDirectPeer(fromDirectId, {
+              op: "reject",
+              from: selfId,
+              to: srcId,
+              reason: "already-direct",
+            });
+            return;
+          }
+          this._openPeerHopVirtualPeer(srcId, hop.name || "Peer", hop.pk, fromDirectId);
+          this._sendHopCtrlToDirectPeer(fromDirectId, {
+            op: "ack",
+            from: selfId,
+            to: srcId,
+            name: this.status.authorName,
+            pk: this.status.e2ee.publicKey,
+            vcodec: "adpcm16",
+            v2pcm: true,
+          });
+          return;
+        }
+        // Mediator role: anti-spoof + direct-only forwarding
+        if (srcId !== fromDirectId || dstId === fromDirectId) return;
+        const dstEntry = this.directPeers.get(dstId);
+        if (!dstEntry || dstEntry.superseded || dstEntry.transport !== "direct" || dstEntry.dc?.readyState !== "open") {
+          this._sendHopCtrlToDirectPeer(fromDirectId, {
+            op: "reject",
+            from: dstId,
+            to: srcId,
+            reason: "no-direct-link",
+          });
+          return;
+        }
+        const pairKey = srcId < dstId ? `${srcId}|${dstId}` : `${dstId}|${srcId}`;
+        this.peerHopMediated.set(pairKey, { a: srcId, b: dstId, startedAt: Date.now() });
+        this._sendHopCtrlToDirectPeer(dstId, {
+          op: "open",
+          from: srcId,
+          to: dstId,
+          via: selfId,
+          name: hop.name || fromDirectEntry.authorName || "Peer",
+          pk: hop.pk || fromDirectEntry.peerPubKey || "",
+          vcodec: hop.vcodec || "opus48",
+          v2pcm: hop.v2pcm !== false,
+        });
+        return;
+      }
+
+      if (op === "ack") {
+        if (dstId === selfId) {
+          this._clearPeerHopPending(srcId);
+          if (!hop.pk || srcId === selfId) return;
+          this._recordPeerVoiceCapsFromSignal({
+            from: srcId,
+            vcodec: hop.vcodec,
+            v2pcm: hop.v2pcm,
+          });
+          const existing = this.directPeers.get(srcId);
+          if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") return;
+          this._openPeerHopVirtualPeer(srcId, hop.name || "Peer", hop.pk, fromDirectId);
+          return;
+        }
+        if (srcId !== fromDirectId) return;
+        this._sendHopCtrlToDirectPeer(dstId, {
+          op: "ack",
+          from: srcId,
+          to: dstId,
+          via: selfId,
+          name: hop.name || fromDirectEntry.authorName || "Peer",
+          pk: hop.pk || fromDirectEntry.peerPubKey || "",
+          vcodec: hop.vcodec || "opus48",
+          v2pcm: hop.v2pcm !== false,
+        });
+        return;
+      }
+
+      if (op === "reject") {
+        if (dstId === selfId) {
+          const pending = this.peerHopPending.get(srcId);
+          if (!pending) return;
+          this._clearPeerHopPending(srcId);
+          if (hop.reason === "already-direct") return;
+          const retried = this._tryPeerHopFallback(
+            srcId,
+            pending.targetName,
+            pending.targetPubKey,
+            pending.triedMediators
+          );
+          if (!retried) {
+            this._finishFallbackAfterPeerHopExhausted(
+              srcId,
+              pending.targetName,
+              pending.targetPubKey
+            );
+          }
+          return;
+        }
+        if (srcId !== fromDirectId) return;
+        this._sendHopCtrlToDirectPeer(dstId, {
+          op: "reject",
+          from: srcId,
+          to: dstId,
+          via: selfId,
+          reason: hop.reason || "rejected",
+        });
+        return;
+      }
+
+      if (op === "close") {
+        if (dstId === selfId) {
+          const existing = this.directPeers.get(srcId);
+          if (existing && existing.transport === "peer-hop" && existing.hopViaPeerId === fromDirectId) {
+            try {
+              existing.dc.close(true);
+            } catch {
+              // ignore
+            }
+          }
+          return;
+        }
+        if (srcId !== fromDirectId) return;
+        const pairKey = srcId < dstId ? `${srcId}|${dstId}` : `${dstId}|${srcId}`;
+        this.peerHopMediated.delete(pairKey);
+        this._sendHopCtrlToDirectPeer(dstId, { op: "close", from: srcId, to: dstId, via: selfId });
+        return;
+      }
+
+      if (op === "sig" && typeof hop.sealed === "string" && hop.sealed) {
+        if (dstId === selfId) {
+          this._handleSealedRoomSignal(hop.sealed, /* allowViaPeerHop = */ true).catch((err) =>
+            this.emit("error", err)
+          );
+          return;
+        }
+        if (srcId !== fromDirectId || dstId === fromDirectId) return;
+        this._sendHopCtrlToDirectPeer(dstId, {
+          op: "sig",
+          from: srcId,
+          to: dstId,
+          via: selfId,
+          sealed: hop.sealed,
+        });
+        return;
+      }
+      return;
+    }
+
+    if (hop.kind === "hop_data") {
+      const srcId = String(hop.from || "");
+      const dstId = String(hop.to || "");
+      if (!srcId || !dstId || typeof hop.d !== "string") return;
+
+      if (dstId === selfId) {
+        const vPeer = this.directPeers.get(srcId);
+        if (!vPeer || vPeer.superseded || vPeer.transport !== "peer-hop") return;
+        vPeer.lastActivityMs = Date.now();
+        if (hop.ch === "bulk" && vPeer.bulkDc && typeof vPeer.bulkDc.onmessage === "function") {
+          vPeer.bulkDc.onmessage({ data: hop.d });
+        } else if (vPeer.dc && typeof vPeer.dc.onmessage === "function") {
+          vPeer.dc.onmessage({ data: hop.d });
+        }
+        return;
+      }
+
+      // Mediator forwarding: anti-spoof + direct-only
+      if (srcId !== fromDirectId || dstId === fromDirectId) return;
+      const dstEntry = this.directPeers.get(dstId);
+      if (!dstEntry || dstEntry.superseded || dstEntry.transport !== "direct" || dstEntry.dc?.readyState !== "open") {
+        return;
+      }
+      const fwdStr = encodeHopData({ ch: hop.ch === "bulk" ? "bulk" : "data", from: srcId, to: dstId, d: hop.d });
+      const targetDc =
+        hop.ch === "bulk" && dstEntry.bulkDc && dstEntry.bulkDc.readyState === "open"
+          ? dstEntry.bulkDc
+          : dstEntry.dc;
+      if ((targetDc.bufferedAmount || 0) < 262144) {
+        try {
+          targetDc.send(fwdStr);
+        } catch {
+          // ignore transient congestion
+        }
+      }
+    }
+  }
+
+  _openPeerHopVirtualPeer(peerId, peerName, peerPubKey, mediatorPeerId) {
+    if (!this.status || !peerId || !peerPubKey || !mediatorPeerId) return;
+    const med = this.directPeers.get(mediatorPeerId);
+    if (!med || med.superseded || med.transport !== "direct" || med.dc?.readyState !== "open") return;
+
+    const existing = this.directPeers.get(peerId);
+    if (existing && existing.dc?.readyState === "open") {
+      if (!canReplaceTransport(existing.transport, "peer-hop")) return;
+      if (existing.transport === "peer-hop" && existing.hopViaPeerId === mediatorPeerId) return;
+    }
+
+    const bot = this;
+    const selfId = this.status.peerId;
+    const virtualPc = {
+      connectionState: "connected",
+      iceConnectionState: "connected",
+      onconnectionstatechange: null,
+      close() {
+        this.connectionState = "closed";
+        this.iceConnectionState = "closed";
+      },
+    };
+
+    const sendViaMediator = (chKind, frameStr) => {
+      const liveMed = bot.directPeers.get(mediatorPeerId);
+      if (!liveMed || liveMed.superseded || liveMed.transport !== "direct" || liveMed.dc?.readyState !== "open") {
+        return false;
+      }
+      const outDc =
+        chKind === "bulk" && liveMed.bulkDc && liveMed.bulkDc.readyState === "open"
+          ? liveMed.bulkDc
+          : liveMed.dc;
+      const sendEnvelope = (innerStr) => {
+        outDc.send(encodeHopData({ ch: chKind, from: selfId, to: peerId, d: innerStr }));
+      };
+      if (frameStr.length <= PEER_HOP_DATA_CHUNK_SIZE) {
+        sendEnvelope(frameStr);
+        return true;
+      }
+      const chunkId = (bot.dcChunkSeq = (bot.dcChunkSeq + 1) >>> 0) || 1;
+      const total = Math.ceil(frameStr.length / PEER_HOP_DATA_CHUNK_SIZE);
+      for (let i = 0; i < total; i++) {
+        const piece = frameStr.slice(i * PEER_HOP_DATA_CHUNK_SIZE, (i + 1) * PEER_HOP_DATA_CHUNK_SIZE);
+        sendEnvelope(JSON.stringify({ kind: "dc_chunk", id: chunkId, i, n: total, d: piece }));
+      }
+      return true;
+    };
+
+    const virtualDc = {
+      label: "p2p-mesh",
+      transport: "peer-hop",
+      hopViaPeerId: mediatorPeerId,
+      readyState: "open",
+      bufferedAmount: 0,
+      onmessage: null,
+      onopen: null,
+      onclose: null,
+      onerror: null,
+      send(frameStr) {
+        if (this.readyState !== "open" || typeof frameStr !== "string") return;
+        if (!sendViaMediator("data", frameStr)) {
+          this.close(true);
+        }
+      },
+      close(silentRemote = false) {
+        if (this.readyState === "closed") return;
+        this.readyState = "closed";
+        const entry = bot.directPeers.get(peerId);
+        const superseded = Boolean(entry && entry.dc === this && entry.superseded);
+        if (!silentRemote && !superseded) {
+          bot._sendHopCtrlToDirectPeer(mediatorPeerId, {
+            op: "close",
+            from: selfId,
+            to: peerId,
+          });
+        }
+        if (typeof this.onclose === "function") {
+          const cb = this.onclose;
+          this.onclose = null;
+          cb();
+        }
+      },
+    };
+
+    const virtualBulkDc = {
+      label: "p2p-bulk",
+      transport: "peer-hop",
+      hopViaPeerId: mediatorPeerId,
+      readyState: "open",
+      bufferedAmount: 0,
+      onmessage: null,
+      onopen: null,
+      onclose: null,
+      onerror: null,
+      send(frameStr) {
+        if (this.readyState !== "open" || typeof frameStr !== "string") return;
+        sendViaMediator("bulk", frameStr);
+      },
+      close() {
+        if (this.readyState === "closed") return;
+        this.readyState = "closed";
+        if (typeof this.onclose === "function") {
+          const cb = this.onclose;
+          this.onclose = null;
+          cb();
+        }
+      },
+    };
+
+    const virtualVoiceDc = {
+      label: "p2p-voice",
+      transport: "peer-hop",
+      hopViaPeerId: mediatorPeerId,
+      readyState: "open",
+      bufferedAmount: 0,
+      onmessage: null,
+      onopen: null,
+      onclose: null,
+      onerror: null,
+      send(packetBytes) {
+        if (this.readyState !== "open" || !packetBytes) return;
+        const medVdc = bot.voiceChannels.get(mediatorPeerId);
+        if (!medVdc || medVdc.readyState !== "open" || (medVdc.bufferedAmount || 0) >= 32768) return;
+        const env = encodePeerHopVoicePacket({
+          srcPeerId: selfId,
+          dstPeerId: peerId,
+          payload: packetBytes,
+          ttl: 1,
+        });
+        if (env) {
+          try {
+            medVdc.send(Buffer.from(env.buffer, env.byteOffset, env.byteLength));
+          } catch {
+            // drop voice frame cleanly under congestion
+          }
+        }
+      },
+      close() {
+        if (this.readyState === "closed") return;
+        this.readyState = "closed";
+        if (typeof this.onclose === "function") {
+          const cb = this.onclose;
+          this.onclose = null;
+          cb();
+        }
+      },
+    };
+
+    this._attachVoiceDataChannel(peerId, virtualVoiceDc);
+    this._attachBulkDataChannel(peerId, virtualBulkDc);
+    this._attachDataChannel(
+      virtualPc,
+      virtualDc,
+      peerId,
+      peerName || this.roomKnownPeers.get(peerId)?.name || "Peer",
+      peerPubKey,
+      false,
+      mediatorPeerId
+    );
+    this.directUpgradeState.set(peerId, { connectedAt: Date.now(), lastAttemptAt: 0, attempts: 0 });
+  }
+
+  _tryBackgroundDirectUpgrades(now) {
+    if (!this.status) return;
+    const hasSignaling = Boolean(
+      this.activeRoom &&
+        this.roomRendezvous &&
+        (this.roomRendezvous.getStatus?.().connectedCount || 0) > 0
+    );
+    for (const [pid, peer] of this.directPeers.entries()) {
+      if (peer.transport === "direct" || peer.superseded) continue;
+      if (this.roomDialing.has(pid)) continue;
+      if (this.status.peerId > pid) continue;
+
+      const state = this.directUpgradeState.get(pid) || {
+        connectedAt: 0,
+        lastAttemptAt: 0,
+        attempts: 0,
+      };
+      const intervalMs = computeDirectUpgradeDelayMs(state.attempts, peer.transport);
+      const lastMarker = Math.max(state.connectedAt || 0, state.lastAttemptAt || 0);
+      if (now - lastMarker < intervalMs) continue;
+
+      const known = this.roomKnownPeers.get(pid);
+      const pk = known?.pk || peer.peerPubKey;
+      if (!pk) continue;
+
+      const hasPeerHopSig =
+        peer.transport === "peer-hop" &&
+        Boolean(peer.hopViaPeerId) &&
+        this.directPeers.get(peer.hopViaPeerId)?.transport === "direct" &&
+        this.directPeers.get(peer.hopViaPeerId)?.dc?.readyState === "open";
+
+      if (hasSignaling || hasPeerHopSig) {
+        state.lastAttemptAt = now;
+        state.attempts += 1;
+        this.directUpgradeState.set(pid, state);
+        this._startRoomOffer(pid, peer.authorName || known?.name || "Peer", pk, true);
+      }
     }
   }
 
@@ -1825,14 +2476,15 @@ export class P2PBot extends EventEmitter {
       name: this.status.authorName,
       pk: this.status.e2ee.publicKey,
       peers: Array.from(this.directPeers.keys()),
+      directPeers: this._getOpenDirectPeerIds(),
       relays: status.connectedUrls || [],
       reply: Boolean(requestReply),
       ts: Date.now(),
     });
   }
 
-  async _handleSealedRoomSignal(sealedPayload) {
-    if (!this.activeRoom || !this.wasm || !this.status) return;
+  async _handleSealedRoomSignal(sealedPayload, allowViaPeerHop = false) {
+    if ((!this.activeRoom && !allowViaPeerHop) || !this.wasm || !this.status) return;
     let msg;
     try {
       const opened = this.wasm.call({
@@ -1861,6 +2513,12 @@ export class P2PBot extends EventEmitter {
         this._recordPeerVoiceCapsFromSignal(msg);
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
+        if (Array.isArray(msg.directPeers)) {
+          this.peerDirectNeighbors.set(
+            msg.from,
+            new Set(msg.directPeers.filter((p) => typeof p === "string" && p))
+          );
+        }
         const existing = this.directPeers.get(msg.from);
         const remoteConnectedToUs =
           Array.isArray(msg.peers) && msg.peers.includes(this.status.peerId);
@@ -1883,7 +2541,7 @@ export class P2PBot extends EventEmitter {
           !this.relayPeers.has(msg.from)
         ) {
           if (this.status.peerId < msg.from) {
-            await this._startRoomOffer(msg.from, msg.name || "Peer", msg.pk);
+            await this._startRoomOffer(msg.from, msg.name || "Peer", msg.pk, false);
           }
         }
         break;
@@ -1920,10 +2578,13 @@ export class P2PBot extends EventEmitter {
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
         const existing = this.directPeers.get(msg.from);
-        if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
+        if (existing && existing.dc?.readyState === "open" && !canReplaceTransport(existing.transport, "relay")) {
           return;
         }
         if (!this.roomUsesCustomRelay) {
+          if (this._tryPeerHopFallback(msg.from, msg.name || "Peer", msg.pk)) {
+            return;
+          }
           this._sendRoomSignal({
             t: "relay-unavailable",
             from: this.status.peerId,
@@ -1965,7 +2626,7 @@ export class P2PBot extends EventEmitter {
           return;
         }
         const existing = this.directPeers.get(msg.from);
-        if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
+        if (existing && existing.dc?.readyState === "open" && !canReplaceTransport(existing.transport, "relay")) {
           return;
         }
         await this._openRelayVirtualPeer(msg.from, msg.name || "Peer", msg.pk);
@@ -1977,6 +2638,11 @@ export class P2PBot extends EventEmitter {
         if (pending) {
           if (pending.retryTimer) clearTimeout(pending.retryTimer);
           this.relayPendingOpens.delete(msg.from);
+        }
+        const known = this.roomKnownPeers.get(msg.from);
+        const pk = known?.pk || "";
+        if (pk && this._tryPeerHopFallback(msg.from, msg.name || known?.name || "Peer", pk)) {
+          break;
         }
         this.emit("relayNeeded", {
           peerId: msg.from,
@@ -2002,10 +2668,34 @@ export class P2PBot extends EventEmitter {
   }
 
   async _requestRelayFallback(targetPeerId, targetName, targetPubKey) {
-    if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
+    if (!this.status) return;
     const existing = this.directPeers.get(targetPeerId);
     if (existing && existing.dc && existing.dc.readyState === "open") return;
-    if (!this.roomUsesCustomRelay) {
+
+    if (this.activeRoom) {
+      await this._ensureRoomMyTag();
+    }
+    const known = this.activeRoom
+      ? await this._registerKnownRoomPeer(targetPeerId, targetName, targetPubKey)
+      : this.roomKnownPeers.get(targetPeerId);
+    const name = targetName || known?.name || "Peer";
+    const pk = targetPubKey || known?.pk || "";
+    if (!pk) return;
+
+    // Priority 2 (after Direct P2P): zero-server Peer-Hop through a mutually direct room peer
+    if (this._tryPeerHopFallback(targetPeerId, name, pk)) {
+      return;
+    }
+
+    // Priority 3: user-configured BYOR relay (zero 3rd-party relays) or emit relayNeeded
+    this._finishFallbackAfterPeerHopExhausted(targetPeerId, name, pk);
+  }
+
+  _finishFallbackAfterPeerHopExhausted(targetPeerId, targetName, targetPubKey) {
+    if (!this.status) return;
+    const existing = this.directPeers.get(targetPeerId);
+    if (existing && existing.dc && existing.dc.readyState === "open") return;
+    if (!this.activeRoom || !this.roomRendezvous || !this.roomUsesCustomRelay) {
       this.emit("relayNeeded", {
         peerId: targetPeerId,
         name: targetName || "Peer",
@@ -2014,11 +2704,6 @@ export class P2PBot extends EventEmitter {
       return;
     }
     if (this.relayPendingOpens.has(targetPeerId)) return;
-
-    await this._ensureRoomMyTag();
-    const known = await this._registerKnownRoomPeer(targetPeerId, targetName, targetPubKey);
-    const pk = targetPubKey || known?.pk || "";
-    if (!pk) return;
 
     const sendOpen = () => {
       const cur = this.directPeers.get(targetPeerId);
@@ -2354,7 +3039,7 @@ export class P2PBot extends EventEmitter {
     }
   }
 
-  async _startRoomOffer(targetPeerId, targetName, targetPubKey) {
+  async _startRoomOffer(targetPeerId, targetName, targetPubKey, isUpgradeProbe = false) {
     if (this.roomDialing.has(targetPeerId)) return;
     let entry = null;
     try {
@@ -2372,6 +3057,7 @@ export class P2PBot extends EventEmitter {
         bulkDc,
         targetName,
         targetPubKey,
+        isUpgradeProbe: Boolean(isUpgradeProbe),
         remoteDescSet: false,
         sdpSent: false,
         localIceQueue: [],
@@ -2423,12 +3109,14 @@ export class P2PBot extends EventEmitter {
         sendIce(entry.localIceQueue.shift());
       }
 
-      entry.fallbackTimer = setTimeout(() => {
-        if (this.roomDialing.get(targetPeerId) !== entry) return;
-        const cur = this.directPeers.get(targetPeerId);
-        if (cur && cur.transport === "direct" && cur.dc?.readyState === "open") return;
-        this._requestRelayFallback(targetPeerId, targetName, targetPubKey);
-      }, DIRECT_FALLBACK_TIMEOUT_MS);
+      if (!entry.isUpgradeProbe) {
+        entry.fallbackTimer = setTimeout(() => {
+          if (this.roomDialing.get(targetPeerId) !== entry) return;
+          const cur = this.directPeers.get(targetPeerId);
+          if (cur && cur.transport === "direct" && cur.dc?.readyState === "open") return;
+          this._requestRelayFallback(targetPeerId, targetName, targetPubKey);
+        }, DIRECT_FALLBACK_TIMEOUT_MS);
+      }
 
       entry.hardTimer = setTimeout(() => {
         if (this.roomDialing.get(targetPeerId) !== entry) return;
@@ -2440,7 +3128,9 @@ export class P2PBot extends EventEmitter {
       } else {
         this.roomDialing.delete(targetPeerId);
       }
-      this._requestRelayFallback(targetPeerId, targetName, targetPubKey);
+      if (!isUpgradeProbe) {
+        this._requestRelayFallback(targetPeerId, targetName, targetPubKey);
+      }
     }
   }
 
@@ -2450,6 +3140,10 @@ export class P2PBot extends EventEmitter {
     if (prev) {
       this._cleanupRoomDialingEntry(msg.from, prev);
     }
+    const curPeer = this.directPeers.get(msg.from);
+    const existingLowerTransport = Boolean(
+      curPeer && curPeer.transport !== "direct" && curPeer.dc?.readyState === "open"
+    );
     let entry = null;
     try {
       const pc = new RTCPeerConnection({ iceServers: this.iceServers });
@@ -2461,6 +3155,7 @@ export class P2PBot extends EventEmitter {
         dc: null,
         targetName: msg.name || "Peer",
         targetPubKey: msg.pk,
+        isUpgradeProbe: existingLowerTransport,
         remoteDescSet: false,
         sdpSent: false,
         localIceQueue: [],
@@ -2475,7 +3170,9 @@ export class P2PBot extends EventEmitter {
         if (this.roomDialing.get(msg.from) !== entry) return;
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           this._cleanupRoomDialingEntry(msg.from, entry);
-          this._requestRelayFallback(msg.from, msg.name || "Peer", msg.pk);
+          if (!entry.isUpgradeProbe) {
+            this._requestRelayFallback(msg.from, msg.name || "Peer", msg.pk);
+          }
         }
       };
 
@@ -2542,12 +3239,14 @@ export class P2PBot extends EventEmitter {
         sendIce(entry.localIceQueue.shift());
       }
 
-      entry.fallbackTimer = setTimeout(() => {
-        if (this.roomDialing.get(msg.from) !== entry) return;
-        const cur = this.directPeers.get(msg.from);
-        if (cur && cur.dc?.readyState === "open") return;
-        this._requestRelayFallback(msg.from, msg.name || "Peer", msg.pk);
-      }, ANSWER_FALLBACK_TIMEOUT_MS);
+      if (!entry.isUpgradeProbe) {
+        entry.fallbackTimer = setTimeout(() => {
+          if (this.roomDialing.get(msg.from) !== entry) return;
+          const cur = this.directPeers.get(msg.from);
+          if (cur && cur.dc?.readyState === "open") return;
+          this._requestRelayFallback(msg.from, msg.name || "Peer", msg.pk);
+        }, ANSWER_FALLBACK_TIMEOUT_MS);
+      }
 
       entry.hardTimer = setTimeout(() => {
         if (this.roomDialing.get(msg.from) !== entry) return;
@@ -2559,7 +3258,9 @@ export class P2PBot extends EventEmitter {
       } else {
         this.roomDialing.delete(msg.from);
       }
-      this._requestRelayFallback(msg.from, msg.name || "Peer", msg.pk);
+      if (!existingLowerTransport) {
+        this._requestRelayFallback(msg.from, msg.name || "Peer", msg.pk);
+      }
     }
   }
 
@@ -2605,7 +3306,13 @@ export class P2PBot extends EventEmitter {
   /* ================= Auto-Mesh Relayed Signaling ================= */
 
   async _startRelayedOffer(targetPeerId, targetName, targetPubKey, viaPeerId) {
-    if (this.directPeers.has(targetPeerId) || this.relayPeers.has(targetPeerId)) return;
+    const existingPeer = this.directPeers.get(targetPeerId);
+    if (
+      (existingPeer && existingPeer.transport === "direct" && existingPeer.dc?.readyState === "open") ||
+      this.relayPeers.has(targetPeerId)
+    ) {
+      return;
+    }
     try {
       const pc = new RTCPeerConnection({ iceServers: this.iceServers });
       const dc = pc.createDataChannel("p2p-mesh", { ordered: true });
@@ -2677,7 +3384,10 @@ export class P2PBot extends EventEmitter {
   }
 
   async _acceptRelayedOffer(fromPeerId, fromName, fromPubKey, viaPeerId, sdp) {
-    if (this.directPeers.has(fromPeerId)) return;
+    const existingPeer = this.directPeers.get(fromPeerId);
+    if (existingPeer && existingPeer.transport === "direct" && existingPeer.dc?.readyState === "open") {
+      return;
+    }
     try {
       const pc = new RTCPeerConnection({ iceServers: this.iceServers });
       const early = this.earlyRelayIce.get(fromPeerId) || [];
@@ -2789,6 +3499,7 @@ export class P2PBot extends EventEmitter {
 
   _attachVoiceDataChannel(peerId, voiceDc) {
     if (!voiceDc) return;
+    const incomingTransport = normalizeTransportKind(voiceDc.transport);
     const prev = this.voiceChannels.get(peerId);
     if (prev && prev !== voiceDc && prev.readyState === "open" && voiceDc.readyState !== "open") {
       voiceDc.onopen = () => {
@@ -2799,7 +3510,8 @@ export class P2PBot extends EventEmitter {
       return;
     }
     if (prev && prev !== voiceDc) {
-      if (voiceDc.transport === "relay" && prev.transport !== "relay" && prev.readyState === "open") {
+      const prevTransport = normalizeTransportKind(prev.transport);
+      if (!canReplaceTransport(prevTransport, incomingTransport) && prev.readyState === "open") {
         try {
           voiceDc.close();
         } catch {
@@ -2817,12 +3529,11 @@ export class P2PBot extends EventEmitter {
     }
     this.voiceChannels.set(peerId, voiceDc);
     const direct = this.directPeers.get(peerId);
-    if (direct) {
+    if (direct && canReplaceTransport(normalizeTransportKind(direct.transport), incomingTransport)) {
       direct.voiceDc = voiceDc;
     }
 
     voiceDc.onmessage = (ev) => {
-      if (!this.inVoice || !this.wasm) return;
       const data = ev.data;
       let bytes = null;
       if (Buffer.isBuffer(data)) {
@@ -2833,6 +3544,59 @@ export class P2PBot extends EventEmitter {
         bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       }
       if (!bytes || bytes.byteLength === 0) return;
+
+      const senderEntry = this.directPeers.get(peerId);
+      if (senderEntry) senderEntry.lastActivityMs = Date.now();
+
+      // Binary "PH" v1 Peer-Hop Voice envelope: runs even when bot is NOT in voice (e.g. standby mediator!)
+      if (isPeerHopVoicePacket(bytes)) {
+        const ph = decodePeerHopVoicePacket(bytes);
+        if (!ph) return;
+        const selfId = this.status?.peerId;
+        if (!selfId) return;
+        if (ph.dstPeerId === selfId) {
+          const vPeer = this.directPeers.get(ph.srcPeerId);
+          if (!vPeer || vPeer.superseded) return;
+          vPeer.lastActivityMs = Date.now();
+          if (!this.inVoice || !this.wasm) return;
+          const decoded = this.wasm.openVoicePacket(ph.srcPeerId, ph.payload);
+          if (decoded && decoded.pcm && decoded.pcm.length > 0) {
+            this.emit("voiceAudio", { peerId: ph.srcPeerId, rms: decoded.rms, pcm: decoded.pcm });
+          }
+          return;
+        }
+        // Mediator forwarding: anti-spoof + direct-only + TTL decrement
+        if (
+          !senderEntry ||
+          senderEntry.transport !== "direct" ||
+          ph.srcPeerId !== peerId ||
+          ph.ttl === 0 ||
+          ph.dstPeerId === peerId
+        ) {
+          return;
+        }
+        const dstEntry = this.directPeers.get(ph.dstPeerId);
+        if (!dstEntry || dstEntry.superseded || dstEntry.transport !== "direct") return;
+        const dstVdc = this.voiceChannels.get(ph.dstPeerId);
+        if (
+          !dstVdc ||
+          dstVdc.readyState !== "open" ||
+          normalizeTransportKind(dstVdc.transport) !== "direct" ||
+          (dstVdc.bufferedAmount || 0) >= 32768
+        ) {
+          return;
+        }
+        const fwd = decrementPeerHopVoiceTtl(bytes);
+        if (!fwd) return;
+        try {
+          dstVdc.send(Buffer.from(fwd.buffer, fwd.byteOffset, fwd.byteLength));
+        } catch {
+          // drop voice frame cleanly under congestion
+        }
+        return;
+      }
+
+      if (!this.inVoice || !this.wasm) return;
       const decoded = this.wasm.openVoicePacket(peerId, bytes);
       if (decoded && decoded.pcm && decoded.pcm.length > 0) {
         this.emit("voiceAudio", { peerId, rms: decoded.rms, pcm: decoded.pcm });
@@ -2847,6 +3611,7 @@ export class P2PBot extends EventEmitter {
 
   _attachBulkDataChannel(peerId, bulkDc) {
     if (!bulkDc) return;
+    const incomingTransport = normalizeTransportKind(bulkDc.transport);
     const prev = this.bulkChannels.get(peerId);
     if (prev && prev !== bulkDc && prev.readyState === "open" && bulkDc.readyState !== "open") {
       bulkDc.onopen = () => {
@@ -2857,7 +3622,8 @@ export class P2PBot extends EventEmitter {
       return;
     }
     if (prev && prev !== bulkDc) {
-      if (bulkDc.transport === "relay" && prev.transport !== "relay" && prev.readyState === "open") {
+      const prevTransport = normalizeTransportKind(prev.transport);
+      if (!canReplaceTransport(prevTransport, incomingTransport) && prev.readyState === "open") {
         try {
           bulkDc.close();
         } catch {
@@ -2875,7 +3641,7 @@ export class P2PBot extends EventEmitter {
     }
     this.bulkChannels.set(peerId, bulkDc);
     const direct = this.directPeers.get(peerId);
-    if (direct && (bulkDc.transport === "relay") === (direct.transport === "relay")) {
+    if (direct && normalizeTransportKind(direct.transport) === incomingTransport) {
       direct.bulkDc = bulkDc;
     }
 
@@ -2902,18 +3668,22 @@ export class P2PBot extends EventEmitter {
   }
 
   _attachDataChannel(pc, dc, peerId, authorName, peerPubKey, viaAutoMesh, introducedBy) {
-    const transport = dc && dc.transport === "relay" ? "relay" : "direct";
+    const transport = normalizeTransportKind(dc?.transport);
+    const hopViaPeerId = transport === "peer-hop" ? dc?.hopViaPeerId || introducedBy || null : null;
     const curVoice = this.voiceChannels.get(peerId);
     const matchedVoice =
-      curVoice && (curVoice.transport === "relay") === (transport === "relay") ? curVoice : null;
+      curVoice && normalizeTransportKind(curVoice.transport) === transport ? curVoice : null;
     const curBulk = this.bulkChannels.get(peerId);
     const matchedBulk =
-      curBulk && (curBulk.transport === "relay") === (transport === "relay") ? curBulk : null;
+      curBulk && normalizeTransportKind(curBulk.transport) === transport ? curBulk : null;
 
     const peerEntry = {
+      peerId,
+      peerPubKey,
       pc,
       dc,
       transport,
+      hopViaPeerId,
       voiceDc: matchedVoice,
       bulkDc: matchedBulk,
       authorName,
@@ -2929,28 +3699,37 @@ export class P2PBot extends EventEmitter {
       if (opened || closed || !this.wasm) return;
       opened = true;
       peerEntry.lastActivityMs = Date.now();
+      this._clearPeerHopPending(peerId);
 
       const prev = this.directPeers.get(peerId);
-      let upgradingFromRelay = false;
+      let upgradingFromLower = false;
+      let switchingHopMediator = false;
       if (prev && prev !== peerEntry) {
-        if (transport === "relay" && prev.transport === "direct" && prev.dc?.readyState === "open") {
+        if (prev.dc?.readyState === "open" && !canReplaceTransport(prev.transport, transport)) {
           try {
-            dc.close(true);
+            if (transport === "relay" || transport === "peer-hop") {
+              dc.close(true);
+            } else {
+              dc.close();
+            }
             pc.close();
           } catch {
             // ignore
           }
           return;
         }
-        upgradingFromRelay =
-          prev.transport === "relay" &&
-          transport === "direct" &&
-          prev.dc &&
-          prev.dc.readyState === "open";
+        upgradingFromLower =
+          isTransportUpgrade(prev.transport, transport) &&
+          Boolean(prev.dc && prev.dc.readyState === "open");
+        switchingHopMediator =
+          prev.transport === "peer-hop" &&
+          transport === "peer-hop" &&
+          prev.hopViaPeerId !== hopViaPeerId &&
+          Boolean(prev.dc && prev.dc.readyState === "open");
         prev.superseded = true;
         try {
           if (prev.bulkDc) prev.bulkDc.close();
-          if (prev.transport === "relay") {
+          if (prev.transport === "relay" || prev.transport === "peer-hop") {
             prev.dc?.close(true);
           } else {
             prev.dc?.close();
@@ -2962,11 +3741,11 @@ export class P2PBot extends EventEmitter {
       }
 
       const latestVoice = this.voiceChannels.get(peerId);
-      if (latestVoice && (latestVoice.transport === "relay") === (transport === "relay")) {
+      if (latestVoice && normalizeTransportKind(latestVoice.transport) === transport) {
         peerEntry.voiceDc = latestVoice;
       }
       const latestBulk = this.bulkChannels.get(peerId);
-      if (latestBulk && (latestBulk.transport === "relay") === (transport === "relay")) {
+      if (latestBulk && normalizeTransportKind(latestBulk.transport) === transport) {
         peerEntry.bulkDc = latestBulk;
       }
 
@@ -2992,11 +3771,16 @@ export class P2PBot extends EventEmitter {
           this.roomDialing.delete(peerId);
         }
         this.relayPeers.delete(peerId);
+        this.directUpgradeState.delete(peerId);
       }
 
       this.directPeers.set(peerId, peerEntry);
 
-      if (upgradingFromRelay) {
+      if (transport === "direct") {
+        this._broadcastDirectNeighborsToDirectPeers();
+      }
+
+      if (upgradingFromLower || switchingHopMediator) {
         return;
       }
 
@@ -3028,6 +3812,10 @@ export class P2PBot extends EventEmitter {
       if (this.bulkChannels.get(peerId) === peerEntry.bulkDc) {
         this.bulkChannels.delete(peerId);
       }
+      if (isOwning && transport === "direct") {
+        this._handleMediatorDisconnected(peerId);
+        this._broadcastDirectNeighborsToDirectPeers();
+      }
       if (isOwning && this.wasm) {
         try {
           const res = this.wasm.call({ cmd: "peer_disconnected", peerId });
@@ -3041,7 +3829,7 @@ export class P2PBot extends EventEmitter {
       const rm = this.roomDialing.get(peerId);
       if (rm && rm.pc === pc) {
         this._cleanupRoomDialingEntry(peerId, rm);
-        if (!this.directPeers.has(peerId)) {
+        if (!rm.isUpgradeProbe && !this.directPeers.has(peerId)) {
           this._requestRelayFallback(peerId, authorName, peerPubKey);
         }
       }
@@ -3060,6 +3848,13 @@ export class P2PBot extends EventEmitter {
     };
 
     const handleIncomingRaw = (raw, asmMap) => {
+      if (peerEntry.transport === "direct") {
+        const hop = tryParseHopFrame(raw);
+        if (hop) {
+          this._handleIncomingHopFrame(peerEntry, hop);
+          return;
+        }
+      }
       if (raw.startsWith('{"kind":"dc_chunk"')) {
         try {
           const ch = JSON.parse(raw);
@@ -3136,7 +3931,16 @@ export class P2PBot extends EventEmitter {
           const peer = this.directPeers.get(act.peerId);
           if (peer && peer.dc && peer.dc.readyState === "open") {
             try {
-              peer.dc.send(act.frame);
+              if (
+                peer.transport === "peer-hop" &&
+                act.frame.length > PEER_HOP_DATA_CHUNK_SIZE &&
+                peer.bulkDc &&
+                peer.bulkDc.readyState === "open"
+              ) {
+                peer.bulkDc.send(act.frame);
+              } else {
+                peer.dc.send(act.frame);
+              }
             } catch {
               // ignore transient send errors
             }
@@ -3330,10 +4134,24 @@ export class P2PBot extends EventEmitter {
       }
     }
 
-    // Expire inactive E2EE relay peers
+    // Check health of Peer-Hop & E2EE relay peers
     for (const [, peer] of Array.from(this.directPeers.entries())) {
-      if (peer.transport !== "relay" || peer.superseded) continue;
-      if (now - (peer.lastActivityMs || 0) > RELAY_INACTIVITY_TIMEOUT_MS) {
+      if (peer.superseded) continue;
+      if (peer.transport === "peer-hop") {
+        const med = peer.hopViaPeerId ? this.directPeers.get(peer.hopViaPeerId) : null;
+        if (!med || med.superseded || med.transport !== "direct" || med.dc?.readyState !== "open") {
+          try {
+            peer.dc.close(true);
+          } catch {
+            // ignore
+          }
+          continue;
+        }
+      }
+      if (
+        (peer.transport === "relay" || peer.transport === "peer-hop") &&
+        now - (peer.lastActivityMs || 0) > RELAY_INACTIVITY_TIMEOUT_MS
+      ) {
         try {
           peer.dc.close(true);
         } catch {
@@ -3341,6 +4159,9 @@ export class P2PBot extends EventEmitter {
         }
       }
     }
+
+    // Always try to upgrade Peer-Hop / Relay peers back to Direct P2P
+    this._tryBackgroundDirectUpgrades(now);
 
     for (const [key, asm] of this.relayChunkAssemblies.entries()) {
       if (now - asm.ts > 30_000) {

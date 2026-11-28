@@ -115,7 +115,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v40</strong>
+            <strong id="app-version-display">v41</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -1499,7 +1499,8 @@
                   <div class="legend-row">
                     <div class="legend-items">
                       <span><i class="legend-dot direct-dot"></i>Direct P2P</span>
-                      <span><i class="legend-dot relay-dot"></i>E2EE Relay</span>
+                      <span><i class="legend-dot hop-dot"></i>Peer-Hop</span>
+                      <span><i class="legend-dot relay-dot"></i>Your Relay</span>
                       <span><i class="legend-dot warn-dot"></i>Connecting</span>
                     </div>
                   </div>
@@ -1649,7 +1650,7 @@
               <div class="turn-config-box" style="margin-bottom: 10px">
                 <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
                   <p class="step-hint" id="turn-test-status" style="margin: 0">
-                    Direct P2P only — zero 3rd-party relays. Add your own relay in Settings → Network if needed.
+                    Direct P2P always preferred — zero-server Peer-Hop fallback (auto-upgrades to Direct) or your own relay.
                   </p>
                   <button type="button" id="btn-turn-test" class="btn btn-sm" style="flex-shrink: 0">
                     Test Path
@@ -1697,7 +1698,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v40</span>
+                <span id="adv-version-number">v41</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>
