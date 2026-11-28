@@ -115,7 +115,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v41</strong>
+            <strong id="app-version-display">v42</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -1698,7 +1698,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v41</span>
+                <span id="adv-version-number">v42</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>
@@ -2311,6 +2311,25 @@
                     <span class="audio-switch-desc">Never contact public brokers even for initial WebRTC handshake.</span>
                   </span>
                 </label>
+              </div>
+            </section>
+
+            <section class="settings-section" aria-labelledby="settings-host-signaling-heading">
+              <div class="settings-section-head">
+                <span class="settings-section-kicker" id="settings-host-signaling-heading">Peer Host Signaling</span>
+                <span class="badge" id="setting-network-host-badge">Off</span>
+              </div>
+              <div class="settings-bot-card">
+                <label class="audio-switch-row settings-switch-row" for="setting-network-elected-host">
+                  <input id="setting-network-elected-host" class="metro-switch" type="checkbox" />
+                  <span class="audio-switch-copy">
+                    <span class="audio-switch-title">Elected host signaling</span>
+                    <span class="audio-switch-desc">Promote 1 room peer (always-on bots preferred) to greet new joiners; other peers disconnect from signaling once meshed and auto-promote a new host if needed.</span>
+                  </span>
+                </label>
+                <p class="settings-privacy-note" id="setting-network-host-status">
+                  Off — every peer stays connected to signaling directly.
+                </p>
               </div>
             </section>
 

@@ -4864,6 +4864,12 @@ input[type="checkbox"]:checked::after {
   color: #ffffff;
 }
 
+.badge.host {
+  background: var(--ochre);
+  border-color: #0e0f12;
+  color: #0e0f12;
+}
+
 .badge.relay {
   background: var(--cyan);
   border-color: #0e0f12;

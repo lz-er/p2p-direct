@@ -660,6 +660,7 @@ export const DEFAULT_NETWORK_SETTINGS = Object.freeze({
   stunServers: [],
   disableThirdPartyStun: false,
   blockThirdPartySignaling: false,
+  electedHostSignaling: false,
 });
 
 export function isValidStunUrl(url) {
@@ -711,6 +712,7 @@ export function sanitizeNetworkSettings(raw) {
     stunServers,
     disableThirdPartyStun: Boolean(src.disableThirdPartyStun),
     blockThirdPartySignaling: Boolean(src.blockThirdPartySignaling),
+    electedHostSignaling: Boolean(src.electedHostSignaling),
   };
 }
 

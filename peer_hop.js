@@ -231,3 +231,134 @@ export function selectPeerHopMediators({
 
   return candidates.map((c) => c.peerId);
 }
+
+export const HOST_SIGNALING_SETTLE_MS = 4500;
+
+/**
+ * Deterministically elects 1 Signaling Host for the connected room mesh so that (when
+ * optional Elected Host Signaling is enabled) only the elected Host maintains a rendezvous
+ * broker connection to greet new joiners while all other peers disconnect from signaling
+ * once meshed.
+ *
+ * Convergence guarantee: uses only globally shared peer attributes so every connected peer
+ * elects the exact same Host without consensus round-trips:
+ *   1. Host-capable peers (`canHost !== false`, i.e. allowed to reach signaling) first.
+ *   2. Always-on bots (`isBot === true`, e.g. Proxmox Home Assistant bot) before browser tabs.
+ *   3. Lexicographically smallest `peerId` as final deterministic tie-breaker.
+ */
+export function electRoomSignalingHost({
+  selfPeerId,
+  selfIsBot = false,
+  selfCanHost = true,
+  directPeers = null,
+  statusPeers = null,
+  peerHostCapable = null,
+}) {
+  if (!selfPeerId) {
+    return { hostPeerId: null, isSelfHost: false, hostIsBot: false, hostCanHost: false, candidates: [] };
+  }
+
+  const botIds = new Set();
+  if (Array.isArray(statusPeers)) {
+    for (const sp of statusPeers) {
+      if (sp?.peerId && sp.isBot) botIds.add(sp.peerId);
+    }
+  }
+
+  const candidateMap = new Map();
+  candidateMap.set(selfPeerId, {
+    peerId: selfPeerId,
+    isBot: Boolean(selfIsBot),
+    canHost: selfCanHost !== false,
+  });
+
+  if (directPeers) {
+    for (const [pid, entry] of directPeers.entries()) {
+      if (!pid || pid === selfPeerId || !entry || entry.superseded) continue;
+      if (!entry.dc || entry.dc.readyState !== "open") continue;
+      const isBot = Boolean(entry.isBot || botIds.has(pid));
+      const canHost = peerHostCapable?.get?.(pid) !== false;
+      candidateMap.set(pid, { peerId: pid, isBot, canHost });
+    }
+  }
+
+  const sorted = Array.from(candidateMap.values()).sort((a, b) => {
+    if (a.canHost !== b.canHost) return a.canHost ? -1 : 1;
+    if (a.isBot !== b.isBot) return a.isBot ? -1 : 1;
+    return a.peerId < b.peerId ? -1 : a.peerId > b.peerId ? 1 : 0;
+  });
+
+  const best = sorted[0];
+  return {
+    hostPeerId: best.peerId,
+    isSelfHost: best.peerId === selfPeerId,
+    hostIsBot: best.isBot,
+    hostCanHost: best.canHost,
+    candidates: sorted.map((c) => c.peerId),
+  };
+}
+
+/**
+ * Pure safety predicate deciding whether a non-host peer with Elected Host Signaling enabled
+ * can safely disconnect from the external signaling broker and rely on the elected Room Host
+ * + P2P auto-mesh + Peer-Hop (`hop_ctrl/sig`).
+ */
+export function shouldDisconnectSignalingBroker({
+  enabled = false,
+  hasActiveRoom = false,
+  selfPeerId = "",
+  hostPeerId = null,
+  hostCanHost = true,
+  directPeers = null,
+  roomDialing = null,
+  pendingAutoMeshCount = 0,
+  relayNeededCount = 0,
+  peerHopPendingCount = 0,
+  hostConnectedAtMs = 0,
+  nowMs = Date.now(),
+  settleMs = HOST_SIGNALING_SETTLE_MS,
+}) {
+  if (!enabled) return { shouldPark: false, reason: "disabled" };
+  if (!hasActiveRoom || !selfPeerId) return { shouldPark: false, reason: "no-room" };
+  if (!hostPeerId || hostPeerId === selfPeerId) return { shouldPark: false, reason: "self-is-host" };
+  if (!hostCanHost) return { shouldPark: false, reason: "host-cannot-signal" };
+  if (!directPeers) return { shouldPark: false, reason: "no-peers" };
+
+  const hostEntry = directPeers.get(hostPeerId);
+  if (
+    !hostEntry ||
+    hostEntry.superseded ||
+    !hostEntry.dc ||
+    hostEntry.dc.readyState !== "open" ||
+    hostEntry.transport === "relay"
+  ) {
+    return { shouldPark: false, reason: "no-p2p-link-to-host" };
+  }
+
+  // Never disconnect signaling broker if any live peer depends on BYOR MQTT relay transport
+  for (const entry of directPeers.values()) {
+    if (entry && !entry.superseded && entry.dc?.readyState === "open" && entry.transport === "relay") {
+      return { shouldPark: false, reason: "active-relay-peer" };
+    }
+  }
+
+  // Wait for active initial WebRTC dials (background upgrade probes are fine — they use hop_ctrl/sig!)
+  if (roomDialing) {
+    for (const dial of roomDialing.values()) {
+      if (dial && !dial.isUpgradeProbe) {
+        return { shouldPark: false, reason: "dialing-in-progress" };
+      }
+    }
+  }
+
+  if (pendingAutoMeshCount > 0 || peerHopPendingCount > 0 || relayNeededCount > 0) {
+    return { shouldPark: false, reason: "mesh-settling" };
+  }
+
+  if (settleMs > 0 && hostConnectedAtMs > 0 && nowMs - hostConnectedAtMs < settleMs) {
+    return { shouldPark: false, reason: "settle-window" };
+  }
+
+  return { shouldPark: true, reason: "delegated-to-host" };
+}
+

@@ -15,11 +15,13 @@ import {
   resolveRelayUrls,
 } from "./mqtt_relay.js";
 import {
+  HOST_SIGNALING_SETTLE_MS,
   PEER_HOP_DATA_CHUNK_SIZE,
   canReplaceTransport,
   computeDirectUpgradeDelayMs,
   decodePeerHopVoicePacket,
   decrementPeerHopVoiceTtl,
+  electRoomSignalingHost,
   encodeHopCtrl,
   encodeHopData,
   encodePeerHopVoicePacket,
@@ -27,6 +29,7 @@ import {
   isTransportUpgrade,
   normalizeTransportKind,
   selectPeerHopMediators,
+  shouldDisconnectSignalingBroker,
   tryParseHopFrame,
 } from "./peer_hop.js";
 import {
@@ -171,7 +174,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v41";
+export const APP_VERSION = "v42";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -3276,6 +3279,12 @@ export class P2PDirectApp {
     this.peerHopPending = new Map(); // targetPeerId -> { mediatorPeerId, triedMediators, timer, targetName, targetPubKey, reasonLabel }
     this.peerHopMediated = new Map(); // "a|b" -> { a, b, startedAt }
 
+    // Optional Elected Host Signaling state (1 peer listens on broker; others park once meshed)
+    this.electedHostPeerId = null;
+    this.signalingParkedForHost = false;
+    this.peerHostCapable = new Map(); // peerId -> boolean (true if peer can connect to signaling)
+    this.peerConnectedAt = new Map(); // peerId -> timestamp ms when P2P link opened
+
     // Background-resilient Web Worker keepalive
     this.keepaliveWorker = null;
     this.keepaliveFallbackTimer = null;
@@ -3653,6 +3662,9 @@ export class P2PDirectApp {
       "setting-network-relays-input",
       "btn-list-add-network-relays",
       "setting-network-block-signaling",
+      "setting-network-host-badge",
+      "setting-network-elected-host",
+      "setting-network-host-status",
       "setting-network-stun-badge",
       "list-chips-network-stun",
       "list-count-network-stun",
@@ -8157,6 +8169,7 @@ export class P2PDirectApp {
           this.executeActions(tickRes.actions);
           this.cleanupStaleLocalDialing(now);
           this.tryBackgroundDirectUpgrades(now);
+          this.reconcileHostSignalingRole(now);
           this.renderStats();
           if (this.advancedMode) {
             this.updateVoiceAdvancedStats();
@@ -10087,17 +10100,25 @@ export class P2PDirectApp {
     const next = saveNetworkSettings({ ...prev, ...patch });
     this.networkSettings = next;
     this.iceConfig = buildIceConfig(next);
-    this.syncNetworkSettingsUi();
+
+    const signalingConfigChanged =
+      prev.blockThirdPartySignaling !== next.blockThirdPartySignaling ||
+      JSON.stringify(prev.relays) !== JSON.stringify(next.relays);
 
     if (this.activeRoom) {
       const nextRelayStr = next.relays.length > 0 ? next.relays.join(",") : null;
-      const roomRelayToUse = this.activeRoom.relay || nextRelayStr;
       if (nextRelayStr && !this.activeRoom.relay) {
         this.activeRoom.relay = nextRelayStr;
       } else if (!nextRelayStr && this.activeRoom.relay && prev.relays.join(",") === this.activeRoom.relay) {
         this.activeRoom.relay = null;
       }
-      this.startRoomRendezvous(this.activeRoom.topic, this.activeRoom.relay || nextRelayStr);
+      if (signalingConfigChanged) {
+        this.startRoomRendezvous(this.activeRoom.topic, this.activeRoom.relay || nextRelayStr, {
+          preserveMeshState: true,
+        });
+        this._broadcastDirectNeighborsToDirectPeers();
+      }
+      this.reconcileHostSignalingRole(Date.now());
       if (this.canUseRelayFallback() && this.relayNeededPeers.size > 0) {
         const pendingPeers = Array.from(this.relayNeededPeers.values());
         this.relayNeededPeers.clear();
@@ -10109,9 +10130,12 @@ export class P2PDirectApp {
         }
       }
       this.renderRoomCard();
+      this.renderPeers();
+      this.renderTopology();
     } else {
       this.renderRelayNeededBanner();
     }
+    this.syncNetworkSettingsUi();
 
     if (!silent) {
       this.showToast("Network settings saved");
@@ -10122,14 +10146,67 @@ export class P2PDirectApp {
     const net = this.networkSettings || loadNetworkSettings();
     const relayCount = net.relays.length;
     const stunCount = net.stunServers.length;
+    const hostModeOn = Boolean(net.electedHostSignaling);
 
     if (this.el["settings-count-network"]) {
-      this.el["settings-count-network"].textContent = relayCount > 0 ? String(relayCount) : "";
+      const activeCount = relayCount + (hostModeOn ? 1 : 0);
+      this.el["settings-count-network"].textContent = activeCount > 0 ? String(activeCount) : "";
     }
     if (this.el["setting-network-relay-badge"]) {
       const b = this.el["setting-network-relay-badge"];
       b.textContent = relayCount > 0 ? `${relayCount} Custom` : "Direct Only";
       b.className = relayCount > 0 ? "badge auto" : "badge";
+    }
+    if (this.el["setting-network-elected-host"]) {
+      this.el["setting-network-elected-host"].checked = hostModeOn;
+    }
+    if (this.el["setting-network-host-badge"] || this.el["setting-network-host-status"]) {
+      const badge = this.el["setting-network-host-badge"];
+      const note = this.el["setting-network-host-status"];
+      if (!hostModeOn) {
+        if (badge) {
+          badge.textContent = "Off";
+          badge.className = "badge";
+        }
+        if (note) {
+          note.textContent = "Off — every peer stays connected to signaling directly.";
+        }
+      } else if (!this.activeRoom) {
+        if (badge) {
+          badge.textContent = "Ready";
+          badge.className = "badge auto";
+        }
+        if (note) {
+          note.textContent = "Enabled — when you join a room, 1 elected peer (bots preferred) greets new joiners while others disconnect from signaling once meshed.";
+        }
+      } else {
+        const info = this.getElectedHostInfo();
+        if (info.isSelfHost) {
+          if (badge) {
+            badge.textContent = "Host";
+            badge.className = "badge host";
+          }
+          if (note) {
+            note.textContent = "You are the elected Room Host — listening on signaling for new joiners and introducing them into the P2P mesh.";
+          }
+        } else if (this.signalingParkedForHost) {
+          if (badge) {
+            badge.textContent = "Via Host";
+            badge.className = "badge auto";
+          }
+          if (note) {
+            note.textContent = `Host: ${info.hostName} — your signaling broker is disconnected (0 server sockets). You will auto-promote if ${info.hostName} leaves.`;
+          }
+        } else {
+          if (badge) {
+            badge.textContent = "Settling";
+            badge.className = "badge pending";
+          }
+          if (note) {
+            note.textContent = `Host: ${info.hostName} — waiting for mesh links to settle before disconnecting your signaling socket.`;
+          }
+        }
+      }
     }
     if (this.el["setting-network-stun-badge"]) {
       const b = this.el["setting-network-stun-badge"];
@@ -10310,6 +10387,17 @@ export class P2PDirectApp {
         this.updateNetworkSettings(
           { blockThirdPartySignaling: this.el["setting-network-block-signaling"].checked },
           { silent: true }
+        );
+      });
+    }
+    if (this.el["setting-network-elected-host"]) {
+      this.el["setting-network-elected-host"].addEventListener("change", () => {
+        const enabled = this.el["setting-network-elected-host"].checked;
+        this.updateNetworkSettings({ electedHostSignaling: enabled }, { silent: true });
+        this.showToast(
+          enabled
+            ? "Elected Host Signaling enabled"
+            : "Elected Host Signaling disabled — direct signaling restored"
         );
       });
     }
@@ -12230,6 +12318,10 @@ export class P2PDirectApp {
     this.peerHopPending.clear();
     this.peerDirectNeighbors.clear();
     this.peerHopMediated.clear();
+    this.electedHostPeerId = null;
+    this.signalingParkedForHost = false;
+    this.peerHostCapable.clear();
+    this.peerConnectedAt.clear();
     this.roomMyTag = null;
     this.roomKnownPeers.clear();
     this.roomTagToPeerId.clear();
@@ -12413,7 +12505,11 @@ export class P2PDirectApp {
   _broadcastDirectNeighborsToDirectPeers() {
     if (!this.status) return;
     const peers = this._getOpenDirectPeerIds();
-    const payload = encodeHopCtrl({ op: "neighbors", peers });
+    const payload = encodeHopCtrl({
+      op: "neighbors",
+      peers,
+      canHost: this._canSelfHostSignaling(),
+    });
     for (const pid of peers) {
       const entry = this.directPeers.get(pid);
       if (entry && entry.dc?.readyState === "open") {
@@ -12617,7 +12713,11 @@ export class P2PDirectApp {
       if (op === "neighbors") {
         const list = Array.isArray(hop.peers) ? hop.peers.filter((p) => typeof p === "string" && p) : [];
         this.peerDirectNeighbors.set(fromDirectId, new Set(list));
+        if (typeof hop.canHost === "boolean") {
+          this.peerHostCapable.set(fromDirectId, hop.canHost);
+        }
         this._retryBlockedPeersWithPeerHop();
+        this.reconcileHostSignalingRole();
         return;
       }
 
@@ -13007,11 +13107,145 @@ export class P2PDirectApp {
     );
   }
 
-  startRoomRendezvous(roomTopic, customRelay) {
+  /* ================= Optional Elected Host Signaling ================= */
+
+  _canSelfHostSignaling() {
+    const effectiveInput = this._getEffectiveRelayInput(this.activeRoom?.relay);
+    const allowPublicSignaling = !Boolean(this.networkSettings?.blockThirdPartySignaling);
+    return resolveRelayUrls(effectiveInput, { allowPublicSignaling }).length > 0;
+  }
+
+  getElectedHostInfo() {
+    if (!this.status) {
+      return {
+        hostPeerId: null,
+        hostName: "",
+        isSelfHost: false,
+        hostIsBot: false,
+        hostCanHost: false,
+        candidates: [],
+      };
+    }
+    const res = electRoomSignalingHost({
+      selfPeerId: this.status.peerId,
+      selfIsBot: false,
+      selfCanHost: this._canSelfHostSignaling(),
+      directPeers: this.directPeers,
+      statusPeers: this.status.peers || [],
+      peerHostCapable: this.peerHostCapable,
+    });
+    let hostName = this.status.authorName || "You";
+    if (res.hostPeerId && !res.isSelfHost) {
+      const live = this.directPeers.get(res.hostPeerId);
+      const sp = (this.status.peers || []).find((p) => p.peerId === res.hostPeerId);
+      hostName = live?.authorName || sp?.authorName || res.hostPeerId;
+    }
+    return { ...res, hostName };
+  }
+
+  _parkSignalingForHost(hostInfo) {
+    if (!this.activeRoom || this.signalingParkedForHost) return;
+    if (this.roomRendezvous) {
+      try {
+        this.roomRendezvous.stop();
+      } catch {
+        // ignore
+      }
+      this.roomRendezvous = null;
+    }
+    this.signalingParkedForHost = true;
+    this.roomRelayStatus = { state: "parked", connectedCount: 0, totalCount: 0, connectedUrls: [] };
+    this.addTelemetry(
+      "room",
+      `Elected ${hostInfo.hostName} as Room Host — disconnected from signaling broker (0 server sockets; auto-promotes on disconnect)`
+    );
+    this.renderRoomCard();
+    this.renderPeers();
+    this.renderTopologyInspector();
+    this.syncNetworkSettingsUi();
+  }
+
+  _resumeSignalingFromHostPark(reason = "promoted to Room Host") {
+    if (!this.signalingParkedForHost) return;
+    this.signalingParkedForHost = false;
+    if (!this.activeRoom) return;
+    this.addTelemetry("room", `Resuming signaling broker (${reason})`);
+    this.startRoomRendezvous(this.activeRoom.topic, this.activeRoom.relay, {
+      preserveMeshState: true,
+    });
+    this.renderRoomCard();
+    this.renderPeers();
+    this.renderTopologyInspector();
+    this.syncNetworkSettingsUi();
+  }
+
+  reconcileHostSignalingRole(now = Date.now()) {
+    if (!this.status) return;
+    const enabled = Boolean(this.networkSettings?.electedHostSignaling);
+    if (!enabled || !this.activeRoom) {
+      const hadHost = Boolean(this.electedHostPeerId);
+      this.electedHostPeerId = null;
+      if (this.signalingParkedForHost) {
+        this._resumeSignalingFromHostPark(enabled ? "room closed" : "elected host signaling disabled");
+      } else if (hadHost) {
+        this.renderRoomCard();
+        this.renderPeers();
+        this.syncNetworkSettingsUi();
+      }
+      return;
+    }
+
+    const prevHostId = this.electedHostPeerId;
+    const hostInfo = this.getElectedHostInfo();
+    this.electedHostPeerId = hostInfo.hostPeerId;
+    const hostChanged = prevHostId !== hostInfo.hostPeerId;
+
+    const decision = shouldDisconnectSignalingBroker({
+      enabled,
+      hasActiveRoom: Boolean(this.activeRoom),
+      selfPeerId: this.status.peerId,
+      hostPeerId: hostInfo.hostPeerId,
+      hostCanHost: hostInfo.hostCanHost,
+      directPeers: this.directPeers,
+      roomDialing: this.roomDialing,
+      pendingAutoMeshCount: (this.status.pendingAutoMesh || []).length,
+      relayNeededCount: this.relayNeededPeers?.size || 0,
+      peerHopPendingCount: this.peerHopPending?.size || 0,
+      hostConnectedAtMs: hostInfo.hostPeerId ? this.peerConnectedAt.get(hostInfo.hostPeerId) || 0 : 0,
+      nowMs: now,
+      settleMs: HOST_SIGNALING_SETTLE_MS,
+    });
+
+    if (decision.shouldPark) {
+      if (!this.signalingParkedForHost) {
+        this._parkSignalingForHost(hostInfo);
+        return;
+      }
+    } else if (this.signalingParkedForHost) {
+      const wasPromoted = hostInfo.isSelfHost;
+      this._resumeSignalingFromHostPark(
+        wasPromoted ? "promoted to Room Host" : `mesh needs signaling (${decision.reason})`
+      );
+      if (wasPromoted) {
+        this.showToast("Promoted to Room Host — greeting new joiners");
+      }
+      return;
+    }
+
+    if (hostChanged) {
+      this.renderRoomCard();
+      this.renderPeers();
+      this.renderTopologyInspector();
+      this.syncNetworkSettingsUi();
+    }
+  }
+
+  startRoomRendezvous(roomTopic, customRelay, { preserveMeshState = false } = {}) {
     const effectiveInput = this._getEffectiveRelayInput(customRelay);
     const allowPublicSignaling = !Boolean(this.networkSettings?.blockThirdPartySignaling);
     const urls = resolveRelayUrls(effectiveInput, { allowPublicSignaling });
     this.roomUsesCustomRelay = hasUserOwnedRelay(urls);
+    this.signalingParkedForHost = false;
 
     if (
       this.roomRendezvous &&
@@ -13028,7 +13262,9 @@ export class P2PDirectApp {
       this.roomRendezvous.stop();
       this.roomRendezvous = null;
     }
-    this._resetRoomRelayState();
+    if (!preserveMeshState) {
+      this._resetRoomRelayState();
+    }
 
     if (urls.length === 0) {
       this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0, connectedUrls: [] };
@@ -13121,6 +13357,7 @@ export class P2PDirectApp {
       pk: this.status.e2ee.publicKey,
       peers: Array.from(this.directPeers.keys()),
       directPeers: this._getOpenDirectPeerIds(),
+      canHost: this._canSelfHostSignaling(),
       relays: status.connectedUrls || [],
       vcodec: this.getLocalVoiceCodec(),
       v2pcm: true,
@@ -13162,6 +13399,9 @@ export class P2PDirectApp {
         this.recordPeerVoiceCodec(msg.from, msg.vcodec === "opus48" ? "opus48" : "adpcm16");
         await this._ensureRoomMyTag();
         await this._registerKnownRoomPeer(msg.from, msg.name, msg.pk, msg.relays);
+        if (typeof msg.canHost === "boolean") {
+          this.peerHostCapable.set(msg.from, msg.canHost);
+        }
         if (Array.isArray(msg.directPeers)) {
           this.peerDirectNeighbors.set(
             msg.from,
@@ -13173,8 +13413,17 @@ export class P2PDirectApp {
         const existing = this.directPeers.get(msg.from);
         const remoteConnectedToUs =
           Array.isArray(msg.peers) && msg.peers.includes(this.status.peerId);
+        const freshlyOpenedSameSession = Boolean(
+          existing &&
+            existing.transport === "direct" &&
+            existing.peerPubKey === msg.pk &&
+            Date.now() - (this.peerConnectedAt.get(msg.from) || 0) < 8000
+        );
         const isHealthy =
-          existing && existing.dc && existing.dc.readyState === "open" && remoteConnectedToUs;
+          existing &&
+          existing.dc &&
+          existing.dc.readyState === "open" &&
+          (remoteConnectedToUs || freshlyOpenedSameSession);
 
         const now = Date.now();
         const lastReply = this.lastHelloReplyPerPeer.get(msg.from) || 0;
@@ -17298,6 +17547,8 @@ export class P2PDirectApp {
       }
 
       if (transport === "direct") {
+        const relEntry = this.relayPeers.get(peerId);
+        if (relEntry?.fallbackTimer) clearTimeout(relEntry.fallbackTimer);
         this.relayPeers.delete(peerId);
         this.earlyRelayIce.delete(peerId);
         this.localDialing.delete(peerId);
@@ -17326,6 +17577,9 @@ export class P2PDirectApp {
         this.latestAnswer = null;
       }
       this.discoveredLocalMeshes.delete(peerId);
+      if (!this.peerConnectedAt.has(peerId)) {
+        this.peerConnectedAt.set(peerId, Date.now());
+      }
       this.directPeers.set(peerId, peerEntry);
 
       if (transport === "direct") {
@@ -17369,6 +17623,7 @@ export class P2PDirectApp {
       if (upgradingFromLower || switchingHopMediator) {
         // Keep existing WASM X25519 + ChaCha20-Poly1305 session and monotonic counters alive
         // for a zero-drop seamless upgrade (Peer-Hop / Relay → Direct P2P, or Relay → Peer-Hop).
+        this.reconcileHostSignalingRole();
         this.renderPeers();
         this.renderTopology();
         this.renderStats();
@@ -17390,6 +17645,7 @@ export class P2PDirectApp {
       });
       this.status = res.status;
       this.executeActions(res.actions);
+      this.reconcileHostSignalingRole();
 
       if (!viaAutoMesh) {
         if (this.wizard.mode === "host" || this.wizard.mode === "join") {
@@ -17440,6 +17696,8 @@ export class P2PDirectApp {
       }
       if (isOwningPeer) {
         this.directPeers.delete(peerId);
+        this.peerConnectedAt.delete(peerId);
+        this.peerHostCapable.delete(peerId);
         if (this.voiceChannels.get(peerId) === peerEntry.voiceDc) {
           this.voiceChannels.delete(peerId);
         }
@@ -17456,10 +17714,12 @@ export class P2PDirectApp {
         const res = this.wasm.call({ cmd: "peer_disconnected", peerId });
         this.status = res.status;
         this.executeActions(res.actions);
+        this.reconcileHostSignalingRole();
         this.renderAll();
       }
       const rel = this.relayPeers.get(peerId);
       if (rel && rel.pc === pc) {
+        if (rel.fallbackTimer) clearTimeout(rel.fallbackTimer);
         this.relayPeers.delete(peerId);
       }
       const loc = this.localDialing.get(peerId);
@@ -17552,6 +17812,8 @@ export class P2PDirectApp {
     if (entry.bulkSendQueue) entry.bulkSendQueue.length = 0;
     if (entry.bulkChunkAssemblies) entry.bulkChunkAssemblies.clear();
     this.directPeers.delete(peerId);
+    this.peerConnectedAt.delete(peerId);
+    this.peerHostCapable.delete(peerId);
     const vdc = this.voiceChannels.get(peerId);
     if (vdc) {
       this.voiceChannels.delete(peerId);
@@ -17590,6 +17852,7 @@ export class P2PDirectApp {
     const res = this.wasm.call({ cmd: "peer_disconnected", peerId });
     this.status = res.status;
     this.executeActions(res.actions);
+    this.reconcileHostSignalingRole();
     this.renderAll();
     this.showToast(`Disconnected from ${entry.authorName || peerId}`);
   }
@@ -17724,6 +17987,9 @@ export class P2PDirectApp {
       const liveInfo = this.status.peers.find((p) => p.peerId === peerId);
       if (liveInfo && liveInfo.authorName && liveInfo.authorName !== peerEntry.authorName) {
         peerEntry.authorName = liveInfo.authorName;
+      }
+      if (liveInfo?.isBot && this.networkSettings?.electedHostSignaling && this.electedHostPeerId !== peerId) {
+        this.reconcileHostSignalingRole();
       }
       this.executeActions(res.actions);
       const onlyMsgUpdate =
@@ -18054,6 +18320,7 @@ export class P2PDirectApp {
         sdpSent: false,
         localIceQueue: [],
         pendingIce: early,
+        fallbackTimer: null,
       };
       this.relayPeers.set(targetPeerId, entry);
       this.attachVoiceDataChannel(targetPeerId, voiceDc);
@@ -18072,6 +18339,14 @@ export class P2PDirectApp {
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      if (this.relayPeers.get(targetPeerId) !== entry) {
+        try {
+          pc.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
 
       const res = this.wasm.call({
         cmd: "send_relay_signal",
@@ -18087,8 +18362,20 @@ export class P2PDirectApp {
       while (entry.localIceQueue.length > 0) {
         this._sendLocalIce(targetPeerId, viaPeerId, entry.localIceQueue.shift());
       }
+
+      // If Direct WebRTC ICE through auto-mesh is blocked (e.g. phone VPN), fall back to Zero-Server Peer-Hop
+      entry.fallbackTimer = setTimeout(() => {
+        entry.fallbackTimer = null;
+        if (this.relayPeers.get(targetPeerId) !== entry) return;
+        const cur = this.directPeers.get(targetPeerId);
+        if (cur && cur.dc?.readyState === "open") return;
+        this.tryPeerHopFallback(targetPeerId, targetName, targetPubKey, "auto-mesh ICE timeout");
+      }, DIRECT_FALLBACK_TIMEOUT_MS);
+
       this.renderAll();
     } catch (err) {
+      const cur = this.relayPeers.get(targetPeerId);
+      if (cur?.fallbackTimer) clearTimeout(cur.fallbackTimer);
       this.relayPeers.delete(targetPeerId);
       this.addTelemetry("error", `Auto-mesh offer to ${targetPeerId} failed: ${err.message}`);
     }
@@ -18101,6 +18388,7 @@ export class P2PDirectApp {
     }
     const prev = this.relayPeers.get(fromPeerId);
     if (prev) {
+      if (prev.fallbackTimer) clearTimeout(prev.fallbackTimer);
       try {
         prev.pc.close();
       } catch {
@@ -18646,16 +18934,27 @@ export class P2PDirectApp {
     const blockedCount = this.relayNeededPeers?.size || 0;
     const strictNoRelay =
       isActive && Boolean(this.networkSettings?.blockThirdPartySignaling) && !this.roomUsesCustomRelay;
+    const hostModeOn = isActive && Boolean(this.networkSettings?.electedHostSignaling);
+    const hostInfo = hostModeOn ? this.getElectedHostInfo() : null;
     if (peerCount > 0) {
-      badgeText =
+      const hostSuffix =
         blockedCount > 0
-          ? `Live · ${peerCount} · Relay Needed`
-          : `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
+          ? " · Relay Needed"
+          : hostModeOn && hostInfo?.isSelfHost
+            ? " · Host"
+            : hostModeOn && this.signalingParkedForHost
+              ? " · Via Host"
+              : "";
+      badgeText = `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}${hostSuffix}`;
       badgeClass = blockedCount > 0 ? "badge pending" : "badge auto";
       statusTitle =
         blockedCount > 0
           ? `${peerCount} connected, ${blockedCount} blocked (needs your own relay)`
-          : `Room online — ${peerCount} ${peerCount === 1 ? "peer" : "peers"} connected`;
+          : hostModeOn && hostInfo?.isSelfHost
+            ? `Room online (${peerCount} ${peerCount === 1 ? "peer" : "peers"}) — you are the elected Host signaling for new joiners`
+            : hostModeOn && this.signalingParkedForHost
+              ? `Room online (${peerCount} ${peerCount === 1 ? "peer" : "peers"}) — signaling delegated to Host ${hostInfo?.hostName || "Peer"} (0 broker sockets)`
+              : `Room online — ${peerCount} ${peerCount === 1 ? "peer" : "peers"} connected`;
       isLive = true;
     } else if (blockedCount > 0) {
       badgeText = "Relay Needed";
@@ -18668,11 +18967,19 @@ export class P2PDirectApp {
       statusTitle = "3rd-party signaling blocked — add your own relay in Settings → Network";
       isLive = false;
     } else if (isActive && relayState === "live" && relayCount > 0) {
-      badgeText = this.roomUsesCustomRelay ? "Ready · Your Relay" : "Ready";
+      badgeText = this.roomUsesCustomRelay
+        ? hostModeOn
+          ? "Ready · Host (Your Relay)"
+          : "Ready · Your Relay"
+        : hostModeOn
+          ? "Ready · Host"
+          : "Ready";
       badgeClass = "badge auto";
       statusTitle = this.roomUsesCustomRelay
         ? "Room ready on your own relay — waiting for peers"
-        : "Room ready — waiting for peers";
+        : hostModeOn
+          ? "Room Host ready — listening for new joiners"
+          : "Room ready — waiting for peers";
       isLive = true;
     }
 
@@ -20072,9 +20379,15 @@ export class P2PDirectApp {
       return;
     }
 
+    const hostModeOn = Boolean(this.activeRoom && this.networkSettings?.electedHostSignaling);
+    const activeHostId = hostModeOn ? this.getElectedHostInfo().hostPeerId : null;
     const parts = [];
     for (const p of direct) {
       const botBadge = p.isBot ? '<span class="bot-tag">BOT</span>' : "";
+      const hostBadge =
+        activeHostId && p.peerId === activeHostId
+          ? '<span class="badge host" title="Elected Room Host signaling for new joiners">host</span>'
+          : "";
       const liveConn = this.directPeers.get(p.peerId);
       const isRelayed = liveConn?.transport === "relay";
       const isPeerHop = liveConn?.transport === "peer-hop";
@@ -20106,7 +20419,7 @@ export class P2PDirectApp {
       parts.push(`
         <li class="peer-item ${transportCls}${selectedCls}" data-peer-id="${escapeHtml(p.peerId)}">
           <div class="peer-main">
-            <div class="peer-name">${colorSwatch}${escapeHtml(p.authorName)} ${botBadge} ${originBadge} ${voiceBadge}</div>
+            <div class="peer-name">${colorSwatch}${escapeHtml(p.authorName)} ${botBadge} ${hostBadge} ${originBadge} ${voiceBadge}</div>
             <div class="peer-id">${escapeHtml(p.peerId)} · code ${escapeHtml(p.safetyCode || "—")}${rttLabel}</div>
           </div>
           <div class="peer-item-actions">
@@ -20456,10 +20769,14 @@ export class P2PDirectApp {
 
     // Local self node selected
     if (selId === this.status.peerId) {
+      const hostModeOn = Boolean(this.activeRoom && this.networkSettings?.electedHostSignaling);
+      const hostInfo = hostModeOn ? this.getElectedHostInfo() : null;
       const relayStatus = this.roomRendezvous?.getStatus?.();
-      const relayInfo = relayStatus
-        ? `${relayStatus.connectedCount}/${relayStatus.totalCount} WSS brokers online`
-        : "No room relay active";
+      const relayInfo = this.signalingParkedForHost
+        ? `Parked (Host: ${hostInfo?.hostName || "Peer"} · 0 sockets)`
+        : relayStatus
+          ? `${hostModeOn && hostInfo?.isSelfHost ? "Host · " : ""}${relayStatus.connectedCount}/${relayStatus.totalCount} WSS brokers online`
+          : "No room relay active";
       const localCodec = this.voice.opusSupported
         ? `48 kHz Opus (${Math.round((this.voice.opusEncoderBitrate || this.computeDesiredOpusBitrate()) / 1000)} kbps)`
         : "16 kHz ADPCM (fallback)";
@@ -20468,6 +20785,7 @@ export class P2PDirectApp {
           <div class="topo-insp-title">
             <span>${escapeHtml(this.status.authorName)}</span>
             <span class="badge">YOU</span>
+            ${hostModeOn && hostInfo?.isSelfHost ? '<span class="badge host">HOST</span>' : ""}
           </div>
           <button type="button" class="btn-link" data-topo-close>✕</button>
         </div>
@@ -20550,12 +20868,18 @@ export class P2PDirectApp {
     const qosSummary = hasBulkLane
       ? "Voice [High] · Chat [Med] · Bulk GIF/Media [Low]"
       : "Voice [High] · Data [Med]";
+    const isElectedHost = Boolean(
+      this.activeRoom &&
+        this.networkSettings?.electedHostSignaling &&
+        this.getElectedHostInfo().hostPeerId === selId
+    );
 
     box.innerHTML = `
       <div class="topo-insp-head">
         <div class="topo-insp-title">
           <span>${escapeHtml(peer.authorName)}</span>
           ${peer.isBot ? '<span class="bot-tag">BOT</span>' : ""}
+          ${isElectedHost ? '<span class="badge host">HOST</span>' : ""}
           <span class="badge ${isRelayed ? "relay" : isPeerHop ? "peer-hop" : "direct"}">${escapeHtml(tech.shortLabel)}</span>
         </div>
         <button type="button" class="btn-link" data-topo-close>✕</button>

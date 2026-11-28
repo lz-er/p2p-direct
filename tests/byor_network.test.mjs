@@ -69,8 +69,10 @@ describe("Bring Your Own Relay (BYOR) — Relay & STUN Policy", () => {
       ],
       disableThirdPartyStun: true,
       blockThirdPartySignaling: true,
+      electedHostSignaling: true,
     });
 
+    assert.equal(DEFAULT_NETWORK_SETTINGS.electedHostSignaling, false);
     assert.deepEqual(clean.relays, ["wss://relay.myhome.example/mqtt"]);
     assert.deepEqual(clean.stunServers, [
       "stun:stun.myhome.example:3478",
@@ -78,6 +80,8 @@ describe("Bring Your Own Relay (BYOR) — Relay & STUN Policy", () => {
     ]);
     assert.equal(clean.disableThirdPartyStun, true);
     assert.equal(clean.blockThirdPartySignaling, true);
+    assert.equal(clean.electedHostSignaling, true);
+    assert.equal(sanitizeNetworkSettings({}).electedHostSignaling, false);
     assert.equal(isValidStunUrl("stun:my-box.local:3478"), true);
     assert.equal(isValidStunUrl("turn:my-box.local:3478"), false);
   });
