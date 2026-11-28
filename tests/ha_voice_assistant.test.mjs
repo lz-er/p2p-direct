@@ -659,6 +659,7 @@ describe("Wyoming Voice Satellite Protocol & Server", () => {
     const received = [];
     const dec = new WyomingFrameDecoder();
     const client = net.createConnection({ host: "127.0.0.1", port });
+    client.setNoDelay(true);
     const waitEvent = (type, timeoutMs = 2000) =>
       new Promise((resolve, reject) => {
         const onData = () => check();

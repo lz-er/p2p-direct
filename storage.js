@@ -22,6 +22,7 @@ import {
   sanitizeRandomizerSettings,
   sanitizeScoreboardSettings,
 } from "./room_bots.js";
+import { isUserOwnedRelayUrl } from "./mqtt_relay.js";
 
 const LEGACY_DB_NAME = "p2p_direct_mesh_v2";
 const LEGACY_LS_PREFIX = "p2p_direct_profile_v2:";
@@ -31,6 +32,7 @@ export const SAVED_ROOMS_KEY = "p2p-direct-saved-rooms-v1";
 export const LAST_ROOM_KEY = "p2p-direct-last-room-v1";
 export const WARFRAME_BOT_SETTINGS_KEY = "p2p-direct-warframe-bot-v1";
 export const BUILTIN_BOTS_SETTINGS_KEY = "p2p-direct-builtin-bots-v1";
+export const NETWORK_SETTINGS_KEY = "p2p-direct-network-settings-v1";
 const MAX_SAVED_ROOMS = 50;
 
 export const DEFAULT_AUDIO_SETTINGS = Object.freeze({
@@ -652,3 +654,89 @@ export function removeListEditorItem(existing, index, { min = 1 } = {}) {
   items.splice(index, 1);
   return { items, removed: true, hitMin: false };
 }
+
+export const DEFAULT_NETWORK_SETTINGS = Object.freeze({
+  relays: [],
+  stunServers: [],
+  disableThirdPartyStun: false,
+  blockThirdPartySignaling: false,
+});
+
+export function isValidStunUrl(url) {
+  if (typeof url !== "string") return false;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed.length > 200 || /\s/.test(trimmed)) return false;
+  return /^stuns?:(?:\/\/)?[a-z0-9.-]+(?::\d{1,5})?$/i.test(trimmed) ||
+    /^stuns?:(?:\/\/)?\[[0-9a-f:]+\](?::\d{1,5})?$/i.test(trimmed);
+}
+
+export function sanitizeNetworkSettings(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const rawRelays = Array.isArray(src.relays)
+    ? src.relays
+    : typeof src.relays === "string"
+      ? splitAllListTokens(src.relays)
+      : [];
+  const relays = [];
+  const seenRelays = new Set();
+  for (const item of rawRelays) {
+    const clean = String(item ?? "").trim().slice(0, 240);
+    if (!clean || !isUserOwnedRelayUrl(clean)) continue;
+    const key = clean.toLowerCase();
+    if (seenRelays.has(key)) continue;
+    seenRelays.add(key);
+    relays.push(clean);
+    if (relays.length >= 6) break;
+  }
+
+  const rawStuns = Array.isArray(src.stunServers)
+    ? src.stunServers
+    : typeof src.stunServers === "string"
+      ? splitAllListTokens(src.stunServers)
+      : [];
+  const stunServers = [];
+  const seenStuns = new Set();
+  for (const item of rawStuns) {
+    const clean = String(item ?? "").trim().slice(0, 200);
+    if (!clean || !isValidStunUrl(clean)) continue;
+    const key = clean.toLowerCase();
+    if (seenStuns.has(key)) continue;
+    seenStuns.add(key);
+    stunServers.push(clean);
+    if (stunServers.length >= 6) break;
+  }
+
+  return {
+    relays,
+    stunServers,
+    disableThirdPartyStun: Boolean(src.disableThirdPartyStun),
+    blockThirdPartySignaling: Boolean(src.blockThirdPartySignaling),
+  };
+}
+
+export function loadNetworkSettings() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem(NETWORK_SETTINGS_KEY);
+      if (raw) {
+        return sanitizeNetworkSettings(JSON.parse(raw));
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return sanitizeNetworkSettings(DEFAULT_NETWORK_SETTINGS);
+}
+
+export function saveNetworkSettings(settings) {
+  const clean = sanitizeNetworkSettings(settings);
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(NETWORK_SETTINGS_KEY, JSON.stringify(clean));
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return clean;
+}
+

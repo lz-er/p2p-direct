@@ -14,6 +14,7 @@ import {
   decodeRelayVoiceBundle,
   encodeRelayVoiceBundle,
   encodeSingleRelayDataChunk,
+  hasUserOwnedRelay,
   resolveRelayUrls,
 } from "../mqtt_relay.js";
 
@@ -1147,6 +1148,7 @@ export class P2PBot extends EventEmitter {
 
     await this._ensureRoomMyTag();
     const relayUrls = resolveRelayUrls(relayOverride);
+    this.roomUsesCustomRelay = hasUserOwnedRelay(relayUrls);
     this.roomRendezvous = new MultiRelayRendezvous({
       roomTopic: encoded.roomTopic,
       urls: relayUrls,
@@ -1921,6 +1923,21 @@ export class P2PBot extends EventEmitter {
         if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
           return;
         }
+        if (!this.roomUsesCustomRelay) {
+          this._sendRoomSignal({
+            t: "relay-unavailable",
+            from: this.status.peerId,
+            to: msg.from,
+            name: this.status.authorName,
+            reason: "no-custom-relay",
+          });
+          this.emit("relayNeeded", {
+            peerId: msg.from,
+            name: msg.name || "Peer",
+            reason: "peer requested relay",
+          });
+          return;
+        }
         const status = this.roomRendezvous?.getStatus();
         this._sendRoomSignal({
           t: "relay-ack",
@@ -1943,11 +1960,29 @@ export class P2PBot extends EventEmitter {
           if (pending.retryTimer) clearTimeout(pending.retryTimer);
           this.relayPendingOpens.delete(msg.from);
         }
+        if (!this.roomUsesCustomRelay) {
+          this.emit("relayNeeded", { peerId: msg.from, name: msg.name || "Peer", reason: "no-custom-relay" });
+          return;
+        }
         const existing = this.directPeers.get(msg.from);
         if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
           return;
         }
         await this._openRelayVirtualPeer(msg.from, msg.name || "Peer", msg.pk);
+        break;
+      }
+      case "relay-unavailable": {
+        if (!msg.from) return;
+        const pending = this.relayPendingOpens.get(msg.from);
+        if (pending) {
+          if (pending.retryTimer) clearTimeout(pending.retryTimer);
+          this.relayPendingOpens.delete(msg.from);
+        }
+        this.emit("relayNeeded", {
+          peerId: msg.from,
+          name: msg.name || "Peer",
+          reason: msg.reason || "no-custom-relay",
+        });
         break;
       }
       case "relay-close": {
@@ -1970,6 +2005,14 @@ export class P2PBot extends EventEmitter {
     if (!this.activeRoom || !this.roomRendezvous || !this.status) return;
     const existing = this.directPeers.get(targetPeerId);
     if (existing && existing.dc && existing.dc.readyState === "open") return;
+    if (!this.roomUsesCustomRelay) {
+      this.emit("relayNeeded", {
+        peerId: targetPeerId,
+        name: targetName || "Peer",
+        reason: "direct ICE blocked",
+      });
+      return;
+    }
     if (this.relayPendingOpens.has(targetPeerId)) return;
 
     await this._ensureRoomMyTag();

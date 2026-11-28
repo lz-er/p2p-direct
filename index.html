@@ -115,7 +115,7 @@
             title="App version &amp; Service Worker cache status (click to check for updates)"
           >
             <span class="status-dot version-dot" id="app-version-dot" aria-hidden="true"></span>
-            <strong id="app-version-display">v39</strong>
+            <strong id="app-version-display">v40</strong>
           </button>
           <span class="hidden" id="lamport-display">0</span>
           <button
@@ -364,6 +364,29 @@
                   <line x1="21" y1="12" x2="9" y2="12" />
                 </svg>
                 <span>Leave<span class="mobile-hide"> Room</span></span>
+              </button>
+            </div>
+          </section>
+
+          <!-- Direct P2P Blocked / Relay Needed Banner (hidden unless direct ICE fails with no user relay) -->
+          <section
+            id="relay-needed-banner"
+            class="relay-needed-banner hidden"
+            role="alert"
+            aria-live="polite"
+          >
+            <div class="relay-needed-copy">
+              <span class="relay-needed-badge" id="relay-needed-badge">RELAY NEEDED</span>
+              <span class="relay-needed-text" id="relay-needed-text">
+                Direct P2P failed. Add your own relay in Settings → Network.
+              </span>
+            </div>
+            <div class="relay-needed-actions">
+              <button type="button" id="btn-relay-needed-setup" class="btn btn-sm btn-primary">
+                Add Relay
+              </button>
+              <button type="button" id="btn-relay-needed-retry" class="btn btn-sm">
+                Retry Direct
               </button>
             </div>
           </section>
@@ -1626,7 +1649,7 @@
               <div class="turn-config-box" style="margin-bottom: 10px">
                 <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
                   <p class="step-hint" id="turn-test-status" style="margin: 0">
-                    Direct P2P (STUN) preferred — automatic E2EE Relay fallback on CGNAT / isolated WiFi (zero TURN).
+                    Direct P2P only — zero 3rd-party relays. Add your own relay in Settings → Network if needed.
                   </p>
                   <button type="button" id="btn-turn-test" class="btn btn-sm" style="flex-shrink: 0">
                     Test Path
@@ -1674,7 +1697,7 @@
             <div class="adv-version-meta">
               <span class="adv-version-pill">
                 <span class="status-dot version-dot" id="adv-version-dot" aria-hidden="true"></span>
-                <span id="adv-version-number">v39</span>
+                <span id="adv-version-number">v40</span>
               </span>
               <span class="adv-version-sep" aria-hidden="true">·</span>
               <span class="adv-version-sw" id="adv-version-sw">SW checking…</span>
@@ -1752,6 +1775,17 @@
             aria-controls="settings-panel-web"
           >
             Web Info <span class="settings-tab-count" id="settings-count-web"></span>
+          </button>
+          <button
+            type="button"
+            class="settings-tab-btn"
+            id="btn-settings-tab-network"
+            data-settings-tab="network"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-panel-network"
+          >
+            Network <span class="settings-tab-count" id="settings-count-network"></span>
           </button>
         </div>
 
@@ -2236,6 +2270,81 @@
                 </div>
                 <p class="settings-privacy-note">
                   Uses <code>api.github.com</code> when on.
+                </p>
+              </div>
+            </section>
+          </div>
+
+          <!-- TAB 4: NETWORK (Bring Your Own Relay & Custom STUN) -->
+          <div class="settings-tab-panel hidden" id="settings-panel-network" data-settings-panel="network" role="tabpanel">
+            <section class="settings-section" aria-labelledby="settings-relay-heading">
+              <div class="settings-section-head">
+                <span class="settings-section-kicker" id="settings-relay-heading">Bring Your Own Relay</span>
+                <span class="badge" id="setting-network-relay-badge">Direct Only</span>
+              </div>
+              <div class="settings-bot-card">
+                <p class="settings-privacy-note">
+                  No 3rd-party relay fallback is used. Add your own MQTT WebSocket relay (<code>wss://</code>) to connect when VPN or strict NAT blocks direct P2P.
+                </p>
+                <div class="settings-field settings-list-editor" id="list-editor-network-relays">
+                  <div class="settings-list-head">
+                    <label class="settings-label" for="setting-network-relays-input">Your Relays (0–6)</label>
+                    <span class="settings-list-count" id="list-count-network-relays">0 / 6</span>
+                  </div>
+                  <div class="settings-list-chips" id="list-chips-network-relays" role="list" aria-label="Your self-hosted relays"></div>
+                  <div class="settings-list-add-row">
+                    <input
+                      id="setting-network-relays-input"
+                      type="text"
+                      class="text-input settings-list-input"
+                      placeholder="wss://relay.yourdomain.com/mqtt"
+                      autocomplete="off"
+                    />
+                    <button type="button" id="btn-list-add-network-relays" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
+                  </div>
+                </div>
+                <label class="audio-switch-row settings-switch-row" for="setting-network-block-signaling">
+                  <input id="setting-network-block-signaling" class="metro-switch" type="checkbox" />
+                  <span class="audio-switch-copy">
+                    <span class="audio-switch-title">Block 3rd-party signaling</span>
+                    <span class="audio-switch-desc">Never contact public brokers even for initial WebRTC handshake.</span>
+                  </span>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-section" aria-labelledby="settings-stun-heading">
+              <div class="settings-section-head">
+                <span class="settings-section-kicker" id="settings-stun-heading">STUN Servers</span>
+                <span class="badge" id="setting-network-stun-badge">Default</span>
+              </div>
+              <div class="settings-bot-card">
+                <div class="settings-field settings-list-editor" id="list-editor-network-stun">
+                  <div class="settings-list-head">
+                    <label class="settings-label" for="setting-network-stun-input">Custom STUN (0–6)</label>
+                    <span class="settings-list-count" id="list-count-network-stun">0 / 6</span>
+                  </div>
+                  <div class="settings-list-chips" id="list-chips-network-stun" role="list" aria-label="Custom STUN servers"></div>
+                  <div class="settings-list-add-row">
+                    <input
+                      id="setting-network-stun-input"
+                      type="text"
+                      class="text-input settings-list-input"
+                      placeholder="stun:stun.yourdomain.com:3478"
+                      autocomplete="off"
+                    />
+                    <button type="button" id="btn-list-add-network-stun" class="btn btn-sm btn-primary settings-list-add-btn">+ Add</button>
+                  </div>
+                </div>
+                <label class="audio-switch-row settings-switch-row" for="setting-network-disable-stun">
+                  <input id="setting-network-disable-stun" class="metro-switch" type="checkbox" />
+                  <span class="audio-switch-copy">
+                    <span class="audio-switch-title">Disable 3rd-party STUN</span>
+                    <span class="audio-switch-desc">Skip Cloudflare &amp; Google STUN (LAN / IPv6 / custom STUN only).</span>
+                  </span>
+                </label>
+                <p class="settings-privacy-note">
+                  New room links embed your relay automatically. Self-host config: <code>relay/docker-compose.yml</code>.
                 </p>
               </div>
             </section>

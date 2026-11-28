@@ -8,6 +8,10 @@ import {
   encodeRelayDataChunks,
   encodeRelayVoiceBundle,
   encodeSingleRelayDataChunk,
+  hasUserOwnedRelay,
+  isThirdPartyRelayUrl,
+  isUserOwnedRelayUrl,
+  isValidRelayUrl,
   resolveRelayUrls,
 } from "./mqtt_relay.js";
 import {
@@ -17,7 +21,9 @@ import {
   clearLastJoinedRoom,
   createEphemeralProfile,
   extractLiveSplitTokens,
+  isValidStunUrl,
   loadLastJoinedRoom,
+  loadNetworkSettings,
   loadSavedRooms,
   loadSessionAudioSettings,
   loadWarframeBotSettings,
@@ -29,10 +35,12 @@ import {
   removeSavedRoom,
   renameSavedRoom,
   saveLastJoinedRoom,
+  saveNetworkSettings,
   saveSessionAudioSettings,
   saveSessionAuthorName,
   saveWarframeBotSettings,
   saveBuiltinBotsSettings,
+  sanitizeNetworkSettings,
   splitAllListTokens,
   upsertSavedRoom,
 } from "./storage.js";
@@ -148,7 +156,7 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 // Keep APP_VERSION strictly in sync with sw.js CACHE_NAME (`p2p-direct-shell-<APP_VERSION>`)
-export const APP_VERSION = "v39";
+export const APP_VERSION = "v40";
 export const APP_CACHE_PREFIX = "p2p-direct-shell-";
 export const APP_CACHE_NAME = `${APP_CACHE_PREFIX}${APP_VERSION}`;
 
@@ -409,10 +417,23 @@ const ICE_CONFIG = {
   iceCandidatePoolSize: 2,
 };
 
-function buildIceConfig() {
+export function buildIceConfig(networkSettings = null) {
   if (typeof window !== "undefined" && Array.isArray(window.__P2P_ICE_SERVERS__)) {
     return {
       iceServers: window.__P2P_ICE_SERVERS__,
+      iceCandidatePoolSize: 2,
+    };
+  }
+  const net = networkSettings && typeof networkSettings === "object" ? networkSettings : null;
+  if (net && Array.isArray(net.stunServers) && net.stunServers.length > 0) {
+    return {
+      iceServers: net.stunServers.map((urls) => ({ urls })),
+      iceCandidatePoolSize: 2,
+    };
+  }
+  if (net && net.disableThirdPartyStun) {
+    return {
+      iceServers: [],
       iceCandidatePoolSize: 2,
     };
   }
@@ -3312,7 +3333,10 @@ export class P2PDirectApp {
       lastCounterSig: "",
     };
 
-    this.iceConfig = ICE_CONFIG;
+    this.networkSettings = loadNetworkSettings();
+    this.roomUsesCustomRelay = false;
+    this.relayNeededPeers = new Map(); // peerId -> { peerId, name, pk, reason, detectedAtMs }
+    this.iceConfig = buildIceConfig(this.networkSettings);
     this.appVersion = APP_VERSION;
     this.swRegistration = null;
     this.appVersionState = resolveSwVersionState({
@@ -3588,12 +3612,33 @@ export class P2PDirectApp {
       "btn-settings-tab-gaming",
       "btn-settings-tab-room",
       "btn-settings-tab-web",
+      "btn-settings-tab-network",
       "settings-count-gaming",
       "settings-count-room",
       "settings-count-web",
+      "settings-count-network",
       "settings-panel-gaming",
       "settings-panel-room",
       "settings-panel-web",
+      "settings-panel-network",
+      // Bring Your Own Relay / Network
+      "relay-needed-banner",
+      "relay-needed-badge",
+      "relay-needed-text",
+      "btn-relay-needed-setup",
+      "btn-relay-needed-retry",
+      "setting-network-relay-badge",
+      "list-chips-network-relays",
+      "list-count-network-relays",
+      "setting-network-relays-input",
+      "btn-list-add-network-relays",
+      "setting-network-block-signaling",
+      "setting-network-stun-badge",
+      "list-chips-network-stun",
+      "list-count-network-stun",
+      "setting-network-stun-input",
+      "btn-list-add-network-stun",
+      "setting-network-disable-stun",
       // Slay the Spire 2
       "setting-sts2-status-badge",
       "setting-sts2-enabled",
@@ -4284,12 +4329,29 @@ export class P2PDirectApp {
       });
     }
 
-    // Settings category tabs (Gaming / Room Tools P2P / Web Info)
+    // Settings category tabs (Gaming / Room Tools P2P / Web Info / Network)
     for (const tabBtn of document.querySelectorAll("[data-settings-tab]")) {
       tabBtn.addEventListener("click", () => {
         this.setSettingsTab(tabBtn.dataset.settingsTab);
       });
     }
+
+    if (this.el["btn-relay-needed-setup"]) {
+      this.el["btn-relay-needed-setup"].addEventListener("click", () => {
+        this.settingsActiveTab = "network";
+        this.toggleSettingsModal(true);
+        this.setSettingsTab("network");
+        if (this.el["setting-network-relays-input"]) {
+          setTimeout(() => this.el["setting-network-relays-input"]?.focus(), 40);
+        }
+      });
+    }
+    if (this.el["btn-relay-needed-retry"]) {
+      this.el["btn-relay-needed-retry"].addEventListener("click", () => {
+        this.retryDirectForBlockedPeers();
+      });
+    }
+    this.bindNetworkSettingsControls();
 
     // Helper for wiring all 9 additional persistent built-in bots cleanly
     const bindBotControls = (botId, fieldsSpec) => {
@@ -5033,7 +5095,8 @@ export class P2PDirectApp {
     this.profile = createEphemeralProfile();
 
     this.wasm = await SafeRustWasmMesh.loadFromUrl("./p2p_mesh.wasm");
-    this.iceConfig = buildIceConfig();
+    this.iceConfig = buildIceConfig(this.networkSettings);
+    this.syncNetworkSettingsUi();
     await this.probeVoiceOpusSupport();
     this.updateVoiceCodecMeta();
     this.renderAppVersion();
@@ -9381,10 +9444,15 @@ export class P2PDirectApp {
     joined = false,
   } = {}) {
     const cleanName = (roomName || this.status.room || "Shared Room").trim() || "Shared Room";
+    const effectiveRelay =
+      relay ||
+      (!joined && this.networkSettings?.relays?.length > 0
+        ? this.networkSettings.relays.join(",")
+        : null);
     const encoded = this.wasm.call({
       cmd: "encode_room_invite",
       room: cleanName,
-      relay: relay || undefined,
+      relay: effectiveRelay || undefined,
       baseUrl: shareableBaseUrl(),
       entropy: randomBase64Url(16),
     });
@@ -9405,7 +9473,7 @@ export class P2PDirectApp {
       code: encoded.code,
       url: encoded.url,
       topic: encoded.roomTopic,
-      relay: relay || null,
+      relay: effectiveRelay || null,
       encrypted: Boolean(encoded.encrypted),
     };
     this.profile.room = displayName;
@@ -9419,7 +9487,7 @@ export class P2PDirectApp {
       }
     }
 
-    this.startRoomRendezvous(encoded.roomTopic, relay);
+    this.startRoomRendezvous(encoded.roomTopic, effectiveRelay);
     this.broadcastMeshBeacon(true);
     if (this.mobileAdvTab === "connect" && typeof window !== "undefined" && window.innerWidth <= 1020) {
       this.setMobileAdvTab("chat", { autoOpen: false, scrollTop: false });
@@ -9450,6 +9518,9 @@ export class P2PDirectApp {
   leaveLongLivedRoom({ silent = false } = {}) {
     this.stopWarframeBotTimers();
     this.stopBuiltinBotsTimers();
+    this.relayNeededPeers.clear();
+    this.roomUsesCustomRelay = false;
+    this.renderRelayNeededBanner();
     this._roomTimersCache = [];
     this._lastRoomTimersSig = "";
     this.composerAgentMode = false;
@@ -9509,6 +9580,7 @@ export class P2PDirectApp {
       this.syncBuiltinBotsSettingsControls();
       this.syncWarframeUiStatus();
       this.syncBuiltinBotsUiStatus();
+      this.syncNetworkSettingsUi();
     }
   }
 
@@ -9872,7 +9944,7 @@ export class P2PDirectApp {
   /* ================= Unified Built-in Persistent Bots Controller ================= */
 
   setSettingsTab(tab) {
-    const allowed = new Set(["gaming", "room", "web"]);
+    const allowed = new Set(["gaming", "room", "web", "network"]);
     const next = allowed.has(tab) ? tab : "gaming";
     this.settingsActiveTab = next;
     for (const btn of document.querySelectorAll("[data-settings-tab]")) {
@@ -9882,6 +9954,352 @@ export class P2PDirectApp {
     }
     for (const panel of document.querySelectorAll("[data-settings-panel]")) {
       panel.classList.toggle("hidden", panel.dataset.settingsPanel !== next);
+    }
+  }
+
+  /* ================= Bring Your Own Relay (Network Settings & Relay Needed UI) ================= */
+
+  canUseRelayFallback() {
+    return Boolean(this.roomUsesCustomRelay);
+  }
+
+  _getEffectiveRelayInput(roomRelay = null) {
+    const out = [];
+    if (typeof roomRelay === "string" && roomRelay.trim()) {
+      out.push(roomRelay.trim());
+    } else if (Array.isArray(roomRelay)) {
+      out.push(...roomRelay);
+    }
+    if (Array.isArray(this.networkSettings?.relays) && this.networkSettings.relays.length > 0) {
+      out.push(...this.networkSettings.relays);
+    }
+    return out;
+  }
+
+  markPeerRelayNeeded(peerId, name, pk, reason = "direct ICE blocked") {
+    if (!peerId) return;
+    const existing = this.directPeers.get(peerId);
+    if (existing && existing.dc?.readyState === "open") return;
+    const prev = this.relayNeededPeers.get(peerId);
+    this.relayNeededPeers.set(peerId, {
+      peerId,
+      name: name || prev?.name || "Peer",
+      pk: pk || prev?.pk || "",
+      reason: reason || prev?.reason || "direct ICE blocked",
+      detectedAtMs: prev?.detectedAtMs || Date.now(),
+    });
+    this.renderRelayNeededBanner();
+    this.renderRoomCard();
+  }
+
+  clearPeerRelayNeeded(peerId) {
+    if (!peerId || !this.relayNeededPeers.has(peerId)) return;
+    this.relayNeededPeers.delete(peerId);
+    this.renderRelayNeededBanner();
+    this.renderRoomCard();
+  }
+
+  renderRelayNeededBanner() {
+    const banner = this.el?.["relay-needed-banner"];
+    if (!banner) return;
+    const badgeEl = this.el["relay-needed-badge"];
+    const textEl = this.el["relay-needed-text"];
+    const retryBtn = this.el["btn-relay-needed-retry"];
+
+    const strictNoSignaling =
+      Boolean(this.activeRoom) &&
+      Boolean(this.networkSettings?.blockThirdPartySignaling) &&
+      !this.roomUsesCustomRelay;
+
+    const blocked = Array.from(this.relayNeededPeers.values()).filter((item) => {
+      const cur = this.directPeers.get(item.peerId);
+      return !(cur && cur.dc?.readyState === "open");
+    });
+
+    if (blocked.length === 0 && !strictNoSignaling) {
+      banner.classList.add("hidden");
+      banner.classList.remove("is-warn");
+      return;
+    }
+
+    banner.classList.remove("hidden");
+    if (strictNoSignaling && blocked.length === 0) {
+      banner.classList.add("is-warn");
+      if (badgeEl) badgeEl.textContent = "NO RELAY SET";
+      if (textEl) {
+        textEl.textContent =
+          "3rd-party signaling is blocked. Add your own relay in Settings → Network or use manual Offer/Answer.";
+      }
+      if (retryBtn) retryBtn.classList.add("hidden");
+      return;
+    }
+
+    banner.classList.remove("is-warn");
+    if (retryBtn) retryBtn.classList.remove("hidden");
+    const names = blocked.map((b) => b.name || "Peer").slice(0, 3);
+    const more = blocked.length > 3 ? ` +${blocked.length - 3}` : "";
+    const peerLabel = `${names.join(", ")}${more}`;
+    if (badgeEl) badgeEl.textContent = "RELAY NEEDED";
+    if (textEl) {
+      textEl.textContent =
+        `Direct P2P failed for ${peerLabel} (VPN / strict NAT). No 3rd-party relay is used — add your own relay.`;
+    }
+  }
+
+  retryDirectForBlockedPeers() {
+    const blocked = Array.from(this.relayNeededPeers.values());
+    if (blocked.length === 0) return;
+    this.relayNeededPeers.clear();
+    this.renderRelayNeededBanner();
+    for (const item of blocked) {
+      const known = this.roomKnownPeers.get(item.peerId);
+      const pk = item.pk || known?.pk || "";
+      if (pk) {
+        this.startRoomOffer(item.peerId, item.name || known?.name || "Peer", pk, false);
+      }
+    }
+    this.announceRoomHello(true);
+    this.showToast("Retrying direct P2P connection…");
+  }
+
+  updateNetworkSettings(patch, { silent = false } = {}) {
+    const prev = this.networkSettings || loadNetworkSettings();
+    const next = saveNetworkSettings({ ...prev, ...patch });
+    this.networkSettings = next;
+    this.iceConfig = buildIceConfig(next);
+    this.syncNetworkSettingsUi();
+
+    if (this.activeRoom) {
+      const nextRelayStr = next.relays.length > 0 ? next.relays.join(",") : null;
+      const roomRelayToUse = this.activeRoom.relay || nextRelayStr;
+      if (nextRelayStr && !this.activeRoom.relay) {
+        this.activeRoom.relay = nextRelayStr;
+      } else if (!nextRelayStr && this.activeRoom.relay && prev.relays.join(",") === this.activeRoom.relay) {
+        this.activeRoom.relay = null;
+      }
+      this.startRoomRendezvous(this.activeRoom.topic, this.activeRoom.relay || nextRelayStr);
+      if (this.canUseRelayFallback() && this.relayNeededPeers.size > 0) {
+        const pendingPeers = Array.from(this.relayNeededPeers.values());
+        this.relayNeededPeers.clear();
+        this.renderRelayNeededBanner();
+        for (const p of pendingPeers) {
+          if (p.pk) {
+            this.requestRelayFallback(p.peerId, p.name, p.pk, "user relay added");
+          }
+        }
+      }
+      this.renderRoomCard();
+    } else {
+      this.renderRelayNeededBanner();
+    }
+
+    if (!silent) {
+      this.showToast("Network settings saved");
+    }
+  }
+
+  syncNetworkSettingsUi() {
+    const net = this.networkSettings || loadNetworkSettings();
+    const relayCount = net.relays.length;
+    const stunCount = net.stunServers.length;
+
+    if (this.el["settings-count-network"]) {
+      this.el["settings-count-network"].textContent = relayCount > 0 ? String(relayCount) : "";
+    }
+    if (this.el["setting-network-relay-badge"]) {
+      const b = this.el["setting-network-relay-badge"];
+      b.textContent = relayCount > 0 ? `${relayCount} Custom` : "Direct Only";
+      b.className = relayCount > 0 ? "badge auto" : "badge";
+    }
+    if (this.el["setting-network-stun-badge"]) {
+      const b = this.el["setting-network-stun-badge"];
+      b.textContent =
+        stunCount > 0
+          ? `${stunCount} Custom`
+          : net.disableThirdPartyStun
+            ? "Disabled"
+            : "Default";
+      b.className = stunCount > 0 ? "badge auto" : net.disableThirdPartyStun ? "badge pending" : "badge";
+    }
+    if (this.el["setting-network-block-signaling"]) {
+      this.el["setting-network-block-signaling"].checked = Boolean(net.blockThirdPartySignaling);
+    }
+    if (this.el["setting-network-disable-stun"]) {
+      this.el["setting-network-disable-stun"].checked = Boolean(net.disableThirdPartyStun);
+    }
+
+    const renderChips = (chipsId, countId, items, max, onRemove) => {
+      const chipsEl = this.el[chipsId];
+      const countEl = this.el[countId];
+      if (countEl) countEl.textContent = `${items.length} / ${max}`;
+      if (!chipsEl) return;
+      chipsEl.innerHTML = "";
+      if (items.length === 0) {
+        const empty = document.createElement("span");
+        empty.className = "settings-list-empty";
+        empty.textContent = "None configured";
+        chipsEl.appendChild(empty);
+        return;
+      }
+      items.forEach((item, idx) => {
+        const chip = document.createElement("span");
+        chip.className = "settings-list-chip";
+        chip.setAttribute("role", "listitem");
+        const label = document.createElement("span");
+        label.className = "settings-list-chip-text";
+        label.textContent = item;
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "settings-list-chip-remove";
+        rm.setAttribute("aria-label", `Remove ${item}`);
+        rm.textContent = "×";
+        rm.addEventListener("click", () => onRemove(idx));
+        chip.append(label, rm);
+        chipsEl.appendChild(chip);
+      });
+    };
+
+    renderChips(
+      "list-chips-network-relays",
+      "list-count-network-relays",
+      net.relays,
+      6,
+      (idx) => {
+        const nextRelays = net.relays.filter((_, i) => i !== idx);
+        this.updateNetworkSettings({ relays: nextRelays }, { silent: true });
+      }
+    );
+    renderChips(
+      "list-chips-network-stun",
+      "list-count-network-stun",
+      net.stunServers,
+      6,
+      (idx) => {
+        const nextStuns = net.stunServers.filter((_, i) => i !== idx);
+        this.updateNetworkSettings({ stunServers: nextStuns }, { silent: true });
+      }
+    );
+  }
+
+  bindNetworkSettingsControls() {
+    const wireUrlList = ({ inputId, addBtnId, prop, validator, invalidMsg, rejectThirdParty = false }) => {
+      const inputEl = this.el[inputId];
+      const addBtn = this.el[addBtnId];
+      const commitTokens = (tokens) => {
+        const valid = [];
+        let rejectedThirdParty = false;
+        let rejectedInvalid = false;
+        for (const raw of tokens) {
+          const clean = String(raw || "").trim();
+          if (!clean) continue;
+          if (rejectThirdParty && isThirdPartyRelayUrl(clean)) {
+            rejectedThirdParty = true;
+            continue;
+          }
+          if (!validator(clean)) {
+            rejectedInvalid = true;
+            continue;
+          }
+          valid.push(clean);
+        }
+        if (valid.length > 0) {
+          const cur = this.networkSettings?.[prop] || [];
+          const { items, addedCount, hitMax } = mergeListEditorItems(cur, valid, {
+            max: 6,
+            maxLen: 240,
+            dedupe: true,
+          });
+          if (addedCount > 0) {
+            this.updateNetworkSettings({ [prop]: items }, { silent: true });
+            this.showToast(`Added ${addedCount} ${prop === "relays" ? "relay" : "STUN"} URL${addedCount === 1 ? "" : "s"}`);
+          } else if (hitMax) {
+            this.showToast("Max 6 entries reached");
+          } else {
+            this.showToast("Already in list");
+          }
+        }
+        if (rejectedThirdParty) {
+          this.showToast("3rd-party public brokers are blocked — enter your own relay URL");
+        } else if (rejectedInvalid && valid.length === 0) {
+          this.showToast(invalidMsg);
+        }
+      };
+
+      if (inputEl) {
+        inputEl.addEventListener("input", (ev) => {
+          const val = inputEl.value;
+          if (!val || !/[,;\n]/.test(val)) return;
+          if (ev.inputType === "insertFromPaste") {
+            commitTokens(splitAllListTokens(val));
+            inputEl.value = "";
+            return;
+          }
+          const { ready, remainder } = extractLiveSplitTokens(val);
+          if (ready.length > 0) {
+            commitTokens(ready);
+            inputEl.value = remainder;
+          }
+        });
+        inputEl.addEventListener("paste", (ev) => {
+          const text = ev.clipboardData?.getData("text") || "";
+          if (!/[,;\n]/.test(text)) return;
+          ev.preventDefault();
+          commitTokens(splitAllListTokens(text));
+          inputEl.value = "";
+        });
+        inputEl.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            if (inputEl.value.trim()) {
+              commitTokens(splitAllListTokens(inputEl.value));
+              inputEl.value = "";
+            }
+          }
+        });
+      }
+      if (addBtn && inputEl) {
+        addBtn.addEventListener("click", () => {
+          if (inputEl.value.trim()) {
+            commitTokens(splitAllListTokens(inputEl.value));
+            inputEl.value = "";
+            inputEl.focus();
+          }
+        });
+      }
+    };
+
+    wireUrlList({
+      inputId: "setting-network-relays-input",
+      addBtnId: "btn-list-add-network-relays",
+      prop: "relays",
+      validator: isUserOwnedRelayUrl,
+      invalidMsg: "Use a valid wss:// or ws:// relay URL",
+      rejectThirdParty: true,
+    });
+    wireUrlList({
+      inputId: "setting-network-stun-input",
+      addBtnId: "btn-list-add-network-stun",
+      prop: "stunServers",
+      validator: isValidStunUrl,
+      invalidMsg: "Use a valid stun:host:port URL",
+      rejectThirdParty: false,
+    });
+
+    if (this.el["setting-network-block-signaling"]) {
+      this.el["setting-network-block-signaling"].addEventListener("change", () => {
+        this.updateNetworkSettings(
+          { blockThirdPartySignaling: this.el["setting-network-block-signaling"].checked },
+          { silent: true }
+        );
+      });
+    }
+    if (this.el["setting-network-disable-stun"]) {
+      this.el["setting-network-disable-stun"].addEventListener("change", () => {
+        this.updateNetworkSettings(
+          { disableThirdPartyStun: this.el["setting-network-disable-stun"].checked },
+          { silent: true }
+        );
+      });
     }
   }
 
@@ -11906,14 +12324,19 @@ export class P2PDirectApp {
   }
 
   startRoomRendezvous(roomTopic, customRelay) {
-    const urls = resolveRelayUrls(customRelay);
+    const effectiveInput = this._getEffectiveRelayInput(customRelay);
+    const allowPublicSignaling = !Boolean(this.networkSettings?.blockThirdPartySignaling);
+    const urls = resolveRelayUrls(effectiveInput, { allowPublicSignaling });
+    this.roomUsesCustomRelay = hasUserOwnedRelay(urls);
+
     if (
       this.roomRendezvous &&
       this.roomRendezvous.roomTopic === roomTopic &&
       JSON.stringify(this.roomRendezvous.urls) === JSON.stringify(urls)
     ) {
       this._ensureRoomMyTag();
-      this.announceRoomHello(true);
+      if (urls.length > 0) this.announceRoomHello(true);
+      this.renderRelayNeededBanner();
       return;
     }
     if (this.roomRendezvous) {
@@ -11922,6 +12345,17 @@ export class P2PDirectApp {
       this.roomRendezvous = null;
     }
     this._resetRoomRelayState();
+
+    if (urls.length === 0) {
+      this.roomRelayStatus = { state: "stopped", connectedCount: 0, totalCount: 0, connectedUrls: [] };
+      this.addTelemetry(
+        "room",
+        "3rd-party signaling blocked and no custom relay configured — add your own relay in Settings → Network"
+      );
+      this.renderRoomCard();
+      this.renderRelayNeededBanner();
+      return;
+    }
 
     this.roomRendezvous = new MultiRelayRendezvous({
       roomTopic,
@@ -11935,11 +12369,12 @@ export class P2PDirectApp {
       onBrokerReady: (client, status) => {
         this.roomRelayStatus = status;
         this.renderRoomCard();
+        this.renderRelayNeededBanner();
         try {
           const host = new URL(client.url).host;
           this.addTelemetry(
             "room",
-            `Relay ready (${status.connectedCount}/${status.totalCount}): ${host}`
+            `${this.roomUsesCustomRelay ? "Your relay" : "Signaling"} ready (${status.connectedCount}/${status.totalCount}): ${host}`
           );
         } catch {
           // ignore invalid URL formatting
@@ -11954,6 +12389,7 @@ export class P2PDirectApp {
     });
     this._ensureRoomMyTag();
     this.roomRendezvous.start();
+    this.renderRelayNeededBanner();
   }
 
   sendRoomSignal(msgObj) {
@@ -12089,6 +12525,21 @@ export class P2PDirectApp {
         if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
           return;
         }
+        if (!this.canUseRelayFallback()) {
+          this.markPeerRelayNeeded(msg.from, msg.name || "Peer", msg.pk, "peer requested relay");
+          this.sendRoomSignal({
+            t: "relay-unavailable",
+            from: this.status.peerId,
+            to: msg.from,
+            name: this.status.authorName,
+            reason: "no-custom-relay",
+          });
+          this.addTelemetry(
+            "room",
+            `Blocked 3rd-party relay request from ${msg.name || msg.from} — configure your own relay in Settings → Network`
+          );
+          return;
+        }
         const status = this.roomRendezvous?.getStatus();
         this.sendRoomSignal({
           t: "relay-ack",
@@ -12114,11 +12565,32 @@ export class P2PDirectApp {
           if (pending.retryTimer) clearTimeout(pending.retryTimer);
           this.relayPendingOpens.delete(msg.from);
         }
+        if (!this.canUseRelayFallback()) {
+          this.markPeerRelayNeeded(msg.from, msg.name || "Peer", msg.pk, "no custom relay");
+          return;
+        }
         const existing = this.directPeers.get(msg.from);
         if (existing && existing.transport === "direct" && existing.dc?.readyState === "open") {
           return;
         }
         await this.openRelayVirtualPeer(msg.from, msg.name || "Peer", msg.pk);
+        break;
+      }
+
+      case "relay-unavailable": {
+        if (!msg.from) return;
+        const pending = this.relayPendingOpens.get(msg.from);
+        if (pending) {
+          if (pending.retryTimer) clearTimeout(pending.retryTimer);
+          this.relayPendingOpens.delete(msg.from);
+        }
+        const known = this.roomKnownPeers.get(msg.from);
+        this.markPeerRelayNeeded(
+          msg.from,
+          msg.name || known?.name || "Peer",
+          known?.pk || "",
+          msg.reason || "no custom relay"
+        );
         break;
       }
 
@@ -12145,9 +12617,6 @@ export class P2PDirectApp {
     if (existing && existing.dc && existing.dc.readyState === "open") {
       return;
     }
-    if (this.relayPendingOpens.has(targetPeerId)) {
-      return;
-    }
 
     await this._ensureRoomMyTag();
     const known = await this._registerKnownRoomPeer(targetPeerId, targetName, targetPubKey);
@@ -12155,9 +12624,22 @@ export class P2PDirectApp {
     const pk = targetPubKey || known?.pk || "";
     if (!pk) return;
 
+    if (!this.canUseRelayFallback()) {
+      this.markPeerRelayNeeded(targetPeerId, name, pk, reasonLabel);
+      this.addTelemetry(
+        "room",
+        `Direct P2P to ${name} failed (${reasonLabel}) — relay needed (3rd-party relays disabled; add your own in Settings → Network)`
+      );
+      return;
+    }
+
+    if (this.relayPendingOpens.has(targetPeerId)) {
+      return;
+    }
+
     this.addTelemetry(
       "room",
-      `Direct P2P to ${name} did not connect (${reasonLabel}) — switching to E2EE Relay fallback`
+      `Direct P2P to ${name} did not connect (${reasonLabel}) — switching to your E2EE Relay`
     );
 
     const sendOpen = () => {
@@ -15914,6 +16396,7 @@ export class P2PDirectApp {
 
     const handleOpen = () => {
       if (closed || peerEntry.superseded) return;
+      this.clearPeerRelayNeeded(peerId);
       const existing = this.directPeers.get(peerId);
       let upgradingFromRelay = false;
 
@@ -17304,15 +17787,36 @@ export class P2PDirectApp {
     let badgeClass = "badge pending";
     let statusTitle = "Connecting to room…";
     let isLive = false;
+    const blockedCount = this.relayNeededPeers?.size || 0;
+    const strictNoRelay =
+      isActive && Boolean(this.networkSettings?.blockThirdPartySignaling) && !this.roomUsesCustomRelay;
     if (peerCount > 0) {
-      badgeText = `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
-      badgeClass = "badge auto";
-      statusTitle = `Room online — ${peerCount} ${peerCount === 1 ? "peer" : "peers"} connected`;
+      badgeText =
+        blockedCount > 0
+          ? `Live · ${peerCount} · Relay Needed`
+          : `Live · ${peerCount} ${peerCount === 1 ? "peer" : "peers"}`;
+      badgeClass = blockedCount > 0 ? "badge pending" : "badge auto";
+      statusTitle =
+        blockedCount > 0
+          ? `${peerCount} connected, ${blockedCount} blocked (needs your own relay)`
+          : `Room online — ${peerCount} ${peerCount === 1 ? "peer" : "peers"} connected`;
       isLive = true;
+    } else if (blockedCount > 0) {
+      badgeText = "Relay Needed";
+      badgeClass = "badge pending";
+      statusTitle = "Direct P2P failed — add your own relay in Settings → Network";
+      isLive = false;
+    } else if (strictNoRelay) {
+      badgeText = "No Relay";
+      badgeClass = "badge pending";
+      statusTitle = "3rd-party signaling blocked — add your own relay in Settings → Network";
+      isLive = false;
     } else if (isActive && relayState === "live" && relayCount > 0) {
-      badgeText = "Ready";
+      badgeText = this.roomUsesCustomRelay ? "Ready · Your Relay" : "Ready";
       badgeClass = "badge auto";
-      statusTitle = "Room ready — waiting for peers";
+      statusTitle = this.roomUsesCustomRelay
+        ? "Room ready on your own relay — waiting for peers"
+        : "Room ready — waiting for peers";
       isLive = true;
     }
 

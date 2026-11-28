@@ -41,6 +41,16 @@ function randomClientId() {
   return `p2pd${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
+const THIRD_PARTY_RELAY_HOSTS = new Set(
+  DEFAULT_MQTT_RELAYS.map((u) => {
+    try {
+      return new URL(u).hostname.toLowerCase();
+    } catch {
+      return "";
+    }
+  }).filter(Boolean)
+);
+
 export function isValidRelayUrl(url) {
   if (typeof url !== "string") return false;
   const trimmed = url.trim();
@@ -53,7 +63,25 @@ export function isValidRelayUrl(url) {
   }
 }
 
-export function resolveRelayUrls(customRelay) {
+export function isThirdPartyRelayUrl(url) {
+  if (!isValidRelayUrl(url)) return false;
+  try {
+    const host = new URL(url.trim()).hostname.toLowerCase();
+    return THIRD_PARTY_RELAY_HOSTS.has(host);
+  } catch {
+    return false;
+  }
+}
+
+export function isUserOwnedRelayUrl(url) {
+  return isValidRelayUrl(url) && !isThirdPartyRelayUrl(url);
+}
+
+export function hasUserOwnedRelay(urls) {
+  return Array.isArray(urls) && urls.some((u) => isUserOwnedRelayUrl(u));
+}
+
+export function resolveRelayUrls(customRelay, { allowPublicSignaling = true } = {}) {
   const list = [];
   const addUrl = (raw) => {
     if (!raw || typeof raw !== "string") return;
@@ -62,8 +90,13 @@ export function resolveRelayUrls(customRelay) {
       list.push(cleaned);
     }
   };
-  const addCsv = (raw) => {
-    if (!raw || typeof raw !== "string") return;
+  const addCsvOrList = (raw) => {
+    if (!raw) return;
+    if (Array.isArray(raw)) {
+      for (const item of raw) addCsvOrList(item);
+      return;
+    }
+    if (typeof raw !== "string") return;
     for (const part of raw.split(",")) {
       addUrl(part);
     }
@@ -71,19 +104,19 @@ export function resolveRelayUrls(customRelay) {
 
   if (typeof window !== "undefined") {
     const params = new URLSearchParams(window.location.search);
-    addCsv(params.get("relay"));
+    addCsvOrList(params.get("relay"));
     if (list.length === 0 && Array.isArray(window.__P2P_MQTT_BROKERS__)) {
       for (const item of window.__P2P_MQTT_BROKERS__) {
         addUrl(typeof item === "string" ? item : item?.url);
       }
     }
   }
-  addCsv(customRelay);
+  addCsvOrList(customRelay);
 
   if (list.length > 0) {
     return list;
   }
-  return DEFAULT_MQTT_RELAYS.slice();
+  return allowPublicSignaling ? DEFAULT_MQTT_RELAYS.slice() : [];
 }
 
 function encodeRemainingLength(len) {
@@ -594,7 +627,7 @@ export class MultiRelayRendezvous {
   constructor({ roomTopic, urls, onMessage, onBinaryMessage, onBrokerReady, onStatusChange }) {
     this.roomTopic = roomTopic;
     this.fullTopic = `${TOPIC_PREFIX}${roomTopic}`;
-    this.urls = Array.isArray(urls) && urls.length > 0 ? urls : DEFAULT_MQTT_RELAYS.slice();
+    this.urls = Array.isArray(urls) ? urls.slice() : DEFAULT_MQTT_RELAYS.slice();
     this.onMessage = onMessage;
     this.onBinaryMessage = onBinaryMessage || null;
     this.onBrokerReady = onBrokerReady;
